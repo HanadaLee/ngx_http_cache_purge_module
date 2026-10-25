@@ -23,6 +23,12 @@ Acceptance remains `preparing` until a real cache fence is published. The intern
 IPC can accept and inspect those records; it does not expose a completed HTTP
 purge API or automatically execute physical cache operations yet.
 
+The shared control-table library uses bounded immutable images for exact,
+prefix, host, and scoped TAG matching. Normal lookups do not acquire a mutex or
+query RocksDB. FENCE and proxy-only PROPAGATE duties share records but expire
+independently. Its process and crash tests are standalone; native request/cache
+hook integration is still pending.
+
 ## Current features
 
 - Exact-key and trailing-wildcard cache removal.
