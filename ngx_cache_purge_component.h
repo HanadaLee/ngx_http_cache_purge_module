@@ -1,0 +1,86 @@
+/* Copyright (C) Hanada */
+#ifndef NGX_CACHE_PURGE_COMPONENT_H
+#define NGX_CACHE_PURGE_COMPONENT_H
+
+#include "ngx_cache_purge_store.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define NGX_CACHE_PURGE_COMPONENT_ABI 1
+#define NGX_CACHE_PURGE_PROTOCOL_VERSION 1
+#define NGX_CACHE_PURGE_FRAME_SIZE 24
+
+typedef struct ngx_cache_purge_component_s ngx_cache_purge_component_t;
+
+typedef enum {
+    NGX_PURGE_COMPONENT_STARTING = 0,
+    NGX_PURGE_COMPONENT_STANDBY,
+    NGX_PURGE_COMPONENT_OPEN,
+    NGX_PURGE_COMPONENT_STOPPING,
+    NGX_PURGE_COMPONENT_STOPPED,
+    NGX_PURGE_COMPONENT_FAILED
+} ngx_cache_purge_component_state_t;
+
+typedef enum {
+    NGX_PURGE_OP_PING = 1,
+    NGX_PURGE_OP_GET,
+    NGX_PURGE_OP_PREPARE,
+    NGX_PURGE_OP_COMMIT,
+    NGX_PURGE_OP_ABORT,
+    NGX_PURGE_OP_RETIRE,
+    NGX_PURGE_OP_COLLECT,
+    NGX_PURGE_OP_QUERY,
+    NGX_PURGE_OP_PENDING,
+    NGX_PURGE_OP_RETIRED,
+    NGX_PURGE_OP_COLLECT_KEYS,
+    NGX_PURGE_OP_ADD_URL,
+    NGX_PURGE_OP_UPDATE
+} ngx_cache_purge_opcode_t;
+
+typedef struct {
+    uint32_t abi;
+    ngx_cache_purge_store_options_t store;
+    uint32_t max_connections;
+    uint32_t max_payload_bytes;
+    uint32_t buffer_bytes;       /* total retained connection payloads */
+    uint32_t io_timeout_ms;      /* frame or response deadline, not idle extension */
+    uint32_t owner_retry_ms;
+} ngx_cache_purge_component_options_t;
+
+typedef struct {
+    uint32_t state;
+    uint32_t error_code;
+    uint64_t connections;
+    uint64_t requests;
+    uint64_t rejected;
+    uint64_t buffered_bytes;
+    uint64_t peak_buffered_bytes;
+} ngx_cache_purge_component_status_t;
+
+void ngx_cache_purge_component_options(ngx_cache_purge_component_options_t *options);
+
+/* Only start after fork in cache_manager, never while parsing configuration or
+ * in master/HTTP workers. Copies its inputs and starts one executor thread.
+ * OPEN means index transport is available, not that unfinished cache writes or
+ * purge fences have been recovered. Socket: <path>/component.sock, mode 0600.
+ * No nginx request, pool, log or configuration pointers cross the thread. */
+int ngx_cache_purge_component_start(const char *path,
+    const ngx_cache_purge_component_options_t *options,
+    ngx_cache_purge_component_t **component, ngx_cache_purge_store_error_t *error);
+
+/* Both calls belong to the starting thread/process. status never queries DB.
+ * stop wakes STANDBY/poll, joins the executor and closes DB before returning.
+ * It can wait for a running sync write; it does not finish an entire purge job.
+ * A lost response is ambiguous: query/retry by durable identity, never assume
+ * that disconnect or shutdown rolled back an acknowledged database write. */
+int ngx_cache_purge_component_status(ngx_cache_purge_component_t *component,
+    ngx_cache_purge_component_status_t *status, ngx_cache_purge_store_error_t *error);
+int ngx_cache_purge_component_stop(ngx_cache_purge_component_t **component,
+    ngx_cache_purge_store_error_t *error);
+
+#ifdef __cplusplus
+}
+#endif
+#endif

@@ -10,9 +10,12 @@ into this checkout; their configuration must not be treated as available feature
 The repository now contains a bounded RocksDB storage bridge and a persistent
 URL/key/file index. They support cross-zone lookup, scoped TAG postings, full
 bytewise prefix scans, shared value storage, and batched fill/retirement records.
-They are internal building blocks; the nginx task dispatcher and cache file
-hooks are still being implemented. Index state changes do not perform filesystem
-operations or provide immediate invalidation by themselves.
+The component executor hosts that index on one thread and accepts bounded local
+IPC independently of the cache-manager event loop. It supports cancellable owner
+handoff, explicit shutdown, and paged queries without retaining server cursors
+between requests. These are internal building blocks; production nginx worker
+integration and cache file hooks are still being implemented. Index state changes
+do not perform filesystem operations or provide immediate invalidation by themselves.
 
 ## Current features
 
@@ -36,9 +39,9 @@ For a dynamic module, use `--add-dynamic-module` and build with `make modules`.
 Use compatible nginx sources and build options. `--with-compat` does not make a
 binary module portable across arbitrary nginx versions or C libraries.
 
-The storage and index libraries can be built separately with RocksDB and OpenSSL
-development packages. RocksDB must provide its CMake targets. Tests also require
-Python 3:
+The storage, index, and component libraries can be built separately on Linux
+with RocksDB and OpenSSL development packages. RocksDB must provide its CMake
+targets. Tests also require Python 3:
 
 ```sh
 cmake -S . -B /tmp/cache-purge-store -DCACHE_PURGE_STORE_TESTS=ON
