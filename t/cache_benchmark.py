@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manual Linux/Actions experiment with real HTTP cache fills; see PERFORMANCE.md."""
+"""Manual Linux/Actions experiment with real HTTP cache fills."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import csv

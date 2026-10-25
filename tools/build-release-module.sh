@@ -52,7 +52,7 @@ http {
 EOF
 objs/nginx -p "$work/runtime/" -c nginx.conf -t
 cp "$module_dir/LICENSE" "$stage/"
-cp "$module_dir/docs/BINARY_MODULES.md" "$stage/README.md"
+cp "$module_dir/README.md" "$stage/README.md"
 {
     printf 'Module: %s\nCommit: %s\nNGINX: %s\nArchitecture: %s\n' \
         "$MODULE_VERSION" "$(git -C "$module_dir" rev-parse HEAD)" "$NGINX_VERSION" "$arch"

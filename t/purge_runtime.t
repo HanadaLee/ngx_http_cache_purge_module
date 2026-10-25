@@ -295,7 +295,7 @@ sub namespace_view {
     return $ns;
 }
 
-# The classification documented in docs/OPERATIONS.md: what a tool reading
+# The queue-status classification: what a tool reading
 # cache files can conclude from the status view and a file's KEY line alone.
 sub classify_generation_file {
     my ($key, $view) = @_;

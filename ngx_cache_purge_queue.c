@@ -1196,8 +1196,7 @@ ngx_http_cache_purge_queue_status_handler(ngx_http_request_t *r)
 
     /* Generation state per namespace (one snapshot each, taken under that
      * namespace's own lock). It lets a tool that reads cache files classify
-     * them without guessing; see "Reading cache files in generation mode" in
-     * docs/OPERATIONS.md. A list that does not fit is cut short and flagged,
+     * them without guessing. A list that does not fit is cut short and flagged,
      * so a large configuration can never turn the status reply into an error. */
     p = ngx_snprintf(p, last - p, ",\"namespaces\":[");
     namespaces = cmcf->namespaces.elts;
