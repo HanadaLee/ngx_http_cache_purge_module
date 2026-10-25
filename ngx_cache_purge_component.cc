@@ -200,7 +200,7 @@ struct ngx_cache_purge_component_s {
         }
         return true;
     }
-    std::string dispatch(Index &index, ngx_cache_purge_store_t *store, const Peer &p) {
+    std::string dispatch(Index &index, Operations &operations, ngx_cache_purge_store_t *store, const Peer &p) {
         wire::Decoder d{p.input}; wire::Encoder e;
         switch (p.request.opcode) {
         case NGX_PURGE_OP_PING: {
@@ -268,13 +268,23 @@ struct ngx_cache_purge_component_s {
             auto id = d.id(); auto revision = d.integer(8); auto metadata = d.string(16384); auto tags = wire::tags(d);
             d.end(); wire::match(e, index.update_metadata(id, revision, metadata, tags)); break;
         }
+        case NGX_PURGE_OP_ACCEPT_OPERATION: {
+            auto input = wire::operation_input(d); d.end();
+            auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            if (now <= 0) throw IndexError(NGX_PURGE_STORE_IO, "invalid component wall clock");
+            wire::operation(e, operations.accept(input, static_cast<uint64_t>(now))); break;
+        }
+        case NGX_PURGE_OP_GET_OPERATION: {
+            auto id = d.string(128); d.end(); wire::operation(e, operations.get(id)); break;
+        }
         default: throw IndexError(NGX_PURGE_STORE_INVALID, "unknown component operation");
         }
         return e.data;
     }
-    void execute(Index &index, ngx_cache_purge_store_t *store, Peer &p) {
+    void execute(Index &index, Operations &operations, ngx_cache_purge_store_t *store, Peer &p) {
         std::string response; uint32_t code = 0; ++requests;
-        try { response = dispatch(index, store, p); }
+        try { response = dispatch(index, operations, store, p); }
         catch (const IndexError &error) {
             if (error.code == NGX_PURGE_STORE_CORRUPT || error.code == NGX_PURGE_STORE_SCHEMA || error.code == NGX_PURGE_STORE_IO) throw;
             wire::Encoder e; e.string(error.what()); response = std::move(e.data); code = error.code;
@@ -286,7 +296,7 @@ struct ngx_cache_purge_component_s {
         p.deadline = Clock::now() + std::chrono::milliseconds(options.io_timeout_ms);
     }
     void serve(ngx_cache_purge_store_t *store) {
-        Index index(store); bind_socket();
+        Index index(store); Operations operations(store); bind_socket();
         peers.resize(options.max_connections); state.store(NGX_PURGE_COMPONENT_OPEN);
         while (!stopping.load()) {
             std::array<pollfd, 66> events{};
@@ -317,7 +327,7 @@ struct ngx_cache_purge_component_s {
                     if (event & POLLOUT) { if (!write_peer(p)) drop(i); continue; }
                     if (event & POLLIN) { if (!read_peer(p)) { drop(i); continue; } }
                     if (!executed && p.output.empty() && p.parsed && p.input_used == p.input.size()) {
-                        execute(index, store, p); executed = true; next_peer = (i + 1) % peers.size();
+                        execute(index, operations, store, p); executed = true; next_peer = (i + 1) % peers.size();
                     }
                 } catch (const IndexError &e) {
                     if (e.code != NGX_PURGE_STORE_INVALID && e.code != NGX_PURGE_STORE_LIMIT) throw;

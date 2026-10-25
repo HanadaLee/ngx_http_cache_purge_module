@@ -17,6 +17,12 @@ between requests. These are internal building blocks; production nginx worker
 integration and cache file hooks are still being implemented. Index state changes
 do not perform filesystem operations or provide immediate invalidation by themselves.
 
+A durable operation ledger now stores selectors, idempotency identities,
+checkpoints, retry scheduling, and independent materialization/propagation states.
+Acceptance remains `preparing` until a real cache fence is published. The internal
+IPC can accept and inspect those records; it does not expose a completed HTTP
+purge API or automatically execute physical cache operations yet.
+
 ## Current features
 
 - Exact-key and trailing-wildcard cache removal.

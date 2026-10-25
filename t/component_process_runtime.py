@@ -95,6 +95,11 @@ def query(kind, value, scope='', bookmark=b'', limit=32):
     return bytes([kind]) + string(value) + string(scope) + string(bookmark) + bytes([limit])
 
 
+def operation_input(name='operation-1', mode=1):
+    return (string(name) + bytes([mode]) + struct.pack('>Q', 1000)
+            + b'\x03' + string('https://a.test/dir/') + string('') + string('config-v1'))
+
+
 class Client:
     def __init__(self, path):
         self.socket = socket.socket(socket.AF_UNIX)
@@ -153,6 +158,15 @@ try:
     c.call(999, code=4)
     c.call(1, b'extra', code=4)
     check(len(c.call(1)) == 72, 'malformed operation does not lose connection framing')
+    operation = operation_input()
+    receipt = c.call(14, operation)
+    fields = struct.unpack('>5Q', receipt[len(operation):len(operation) + 40])
+    check(receipt.startswith(operation) and fields[3:] == (0, 0) and receipt[len(operation) + 40] == 1,
+          'durable operation receipt remains preparing until FENCE publication')
+    check(c.call(14, operation) == receipt and c.call(15, string('operation-1')) == receipt,
+          'operation acceptance and status are idempotent over IPC')
+    c.call(14, operation_input(mode=2), code=7)
+    check(c.call(15, string('operation-1')) == receipt, 'changed operation mode does not replace original receipt')
     records = b'\x03' + record(1) + record(2, root='/cache/b') + record(3, misc='fr')
     check(c.call(3, records)[0] == 3, 'batch prepare over IPC')
     c.call(4, batch([(1, 1), (2, 1), (3, 999)]), code=7)
@@ -186,6 +200,7 @@ try:
     successor.opened()
     c = Client(path)
     check(c.page(1, 'https://alias.test/a')[0] == [1, 2], 'new owner reopens persistent relationships')
+    check(c.call(15, string('operation-1')) == receipt, 'owner handoff preserves operation ledger')
     c.close()
     successor.process.kill()
     successor.process.wait(timeout=5)
@@ -193,6 +208,7 @@ try:
     recovered.opened()
     c = Client(path)
     check(c.page(1, 'https://a.test/dir/a')[0] == [1, 2, 3], 'owner SIGKILL recovers WAL and stale socket')
+    check(c.call(14, operation) == receipt, 'crash recovery preserves original operation timestamps')
     c.call(6, batch([(1, 3), (2, 2), (3, 2)]))
     c.call(7, batch([(1, 4), (2, 3), (3, 3)]))
     while struct.unpack('>I', c.call(11, b'\x08'))[0]:

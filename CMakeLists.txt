@@ -21,9 +21,14 @@ set_target_properties(ngx_cache_purge_index PROPERTIES POSITION_INDEPENDENT_CODE
 target_link_libraries(ngx_cache_purge_index PUBLIC ngx_cache_purge_store OpenSSL::Crypto)
 target_compile_options(ngx_cache_purge_index PRIVATE -Wall -Wextra -Werror)
 
+add_library(ngx_cache_purge_operations STATIC ngx_cache_purge_operations.cc)
+set_target_properties(ngx_cache_purge_operations PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(ngx_cache_purge_operations PUBLIC ngx_cache_purge_index)
+target_compile_options(ngx_cache_purge_operations PRIVATE -Wall -Wextra -Werror)
+
 add_library(ngx_cache_purge_component STATIC ngx_cache_purge_component.cc)
 set_target_properties(ngx_cache_purge_component PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(ngx_cache_purge_component PUBLIC ngx_cache_purge_index)
+target_link_libraries(ngx_cache_purge_component PUBLIC ngx_cache_purge_operations)
 target_compile_options(ngx_cache_purge_component PRIVATE -Wall -Wextra -Werror)
 
 option(CACHE_PURGE_STORE_TESTS "Build cache index storage regression tests" OFF)
@@ -55,5 +60,14 @@ if(CACHE_PURGE_STORE_TESTS)
     ${CMAKE_CURRENT_SOURCE_DIR}/t/component_process_runtime.py
     --binary $<TARGET_FILE:cache_purge_component_test>
     --output ${CMAKE_CURRENT_BINARY_DIR}/component-process-results.json)
-  set_tests_properties(store_runtime index_runtime index_process_runtime component_process_runtime PROPERTIES TIMEOUT 120)
+  add_executable(cache_purge_operations_test t/operations_runtime.cc)
+  target_link_libraries(cache_purge_operations_test PRIVATE ngx_cache_purge_operations)
+  target_compile_options(cache_purge_operations_test PRIVATE -Wall -Wextra -Werror)
+  add_test(NAME operations_runtime COMMAND cache_purge_operations_test)
+  add_test(NAME operations_process_runtime COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/t/operations_process_runtime.py
+    --binary $<TARGET_FILE:cache_purge_operations_test>
+    --output ${CMAKE_CURRENT_BINARY_DIR}/operations-process-results.json)
+  set_tests_properties(store_runtime index_runtime index_process_runtime component_process_runtime
+    operations_runtime operations_process_runtime PROPERTIES TIMEOUT 120)
 endif()

@@ -36,7 +36,9 @@ typedef enum {
     NGX_PURGE_OP_RETIRED,
     NGX_PURGE_OP_COLLECT_KEYS,
     NGX_PURGE_OP_ADD_URL,
-    NGX_PURGE_OP_UPDATE
+    NGX_PURGE_OP_UPDATE,
+    NGX_PURGE_OP_ACCEPT_OPERATION,
+    NGX_PURGE_OP_GET_OPERATION
 } ngx_cache_purge_opcode_t;
 
 typedef struct {

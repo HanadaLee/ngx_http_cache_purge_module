@@ -4,6 +4,7 @@
 
 #include "ngx_cache_purge_component.h"
 #include "ngx_cache_purge_index.hpp"
+#include "ngx_cache_purge_operations.hpp"
 #include <cstring>
 #include <string_view>
 
@@ -100,6 +101,20 @@ inline std::vector<ExpectedFile> expected(Decoder &d) {
     std::vector<ExpectedFile> result; result.reserve(n);
     while (n--) { auto id = d.id(); result.push_back({id, d.integer(8)}); }
     return result;
+}
+inline OperationInput operation_input(Decoder &d) {
+    OperationInput in; in.id = d.string(128); in.mode = static_cast<PurgeMode>(d.integer(1));
+    in.issued_at_ms = d.integer(8); in.selector = selector(d); in.binding = d.string(256); return in;
+}
+inline void operation(Encoder &e, const Operation &op) {
+    e.string(op.input.id); e.byte(static_cast<unsigned>(op.input.mode)); e.integer(op.input.issued_at_ms, 8);
+    e.byte(static_cast<unsigned>(op.input.selector.kind)); e.string(op.input.selector.value);
+    e.string(op.input.selector.scope); e.string(op.input.binding);
+    for (auto n : {op.sequence, op.revision, op.accepted_at_ms, op.effective_at_ms, op.propagation_until_ms}) e.integer(n, 8);
+    e.byte(static_cast<unsigned>(op.stage)); e.integer(op.propagation_ms, 4); e.byte(op.propagate);
+    e.string(op.bookmark); e.byte(op.scan_done);
+    for (auto n : {op.next_run_ms, op.visits, op.pending, op.failed, op.checkpoint_id}) e.integer(n, 8);
+    e.string(op.last_error);
 }
 
 } // namespace ngx_cache_purge::protocol
