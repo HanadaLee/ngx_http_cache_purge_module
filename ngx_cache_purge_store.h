@@ -125,9 +125,17 @@ int ngx_cache_purge_store_write(ngx_cache_purge_store_t *store,
     ngx_cache_purge_store_error_t *error);
 
 /* Bytewise prefix scan, with an optional exclusive resume key in that prefix.
- * No prefix truncation or fixed-length prefix extractor is used. Each cursor
- * owns a bounded-lifetime snapshot shared by cursor_next and cursor_get. */
+ * An empty prefix scans the whole CF, including the reserved schema marker.
+ * No prefix truncation or fixed-length prefix extractor is used. next/get use
+ * a bounded-lifetime snapshot; forked cursors share its original deadline. */
 int ngx_cache_purge_cursor_open(ngx_cache_purge_store_t *store,
+    ngx_cache_purge_cf_t cf, ngx_cache_purge_bytes_t prefix,
+    ngx_cache_purge_bytes_t after, ngx_cache_purge_cursor_t **cursor,
+    ngx_cache_purge_store_error_t *error);
+/* Open a related range using the parent's exact snapshot and deadline. A child
+ * remains valid after its parent closes, until that shared deadline expires.
+ * Every cursor consumes one bounded slot and must be closed, even on EXPIRED. */
+int ngx_cache_purge_cursor_fork(ngx_cache_purge_cursor_t *parent,
     ngx_cache_purge_cf_t cf, ngx_cache_purge_bytes_t prefix,
     ngx_cache_purge_bytes_t after, ngx_cache_purge_cursor_t **cursor,
     ngx_cache_purge_store_error_t *error);

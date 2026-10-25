@@ -3,6 +3,7 @@ project(ngx_cache_purge_store LANGUAGES C CXX)
 
 find_package(RocksDB CONFIG REQUIRED)
 find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 
 add_library(ngx_cache_purge_store STATIC ngx_cache_purge_store.cc)
 target_compile_features(ngx_cache_purge_store PUBLIC cxx_std_17)
@@ -14,6 +15,12 @@ if(UNIX)
 endif()
 target_compile_options(ngx_cache_purge_store PRIVATE -Wall -Wextra -Werror)
 
+add_library(ngx_cache_purge_index STATIC ngx_cache_purge_index.cc)
+target_compile_features(ngx_cache_purge_index PUBLIC cxx_std_17)
+set_target_properties(ngx_cache_purge_index PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(ngx_cache_purge_index PUBLIC ngx_cache_purge_store OpenSSL::Crypto)
+target_compile_options(ngx_cache_purge_index PRIVATE -Wall -Wextra -Werror)
+
 option(CACHE_PURGE_STORE_TESTS "Build cache index storage regression tests" OFF)
 option(CACHE_PURGE_STORE_SANITIZE "Enable address and undefined behavior sanitizers" OFF)
 if(CACHE_PURGE_STORE_SANITIZE)
@@ -23,8 +30,18 @@ endif()
 
 if(CACHE_PURGE_STORE_TESTS)
   enable_testing()
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
   add_executable(cache_purge_store_test t/store_runtime.cc t/store_c_api.c)
   target_link_libraries(cache_purge_store_test PRIVATE ngx_cache_purge_store)
   target_compile_options(cache_purge_store_test PRIVATE -Wall -Wextra -Werror)
   add_test(NAME store_runtime COMMAND cache_purge_store_test)
+  add_executable(cache_purge_index_test t/index_runtime.cc)
+  target_link_libraries(cache_purge_index_test PRIVATE ngx_cache_purge_index)
+  target_compile_options(cache_purge_index_test PRIVATE -Wall -Wextra -Werror)
+  add_test(NAME index_runtime COMMAND cache_purge_index_test)
+  add_test(NAME index_process_runtime COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/t/index_process_runtime.py
+    --binary $<TARGET_FILE:cache_purge_index_test>
+    --output ${CMAKE_CURRENT_BINARY_DIR}/index-process-results.json)
+  set_tests_properties(store_runtime index_runtime index_process_runtime PROPERTIES TIMEOUT 120)
 endif()

@@ -7,10 +7,12 @@ still implements the legacy PURGE/REFRESH interfaces. Persistent RocksDB indexin
 the new Invalidate/Delete API, and multilevel cache propagation are not yet wired
 into this checkout; their configuration must not be treated as available features.
 
-The repository now contains a bounded RocksDB storage bridge with a C API,
-atomic cross-column-family writes, conditional updates, and bytewise prefix
-cursors. It is an internal building block; the nginx task dispatcher and cache
-file/index lifecycle are still being implemented.
+The repository now contains a bounded RocksDB storage bridge and a persistent
+URL/key/file index. They support cross-zone lookup, scoped TAG postings, full
+bytewise prefix scans, shared value storage, and batched fill/retirement records.
+They are internal building blocks; the nginx task dispatcher and cache file
+hooks are still being implemented. Index state changes do not perform filesystem
+operations or provide immediate invalidation by themselves.
 
 ## Current features
 
@@ -34,8 +36,9 @@ For a dynamic module, use `--add-dynamic-module` and build with `make modules`.
 Use compatible nginx sources and build options. `--with-compat` does not make a
 binary module portable across arbitrary nginx versions or C libraries.
 
-The storage bridge can be built and tested separately with a RocksDB development
-package that provides its CMake targets:
+The storage and index libraries can be built separately with RocksDB and OpenSSL
+development packages. RocksDB must provide its CMake targets. Tests also require
+Python 3:
 
 ```sh
 cmake -S . -B /tmp/cache-purge-store -DCACHE_PURGE_STORE_TESTS=ON

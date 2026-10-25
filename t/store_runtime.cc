@@ -224,7 +224,10 @@ int main(int argc, char **argv) {
         expect(ngx_cache_purge_cursor_open(store, NGX_PURGE_STORE_TAG, bytes(prefix), bytes(""), &third, &error), NGX_PURGE_STORE_LIMIT, "cursor limit");
         expect(ngx_cache_purge_store_close(&store, &error), NGX_PURGE_STORE_BUSY, "refuse close with live handles");
         expect(ngx_cache_purge_cursor_close(&second, &error), NGX_PURGE_STORE_OK, "close second");
+        expect(ngx_cache_purge_cursor_fork(cursor, NGX_PURGE_STORE_DEFAULT, bytes(prefix), bytes(""), &second, &error), NGX_PURGE_STORE_OK, "fork exact snapshot");
         expect(ngx_cache_purge_cursor_close(&cursor, &error), NGX_PURGE_STORE_OK, "close first");
+        require(get(store, NGX_PURGE_STORE_DEFAULT, key, second) == replacement, "child retains snapshot after parent closes");
+        expect(ngx_cache_purge_cursor_close(&second, &error), NGX_PURGE_STORE_OK, "close child");
 
         int wrong_thread = 0;
         std::thread thread([&] {
@@ -244,10 +247,14 @@ int main(int argc, char **argv) {
         store = open(path, options);
         require(get(store, NGX_PURGE_STORE_DEFAULT, key) == "later", "reopen persistent data");
         expect(ngx_cache_purge_cursor_open(store, NGX_PURGE_STORE_URL, bytes(prefix), bytes(""), &cursor, &error), NGX_PURGE_STORE_OK, "expiring cursor");
+        expect(ngx_cache_purge_cursor_fork(cursor, NGX_PURGE_STORE_DEFAULT, bytes(prefix), bytes(""), &second, &error), NGX_PURGE_STORE_OK, "fork expiring view");
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         expect(ngx_cache_purge_store_stats(store, &stats, &error), NGX_PURGE_STORE_OK, "expire via stats");
-        require(stats.active_cursors == 0 && stats.cursor_handles == 1, "expired cursor releases snapshot, retains bounded handle");
+        require(stats.active_cursors == 0 && stats.cursor_handles == 2, "expired cursors release shared snapshot, retain bounded handles");
         expect(ngx_cache_purge_cursor_next(cursor, &key_buffer, &value_buffer, &error), NGX_PURGE_STORE_EXPIRED, "expired read rejected");
+        expect(ngx_cache_purge_cursor_next(second, &key_buffer, &value_buffer, &error), NGX_PURGE_STORE_EXPIRED, "child shares original expiration");
+        expect(ngx_cache_purge_cursor_fork(cursor, NGX_PURGE_STORE_DEFAULT, bytes(prefix), bytes(""), &third, &error), NGX_PURGE_STORE_EXPIRED, "expired parent cannot fork");
+        expect(ngx_cache_purge_cursor_close(&second, &error), NGX_PURGE_STORE_OK, "close expired child");
         expect(ngx_cache_purge_cursor_close(&cursor, &error), NGX_PURGE_STORE_OK, "close expired cursor");
         close(store);
         auto reduced = options;

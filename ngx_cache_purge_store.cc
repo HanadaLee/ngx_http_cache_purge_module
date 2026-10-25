@@ -112,21 +112,27 @@ struct ngx_cache_purge_store_s {
     void expire();
 };
 
-struct ngx_cache_purge_cursor_s {
+struct StoreSnapshot {
     ngx_cache_purge_store_t *store;
     const rocksdb::Snapshot *snapshot = nullptr;
+    Clock::time_point deadline;
+    explicit StoreSnapshot(ngx_cache_purge_store_t *s) : store(s) {}
+    ~StoreSnapshot() { if (snapshot) store->db->ReleaseSnapshot(snapshot); }
+};
+
+struct ngx_cache_purge_cursor_s {
+    ngx_cache_purge_store_t *store;
+    std::shared_ptr<StoreSnapshot> view;
     std::string prefix;
     std::string upper;
     rocksdb::Slice bound;
     std::unique_ptr<rocksdb::Iterator> iterator;
-    Clock::time_point deadline;
     bool expired = false;
 
     explicit ngx_cache_purge_cursor_s(ngx_cache_purge_store_t *s) : store(s) {}
     void release() noexcept {
         iterator.reset();
-        if (snapshot) store->db->ReleaseSnapshot(snapshot);
-        snapshot = nullptr;
+        view.reset();
     }
     ~ngx_cache_purge_cursor_s() { release(); }
 };
@@ -134,7 +140,7 @@ struct ngx_cache_purge_cursor_s {
 void ngx_cache_purge_store_s::expire() {
     const auto now = Clock::now();
     for (auto *cursor : cursors) {
-        if (!cursor->expired && now >= cursor->deadline) {
+        if (!cursor->expired && now >= cursor->view->deadline) {
             cursor->release();
             cursor->expired = true;
         }
@@ -418,20 +424,21 @@ ngx_cache_purge_store_write(ngx_cache_purge_store_t *store,
     });
 }
 
-extern "C" int
-ngx_cache_purge_cursor_open(ngx_cache_purge_store_t *store, ngx_cache_purge_cf_t cf,
-                           ngx_cache_purge_bytes_t prefix, ngx_cache_purge_bytes_t after,
-                           ngx_cache_purge_cursor_t **output, ngx_cache_purge_store_error_t *error) {
-    if (output) *output = nullptr;
-    return boundary(error, [&]() -> int {
+static int
+open_cursor(ngx_cache_purge_store_t *store, ngx_cache_purge_cf_t cf,
+            ngx_cache_purge_bytes_t prefix, ngx_cache_purge_bytes_t after,
+            std::shared_ptr<StoreSnapshot> view, ngx_cache_purge_cursor_t **output,
+            ngx_cache_purge_store_error_t *error) {
         int code = check(store, error);
         if (code != NGX_PURGE_STORE_OK) return code;
-        if (!output || !cf_valid(cf) || !key_valid(store, prefix)
+        if (!output || !cf_valid(cf) || !bytes_valid(prefix, store->options.max_key_bytes)
             || !bytes_valid(after, store->options.max_key_bytes)
             || (after.len && !slice(after).starts_with(slice(prefix))))
             return fail(error, NGX_PURGE_STORE_INVALID, "invalid cache index cursor range");
         if (store->cursors.size() >= store->options.max_cursors)
             return fail(error, NGX_PURGE_STORE_LIMIT, "cache index cursor handle limit");
+        if (view && Clock::now() >= view->deadline)
+            return fail(error, NGX_PURGE_STORE_EXPIRED, "cache index parent snapshot expired");
         auto cursor = std::make_unique<ngx_cache_purge_cursor_t>(store);
         cursor->prefix = slice(prefix).ToString();
         cursor->upper = cursor->prefix;
@@ -439,12 +446,16 @@ ngx_cache_purge_cursor_open(ngx_cache_purge_store_t *store, ngx_cache_purge_cf_t
             cursor->upper.pop_back();
         if (!cursor->upper.empty()) ++cursor->upper.back();
         cursor->bound = cursor->upper;
-        cursor->snapshot = store->db->GetSnapshot();
-        if (!cursor->snapshot)
-            return fail(error, NGX_PURGE_STORE_IO, "cache index snapshot unavailable");
-        cursor->deadline = Clock::now() + std::chrono::milliseconds(store->options.cursor_lifetime_ms);
+        if (!view) {
+            view = std::make_shared<StoreSnapshot>(store);
+            view->snapshot = store->db->GetSnapshot();
+            if (!view->snapshot)
+                return fail(error, NGX_PURGE_STORE_IO, "cache index snapshot unavailable");
+            view->deadline = Clock::now() + std::chrono::milliseconds(store->options.cursor_lifetime_ms);
+        }
+        cursor->view = std::move(view);
         rocksdb::ReadOptions read;
-        read.snapshot = cursor->snapshot;
+        read.snapshot = cursor->view->snapshot;
         read.fill_cache = false;
         read.total_order_seek = true;
         if (!cursor->upper.empty()) read.iterate_upper_bound = &cursor->bound;
@@ -456,6 +467,27 @@ ngx_cache_purge_cursor_open(ngx_cache_purge_store_t *store, ngx_cache_purge_cf_t
         store->cursors.push_back(cursor.get());
         *output = cursor.release();
         return NGX_PURGE_STORE_OK;
+}
+
+extern "C" int
+ngx_cache_purge_cursor_open(ngx_cache_purge_store_t *store, ngx_cache_purge_cf_t cf,
+                           ngx_cache_purge_bytes_t prefix, ngx_cache_purge_bytes_t after,
+                           ngx_cache_purge_cursor_t **output, ngx_cache_purge_store_error_t *error) {
+    if (output) *output = nullptr;
+    return boundary(error, [&]() -> int {
+        return open_cursor(store, cf, prefix, after, nullptr, output, error);
+    });
+}
+
+extern "C" int
+ngx_cache_purge_cursor_fork(ngx_cache_purge_cursor_t *parent, ngx_cache_purge_cf_t cf,
+                           ngx_cache_purge_bytes_t prefix, ngx_cache_purge_bytes_t after,
+                           ngx_cache_purge_cursor_t **output, ngx_cache_purge_store_error_t *error) {
+    if (output) *output = nullptr;
+    return boundary(error, [&]() -> int {
+        int code = check(parent, error);
+        if (code != NGX_PURGE_STORE_OK) return code;
+        return open_cursor(parent->store, cf, prefix, after, parent->view, output, error);
     });
 }
 
@@ -490,7 +522,7 @@ ngx_cache_purge_cursor_get(ngx_cache_purge_cursor_t *cursor, ngx_cache_purge_cf_
     return boundary(error, [&]() -> int {
         int code = check(cursor, error);
         if (code != NGX_PURGE_STORE_OK) return code;
-        return get(cursor->store, cursor->snapshot, cf, key, value, error);
+        return get(cursor->store, cursor->view->snapshot, cf, key, value, error);
     });
 }
 
