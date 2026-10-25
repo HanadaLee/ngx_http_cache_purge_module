@@ -1,6 +1,7 @@
 /* Copyright (C) Hanada */
 #include "ngx_cache_purge_component.h"
 #include "ngx_cache_purge_protocol.hpp"
+#include "ngx_cache_purge_coordinator.hpp"
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
@@ -76,6 +77,8 @@ struct ngx_cache_purge_component_s {
     std::atomic<bool> stopping{false};
     std::atomic<uint32_t> state{NGX_PURGE_COMPONENT_STARTING}, error_code{0};
     std::atomic<uint64_t> connections{0}, requests{0}, rejected{0}, buffered{0}, peak{0};
+    std::atomic<uint32_t> control_state{0};
+    std::atomic<uint64_t> control_publication{0};
     ngx_cache_purge_store_error_t terminal_error{};
     std::vector<std::unique_ptr<Peer>> peers;
     size_t next_peer = 0;
@@ -200,7 +203,7 @@ struct ngx_cache_purge_component_s {
         }
         return true;
     }
-    std::string dispatch(Index &index, Operations &operations, ngx_cache_purge_store_t *store, const Peer &p) {
+    std::string dispatch(Index &index, Operations &operations, Coordinator *coordinator, ngx_cache_purge_store_t *store, const Peer &p) {
         wire::Decoder d{p.input}; wire::Encoder e;
         switch (p.request.opcode) {
         case NGX_PURGE_OP_PING: {
@@ -273,18 +276,23 @@ struct ngx_cache_purge_component_s {
             auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
             if (now <= 0) throw IndexError(NGX_PURGE_STORE_IO, "invalid component wall clock");
-            wire::operation(e, operations.accept(input, static_cast<uint64_t>(now))); break;
+            wire::operation(e, coordinator ? coordinator->accept(input, static_cast<uint64_t>(now), options.propagation_ms)
+                                           : operations.accept(input, static_cast<uint64_t>(now), options.propagation_ms)); break;
         }
         case NGX_PURGE_OP_GET_OPERATION: {
             auto id = d.string(128); d.end(); wire::operation(e, operations.get(id)); break;
+        }
+        case NGX_PURGE_OP_GET_CONTROL_STATUS: {
+            d.end(); e.integer(coordinator ? static_cast<unsigned>(coordinator->state()) : 0, 4);
+            e.integer(coordinator ? coordinator->publication() : 0, 8); break;
         }
         default: throw IndexError(NGX_PURGE_STORE_INVALID, "unknown component operation");
         }
         return e.data;
     }
-    void execute(Index &index, Operations &operations, ngx_cache_purge_store_t *store, Peer &p) {
+    void execute(Index &index, Operations &operations, Coordinator *coordinator, ngx_cache_purge_store_t *store, Peer &p) {
         std::string response; uint32_t code = 0; ++requests;
-        try { response = dispatch(index, operations, store, p); }
+        try { response = dispatch(index, operations, coordinator, store, p); }
         catch (const IndexError &error) {
             if (error.code == NGX_PURGE_STORE_CORRUPT || error.code == NGX_PURGE_STORE_SCHEMA || error.code == NGX_PURGE_STORE_IO) throw;
             wire::Encoder e; e.string(error.what()); response = std::move(e.data); code = error.code;
@@ -296,9 +304,26 @@ struct ngx_cache_purge_component_s {
         p.deadline = Clock::now() + std::chrono::milliseconds(options.io_timeout_ms);
     }
     void serve(ngx_cache_purge_store_t *store) {
-        Index index(store); Operations operations(store); bind_socket();
+        Index index(store); Operations operations(store, {options.max_live_operations, options.live_selector_bytes});
+        std::unique_ptr<Coordinator> coordinator;
+        if (options.control_memory) coordinator = std::make_unique<Coordinator>(operations, options.control_memory, options.control_bytes);
+        auto expire_at = Clock::now() + std::chrono::seconds(1);
+        bind_socket();
         peers.resize(options.max_connections); state.store(NGX_PURGE_COMPONENT_OPEN);
         while (!stopping.load()) {
+            bool control_progress = false;
+            if (coordinator) {
+                if (coordinator->state() != Coordination::ready) control_progress = coordinator->step();
+                else if (Clock::now() >= expire_at) {
+                    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    if (now <= 0) throw IndexError(NGX_PURGE_STORE_IO, "invalid component expiration clock");
+                    if (operations.expire_propagation(static_cast<uint64_t>(now), 32)) coordinator->refresh();
+                    expire_at = Clock::now() + std::chrono::seconds(1);
+                }
+                control_state.store(static_cast<unsigned>(coordinator->state()));
+                control_publication.store(coordinator->publication());
+            }
             std::array<pollfd, 66> events{};
             events[0] = {wake_read.value, POLLIN, 0}; events[1] = {listener.value, POLLIN, 0};
             bool ready = false;
@@ -311,7 +336,8 @@ struct ngx_cache_purge_component_s {
                 events[i + 2] = {p.fd.value, static_cast<short>(!p.output.empty() ? POLLOUT : complete ? 0 : POLLIN), 0};
                 ready |= complete && p.output.empty();
             }
-            int rc = poll(events.data(), peers.size() + 2, ready ? 0 : 50);
+            bool control_pending = coordinator && coordinator->state() != Coordination::ready;
+            int rc = poll(events.data(), peers.size() + 2, ready || (control_pending && control_progress) ? 0 : 50);
             if (rc < 0) { if (errno == EINTR) continue; system_error("component poll"); }
             if (events[0].revents) clear_wake();
             if (stopping.load()) break;
@@ -327,7 +353,7 @@ struct ngx_cache_purge_component_s {
                     if (event & POLLOUT) { if (!write_peer(p)) drop(i); continue; }
                     if (event & POLLIN) { if (!read_peer(p)) { drop(i); continue; } }
                     if (!executed && p.output.empty() && p.parsed && p.input_used == p.input.size()) {
-                        execute(index, operations, store, p); executed = true; next_peer = (i + 1) % peers.size();
+                        execute(index, operations, coordinator.get(), store, p); executed = true; next_peer = (i + 1) % peers.size();
                     }
                 } catch (const IndexError &e) {
                     if (e.code != NGX_PURGE_STORE_INVALID && e.code != NGX_PURGE_STORE_LIMIT) throw;
@@ -373,7 +399,9 @@ extern "C" void ngx_cache_purge_component_options(ngx_cache_purge_component_opti
     *o = {}; o->abi = NGX_CACHE_PURGE_COMPONENT_ABI; ngx_cache_purge_store_options(&o->store);
     o->max_connections = 32; o->max_payload_bytes = 512 * 1024; o->buffer_bytes = 4 * 1024 * 1024;
     o->io_timeout_ms = 30000; o->owner_retry_ms = 50;
+    o->propagation_ms = 300000; o->max_live_operations = 4096; o->live_selector_bytes = 4 * 1024 * 1024;
 }
+extern "C" uint32_t ngx_cache_purge_component_abi_2(void) { return NGX_CACHE_PURGE_COMPONENT_ABI; }
 extern "C" int ngx_cache_purge_component_start(const char *path,
     const ngx_cache_purge_component_options_t *options,
     ngx_cache_purge_component_t **output, ngx_cache_purge_store_error_t *error) {
@@ -384,7 +412,10 @@ extern "C" int ngx_cache_purge_component_start(const char *path,
             || options->max_payload_bytes < 1024 || options->max_payload_bytes > 1024 * 1024
             || options->buffer_bytes < 2 * options->max_payload_bytes + NGX_CACHE_PURGE_FRAME_SIZE
             || options->buffer_bytes > 64 * 1024 * 1024 || !options->io_timeout_ms || options->io_timeout_ms > 300000
-            || !options->owner_retry_ms || options->owner_retry_ms > 1000)
+            || !options->owner_retry_ms || options->owner_retry_ms > 1000
+            || !options->max_live_operations || options->max_live_operations > 65536
+            || options->live_selector_bytes < 1024 || options->live_selector_bytes > 64 * 1024 * 1024
+            || (options->control_memory == nullptr) != (options->control_bytes == 0))
             return failure(error, NGX_PURGE_STORE_INVALID, "invalid component options");
         auto component = std::make_unique<ngx_cache_purge_component_s>();
         component->path = path; component->socket_path = component->path + "/component.sock";
@@ -414,7 +445,7 @@ extern "C" int ngx_cache_purge_component_status(ngx_cache_purge_component_t *c,
         if (!c || !status) return failure(error, NGX_PURGE_STORE_INVALID, "null component status");
         if (!c->owner()) return failure(error, NGX_PURGE_STORE_OWNER, "component creator mismatch");
         *status = {c->state.load(), c->error_code.load(), c->connections.load(), c->requests.load(),
-                   c->rejected.load(), c->buffered.load(), c->peak.load()};
+                   c->rejected.load(), c->buffered.load(), c->peak.load(), c->control_state.load(), c->control_publication.load()};
         return 0;
     });
 }

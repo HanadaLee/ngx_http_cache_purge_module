@@ -329,6 +329,10 @@ ngx_http_cache_purge_exit_worker(ngx_cycle_t *cycle)
 {
     ngx_http_cache_purge_work_t  *work;
 
+#if (NGX_CACHE_PURGE_ROCKSDB)
+    ngx_http_cache_purge_runtime_worker_exit(cycle);
+#endif
+
     work = &ngx_cache_purge_work;
     if (work->event.timer_set) {
         ngx_del_timer(&work->event);

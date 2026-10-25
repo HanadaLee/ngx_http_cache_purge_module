@@ -31,9 +31,14 @@ set_target_properties(ngx_cache_purge_control PROPERTIES POSITION_INDEPENDENT_CO
 target_link_libraries(ngx_cache_purge_control PUBLIC ngx_cache_purge_operations)
 target_compile_options(ngx_cache_purge_control PRIVATE -Wall -Wextra -Werror)
 
+add_library(ngx_cache_purge_coordinator STATIC ngx_cache_purge_coordinator.cc)
+set_target_properties(ngx_cache_purge_coordinator PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(ngx_cache_purge_coordinator PUBLIC ngx_cache_purge_control)
+target_compile_options(ngx_cache_purge_coordinator PRIVATE -Wall -Wextra -Werror)
+
 add_library(ngx_cache_purge_component STATIC ngx_cache_purge_component.cc)
 set_target_properties(ngx_cache_purge_component PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(ngx_cache_purge_component PUBLIC ngx_cache_purge_operations)
+target_link_libraries(ngx_cache_purge_component PUBLIC ngx_cache_purge_coordinator)
 target_compile_options(ngx_cache_purge_component PRIVATE -Wall -Wextra -Werror)
 
 option(CACHE_PURGE_STORE_TESTS "Build cache index storage regression tests" OFF)
@@ -88,6 +93,15 @@ if(CACHE_PURGE_STORE_TESTS)
   add_executable(cache_purge_control_benchmark t/control_benchmark.cc)
   target_link_libraries(cache_purge_control_benchmark PRIVATE ngx_cache_purge_control)
   target_compile_options(cache_purge_control_benchmark PRIVATE -Wall -Wextra -Werror)
+  add_executable(cache_purge_coordinator_test t/coordinator_runtime.cc)
+  target_link_libraries(cache_purge_coordinator_test PRIVATE ngx_cache_purge_coordinator)
+  target_compile_options(cache_purge_coordinator_test PRIVATE -Wall -Wextra -Werror)
+  add_test(NAME coordinator_runtime COMMAND cache_purge_coordinator_test)
+  add_test(NAME coordinator_process_runtime COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/t/coordinator_process_runtime.py
+    --binary $<TARGET_FILE:cache_purge_coordinator_test>
+    --output ${CMAKE_CURRENT_BINARY_DIR}/coordinator-process-results.json)
   set_tests_properties(store_runtime index_runtime index_process_runtime component_process_runtime
-    operations_runtime operations_process_runtime control_runtime control_fault_runtime PROPERTIES TIMEOUT 120)
+    operations_runtime operations_process_runtime control_runtime control_fault_runtime
+    coordinator_runtime coordinator_process_runtime PROPERTIES TIMEOUT 120)
 endif()

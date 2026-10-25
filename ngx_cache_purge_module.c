@@ -99,6 +99,20 @@ ngx_http_cache_purge_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child);
 
 static ngx_command_t  ngx_http_cache_purge_module_commands[] = {
 
+# if (NGX_CACHE_PURGE_ROCKSDB)
+    { ngx_string("cache_purge_store"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_1MORE,
+      ngx_http_cache_purge_store_conf, NGX_HTTP_MAIN_CONF_OFFSET, 0, NULL },
+
+    { ngx_string("cache_purge_state_zone"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE2,
+      ngx_http_cache_purge_state_conf, NGX_HTTP_MAIN_CONF_OFFSET, 0, NULL },
+
+    { ngx_string("cache_purge_propagation_timeout"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_http_cache_purge_propagation_conf, NGX_HTTP_MAIN_CONF_OFFSET, 0, NULL },
+# endif
+
     { ngx_string("cache_purge_namespace"),
       NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE3,
       ngx_http_cache_purge_namespace_conf,
@@ -227,7 +241,11 @@ ngx_module_t  ngx_http_cache_purge_module = {
     ngx_http_cache_purge_module_commands,
     NGX_HTTP_MODULE,
     NULL,                                   /* init master  */
+# if (NGX_CACHE_PURGE_ROCKSDB)
+    ngx_http_cache_purge_runtime_module_init, /* init module  */
+# else
     NULL,                                   /* init module  */
+# endif
     ngx_http_cache_purge_init_worker,       /* init process */
     NULL,                                   /* init thread  */
     NULL,                                   /* exit thread  */
@@ -516,6 +534,12 @@ ngx_http_cache_purge_create_main_conf(ngx_conf_t *cf)
     cmcf->batch_size          = NGX_CONF_UNSET_UINT;
     cmcf->throttle_ms         = NGX_CONF_UNSET_MSEC;
     cmcf->vary_aware          = NGX_CONF_UNSET;
+# if (NGX_CACHE_PURGE_ROCKSDB)
+    cmcf->runtime = ngx_http_cache_purge_runtime_create(cf);
+    if (cmcf->runtime == NULL) {
+        return NULL;
+    }
+# endif
 
     return cmcf;
 }
@@ -707,6 +731,11 @@ ngx_http_cache_purge_postconfiguration(ngx_conf_t *cf)
 
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_cache_purge_module);
     locations = cmcf->queue_status_locations.elts;
+# if (NGX_CACHE_PURGE_ROCKSDB)
+    if (ngx_http_cache_purge_runtime_post(cf) != NGX_OK) {
+        return NGX_ERROR;
+    }
+# endif
     paths = cmcf->paths->elts;
     namespaces = cmcf->namespaces.elts;
     prefix = sizeof("cache_purge_namespace:") - 1;

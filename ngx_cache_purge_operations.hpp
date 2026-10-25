@@ -69,6 +69,7 @@ struct OperationUsage {
 class Operations {
 public:
     explicit Operations(ngx_cache_purge_store_t *store, OperationLimits limits = {});
+    Operation preview(const OperationInput &input, uint64_t now_ms, uint32_t propagation_ms = 300000);
     Operation accept(const OperationInput &input, uint64_t now_ms, uint32_t propagation_ms = 300000);
     Operation get(const std::string &id);
     OperationUsage usage(); // Recovery verifies this budget against paged live records.
@@ -82,6 +83,8 @@ private:
     ngx_cache_purge_store_t *store_;
     OperationLimits limits_;
 };
+
+uint64_t operation_control_bytes(const OperationInput &input);
 
 } // namespace ngx_cache_purge
 #endif

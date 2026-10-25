@@ -36,12 +36,14 @@ def wait_for(function, timeout=10):
 
 
 class Component:
-    def __init__(self, path, connections=8, timeout=3000, budget=1100000, payload=512 * 1024):
+    def __init__(self, path, connections=8, timeout=3000, budget=1100000, payload=512 * 1024, shared=None):
         self.path = path
         path.mkdir(exist_ok=True)
         self.stderr = (root / f'stderr-{len(processes)}.log').open('w')
-        self.process = subprocess.Popen([str(args.binary), str(path), str(connections),
-                                         str(timeout), str(budget), str(payload)],
+        command = [str(args.binary), str(path), str(connections), str(timeout), str(budget), str(payload)]
+        if shared:
+            command.append(str(shared))
+        self.process = subprocess.Popen(command,
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=self.stderr, text=True, bufsize=1)
         processes.append(self)
@@ -60,6 +62,18 @@ class Component:
 
     def opened(self):
         return wait_for(lambda: self.status()[0] == 2)
+
+    def match(self):
+        self.process.stdin.write('m\n')
+        self.process.stdin.flush()
+        line = self.line().split()
+        assert line[0] == 'MATCH'
+        return list(map(int, line[1:]))
+
+    def guard(self, release=False):
+        self.process.stdin.write('r\n' if release else 'g\n')
+        self.process.stdin.flush()
+        assert self.line() == ('RELEASE 0' if release else 'GUARD 0')
 
     def stop(self, expected=0):
         self.process.stdin.write('q\n')
@@ -270,6 +284,34 @@ try:
     wait_for(lambda: refused.status()[0] == 5)
     refused.stop(expected=4)
     check((protected / 'component.sock').read_text() == 'preserve me', 'non-socket path is preserved')
+
+    shared = root / 'control.shm'
+    controlled = Component(root / 'controlled', shared=shared)
+    controlled.opened()
+    c = Client(controlled.path)
+    wait_for(lambda: struct.unpack('>IQ', c.call(16))[0] == 6)
+    check(controlled.match()[:3] == [0, 0, 0], 'coordinator publishes empty recovered table')
+    controlled.guard()
+    accepted = c.call(14, operation_input('guarded-operation'))
+    check(accepted[len(operation_input('guarded-operation')) + 40] == 1, 'coordinated admission still reports PREPARING')
+    wait_for(lambda: struct.unpack('>IQ', c.call(16))[0] == 5)
+    check(controlled.match()[0] == 6, 'old pinned admission keeps new gate closed')
+    check(len(c.call(1)) == 72, 'blocked publication does not block component IPC')
+    controlled.guard(release=True)
+    wait_for(lambda: struct.unpack('>IQ', c.call(16))[0] == 6)
+    check(controlled.match()[:3] == [0, 1, 5], 'durable operation appears as FENCE plus PREPARING')
+    check(c.call(15, string('guarded-operation')) == accepted, 'publication alone does not claim native effectiveness')
+    c.close()
+    controlled.process.kill()
+    controlled.process.wait(timeout=5)
+    restored = Component(controlled.path, shared=shared)
+    restored.opened()
+    c = Client(restored.path)
+    wait_for(lambda: struct.unpack('>IQ', c.call(16))[0] == 6)
+    check(restored.match()[:3] == [0, 1, 5], 'manager crash reloads durable controls into shared memory')
+    check(c.call(14, operation_input('guarded-operation')) == accepted, 'recovered control keeps original durable identity')
+    c.close()
+    restored.stop()
 finally:
     for component in processes:
         if component.process.poll() is None:
@@ -278,6 +320,6 @@ finally:
         component.stderr.close()
 
 result = {'checks': checks, 'count': len(checks), 'root': str(root),
-          'scope': 'component/index IPC only; no HTTP cache hooks, purge jobs or FENCE/PROPAGATE'}
+          'scope': 'component/index/ledger IPC and PREPARING control publication; native cache hooks and physical jobs are not wired'}
 args.output.write_text(json.dumps(result, indent=2) + '\n')
 print(json.dumps(result), flush=True)

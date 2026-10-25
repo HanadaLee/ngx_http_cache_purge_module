@@ -52,18 +52,57 @@ CACHE_PURGE_DEPS="$ngx_addon_dir/ngx_cache_purge.h \
                   $ngx_addon_dir/ngx_cache_purge_upstream.h \
                   $ngx_addon_dir/ngx_cache_purge_win32.h"
 
+# Optional persistent-runtime build. nginx still compiles its sources as C.
+CACHE_PURGE_LIBS=
+if [ -n "$CACHE_PURGE_ROCKSDB_LIB_DIR" ]; then
+    if [ "$NGX_PLATFORM" = win32 ] || [ "$HTTP_CACHE" = NO ] || [ "$HTTP" = NO ]; then
+        echo "cache purge persistent runtime requires Linux and HTTP cache support"
+        exit 1
+    fi
+    for archive in component coordinator control operations index store; do
+        if [ ! -f "$CACHE_PURGE_ROCKSDB_LIB_DIR/libngx_cache_purge_${archive}.a" ]; then
+            echo "missing cache purge archive: $CACHE_PURGE_ROCKSDB_LIB_DIR/libngx_cache_purge_${archive}.a"
+            exit 1
+        fi
+        CACHE_PURGE_LIBS="$CACHE_PURGE_LIBS $CACHE_PURGE_ROCKSDB_LIB_DIR/libngx_cache_purge_${archive}.a"
+    done
+    CACHE_PURGE_LIBS="$CACHE_PURGE_LIBS ${CACHE_PURGE_ROCKSDB_LIBS:--lrocksdb -lcrypto -lstdc++ -lm -pthread}"
+    ngx_feature="cache purge persistent runtime libraries"
+    ngx_feature_name=NGX_CACHE_PURGE_ROCKSDB
+    ngx_feature_run=no
+    # nginx-ext finalizes its extension macros after addon configuration.
+    # The adapter checks NGX_HAVE_CACHE_MANAGER_EXIT at real compile time.
+    ngx_feature_incs='#include "ngx_cache_purge_component.h"
+                      #if !defined(__linux__)
+                      #error Linux is required
+                      #endif'
+    ngx_feature_path="src/core src/event src/event/modules src/os/unix $NGX_OBJS $ngx_addon_dir"
+    ngx_feature_libs="$CACHE_PURGE_LIBS"
+    ngx_feature_test='ngx_cache_purge_component_options_t o;
+                      ngx_cache_purge_component_options(&o);
+                      if (o.abi != ngx_cache_purge_component_abi_2()) return 1;'
+    . auto/feature
+    if [ "$ngx_found" != yes ]; then
+        echo "cache purge persistent runtime libraries could not link"
+        exit 1
+    fi
+    CACHE_PURGE_SRCS="$CACHE_PURGE_SRCS $ngx_addon_dir/ngx_cache_purge_runtime.c"
+    CACHE_PURGE_DEPS="$CACHE_PURGE_DEPS $ngx_addon_dir/ngx_cache_purge_runtime.h $ngx_addon_dir/ngx_cache_purge_component.h $ngx_addon_dir/ngx_cache_purge_control.h"
+fi
+
 # auto/module supports static and dynamic registration since NGINX 1.9.11.
 if [ -n "$ngx_module_link" ]; then
     ngx_module_type=HTTP
     ngx_module_name="$ngx_addon_name"
     ngx_module_srcs="$CACHE_PURGE_SRCS"
     ngx_module_deps="$CACHE_PURGE_DEPS"
-    ngx_module_libs=""
+    ngx_module_libs="$CACHE_PURGE_LIBS"
     . auto/module
 else
     HTTP_MODULES="$HTTP_MODULES $ngx_addon_name"
     NGX_ADDON_SRCS="$NGX_ADDON_SRCS $CACHE_PURGE_SRCS"
     NGX_ADDON_DEPS="$NGX_ADDON_DEPS $CACHE_PURGE_DEPS"
+    CORE_LIBS="$CORE_LIBS $CACHE_PURGE_LIBS"
 fi
 
 have=NGX_CACHE_PURGE_MODULE . auto/have

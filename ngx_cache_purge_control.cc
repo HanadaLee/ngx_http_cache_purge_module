@@ -501,7 +501,9 @@ extern "C" int ngx_cache_purge_control_writer_close(ngx_cache_purge_control_writ
     ngx_cache_purge_store_error_t *error) {
     return boundary(error, [&] {
         require(output && *output, NGX_PURGE_STORE_INVALID, "null control writer close");
-        auto *w = *output; writer_owner(w); Lock lock(w->shared); put(&w->shared->serving, uint64_t(0));
+        auto *w = *output; writer_owner(w); put(&w->shared->serving, uint64_t(0));
+        // Stop publishing before releasing ownership. Registration may hold
+        // the mutex; shutdown must not wait for an unrelated live reader.
         put(&w->shared->owner_token, uint64_t(0)); delete w; *output = nullptr;
     });
 }

@@ -50,6 +50,9 @@
 
 
 #if (NGX_HTTP_CACHE)
+#if (NGX_CACHE_PURGE_ROCKSDB)
+#include "ngx_cache_purge_runtime.h"
+#endif
 #include "ngx_cache_purge_invalidation.h"
 #if (NGX_WIN32)
 #include "ngx_cache_purge_win32.h"
@@ -184,6 +187,9 @@ struct ngx_http_cache_purge_queue_s {
 };
 
 struct ngx_http_cache_purge_main_conf_s {
+#if (NGX_CACHE_PURGE_ROCKSDB)
+    ngx_http_cache_purge_runtime_t *runtime;
+#endif
     ngx_http_cache_purge_queue_t  *queue;
     ngx_shm_zone_t                *shm_zone;
     ngx_uint_t                     queue_size;

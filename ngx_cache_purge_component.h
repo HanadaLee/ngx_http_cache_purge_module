@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define NGX_CACHE_PURGE_COMPONENT_ABI 1
+#define NGX_CACHE_PURGE_COMPONENT_ABI 2
 #define NGX_CACHE_PURGE_PROTOCOL_VERSION 1
 #define NGX_CACHE_PURGE_FRAME_SIZE 24
 
@@ -38,7 +38,8 @@ typedef enum {
     NGX_PURGE_OP_ADD_URL,
     NGX_PURGE_OP_UPDATE,
     NGX_PURGE_OP_ACCEPT_OPERATION,
-    NGX_PURGE_OP_GET_OPERATION
+    NGX_PURGE_OP_GET_OPERATION,
+    NGX_PURGE_OP_GET_CONTROL_STATUS
 } ngx_cache_purge_opcode_t;
 
 typedef struct {
@@ -49,6 +50,11 @@ typedef struct {
     uint32_t buffer_bytes;       /* total retained connection payloads */
     uint32_t io_timeout_ms;      /* frame or response deadline, not idle extension */
     uint32_t owner_retry_ms;
+    uint32_t propagation_ms;
+    uint32_t max_live_operations;
+    uint64_t live_selector_bytes;
+    void    *control_memory;     /* shared mapping owned by nginx, valid until stop */
+    size_t   control_bytes;
 } ngx_cache_purge_component_options_t;
 
 typedef struct {
@@ -59,9 +65,12 @@ typedef struct {
     uint64_t rejected;
     uint64_t buffered_bytes;
     uint64_t peak_buffered_bytes;
+    uint32_t control_state;      /* 0: no table; otherwise Coordination state */
+    uint64_t control_publication;
 } ngx_cache_purge_component_status_t;
 
 void ngx_cache_purge_component_options(ngx_cache_purge_component_options_t *options);
+uint32_t ngx_cache_purge_component_abi_2(void); /* Link-time header/archive compatibility marker. */
 
 /* Only start after fork in cache_manager, never while parsing configuration or
  * in master/HTTP workers. Copies its inputs and starts one executor thread.

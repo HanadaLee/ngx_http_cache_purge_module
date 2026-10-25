@@ -257,23 +257,32 @@ OperationUsage Operations::usage() {
     require(next != 0, NGX_PURGE_STORE_CORRUPT, "invalid operation sequence allocator");
     return {integer(tx.need("M:op-live")), integer(tx.need("M:op-bytes")), next - 1};
 }
-Operation Operations::accept(const OperationInput &input, uint64_t now, uint32_t propagation_ms) {
+uint64_t operation_control_bytes(const OperationInput &input) { return charge(input); }
+static Operation preview_accept(Tx &tx, const OperationInput &input, uint64_t now, uint32_t propagation_ms, OperationLimits limits) {
     validate(input); require(now != 0, NGX_PURGE_STORE_INVALID, "invalid operation clock");
-    Tx tx(store_);
     if (auto old = tx.get(row(input.id))) {
         auto value = tx.load(input.id);
         require(encode_input(value.op.input) == encode_input(input), NGX_PURGE_STORE_CONFLICT, "operation ID reused with different input");
         return value.op;
     }
     uint64_t count = integer(tx.need("M:op-live")), size = integer(tx.need("M:op-bytes"));
-    require(count < limits_.live_records && size <= limits_.live_selector_bytes
-            && charge(input) <= limits_.live_selector_bytes - size, NGX_PURGE_STORE_LIMIT, "resident operation capacity exhausted");
+    require(count < limits.live_records && size <= limits.live_selector_bytes
+            && charge(input) <= limits.live_selector_bytes - size, NGX_PURGE_STORE_LIMIT, "resident operation capacity exhausted");
     auto sequence = integer(tx.need("M:op-next"));
     require(sequence && sequence != UINT64_MAX, NGX_PURGE_STORE_LIMIT, "operation sequence exhausted");
-    Stored value; auto &op = value.op; op.input = input; op.sequence = sequence; op.revision = 1;
+    Operation op; op.input = input; op.sequence = sequence; op.revision = 1;
     op.accepted_at_ms = now; op.propagation_ms = propagation_ms;
+    return op;
+}
+Operation Operations::preview(const OperationInput &input, uint64_t now, uint32_t propagation_ms) {
+    Tx tx(store_); return preview_accept(tx, input, now, propagation_ms, limits_);
+}
+Operation Operations::accept(const OperationInput &input, uint64_t now, uint32_t propagation_ms) {
+    Tx tx(store_); auto op = preview_accept(tx, input, now, propagation_ms, limits_);
+    if (tx.get(row(input.id))) return op;
+    uint64_t count = integer(tx.need("M:op-live")), size = integer(tx.need("M:op-bytes")), sequence = op.sequence;
     tx.put("M:op-next", number(sequence + 1)); tx.put("M:op-live", number(count + 1)); tx.put("M:op-bytes", number(size + charge(input)));
-    tx.put(row(input.id), encode(value)); tx.put(live_key(op), input.id); tx.commit(); return op;
+    tx.put(row(input.id), encode({op, ""})); tx.put(live_key(op), input.id); tx.commit(); return op;
 }
 Operation Operations::activate(const std::string &id, uint64_t expected, uint64_t now) {
     require(now != 0, NGX_PURGE_STORE_INVALID, "invalid activation clock");
