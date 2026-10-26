@@ -4,12 +4,15 @@
 #include "ngx_cache_purge_index.hpp"
 namespace ngx_cache_purge {
 struct RootSpec { std::string path, zone; unsigned kind; };
+struct PublicationTarget { std::string root, address; FileId previous{}; };
 /* Executor-thread filesystem policy; pinned roots are configuration-sized,
  * never an in-memory copy of the file index. Construction may perform I/O. */
 class Publications {
 public:
     Publications(const std::vector<RootSpec> &roots, const std::string &database);
     ~Publications();
+    PublicationTarget target(Index &index, const std::string &root,
+                             const std::string &zone, const std::string &path);
     Match prepare(Index &index, Fill fill, const std::string &temporary,
                   int anchor_fd, int lease_fd, int temporary_fd, uint32_t peer_uid);
     /* Caller must have finished/abandoned native writing and retain the lease.

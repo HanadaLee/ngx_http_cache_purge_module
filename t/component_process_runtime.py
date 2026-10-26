@@ -157,8 +157,10 @@ class Client:
         self.socket.sendall(self.packet(operation, data))
         return self.reply(operation, code)
 
-    def lease(self, address):
-        self.socket.sendall(self.packet(17, string(address)))
+    def lease(self, address, target=None, previous=0):
+        operation = 20 if target else 17
+        request_data = b''.join(map(string, target)) if target else string(address)
+        self.socket.sendall(self.packet(operation, request_data))
         first, control, flags, _ = self.socket.recvmsg(1, socket.CMSG_SPACE(8), socket.MSG_CMSG_CLOEXEC)
         rights = array.array('i')
         for level, kind, data in control:
@@ -167,8 +169,14 @@ class Client:
         try:
             magic, version, op, request, size, result = struct.unpack('>4sHHQII', first + self.read(23))
             payload = self.read(size)
-            assert (magic, version, op, request, result, flags & socket.MSG_CTRUNC) == (b'NCP1', 1, 17, self.counter, 0, 0)
-            assert len(rights) == 1 and len(payload) == 24
+            assert (magic, version, op, request, result, flags & socket.MSG_CTRUNC) == (b'NCP1', 1, operation, self.counter, 0, 0)
+            assert len(rights) == 1
+            if target:
+                canonical = str(Path(target[0]).resolve())
+                prefix = string(canonical) + identity(previous)
+                assert payload.startswith(prefix)
+                payload = payload[len(prefix):]
+            assert len(payload) == 24
             digest = hashlib.sha256(address.encode()).digest()
             assert payload == digest[:16] + struct.pack('>Q', int.from_bytes(digest[16:24], 'big') & 0x3fffffffffffffff)
             assert fcntl.fcntl(rights[0], fcntl.F_GETFD) & fcntl.FD_CLOEXEC
@@ -207,7 +215,10 @@ try:
     temp = temp_root / 'body'
     temp.write_bytes(b'complete cached entity')
     target = cache_root / 'a/00/401'
-    lease = client.lease(str(target))
+    client.call(20, string(str(cache_root)) + string('wrong-zone') + string('a/00/401'), code=4)
+    client.call(20, string(str(cache_root)) + string('zone-a') + string('../escape'), code=4)
+    lease = client.lease(str(target), target=(str(cache_root), 'zone-a', 'a/00/401'))
+    check(True, 'ACQUIRE_PUBLICATION validates root/zone/path and returns canonical identity plus an exclusive lease')
     temporary = os.open(temp, os.O_RDWR | os.O_CLOEXEC)
     payload = record(401, root=str(cache_root), zone='zone-a') + string(str(temp))
     prepared = client.prepare_file(payload, [lease, temporary])

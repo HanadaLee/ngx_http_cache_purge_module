@@ -37,6 +37,14 @@ static void ngx_http_cache_purge_runtime_exit(void *data);
 static ngx_int_t ngx_http_cache_purge_runtime_shared(ngx_shm_zone_t *zone, void *old);
 static ngx_int_t ngx_http_cache_purge_runtime_paths(ngx_http_cache_purge_runtime_t *rt, ngx_log_t *log);
 
+ngx_flag_t
+ngx_http_cache_purge_runtime_configured(ngx_conf_t *cf)
+{
+    ngx_http_cache_purge_main_conf_t *conf;
+    conf = ngx_http_conf_get_module_main_conf(cf, ngx_http_cache_purge_module);
+    return conf->runtime && conf->runtime->path && conf->runtime->zone;
+}
+
 ngx_http_cache_purge_runtime_t *
 ngx_http_cache_purge_runtime_create(ngx_conf_t *cf)
 {

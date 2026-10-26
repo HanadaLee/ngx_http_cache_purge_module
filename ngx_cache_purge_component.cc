@@ -243,6 +243,22 @@ struct ngx_cache_purge_component_s {
     std::string dispatch(Index &index, Operations &operations, Coordinator *coordinator, ngx_cache_purge_store_t *store, Peer &p) {
         wire::Decoder d{p.input}; wire::Encoder e;
         switch (p.request.opcode) {
+        case NGX_PURGE_OP_ACQUIRE_PUBLICATION: {
+            auto root = d.string(); auto zone = d.string(); auto name = d.string(); d.end();
+            auto target = publications->target(index, root, zone, name);
+            unsigned char digest[16]; uint64_t offset;
+            ngx_cache_purge_store_error_t error;
+            checked(ngx_cache_purge_file_address({reinterpret_cast<const unsigned char *>(target.address.data()),
+                                                  target.address.size()}, digest, &offset, &error), error);
+            auto lock_path = path + "/file.leases";
+            if (lease_anchor.value < 0)
+                checked(ngx_cache_purge_file_locks_open(lock_path.c_str(), geteuid(), 1, &lease_anchor.value, &error), error);
+            checked(ngx_cache_purge_file_lease_acquire(lock_path.c_str(), lease_anchor.value, offset,
+                                                     &p.output_lease.value, &error), error);
+            e.string(target.root); e.id(target.previous);
+            e.data.append(reinterpret_cast<const char *>(digest), sizeof(digest)); e.integer(offset, 8);
+            break;
+        }
         case NGX_PURGE_OP_FINISH_FILE: {
             auto id = d.id(); auto revision = d.integer(8); d.end();
             auto lock_path = path + "/file.leases";

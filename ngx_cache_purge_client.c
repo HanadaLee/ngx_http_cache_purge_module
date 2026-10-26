@@ -378,6 +378,7 @@ ngx_cache_purge_client_read(ngx_event_t *ev)
     ssize_t n;
     int rights[NGX_CACHE_PURGE_TRANSPORT_FDS], saved;
     size_t count, i;
+    ngx_uint_t lease_reply;
 
     if (call == NULL) {
         if (c->close || c->recv(c, &byte, 1) != NGX_AGAIN) {
@@ -391,6 +392,8 @@ ngx_cache_purge_client_read(ngx_event_t *ev)
         ngx_cache_purge_client_write(c->write);
         return;
     }
+    lease_reply = call->opcode == NGX_PURGE_OP_ACQUIRE_FILE_LEASE
+                  || call->opcode == NGX_PURGE_OP_ACQUIRE_PUBLICATION;
     while (budget) {
         if (client->header_used < sizeof(client->header)) {
             destination = client->header + client->header_used;
@@ -400,11 +403,11 @@ ngx_cache_purge_client_read(ngx_event_t *ev)
             remaining = client->response.len - client->received;
         }
         /* Only lease replies need a one-byte boundary for ancillary rights. */
-        if (client->header_used == 0 && call->opcode == NGX_PURGE_OP_ACQUIRE_FILE_LEASE) {
+        if (client->header_used == 0 && lease_reply) {
             remaining = 1;
         }
         n = ngx_cache_purge_transport_recv(c->fd, destination, ngx_min(budget, remaining),
-                         client->header_used == 0 && call->opcode == NGX_PURGE_OP_ACQUIRE_FILE_LEASE,
+                         client->header_used == 0 && lease_reply,
                          rights, &count);
         saved = n < 0 ? errno : 0;
         if (n < 0 && saved == EINTR) { continue; }
@@ -420,7 +423,7 @@ ngx_cache_purge_client_read(ngx_event_t *ev)
             return;
         }
         if (count) {
-            if (count != 1 || client->lease_fd >= 0 || call->opcode != NGX_PURGE_OP_ACQUIRE_FILE_LEASE) {
+            if (count != 1 || client->lease_fd >= 0 || !lease_reply) {
                 for (i = 0; i < count; i++) { close(rights[i]); }
                 ngx_cache_purge_client_finish(call, NGX_PURGE_CLIENT_PROTOCOL, 1);
                 return;
@@ -443,7 +446,7 @@ ngx_cache_purge_client_read(ngx_event_t *ev)
             }
             client->response.len = (size_t) ngx_cache_purge_client_get(client->header + 16, 4);
             client->result = (uint32_t) ngx_cache_purge_client_get(client->header + 20, 4);
-            if ((client->lease_fd >= 0) != (call->opcode == NGX_PURGE_OP_ACQUIRE_FILE_LEASE && client->result == 0)) {
+            if ((client->lease_fd >= 0) != (lease_reply && client->result == 0)) {
                 ngx_cache_purge_client_finish(call, NGX_PURGE_CLIENT_PROTOCOL, 1);
                 return;
             }

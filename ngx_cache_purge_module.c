@@ -40,6 +40,7 @@
 /* -- module commands ---------------------------------------------------- */
 
 
+#if !(NGX_CACHE_PURGE_ROCKSDB)
 static ngx_int_t
 ngx_http_cache_purge_key_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
@@ -49,6 +50,7 @@ static char *
 ngx_http_cache_purge_namespace_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *
 ngx_http_cache_purge_key_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+#endif
 static char *
 ngx_http_cache_purge_legacy(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 
@@ -113,6 +115,7 @@ static ngx_command_t  ngx_http_cache_purge_module_commands[] = {
       ngx_http_cache_purge_propagation_conf, NGX_HTTP_MAIN_CONF_OFFSET, 0, NULL },
 # endif
 
+#if !(NGX_CACHE_PURGE_ROCKSDB)
     { ngx_string("cache_purge_namespace"),
       NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE3,
       ngx_http_cache_purge_namespace_conf,
@@ -122,6 +125,7 @@ static ngx_command_t  ngx_http_cache_purge_module_commands[] = {
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE2,
       ngx_http_cache_purge_key_conf,
       NGX_HTTP_LOC_CONF_OFFSET, 0, NULL },
+#endif
 
 # if (NGX_HTTP_FASTCGI)
     { ngx_string("fastcgi_cache_purge"),
@@ -225,7 +229,11 @@ static ngx_command_t  ngx_http_cache_purge_module_commands[] = {
 /* -- module context & descriptor ---------------------------------------- */
 
 static ngx_http_module_t  ngx_http_cache_purge_module_ctx = {
+#if (NGX_CACHE_PURGE_ROCKSDB)
+    NULL,                                  /* preconfiguration  */
+#else
     ngx_http_cache_purge_variables,          /* preconfiguration  */
+#endif
     ngx_http_cache_purge_postconfiguration, /* postconfiguration */
     ngx_http_cache_purge_create_main_conf,  /* create main conf  */
     ngx_http_cache_purge_init_main_conf,    /* init main conf    */
@@ -257,6 +265,7 @@ ngx_module_t  ngx_http_cache_purge_module = {
 /* Each worker owns one fixed key array and one active walk. */
 /* -- main configuration ------------------------------------------------- */
 
+#if !(NGX_CACHE_PURGE_ROCKSDB)
 static ngx_int_t
 ngx_http_cache_purge_key_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data)
@@ -391,6 +400,8 @@ ngx_http_cache_purge_key_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
            ? NGX_CONF_OK : NGX_CONF_ERROR;
 }
 
+
+#endif
 
 static char *
 ngx_http_cache_purge_legacy(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)

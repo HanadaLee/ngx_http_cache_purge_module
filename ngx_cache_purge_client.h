@@ -65,7 +65,7 @@ ngx_int_t ngx_cache_purge_client_submit(ngx_cache_purge_client_t *client,
 /* PREPARE_FILE accepts two borrowed input FDs (lease, complete temp file).
  * Successful submit copies them with CLOEXEC; the caller keeps its originals.
  * Copies are bounded by 2 * max_pending and released on send/cancel/failure.
- * No other current opcode accepts request descriptors. */
+ * FINISH_FILE separately accepts one lease descriptor. */
 ngx_int_t ngx_cache_purge_client_submit_files(ngx_cache_purge_client_t *client,
     const ngx_str_t *payload, const int fds[2], ngx_msec_t timeout,
     ngx_cache_purge_client_done_pt done, void *data, ngx_cache_purge_call_t **call);

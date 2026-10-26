@@ -5,8 +5,9 @@ HTTP cache invalidation for nginx proxy, FastCGI, SCGI, and uWSGI caches.
 The module is undergoing a storage and lifecycle redesign. The default build
 implements the legacy PURGE/REFRESH interfaces. An opt-in development build now
 connects RocksDB ownership, durable operations, and shared control publication to
-one executor in ordinary nginx worker 0. Native cache file integration, the new Invalidate/Delete HTTP
-API, and multilevel cache propagation are still being implemented.
+one executor in ordinary nginx worker 0. Real upstream fills now enter the
+persistent index through standard module interfaces. Read admission, the new
+Invalidate/Delete HTTP API, and multilevel cache propagation are still being implemented.
 
 The repository now contains a bounded RocksDB storage bridge and a persistent
 URL/key/file index. They support cross-zone lookup, scoped TAG postings, full
@@ -14,8 +15,8 @@ bytewise prefix scans, shared value storage, and batched fill/retirement records
 The component executor hosts that index on one thread and accepts bounded local
 IPC independently of nginx's event loops. It supports cancellable owner
 handoff, explicit shutdown, and paged queries without retaining server cursors
-between requests. These are internal building blocks; request handling and cache
-file lifecycle integration is still being implemented. Index state changes
+between requests. Cache-fill capture is connected; invalidation request handling
+and the rest of the file lifecycle are still being implemented. Index state changes
 do not perform filesystem operations or provide immediate invalidation by themselves.
 
 HTTP workers now have an event-driven Unix IPC client with a reusable connection,
@@ -31,8 +32,8 @@ process; duplicated or transferred lease descriptors keep a transaction protecte
 until its last reference closes. The file API is version 2 and requires OFD-lock
 support. Its tests cover real descriptor handoff, sender death, same-process
 contention, and unfinished index publication recovery. The component can acquire
-a lease and return its descriptor through the worker IPC client. Only this
-operation's successful response may carry one descriptor, attached to the first
+a lease and return its descriptor through the worker IPC client. Successful
+lease-acquisition replies may carry one descriptor, attached to the first
 frame byte. The client closes its borrowed reference after the callback and on
 failure or cancellation. Consumers that retain a duplicate must bound and close
 it separately. `PREPARE_FILE` accepts a lease and a complete temporary-file
@@ -43,8 +44,10 @@ original prepared revision and a lease descriptor, verifies the final instance,
 and completes durable index/READY-marker publication after a same-filesystem
 rename. Retries recover interrupted publication without recreating an evicted
 file. Raw index mutations cannot bypass these checks for physical records.
-Cross-filesystem copy verification and the native upstream fill consumer remain
-unfinished. Blocking file operations remain outside the HTTP event loop.
+`ACQUIRE_PUBLICATION` also resolves the registered root and current file ID, so
+the native fill consumer can replace an indexed instance safely. Cross-filesystem
+copy verification remains unfinished. Added database, marker, and fsync work
+runs on the executor; nginx's existing rename/copy path is unchanged.
 
 A durable operation ledger now stores selectors, idempotency identities,
 checkpoints, retry scheduling, and independent materialization/propagation states.
@@ -68,9 +71,41 @@ until asynchronous preparation has completed. It retains the request and cache
 node through cancellation and reload, and works on unmodified nginx without a
 custom store hook. FINISH verifies the actual final file because native update
 does not return a rename result. `t/native_fill_runtime.py` covers the native
-lifecycle separately. These fixtures are not the
-production purge consumer: persistent index transactions, 304 commits, eviction
-coordination, and background file operations remain to be connected.
+lifecycle separately. `t/capture_runtime.py` exercises real native fills through
+the companion key module, worker IPC, durable preparation, rename and READY
+publication. Cached-response admission, 304 commits, eviction coordination and
+background invalidation remain to be connected.
+
+The persistent build provides `cache_purge_key`, `cache_purge_url`,
+`cache_purge_tag`, and `cache_purge_tag_namespace` as independently inherited
+complex values. Configuring `cache_purge_key` enables capture for that cached
+location and requires `cache_purge_store` and `cache_purge_state_zone`.
+For a location using the companion key module:
+
+```nginx
+proxy_cache_key $cache_key_full;
+cache_purge_key $cache_key_base;
+cache_purge_url $cache_key_url;
+cache_purge_tag $upstream_http_cache_tag;
+cache_purge_tag_namespace $cache_key_namespace;
+```
+
+Key, URL and namespace inputs are frozen after native key creation, including
+requests that bypass cache reads. Exact companion-variable references use its
+committed C snapshot and preserve component boundaries in the index. An omitted
+URL expression uses the actual native cache-key bytes. TAG values are comma
+separated, case sensitive, trimmed and deduplicated; an empty value clears the
+new entity's TAG set. Namespace defaults to `$host`.
+
+Publication is limited to 64 concurrent transactions and a 2 MiB logical buffer
+budget per worker, with a three-second overall IPC deadline. The limits apply
+after the response body is complete and do not turn normal HITs into origin
+requests. Request inputs and each publication payload are separately bounded
+to 128 KiB; these limits exclude allocator overhead and native nginx buffers.
+The persistent build replaces the legacy generation form of `cache_purge_key`
+with its single-expression index meaning and does not register generation
+namespace directives or variables. Automatic recovery of unfinished native
+publications and URL aliases first seen on HITs are still pending.
 
 ## Current features
 

@@ -150,6 +150,20 @@ Publications::Publications(const std::vector<RootSpec> &roots, const std::string
     }
 }
 Publications::~Publications() = default;
+PublicationTarget Publications::target(Index &index, const std::string &root,
+                                       const std::string &zone, const std::string &path) {
+    require(relative(path), "unsafe target path");
+    for (const auto &entry : impl_->roots) {
+        if (entry->configured.kind != NGX_PURGE_ROOT_CACHE || entry->configured.zone != zone
+            || (entry->configured.path != root && entry->path != root)) continue;
+        entry->verify();
+        PublicationTarget result{entry->path, entry->path + '/' + path, {}};
+        auto current = index.current(result.root, path);
+        if (current) result.previous = current->id;
+        return result;
+    }
+    throw IndexError(NGX_PURGE_STORE_INVALID, "unregistered cache root/zone");
+}
 Match Publications::prepare(Index &index, Fill fill, const std::string &temporary,
                             int anchor, int lease, int temporary_fd, uint32_t peer_uid) {
     auto &file = fill.file;

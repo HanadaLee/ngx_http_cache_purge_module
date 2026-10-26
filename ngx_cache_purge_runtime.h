@@ -11,6 +11,7 @@
 typedef struct ngx_http_cache_purge_runtime_s ngx_http_cache_purge_runtime_t;
 
 ngx_http_cache_purge_runtime_t *ngx_http_cache_purge_runtime_create(ngx_conf_t *cf);
+ngx_flag_t ngx_http_cache_purge_runtime_configured(ngx_conf_t *cf);
 char *ngx_http_cache_purge_store_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 char *ngx_http_cache_purge_state_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 char *ngx_http_cache_purge_propagation_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
