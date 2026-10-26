@@ -21,7 +21,7 @@ set_target_properties(ngx_cache_purge_index PROPERTIES POSITION_INDEPENDENT_CODE
 target_link_libraries(ngx_cache_purge_index PUBLIC ngx_cache_purge_store OpenSSL::Crypto)
 target_compile_options(ngx_cache_purge_index PRIVATE -Wall -Wextra -Werror)
 
-add_library(ngx_cache_purge_files STATIC ngx_cache_purge_files.cc)
+add_library(ngx_cache_purge_files STATIC ngx_cache_purge_files.cc ngx_cache_purge_transport.c)
 target_compile_features(ngx_cache_purge_files PUBLIC cxx_std_17)
 target_include_directories(ngx_cache_purge_files PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 set_target_properties(ngx_cache_purge_files PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -45,7 +45,7 @@ target_compile_options(ngx_cache_purge_coordinator PRIVATE -Wall -Wextra -Werror
 
 add_library(ngx_cache_purge_component STATIC ngx_cache_purge_component.cc)
 set_target_properties(ngx_cache_purge_component PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(ngx_cache_purge_component PUBLIC ngx_cache_purge_coordinator)
+target_link_libraries(ngx_cache_purge_component PUBLIC ngx_cache_purge_coordinator ngx_cache_purge_files)
 target_compile_options(ngx_cache_purge_component PRIVATE -Wall -Wextra -Werror)
 
 option(CACHE_PURGE_STORE_TESTS "Build cache index storage regression tests" OFF)

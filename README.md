@@ -30,10 +30,14 @@ Linux open-file-description leases. Separate writers conflict even in the same
 process; duplicated or transferred lease descriptors keep a transaction protected
 until its last reference closes. The file API is version 2 and requires OFD-lock
 support. Its tests cover real descriptor handoff, sender death, same-process
-contention, and unfinished index publication recovery. The production IPC client
-does not transfer file descriptors yet; these primitives are not connected to
-native cache writes. Consumers must bound live lease descriptors and execute
-blocking file operations outside the HTTP event loop.
+contention, and unfinished index publication recovery. The component can acquire
+a lease and return its descriptor through the worker IPC client. Only this
+operation's successful response may carry one descriptor, attached to the first
+frame byte. The client closes its borrowed reference after the callback and on
+failure or cancellation. Consumers that retain a duplicate must bound and close
+it separately. Incoming request descriptors are currently rejected; native file
+transactions are not connected yet. Blocking file operations remain outside the
+HTTP event loop.
 
 A durable operation ledger now stores selectors, idempotency identities,
 checkpoints, retry scheduling, and independent materialization/propagation states.

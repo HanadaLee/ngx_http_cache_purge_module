@@ -79,6 +79,7 @@ rpc_done(ngx_cache_purge_call_t *call, void *data, const ngx_cache_purge_reply_t
     status = reply->transport == NGX_PURGE_CLIENT_OK ? 200
              : reply->transport == NGX_PURGE_CLIENT_TIMEOUT ? 504 : 503;
     if (rpc_header(r, "X-IPC-Transport", reply->transport) != NGX_OK
+        || rpc_header(r, "X-IPC-Lease", reply->lease_fd >= 0) != NGX_OK
         || rpc_header(r, "X-IPC-Result", reply->result) != NGX_OK
         || rpc_header(r, "X-IPC-Ambiguous", reply->may_have_executed) != NGX_OK)
     {

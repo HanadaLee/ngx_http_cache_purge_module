@@ -2,6 +2,8 @@
 #include "ngx_cache_purge_component.h"
 #include "ngx_cache_purge_protocol.hpp"
 #include "ngx_cache_purge_coordinator.hpp"
+#include "ngx_cache_purge_files.h"
+#include "ngx_cache_purge_transport.h"
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
@@ -55,6 +57,7 @@ struct Descriptor {
 };
 struct Peer {
     Descriptor fd;
+    Descriptor output_lease;
     std::array<char, NGX_CACHE_PURGE_FRAME_SIZE> header{};
     size_t header_used = 0, input_used = 0, output_used = 0;
     std::string input, output;
@@ -70,7 +73,7 @@ struct ngx_cache_purge_component_s {
     pid_t pid = getpid();
     std::thread::id creator = std::this_thread::get_id();
     std::thread executor;
-    Descriptor wake_read, wake_write, listener;
+    Descriptor wake_read, wake_write, listener, lease_anchor;
     bool socket_owned = false;
     dev_t socket_device = 0;
     ino_t socket_inode = 0;
@@ -178,7 +181,9 @@ struct ngx_cache_purge_component_s {
             if (!p.parsed) { destination = p.header.data() + p.header_used; remaining = p.header.size() - p.header_used; }
             else { destination = p.input.data() + p.input_used; remaining = p.input.size() - p.input_used; }
             if (!remaining) return true;
-            ssize_t n = recv(p.fd.value, destination, std::min(budget, remaining), 0);
+            int rights[NGX_CACHE_PURGE_TRANSPORT_FDS]; size_t count;
+            ssize_t n = ngx_cache_purge_transport_recv(p.fd.value, destination,
+                              std::min(budget, remaining), 0, rights, &count);
             if (n < 0) {
                 if (errno == EINTR) continue;
                 return errno == EAGAIN || errno == EWOULDBLOCK;
@@ -198,9 +203,13 @@ struct ngx_cache_purge_component_s {
     }
     bool write_peer(Peer &p) {
         const auto remaining = p.output.size() - p.output_used;
-        auto n = send(p.fd.value, p.output.data() + p.output_used, std::min<size_t>(65536, remaining), MSG_NOSIGNAL);
+        bool attach = p.output_lease.value >= 0;
+        auto n = ngx_cache_purge_transport_send(p.fd.value, p.output.data() + p.output_used,
+                         attach ? 1 : std::min<size_t>(65536, remaining),
+                         &p.output_lease.value, attach ? 1 : 0);
         if (n < 0) return errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK;
         if (!n) return false;
+        if (attach) p.output_lease.reset(); // The socket queue now owns the transferred reference.
         p.output_used += n;
         if (p.output_used == p.output.size()) {
             release(p.output); p.output_used = p.header_used = p.input_used = 0; p.parsed = false;
@@ -208,9 +217,23 @@ struct ngx_cache_purge_component_s {
         }
         return true;
     }
-    std::string dispatch(Index &index, Operations &operations, Coordinator *coordinator, ngx_cache_purge_store_t *store, const Peer &p) {
+    std::string dispatch(Index &index, Operations &operations, Coordinator *coordinator, ngx_cache_purge_store_t *store, Peer &p) {
         wire::Decoder d{p.input}; wire::Encoder e;
         switch (p.request.opcode) {
+        case NGX_PURGE_OP_ACQUIRE_FILE_LEASE: {
+            auto address = d.string(65536); d.end();
+            unsigned char digest[16]; uint64_t offset;
+            ngx_cache_purge_store_error_t error;
+            checked(ngx_cache_purge_file_address({reinterpret_cast<const unsigned char *>(address.data()), address.size()},
+                                                digest, &offset, &error), error);
+            auto lock_path = path + "/file.leases";
+            if (lease_anchor.value < 0)
+                checked(ngx_cache_purge_file_locks_open(lock_path.c_str(), geteuid(), 1, &lease_anchor.value, &error), error);
+            checked(ngx_cache_purge_file_lease_acquire(lock_path.c_str(), lease_anchor.value, offset,
+                                                     &p.output_lease.value, &error), error);
+            e.data.append(reinterpret_cast<const char *>(digest), sizeof(digest)); e.integer(offset, 8);
+            break;
+        }
         case NGX_PURGE_OP_PING: {
             d.end(); ngx_cache_purge_store_stats_t stats; ngx_cache_purge_store_error_t error;
             checked(ngx_cache_purge_store_stats(store, &stats, &error), error);
@@ -299,6 +322,7 @@ struct ngx_cache_purge_component_s {
         std::string response; uint32_t code = 0; ++requests;
         try { response = dispatch(index, operations, coordinator, store, p); }
         catch (const IndexError &error) {
+            p.output_lease.reset();
             if (error.code == NGX_PURGE_STORE_CORRUPT || error.code == NGX_PURGE_STORE_SCHEMA || error.code == NGX_PURGE_STORE_IO) throw;
             wire::Encoder e; e.string(error.what()); response = std::move(e.data); code = error.code;
         }
@@ -389,6 +413,7 @@ struct ngx_cache_purge_component_s {
         state.store(NGX_PURGE_COMPONENT_STOPPING);
         for (size_t i = 0; i < peers.size(); ++i) drop(i);
         remove_socket(); // Still own the DB lock when removing the rendezvous path.
+        lease_anchor.reset();
         if (store) {
             ngx_cache_purge_store_error_t error;
             int closed = ngx_cache_purge_store_close(&store, &error);

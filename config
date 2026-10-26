@@ -61,7 +61,7 @@ if [ -n "$CACHE_PURGE_ROCKSDB_LIB_DIR" ]; then
         echo "cache purge persistent runtime requires Linux and HTTP cache support"
         exit 1
     fi
-    for archive in component coordinator control operations index store; do
+    for archive in component coordinator control operations index store files; do
         if [ ! -f "$CACHE_PURGE_ROCKSDB_LIB_DIR/libngx_cache_purge_${archive}.a" ]; then
             echo "missing cache purge archive: $CACHE_PURGE_ROCKSDB_LIB_DIR/libngx_cache_purge_${archive}.a"
             exit 1
@@ -88,7 +88,7 @@ if [ -n "$CACHE_PURGE_ROCKSDB_LIB_DIR" ]; then
         exit 1
     fi
     CACHE_PURGE_SRCS="$CACHE_PURGE_SRCS $ngx_addon_dir/ngx_cache_purge_runtime.c $ngx_addon_dir/ngx_cache_purge_client.c"
-    CACHE_PURGE_DEPS="$CACHE_PURGE_DEPS $ngx_addon_dir/ngx_cache_purge_runtime.h $ngx_addon_dir/ngx_cache_purge_component.h $ngx_addon_dir/ngx_cache_purge_control.h $ngx_addon_dir/ngx_cache_purge_client.h"
+    CACHE_PURGE_DEPS="$CACHE_PURGE_DEPS $ngx_addon_dir/ngx_cache_purge_runtime.h $ngx_addon_dir/ngx_cache_purge_component.h $ngx_addon_dir/ngx_cache_purge_control.h $ngx_addon_dir/ngx_cache_purge_client.h $ngx_addon_dir/ngx_cache_purge_transport.h"
 fi
 
 # auto/module supports static and dynamic registration since NGINX 1.9.11.

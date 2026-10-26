@@ -39,6 +39,8 @@ typedef struct {
     ngx_cache_purge_client_result_t transport;
     uint32_t result; /* Component result, meaningful only for transport OK. */
     ngx_str_t payload; /* Borrowed bytes, valid only inside the callback. */
+    int lease_fd; /* Borrowed OFD lease, or -1. Callback may dup with CLOEXEC;
+                   * the consumer must bound/close its retained references. */
     unsigned may_have_executed:1;
 } ngx_cache_purge_reply_t;
 

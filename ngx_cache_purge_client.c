@@ -1,5 +1,6 @@
 /* Copyright (C) Hanada */
 #include "ngx_cache_purge_client.h"
+#include "ngx_cache_purge_transport.h"
 #include <sys/un.h>
 
 #define NGX_PURGE_CLIENT_IO_BUDGET  65536
@@ -33,6 +34,7 @@ struct ngx_cache_purge_client_s {
     size_t header_used, received;
     ngx_str_t response;
     uint32_t result;
+    int lease_fd;
     uint64_t next_id;
     unsigned connecting:1;
     unsigned stopped:1;
@@ -110,6 +112,7 @@ ngx_cache_purge_client_create(ngx_pool_t *pool, ngx_log_t *log,
         return NULL;
     }
     client->options = *options;
+    client->lease_fd = -1;
     client->log = log;
     client->address.sun_family = AF_UNIX;
     ngx_memcpy(client->address.sun_path, path->data, path->len);
@@ -324,6 +327,8 @@ ngx_cache_purge_client_read(ngx_event_t *ev)
     u_char byte, *destination;
     size_t budget = NGX_PURGE_CLIENT_IO_BUDGET, remaining;
     ssize_t n;
+    int rights[NGX_CACHE_PURGE_TRANSPORT_FDS], saved;
+    size_t count, i;
 
     if (call == NULL) {
         if (c->close || c->recv(c, &byte, 1) != NGX_AGAIN) {
@@ -345,16 +350,33 @@ ngx_cache_purge_client_read(ngx_event_t *ev)
             destination = client->response.data + client->received;
             remaining = client->response.len - client->received;
         }
-        n = c->recv(c, destination, ngx_min(budget, remaining));
-        if (n == NGX_AGAIN) {
+        /* Only lease replies need a one-byte boundary for ancillary rights. */
+        if (client->header_used == 0 && call->opcode == NGX_PURGE_OP_ACQUIRE_FILE_LEASE) {
+            remaining = 1;
+        }
+        n = ngx_cache_purge_transport_recv(c->fd, destination, ngx_min(budget, remaining),
+                         client->header_used == 0 && call->opcode == NGX_PURGE_OP_ACQUIRE_FILE_LEASE,
+                         rights, &count);
+        saved = n < 0 ? errno : 0;
+        if (n < 0 && saved == EINTR) { continue; }
+        if (n < 0 && (saved == EAGAIN || saved == EWOULDBLOCK)) {
+            c->read->ready = 0;
             if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
                 ngx_cache_purge_client_finish(call, NGX_PURGE_CLIENT_IO, 1);
             }
             return;
         }
         if (n <= 0) {
-            ngx_cache_purge_client_finish(call, NGX_PURGE_CLIENT_IO, 1);
+            ngx_cache_purge_client_finish(call, saved == EPROTO ? NGX_PURGE_CLIENT_PROTOCOL : NGX_PURGE_CLIENT_IO, 1);
             return;
+        }
+        if (count) {
+            if (count != 1 || client->lease_fd >= 0 || call->opcode != NGX_PURGE_OP_ACQUIRE_FILE_LEASE) {
+                for (i = 0; i < count; i++) { close(rights[i]); }
+                ngx_cache_purge_client_finish(call, NGX_PURGE_CLIENT_PROTOCOL, 1);
+                return;
+            }
+            client->lease_fd = rights[0];
         }
         budget -= n;
         if (client->header_used < sizeof(client->header)) {
@@ -372,6 +394,10 @@ ngx_cache_purge_client_read(ngx_event_t *ev)
             }
             client->response.len = (size_t) ngx_cache_purge_client_get(client->header + 16, 4);
             client->result = (uint32_t) ngx_cache_purge_client_get(client->header + 20, 4);
+            if ((client->lease_fd >= 0) != (call->opcode == NGX_PURGE_OP_ACQUIRE_FILE_LEASE && client->result == 0)) {
+                ngx_cache_purge_client_finish(call, NGX_PURGE_CLIENT_PROTOCOL, 1);
+                return;
+            }
             if (client->response.len > client->options.max_payload) {
                 ngx_cache_purge_client_finish(call, NGX_PURGE_CLIENT_LIMIT, 1);
                 return;
@@ -418,9 +444,11 @@ ngx_cache_purge_client_finish(ngx_cache_purge_call_t *call,
     ngx_cache_purge_client_t *client = call->client;
     ngx_cache_purge_reply_t reply;
     u_char *response = NULL;
+    int lease_fd = -1;
 
     call->completing = 1;
     ngx_memzero(&reply, sizeof(reply));
+    reply.lease_fd = -1;
     reply.transport = result;
     reply.may_have_executed = call->sent != 0;
     if (client->current == call) {
@@ -429,7 +457,10 @@ ngx_cache_purge_client_finish(ngx_cache_purge_call_t *call,
         } else {
             reply.result = client->result;
             reply.payload = client->response;
+            reply.lease_fd = client->lease_fd;
         }
+        lease_fd = client->lease_fd;
+        client->lease_fd = -1;
         response = client->response.data;
         ngx_str_null(&client->response);
         client->current = NULL;
@@ -453,6 +484,7 @@ ngx_cache_purge_client_finish(ngx_cache_purge_call_t *call,
         ngx_free(response);
         client->stats.response_bytes = 0;
     }
+    if (lease_fd >= 0) { close(lease_fd); }
     ngx_free(call);
     if (!client->stopped) {
         if (!ngx_queue_empty(&client->queue)) {

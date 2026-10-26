@@ -22,11 +22,13 @@ int result(ngx_cache_purge_store_error_t *error, int code, const char *message =
 }
 int io(ngx_cache_purge_store_error_t *error, const char *operation) {
     int saved = errno;
+    int code = saved == EMFILE || saved == ENFILE || saved == ENOMEM || saved == ENOLCK
+               ? NGX_PURGE_STORE_LIMIT : NGX_PURGE_STORE_IO;
     if (error) {
-        error->code = NGX_PURGE_STORE_IO;
+        error->code = code;
         std::snprintf(error->message, sizeof(error->message), "%s: errno %d", operation, saved);
     }
-    return NGX_PURGE_STORE_IO;
+    return code;
 }
 bool zero(const unsigned char *id) {
     unsigned value = 0;

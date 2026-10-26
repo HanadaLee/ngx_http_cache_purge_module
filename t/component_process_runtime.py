@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Bounded index IPC, ambiguous replies, owner handoff and crash recovery."""
 import argparse
+import array
+import fcntl
+import hashlib
 import json
 import os
 import select
@@ -149,6 +152,26 @@ class Client:
         self.socket.sendall(self.packet(operation, data))
         return self.reply(operation, code)
 
+    def lease(self, address):
+        self.socket.sendall(self.packet(17, string(address)))
+        first, control, flags, _ = self.socket.recvmsg(1, socket.CMSG_SPACE(8), socket.MSG_CMSG_CLOEXEC)
+        rights = array.array('i')
+        for level, kind, data in control:
+            assert level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS
+            rights.frombytes(data)
+        try:
+            magic, version, op, request, size, result = struct.unpack('>4sHHQII', first + self.read(23))
+            payload = self.read(size)
+            assert (magic, version, op, request, result, flags & socket.MSG_CTRUNC) == (b'NCP1', 1, 17, self.counter, 0, 0)
+            assert len(rights) == 1 and len(payload) == 24
+            digest = hashlib.sha256(address.encode()).digest()
+            assert payload == digest[:16] + struct.pack('>Q', int.from_bytes(digest[16:24], 'big') & 0x3fffffffffffffff)
+            assert fcntl.fcntl(rights[0], fcntl.F_GETFD) & fcntl.FD_CLOEXEC
+            return rights.pop()
+        finally:
+            for fd in rights:
+                os.close(fd)
+
     def page(self, kind, value, scope='', bookmark=b'', limit=32):
         data = self.call(8, query(kind, value, scope, bookmark, limit))
         count, done, size = struct.unpack('>BBI', data[:6])
@@ -159,6 +182,40 @@ class Client:
 
 
 try:
+    lease_component = Component(root / 'leases')
+    lease_component.opened()
+    lease_client = Client(lease_component.path)
+    lease_fd = lease_client.lease('/cache/root/one')
+    lease_client.call(17, string('/cache/root/one'), code=6)
+    other_fd = lease_client.lease('/cache/root/two')
+    os.close(other_fd)
+    check(True, 'component returns a real OFD lease and serializes competing addresses')
+    lease_client.close()
+    lease_component.stop()
+    successor = Component(lease_component.path)
+    successor.opened()
+    lease_client = Client(successor.path)
+    lease_client.call(17, string('/cache/root/one'), code=6)
+    os.close(lease_fd)
+    os.close(lease_client.lease('/cache/root/one'))
+    check(True, 'lease retained by a worker survives component owner replacement')
+    before = len(list(Path(f'/proc/{successor.process.pid}/fd').iterdir()))
+    for count in (1, 2, 8):
+        unexpected = Client(successor.path)
+        packet = unexpected.packet(1)
+        with open('/dev/null', 'rb') as source:
+            unexpected.socket.sendmsg([packet], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                                   array.array('i', [source.fileno()] * count))])
+        try:
+            assert unexpected.socket.recv(1) == b''
+        except ConnectionResetError:
+            pass
+        unexpected.close()
+    wait_for(lambda: len(list(Path(f'/proc/{successor.process.pid}/fd').iterdir())) <= before)
+    check(len(lease_client.call(1)) == 72, 'unexpected and truncated request rights are rejected without descriptor leaks or owner failure')
+    lease_client.close()
+    successor.stop()
+
     path = root / 'index'
     first = Component(path)
     first.opened()

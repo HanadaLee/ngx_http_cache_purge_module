@@ -39,7 +39,8 @@ typedef enum {
     NGX_PURGE_OP_UPDATE,
     NGX_PURGE_OP_ACCEPT_OPERATION,
     NGX_PURGE_OP_GET_OPERATION,
-    NGX_PURGE_OP_GET_CONTROL_STATUS
+    NGX_PURGE_OP_GET_CONTROL_STATUS,
+    NGX_PURGE_OP_ACQUIRE_FILE_LEASE /* string canonical address -> digest[16], offset u64 + one FD */
 } ngx_cache_purge_opcode_t;
 
 typedef struct {

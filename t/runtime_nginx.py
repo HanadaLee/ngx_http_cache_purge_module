@@ -86,7 +86,7 @@ manifest = {'nginx_revision': revision, 'openresty_patches': patches, 'dynamic':
             'shared_rocksdb': a.shared_rocksdb,
             'sanitizer': a.sanitize,
             'archives': {name: hashlib.sha256(path.read_bytes()).hexdigest()
-                         for name in ('component', 'coordinator', 'control', 'operations', 'index', 'store')
+                         for name in ('component', 'coordinator', 'control', 'operations', 'index', 'store', 'files')
                          for path in [a.libraries / f'libngx_cache_purge_{name}.a']}}
 if a.runtime_only:
     assert json.loads((root / 'build.json').read_text()) == manifest, 'stale build manifest'
@@ -579,7 +579,7 @@ result = {'root': str(root), 'nginx_revision': revision, 'dynamic': a.dynamic,
           'process_group_memory': memory,
           'empty_component_pss_increment_kib': memory['component_empty']['pss_kib'] - memory['baseline']['pss_kib'],
           'library_sha256': {name: hashlib.sha256((a.libraries / f'libngx_cache_purge_{name}.a').read_bytes()).hexdigest()
-                             for name in ('component', 'coordinator', 'control', 'operations', 'index', 'store')},
+                             for name in ('component', 'coordinator', 'control', 'operations', 'index', 'store', 'files')},
           'addon_sha256': {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in addon.iterdir() if path.is_file()},
           'probe_sha256': {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in probe.iterdir() if path.is_file()},
           'runtime_paths': [str(instance.path) for instance in runtime_cases],

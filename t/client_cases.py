@@ -1,5 +1,6 @@
 """Worker-side IPC checks using the real component and a fault-injection peer."""
 import concurrent.futures
+import array
 import http.client
 import json
 import os
@@ -58,6 +59,33 @@ def run_client_cases(Run, root, checks):
                     response = struct.pack('>4sHHQII', b'FAIL' if op == 102 else magic,
                         2 if op == 104 else version, op + 1 if op == 105 else op,
                         label + 1 if op == 103 else label, 524289 if op == 106 else len(data), 0)
+                    if op == 17 or (op == 111):
+                        if data == b'error-fd':
+                            response = response[:20] + struct.pack('>I', 4)
+                        if data == b'missing':
+                            self.request.sendall(response + data)
+                            continue
+                        number = 8 if data == b'truncated' else 2 if data == b'double' else 1
+                        with descriptor_path.open('rb') as source:
+                            ancillary = [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                          array.array('i', [source.fileno()] * number))]
+                            if data == b'late':
+                                self.request.sendall(response[:1])
+                                self.request.sendmsg([response[1:2]], ancillary)
+                                self.request.sendall(response[2:] + data)
+                                continue
+                            assert self.request.sendmsg([response[:1]], ancillary) == 1
+                        if data == b'disconnect':
+                            return
+                        if data in (b'slow', b'cancel'):
+                            time.sleep(.4)
+                        if data == b'fragment':
+                            for byte in response[1:] + data:
+                                self.request.sendall(bytes([byte]))
+                                time.sleep(.001)
+                        else:
+                            self.request.sendall(response[1:] + data)
+                        continue
                     if op in (101, 107):
                         for byte in response:
                             self.request.sendall(bytes([byte]))
@@ -72,6 +100,8 @@ def run_client_cases(Run, root, checks):
     directory = Path(tempfile.mkdtemp(prefix='client-peer-', dir=root))
     directory.chmod(0o755)
     path = directory / 'peer.sock'
+    descriptor_path = directory / 'transferred-fd'
+    descriptor_path.write_bytes(b'lease transport fixture')
     server = socketserver.ThreadingUnixStreamServer(str(path), Peer)
     server.daemon_threads = True
     path.chmod(0o666)  # Isolate SO_PEERCRED from filesystem access in UID tests.
@@ -129,6 +159,46 @@ def run_client_cases(Run, root, checks):
         data = bytes(range(256)) * 128
         assert rpc('/rpc-fake/?op=101', data)[2] == data
         checks.append('fragmented headers and binary response payloads are assembled without truncation')
+
+        value = rpc('/rpc/?op=17', text('/cache/fixture/file'))
+        assert value[0] == 200 and value[1]['X-IPC-Lease'] == '1' and len(value[2]) == 24
+        assert rpc('/rpc/?op=17', text('/cache/fixture/file'))[1]['X-IPC-Result'] == '0'
+        checks.append('real worker receives a component-acquired OFD lease and releases its borrowed callback reference')
+
+        def rights_gone():
+            for fd in Path(f'/proc/{owner}/fd').iterdir():
+                try:
+                    if os.readlink(fd) == str(descriptor_path):
+                        return False
+                except FileNotFoundError:
+                    pass
+            return True
+        for data in (b'ok', b'fragment'):
+            value = rpc('/rpc-fake/?op=17', data)
+            assert value[0] == 200 and value[1]['X-IPC-Lease'] == '1' and value[2] == data, value
+            until(rights_gone)
+        checks.append('one-byte ancillary transfer remains associated with fragmented reply headers and payloads')
+        for data in (b'missing', b'double', b'truncated', b'late', b'error-fd'):
+            value = rpc('/rpc-fake/?op=17', data)
+            assert value[0] == 503 and value[1]['X-IPC-Transport'] == '3', (data, value)
+            until(rights_gone)
+        assert rpc('/rpc-fake/?op=111', b'wrong-op')[1]['X-IPC-Transport'] == '3'
+        until(rights_gone)
+        checks.append('missing, extra, truncated, late and disallowed reply descriptors are rejected and closed')
+        assert rpc('/rpc-fake/?op=17', b'disconnect')[1]['X-IPC-Transport'] == '1'
+        assert rpc('/rpc-fake/?op=17&timeout=50', b'slow')[0] == 504
+        until(rights_gone)
+        before = stats()['cancelled']
+        seen = count(17)
+        raw = socket.create_connection(('127.0.0.1', case.port))
+        raw.sendall(b'POST /rpc-fake/?op=17 HTTP/1.1\r\nHost: probe.test\r\nContent-Length: 6\r\n\r\ncancel')
+        until(lambda: count(17) > seen)
+        raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+        raw.close()
+        until(lambda: stats()['cancelled'] == before + 1)
+        until(rights_gone)
+        assert rpc('/rpc-fake/?op=100', b'after-rights')[2] == b'after-rights'
+        checks.append('disconnect, timeout and HTTP cancellation after descriptor transfer release rights and reconnect safely')
 
         for op, expected in ((102, 3), (103, 3), (104, 3), (105, 3), (106, 4)):
             value = rpc('/rpc-fake/?op=' + str(op), b'probe')
