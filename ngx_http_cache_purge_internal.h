@@ -522,6 +522,31 @@ ngx_http_cache_purge_query_bookmark(const ngx_http_cache_purge_query_t *query);
 int ngx_http_cache_purge_query_close(ngx_http_cache_purge_query_t **query,
     ngx_http_cache_rocksdb_error_t *error);
 
+typedef struct {
+    unsigned char  id[16];
+    uint64_t       revision;
+} ngx_http_cache_purge_index_expected_t;
+
+typedef enum {
+    NGX_HTTP_CACHE_PURGE_INDEX_COMMIT = 0,
+    NGX_HTTP_CACHE_PURGE_INDEX_COMMIT_PENDING,
+    NGX_HTTP_CACHE_PURGE_INDEX_PUBLISH,
+    NGX_HTTP_CACHE_PURGE_INDEX_DISCARD,
+    NGX_HTTP_CACHE_PURGE_INDEX_ABORT,
+    NGX_HTTP_CACHE_PURGE_INDEX_RETIRE
+} ngx_http_cache_purge_index_action_e;
+
+int ngx_http_cache_purge_index_init(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_rocksdb_error_t *error);
+/* Atomic state transitions on the executor. COMMIT and RETIRE accept 1-32
+ * records; other actions accept one. matches has count caller-owned elements.
+ * It is cleared on failure; the database never receives a partial batch. */
+int ngx_http_cache_purge_index_apply(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_purge_index_action_e action,
+    const ngx_http_cache_purge_index_expected_t *files, size_t count,
+    ngx_http_cache_purge_index_match_t *matches,
+    ngx_http_cache_rocksdb_error_t *error);
+
 #ifdef __cplusplus
 }
 #endif

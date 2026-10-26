@@ -443,24 +443,42 @@ void tag_links(Transaction &tx, const Record &record, bool add) {
 } // namespace
 
 Index::Index(ngx_http_cache_rocksdb_t *store) : store_(store) {
-    Transaction tx(store_);
-    auto schema = tx.get(common, "M:index");
-    if (schema) {
-        require(*schema == "1" || *schema == "2", NGX_HTTP_CACHE_ROCKSDB_SCHEMA, "unsupported file index schema");
-        require(integer(tx.need(common, "M:next")) != 0, NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid index ID allocator");
-        /* Record encodings are unchanged. Version 2 additionally permits a
-         * committed instance to retain its pending-publication lease. */
-        if (*schema == "1") { tx.put(common, "M:index", "2"); tx.commit(); }
-        return;
+    ngx_http_cache_rocksdb_error_t error;
+    int rc = ngx_http_cache_purge_index_init(store, &error);
+    checked(rc, error);
+}
+
+/* Conversion-only adapters; C owns validation, state changes and WriteBatch. */
+static Match native_match(const ngx_http_cache_purge_index_match_t &value) {
+    Match result;
+    std::memcpy(result.id.data(), value.id, result.id.size());
+    result.revision = value.revision;
+    result.state = static_cast<FileState>(value.state);
+    return result;
+}
+static Match apply_one(ngx_http_cache_rocksdb_t *store, ngx_http_cache_purge_index_action_e action,
+                       const FileId &id, uint64_t revision) {
+    ngx_http_cache_purge_index_expected_t input{};
+    std::memcpy(input.id, id.data(), id.size()); input.revision = revision;
+    ngx_http_cache_purge_index_match_t output{};
+    ngx_http_cache_rocksdb_error_t error;
+    int rc = ngx_http_cache_purge_index_apply(store, action, &input, 1, &output, &error);
+    checked(rc, error); return native_match(output);
+}
+static std::vector<Match> apply_batch(ngx_http_cache_rocksdb_t *store, ngx_http_cache_purge_index_action_e action,
+                                     const std::vector<ExpectedFile> &files) {
+    require(!files.empty() && files.size() <= 32, NGX_HTTP_CACHE_ROCKSDB_LIMIT, "index batch must contain 1-32 files");
+    std::array<ngx_http_cache_purge_index_expected_t, 32> input{};
+    std::array<ngx_http_cache_purge_index_match_t, 32> output{};
+    std::vector<Match> result(files.size());
+    for (size_t i = 0; i < files.size(); i++) {
+        std::memcpy(input[i].id, files[i].id.data(), files[i].id.size()); input[i].revision = files[i].revision;
     }
-    for (Cf cf : {common, urls, tags}) {
-        Cursor cursor; cursor.open(store_, cf, "");
-        std::string key, value;
-        while (cursor.next(key, value))
-            require(cf == common && !key.empty() && key[0] == 0,
-                    NGX_HTTP_CACHE_ROCKSDB_SCHEMA, "file index schema missing from non-empty store");
-    }
-    tx.put(common, "M:index", "2"); tx.put(common, "M:next", number(1)); tx.commit();
+    ngx_http_cache_rocksdb_error_t error;
+    int rc = ngx_http_cache_purge_index_apply(store, action, input.data(), files.size(), output.data(), &error);
+    checked(rc, error);
+    for (size_t i = 0; i < files.size(); i++) result[i] = native_match(output[i]);
+    return result;
 }
 
 static Match prepare_record(Transaction &tx, Values &pool, const File &file, const FileId &expected_previous) {
@@ -537,69 +555,20 @@ std::vector<Match> Index::prepare_batch(const std::vector<Fill> &fills) {
     tx.commit(); return result;
 }
 
-static Match commit_record(Transaction &tx, const FileId &id, uint64_t revision,
-                           bool pending_publication = false) {
-    auto record = load(tx, id, revision);
-    require(record.state == FileState::prepared, NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "file is not prepared");
-    require(tx.need(common, lease(record.root, record.path)) == id_bytes(id), NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "fill lease changed");
-    auto current = tx.get(common, location(record.root, record.path));
-    require((current ? file_id(*current) : FileId{}) == record.previous, NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "cache path changed before commit");
-    if (!zero(record.previous)) {
-        auto old = decode_record(tx.need(common, object(record.previous)));
-        require(old.id == record.previous && old.state == FileState::committed
-                && old.root == record.root && old.path == record.path,
-                NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "previous path record is inconsistent");
-        old.state = FileState::retired; advance(old); tx.put(common, object(old.id), encode(old));
-        tx.put(common, "g" + id_bytes(old.id), number(old.revision));
-    }
-    record.state = FileState::committed; advance(record);
-    tx.put(common, object(id), encode(record)); tx.put(common, location(record.root, record.path), id_bytes(id));
-    if (!pending_publication) tx.del(common, lease(record.root, record.path));
-    return match(record);
-}
-
 Match Index::commit(const FileId &id, uint64_t revision) {
-    Transaction tx(store_); auto result = commit_record(tx, id, revision); tx.commit(); return result;
+    return apply_one(store_, NGX_HTTP_CACHE_PURGE_INDEX_COMMIT, id, revision);
 }
 std::vector<Match> Index::commit_batch(const std::vector<ExpectedFile> &files) {
-    require(!files.empty() && files.size() <= 32, NGX_HTTP_CACHE_ROCKSDB_LIMIT, "commit batch must contain 1-32 files");
-    Transaction tx(store_); std::vector<Match> result; result.reserve(files.size());
-    for (const auto &file : files) result.push_back(commit_record(tx, file.id, file.revision));
-    tx.commit(); return result;
+    return apply_batch(store_, NGX_HTTP_CACHE_PURGE_INDEX_COMMIT, files);
 }
-
 Match Index::commit_pending(const FileId &id, uint64_t revision) {
-    Transaction tx(store_); auto result = commit_record(tx, id, revision, true);
-    tx.commit(); return result;
+    return apply_one(store_, NGX_HTTP_CACHE_PURGE_INDEX_COMMIT_PENDING, id, revision);
 }
-
 Match Index::publish(const FileId &id, uint64_t revision) {
-    Transaction tx(store_); auto record = load(tx, id, revision);
-    require(record.state == FileState::committed, NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "file is not committed");
-    require(tx.need(common, location(record.root, record.path)) == id_bytes(id),
-            NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "cache path changed before publication");
-    auto intent = tx.get(common, lease(record.root, record.path));
-    if (intent) {
-        require(*intent == id_bytes(id), NGX_HTTP_CACHE_ROCKSDB_BUSY, "another fill owns the path lease");
-        tx.del(common, lease(record.root, record.path));
-    }
-    tx.commit(); return match(record);
+    return apply_one(store_, NGX_HTTP_CACHE_PURGE_INDEX_PUBLISH, id, revision);
 }
-
 Match Index::discard_publication(const FileId &id, uint64_t revision) {
-    Transaction tx(store_); auto record = load(tx, id, revision);
-    require(record.state == FileState::committed, NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "file is not committed");
-    auto intent = tx.get(common, lease(record.root, record.path));
-    require(intent && *intent == id_bytes(id),
-            NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "publication lease changed");
-    require(tx.need(common, location(record.root, record.path)) == id_bytes(id),
-            NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "cache path changed before publication discard");
-    tx.del(common, lease(record.root, record.path));
-    tx.del(common, location(record.root, record.path));
-    record.state = FileState::retired; advance(record);
-    tx.put(common, object(id), encode(record));
-    tx.put(common, "g" + id_bytes(id), number(record.revision));
-    tx.commit(); return match(record);
+    return apply_one(store_, NGX_HTTP_CACHE_PURGE_INDEX_DISCARD, id, revision);
 }
 
 std::optional<Match> Index::current(const std::string &root, const std::string &path) {
@@ -635,35 +604,13 @@ bool Index::has_fill_intent(const FileId &id) {
 }
 
 Match Index::abort_prepare(const FileId &id, uint64_t revision) {
-    Transaction tx(store_); auto record = load(tx, id, revision);
-    require(record.state == FileState::prepared, NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "file is not prepared");
-    require(tx.need(common, lease(record.root, record.path)) == id_bytes(id), NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "fill lease changed");
-    record.state = FileState::retired; advance(record);
-    tx.del(common, lease(record.root, record.path)); tx.put(common, object(id), encode(record));
-    tx.put(common, "g" + id_bytes(id), number(record.revision));
-    tx.commit(); return match(record);
+    return apply_one(store_, NGX_HTTP_CACHE_PURGE_INDEX_ABORT, id, revision);
 }
-
-static Match retire_record(Transaction &tx, const FileId &id, uint64_t revision) {
-    auto record = load(tx, id, revision);
-    if (record.state == FileState::retired) return match(record);
-    require(record.state == FileState::committed, NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "prepared file must be drained and aborted");
-    require(!tx.get(common, lease(record.root, record.path)), NGX_HTTP_CACHE_ROCKSDB_BUSY, "cache path has an unfinished fill");
-    auto current = tx.get(common, location(record.root, record.path));
-    if (current && file_id(*current) == id) tx.del(common, location(record.root, record.path));
-    record.state = FileState::retired; advance(record); tx.put(common, object(id), encode(record));
-    tx.put(common, "g" + id_bytes(id), number(record.revision));
-    return match(record);
-}
-
 Match Index::retire(const FileId &id, uint64_t revision) {
-    Transaction tx(store_); auto result = retire_record(tx, id, revision); tx.commit(); return result;
+    return apply_one(store_, NGX_HTTP_CACHE_PURGE_INDEX_RETIRE, id, revision);
 }
 std::vector<Match> Index::retire_batch(const std::vector<ExpectedFile> &files) {
-    require(!files.empty() && files.size() <= 32, NGX_HTTP_CACHE_ROCKSDB_LIMIT, "retire batch must contain 1-32 files");
-    Transaction tx(store_); std::vector<Match> result; result.reserve(files.size());
-    for (const auto &file : files) result.push_back(retire_record(tx, file.id, file.revision));
-    tx.commit(); return result;
+    return apply_batch(store_, NGX_HTTP_CACHE_PURGE_INDEX_RETIRE, files);
 }
 
 Match Index::update_metadata(const FileId &id, uint64_t revision,
