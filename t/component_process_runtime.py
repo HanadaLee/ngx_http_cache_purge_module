@@ -49,6 +49,7 @@ class Component:
         env = os.environ.copy()
         env.pop('CACHE_PURGE_TEST_CACHE_ROOT', None)
         env.pop('CACHE_PURGE_TEST_TEMP_ROOT', None)
+        env.pop('CACHE_PURGE_TEST_CACHE_ZONE', None)
         if roots:
             env['CACHE_PURGE_TEST_CACHE_ROOT'], env['CACHE_PURGE_TEST_TEMP_ROOT'] = map(str, roots)
         self.process = subprocess.Popen(command, env=env,
@@ -265,16 +266,16 @@ try:
     cache_root.rmdir()
     (root / 'old-cache').rename(cache_root)
     check(not os.listxattr(replacement_fd), 'replacing a configured root cannot silently redirect prepared file identity')
-    for fd in (lease, temporary, replacement_fd, outside_fd, wrong_lease):
+    for fd in (temporary, replacement_fd, outside_fd, wrong_lease):
         os.close(fd)
     client.close()
     publisher.process.kill(); publisher.process.wait(timeout=5)
     publisher = Component(publisher.path, roots=(cache_root, temp_root))
     publisher.opened(); client = Client(publisher.path)
     assert client.call(2, identity(401))[0] == 1
-    lease = client.lease(str(target)); temporary = os.open(temp, os.O_RDWR | os.O_CLOEXEC)
+    temporary = os.open(temp, os.O_RDWR | os.O_CLOEXEC)
     assert client.prepare_file(payload, [lease, temporary]) == prepared
-    check(True, 'owner crash preserves PREPARE_FILE intent and permits an identical file retry without index rebuild')
+    check(True, 'owner crash preserves a lease-held PREPARE_FILE intent and permits an identical file retry without index rebuild')
     target.parent.mkdir(parents=True, exist_ok=True)
     temp.rename(target)
     finished = client.finish_file(401, lease)
@@ -312,6 +313,68 @@ try:
         os.close(temporary); os.close(lease)
     check(True, 'missing, failed and changed candidates retire safely without altering unrelated final paths')
     client.close(); publisher.stop()
+
+    recovery_cache, recovery_temp = root / 'recovery-cache', root / 'recovery-temp'
+    recovery_cache.mkdir(); recovery_temp.mkdir()
+    recovering = Component(root / 'recovery-owner', roots=(recovery_cache, recovery_temp))
+    recovering.opened(); recovery_client = Client(recovering.path)
+    for number, scenario in ((501, 'missing'), (502, 'renamed'), (503, 'restart'),
+                             (504, 'damaged'), (505, 'lost-prepare')):
+        source = recovery_temp / str(number)
+        source.write_bytes(b'complete recovery entity')
+        destination = recovery_cache / f'a/00/{number}'
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        lease = recovery_client.lease(str(destination))
+        temporary = os.open(source, os.O_RDWR | os.O_CLOEXEC)
+        prepare_data = record(number, root=str(recovery_cache), zone='zone-a',
+                              uri=f'/recovery/{number}') + string(str(source))
+        if scenario == 'lost-prepare':
+            packet = recovery_client.packet(18, prepare_data)
+            assert recovery_client.socket.sendmsg([packet[:1]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                                     array.array('i', [lease, temporary]))]) == 1
+            recovery_client.socket.sendall(packet[1:])
+            wait_for(lambda: 'user.ngx_cache_purge.id' in os.listxattr(temporary))
+            recovery_client.close()  # Drop the unread reply after durable preparation.
+            recovery_client = Client(recovering.path)
+        else:
+            recovery_client.prepare_file(prepare_data, [lease, temporary])
+        if scenario not in ('missing', 'lost-prepare'):
+            source.rename(destination)
+        if scenario == 'restart':
+            recovery_client.close()
+            recovering.process.kill(); recovering.process.wait(timeout=5)
+            recovering = Component(recovering.path, roots=(recovery_cache, recovery_temp))
+            recovering.opened(); recovery_client = Client(recovering.path)
+        time.sleep(1.2)
+        assert recovery_client.call(2, identity(number))[0] == 1
+        assert os.getxattr(temporary, 'user.ngx_cache_purge.id')[7] == 1
+        check(True, f'background recovery does not advance a live OFD-held {scenario} publication')
+        if scenario == 'renamed':
+            retained = os.dup(lease)
+            os.close(lease); lease = retained
+            time.sleep(1.2)
+            assert recovery_client.call(2, identity(number))[0] == 1
+            check(True, 'a duplicate OFD reference continues to exclude background recovery')
+        if scenario == 'damaged':
+            os.setxattr(temporary, 'user.ngx_cache_purge.id', b'broken-marker')
+        os.close(temporary); os.close(lease)
+        if scenario == 'damaged':
+            time.sleep(1.2)
+            assert recovery_client.call(2, identity(number))[0] == 1
+            assert os.getxattr(destination, 'user.ngx_cache_purge.id') == b'broken-marker'
+            assert recovery_client.call(9, string('') + b'\x20')[0] == 1
+            check(True, 'background recovery retains a malformed candidate without stamping it READY')
+            destination.unlink()  # Remove only this test-owned damaged candidate.
+        expected = 3 if scenario in ('missing', 'damaged', 'lost-prepare') else 2
+        wait_for(lambda: recovery_client.call(2, identity(number))[0] == expected)
+        wait_for(lambda: recovery_client.call(9, string('') + b'\x20')[0] == 0)
+        if expected == 2:
+            assert os.getxattr(destination, 'user.ngx_cache_purge.id')[7] == 2
+            assert destination.read_bytes() == b'complete recovery entity'
+        else:
+            assert not destination.exists()
+        check(True, f'background recovery completes abandoned {scenario} publication without a FINISH RPC')
+    recovery_client.close(); recovering.stop()
 
     lease_component = Component(root / 'leases')
     lease_component.opened()
@@ -508,6 +571,6 @@ finally:
         component.stderr.close()
 
 result = {'checks': checks, 'count': len(checks), 'root': str(root),
-    'scope': 'component/index/ledger IPC and same-filesystem PREPARE/FINISH; native upstream producer, immediate invalidation and physical jobs are not wired'}
+    'scope': 'component/index/ledger IPC, same-filesystem PREPARE/FINISH and automatic recovery; this fixture does not prove native read admission, immediate invalidation or background purge'}
 args.output.write_text(json.dumps(result, indent=2) + '\n')
 print(json.dumps(result), flush=True)

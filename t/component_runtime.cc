@@ -23,9 +23,11 @@ int main(int argc, char **argv) {
     ngx_http_cache_purge_root_t roots[2]{};
     const char *cache = std::getenv("CACHE_PURGE_TEST_CACHE_ROOT");
     const char *temporary = std::getenv("CACHE_PURGE_TEST_TEMP_ROOT");
+    const char *zone = std::getenv("CACHE_PURGE_TEST_CACHE_ZONE");
+    if (!zone) zone = "zone-a";
     if (cache && temporary) {
         roots[0] = {{reinterpret_cast<const unsigned char *>(cache), std::strlen(cache)},
-                    {reinterpret_cast<const unsigned char *>("zone-a"), 6}, NGX_HTTP_CACHE_PURGE_ROOT_CACHE};
+                    {reinterpret_cast<const unsigned char *>(zone), std::strlen(zone)}, NGX_HTTP_CACHE_PURGE_ROOT_CACHE};
         roots[1] = {{reinterpret_cast<const unsigned char *>(temporary), std::strlen(temporary)},
                     {nullptr, 0}, NGX_HTTP_CACHE_PURGE_ROOT_TEMP};
         options.roots = roots; options.root_count = 2;

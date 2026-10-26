@@ -49,13 +49,13 @@ typedef struct {
 } ngx_http_cache_purge_component_frame_t;
 
 typedef struct {
-    int                                      fd;
-    int                                      output_lease;
-    int                                      input_rights[2];
-    size_t                                   rights_count;
-    uid_t                                    uid;
+    int     fd;
+    int     output_lease;
+    int     input_rights[2];
+    size_t  rights_count;
+    uid_t   uid;
 
-    unsigned char  header[NGX_HTTP_CACHE_PURGE_FRAME_SIZE];
+    unsigned char header[NGX_HTTP_CACHE_PURGE_FRAME_SIZE];
 
     size_t                                   header_used;
     size_t                                   input_used;
@@ -100,6 +100,8 @@ struct ngx_http_cache_purge_component_s {
     ngx_http_cache_purge_coordinator_t       *coordinator;
     ngx_http_cache_purge_operations_t         operations;
     size_t                                    next_peer;
+    ngx_http_cache_purge_component_buffer_t   recovery_bookmark;
+    uint64_t                                  recovery_at;
 };
 
 static int
@@ -1396,11 +1398,11 @@ ngx_http_cache_purge_component_read(ngx_http_cache_purge_component_t *c,
     size_t                                    i;
     size_t                                    expected;
 
-    int  rights[NGX_HTTP_CACHE_PURGE_TRANSPORT_FDS];
+    int rights[NGX_HTTP_CACHE_PURGE_TRANSPORT_FDS];
 
-    int                                       first;
-    int                                       rc;
-    ssize_t                                   n;
+    int      first;
+    int      rc;
+    ssize_t  n;
 
     budget = 65536;
     *alive = 1;
@@ -1528,6 +1530,113 @@ ngx_http_cache_purge_component_write(ngx_http_cache_purge_component_t *c,
 }
 
 static int
+ngx_http_cache_purge_component_recover(ngx_http_cache_purge_component_t *c,
+    ngx_http_cache_rocksdb_t *store, ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_query_t              *query;
+    ngx_http_cache_purge_index_match_t         match;
+    ngx_http_cache_purge_index_file_t          file;
+    ngx_http_cache_purge_publication_target_t  target;
+    ngx_http_cache_rocksdb_bytes_t             bookmark;
+    unsigned char                              digest[16];
+    uint64_t                                   offset;
+    int                                       lease, rc;
+
+    query = NULL;
+    lease = -1;
+    memset(&file, 0, sizeof(file));
+    memset(&target, 0, sizeof(target));
+    bookmark.data = c->recovery_bookmark.data;
+    bookmark.len = c->recovery_bookmark.len;
+    c->recovery_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 1000;
+
+    rc = ngx_http_cache_purge_query_open(store, NULL,
+                                         NGX_HTTP_CACHE_PURGE_QUERY_PENDING,
+                                         bookmark, &query, error);
+    if (rc != 0) {
+        goto done;
+    }
+    rc = ngx_http_cache_purge_query_next(query, &match, error);
+    if (rc == NGX_HTTP_CACHE_ROCKSDB_DONE) {
+        c->recovery_bookmark.len = 0;
+        rc = 0;
+        goto done;
+    }
+    if (rc != 0) {
+        goto done;
+    }
+    bookmark = ngx_http_cache_purge_query_bookmark(query);
+    rc = ngx_http_cache_purge_component_buffer_size(
+        &c->recovery_bookmark, bookmark.len, 33024, 0, error);
+    if (rc != 0) {
+        goto done;
+    }
+    if (bookmark.len) {
+        memcpy(c->recovery_bookmark.data, bookmark.data, bookmark.len);
+    }
+    ngx_http_cache_purge_query_close(&query, NULL);
+    c->recovery_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 10;
+    rc = ngx_http_cache_purge_index_get_file(store, match.id, &file, error);
+    if (rc != 0) {
+        goto done;
+    }
+
+    /* Logical preparations are not native filesystem publication intents. */
+    if (file.metadata.len < 4 || memcmp(file.metadata.data, "NFP1", 4) != 0) {
+        rc = 0;
+        goto done;
+    }
+    rc = ngx_http_cache_purge_publications_target(c->publications, store,
+                                                  file.root, file.zone,
+                                                  file.path, &target, error);
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_file_address(target.address, digest, &offset,
+                                               error);
+    }
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_component_anchor(c, error);
+    }
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_file_lease_acquire(
+            c->lease_path, c->lease_anchor, offset, &lease, error);
+    }
+    if (rc == 0) {
+        /*
+         * A worker, an in-flight SCM_RIGHTS reference, or another publisher
+         * keeps its OFD lease until writing/renaming is finished. Acquisition
+         * on an independent description proves none of them still owns it.
+         */
+        rc = ngx_http_cache_purge_publications_finish(
+            c->publications, store, file.id, file.revision, c->lease_anchor,
+            lease, c->options.client_uid, &match, error);
+    }
+
+done:
+    if (query != NULL) {
+        ngx_http_cache_purge_query_close(&query, NULL);
+    }
+    ngx_http_cache_purge_component_close(&lease);
+    ngx_http_cache_purge_index_file_free(&file);
+    ngx_http_cache_purge_publication_target_free(&target);
+
+    /*
+     * Active leases, unavailable roots and changed identities remain durable
+     * and are revisited on the next bounded scan. Never stamp them READY.
+     * Store corruption and I/O errors retain the executor's fail-closed path.
+     */
+    if (rc == NGX_HTTP_CACHE_ROCKSDB_BUSY
+        || rc == NGX_HTTP_CACHE_ROCKSDB_CONFLICT
+        || rc == NGX_HTTP_CACHE_ROCKSDB_INVALID
+        || rc == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND
+        || rc == NGX_HTTP_CACHE_ROCKSDB_EXPIRED
+        || rc == NGX_HTTP_CACHE_ROCKSDB_LIMIT)
+    {
+        return ngx_http_cache_purge_component_error(error, 0, "");
+    }
+    return rc;
+}
+
+static int
 ngx_http_cache_purge_component_controls(ngx_http_cache_purge_component_t *c,
     uint64_t *expire_at, int *progress, ngx_http_cache_rocksdb_error_t *error)
 {
@@ -1602,6 +1711,7 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
     int                                      pending;
     int                                      executed;
     int                                      alive;
+    int                                      timeout;
     short                                    event;
 
     rc = ngx_http_cache_purge_publications_open(
@@ -1635,6 +1745,13 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
         if (rc != 0) {
             return rc;
         }
+        now = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC);
+        if (now >= c->recovery_at) {
+            rc = ngx_http_cache_purge_component_recover(c, store, error);
+            if (rc != 0) {
+                return rc;
+            }
+        }
         memset(events, 0, sizeof(events));
         events[0].fd = c->wake_read;
         events[0].events = POLLIN;
@@ -1663,8 +1780,15 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
         pending = c->coordinator != NULL
                   && ngx_http_cache_purge_component_load32(&c->control_state)
                          != NGX_HTTP_CACHE_PURGE_COORD_READY;
+        timeout = 50;
+        now = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC);
+        if (c->recovery_at <= now) {
+            timeout = 0;
+        } else if (c->recovery_at - now < 50) {
+            timeout = (int) (c->recovery_at - now);
+        }
         rc = poll(events, c->options.max_connections + 2,
-                  ready || (pending && progress) ? 0 : 50);
+                  ready || (pending && progress) ? 0 : timeout);
         if (rc < 0) {
             if (errno == EINTR) {
                 continue;
@@ -1826,6 +1950,7 @@ ngx_http_cache_purge_component_destroy(ngx_http_cache_purge_component_t *c)
     free(c->peers);
     free(c->roots);
     free(c->root_storage);
+    ngx_http_cache_purge_component_buffer_free(&c->recovery_bookmark);
     free(c);
 }
 

@@ -28,6 +28,13 @@ between requests. Cache-fill capture is connected; invalidation request handling
 and the rest of the file lifecycle are still being implemented. Index state changes
 do not perform filesystem operations or provide immediate invalidation by themselves.
 
+The executor automatically revisits unfinished native file publications in
+bounded background steps, including after owner restart or a lost reply. It
+first acquires an independent OFD lease, so active writers remain protected.
+Verified renamed files become READY; abandoned preparations are retired without
+deleting unrelated files. Changed identities and inaccessible roots remain
+pending. This recovery does not yet provide native read admission or purge FENCEs.
+
 HTTP workers now have an event-driven Unix IPC client with a reusable connection,
 bounded queues and buffers, absolute deadlines, peer UID verification, and explicit
 cancellation/shutdown. It preserves application errors and reports uncertain
