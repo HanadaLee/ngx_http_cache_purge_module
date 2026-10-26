@@ -43,7 +43,7 @@ patch = subprocess.check_output(['git', '-c', 'core.autocrlf=true', '-c', 'core.
 if patch:
     subprocess.run(['git', 'apply', '-'], input=patch, cwd=build, check=True)
 configure = 'auto/configure' if (build / 'auto/configure').exists() else 'configure'
-args = ['sh', configure, '--prefix=' + str(root / 'default'), '--without-http_gzip_module',
+args = ['sh', configure, '--prefix=' + str(root / 'default'), '--with-http_ssl_module',
         '--with-http_slice_module', '--with-threads', '--with-debug']
 if a.expr:
     args.append('--add-module=' + str(a.expr))
@@ -79,7 +79,7 @@ class Origin(http.server.BaseHTTPRequestHandler):
             return
         version = current.get('version', 1)
         language = self.headers.get('Accept-Language', '') if path == '/vary' else ''
-        entity = body if path == '/slice' else f'{path}:v{version}:{language}'.encode()
+        entity = current.get('body', body if path == '/slice' else f'{path}:v{version}:{language}'.encode())
         etag = '"' + hashlib.sha256(entity).hexdigest() + '"'
         status = current.get('status', 200)
         if status == 200 and self.headers.get('If-None-Match') == etag:
@@ -99,7 +99,8 @@ class Origin(http.server.BaseHTTPRequestHandler):
             self.send_header('Vary', 'Accept-Language')
         if content_range:
             self.send_header('Content-Range', content_range)
-        self.send_header('Content-Length', str(len(entity)))
+        if not current.get('eof'):
+            self.send_header('Content-Length', str(len(entity)))
         self.end_headers()
         if status != 304:
             try:
@@ -186,6 +187,13 @@ def warm(path, headers=None):
     first, second = get(path, headers), get(path, headers)
     assert first[0] == second[0] == 200 and second[1] == 'HIT', (first, second)
     return second
+
+def cache_file(path):
+    return run / 'cache-a' / hashlib.md5(path.encode()).hexdigest()
+
+def phase_seen(path, phase, result=0, complete=False):
+    label = 'complete' if complete else 'phase'
+    return f'probe store {label} {phase} {result} {path} ' in (run / 'error.log').read_text()
 
 stderr = (run / 'stderr.log').open('w')
 process = subprocess.Popen(command, stderr=stderr)
@@ -301,6 +309,68 @@ try:
     value = warm('/native')
     assert value[3] is None
     checks.append('unmanaged locations preserve native behavior with no adapter context')
+
+    value = get('/store-pending?prepare=300&finish=300')
+    assert value[0] == 200
+    until(lambda: phase_seen('/store-pending', 1))
+    assert not cache_file('/store-pending').exists()
+    until(lambda: phase_seen('/store-pending', 2, complete=True))
+    assert cache_file('/store-pending').is_file()
+    assert get('/store-pending')[1] == 'HIT' and count('/store-pending') == 1
+    checks.append('async prepare precedes rename; finish outlives origin FIN and its read timeout')
+
+    states['/store-eof'] = {'eof': True}
+    assert get('/store-eof?prepare=25&finish=25')[0] == 200
+    until(lambda: phase_seen('/store-eof', 2, complete=True))
+    assert get('/store-eof')[1] == 'HIT'
+    checks.append('EOF-delimited complete bodies use the same async store lifecycle')
+
+    large = body * 128
+    states['/aio/large'] = {'body': large}
+    assert get('/aio/large?prepare=25&finish=25')[2] == large
+    until(lambda: phase_seen('/aio/large', 2, complete=True))
+    value = get('/aio/large?delay=10')
+    assert value[1] == 'HIT' and value[2] == large, value[:2]
+    checks.append('native threaded temp-file writes and cache response reads preserve a large body across async store')
+
+    assert get('/store-rejected?mode=store_reject&prepare=25&finish=25')[0] == 200
+    until(lambda: phase_seen('/store-rejected', 2, -5))
+    until(lambda: phase_seen('/store-rejected', 2, complete=True))
+    assert not cache_file('/store-rejected').exists()
+    warm('/store-rejected')
+    checks.append('prepare rejection skips rename, releases the node and permits a later fill')
+
+    assert get('/store-cancel-prepare?mode=store_cancel_prepare&prepare=30&finish=30')[0] == 200
+    until(lambda: phase_seen('/store-cancel-prepare', 2, -6))
+    until(lambda: phase_seen('/store-cancel-prepare', 2, complete=True))
+    assert not cache_file('/store-cancel-prepare').exists()
+    warm('/store-cancel-prepare')
+    assert get('/store-cancel-finish?mode=store_cancel_finish&prepare=20&finish=30')[0] == 200
+    until(lambda: phase_seen('/store-cancel-finish', 2, complete=True))
+    assert get('/store-cancel-finish')[1] == 'HIT'
+    checks.append('termination before rename aborts; termination after rename retains completion and releases pins')
+
+    assert get('/store-finish-failed?mode=store_finish_error&finish=30')[0] == 200
+    until(lambda: phase_seen('/store-finish-failed', 2, -1, complete=True))
+    assert cache_file('/store-finish-failed').exists()
+    checks.append('finish failure preserves the published file for consumer reconciliation without double free')
+
+    assert get('/store-rename-failed?prepare=200&finish=15')[0] == 200
+    until(lambda: phase_seen('/store-rename-failed', 1))
+    cache_file('/store-rename-failed').mkdir()
+    until(lambda: phase_seen('/store-rename-failed', 2, -1))
+    until(lambda: phase_seen('/store-rename-failed', 2, complete=True))
+    cache_file('/store-rename-failed').rmdir()
+    warm('/store-rename-failed')
+    checks.append('native rename failure reaches finish and releases the cache node for retry')
+
+    assert get('/store-reload?prepare=150&finish=200')[0] == 200
+    until(lambda: phase_seen('/store-reload', 1))
+    process.send_signal(signal.SIGHUP)
+    until(lambda: phase_seen('/store-reload', 2, complete=True))
+    assert get('/store-reload')[1] == 'HIT'
+    checks.append('reload retains the old worker until both store phases and native node cleanup complete')
+
     with concurrent.futures.ThreadPoolExecutor(1) as pool:
         pending = pool.submit(get, '/basic?delay=150')
         time.sleep(.03)
@@ -327,6 +397,6 @@ result = {'root': str(root), 'run': str(run), 'revision': revision,
           'dynamic': a.dynamic, 'expr': bool(a.expr), 'sanitizer': a.sanitize,
           'sanitizer_exclusions': ['nonnull-attribute'] if a.sanitize else [],
           'checks': checks,
-          'scope': 'Native read/admission adapter fixture; no production purge consumer, durable 304/store or deletion'}
+          'scope': 'Native read/admission and two-phase store fixture; no production purge consumer, durable DB/file transaction, 304 update adapter or deletion'}
 a.output.write_text(json.dumps(result, indent=2) + '\n')
 print('PASS', len(checks), 'native cache adapter scenarios', flush=True)

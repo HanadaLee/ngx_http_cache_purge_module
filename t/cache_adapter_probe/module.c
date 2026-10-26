@@ -15,10 +15,14 @@ typedef struct {
     ngx_http_request_t  *request;
     ngx_http_cache_t    *cache;
     ngx_event_t          event;
+    ngx_event_t          store_event;
     ngx_str_t            mode;
     ngx_uint_t           lookups;
     u_char              *last;
     u_char               digest[NGX_HTTP_CACHE_KEY_LEN];
+    ngx_uint_t           store_phase;
+    ngx_uint_t           store_calls;
+    ngx_int_t            store_result;
 } probe_ctx_t;
 
 extern ngx_module_t ngx_http_cache_adapter_probe_module;
@@ -135,6 +139,76 @@ send_response(ngx_http_request_t *r, ngx_http_handler_pt next)
     return next(r);
 }
 
+static void
+store_complete(ngx_event_t *ev)
+{
+    probe_ctx_t *ctx = ev->data;
+
+    if ((mode(ctx, "store_cancel_prepare")
+         && ctx->store_phase == NGX_HTTP_CACHE_STORE_PREPARE)
+        || (mode(ctx, "store_cancel_finish")
+            && ctx->store_phase == NGX_HTTP_CACHE_STORE_FINISH))
+    {
+        ngx_http_finalize_request(ctx->request, NGX_HTTP_CLIENT_CLOSED_REQUEST);
+    }
+
+    ngx_log_error(NGX_LOG_NOTICE, ctx->request->connection->log, 0,
+                  "probe store complete %ui %i %V", ctx->store_phase,
+                  ctx->store_result, &ctx->request->uri);
+    ngx_http_file_cache_store_complete(ctx->request, ctx->cache,
+                                       ctx->store_result);
+}
+
+static ngx_int_t
+store(ngx_http_request_t *r, ngx_http_cache_t *c, ngx_temp_file_t *tf,
+    ngx_uint_t phase, ngx_int_t result)
+{
+    probe_ctx_t *ctx = c->adapter_ctx;
+    ngx_str_t value;
+    ngx_int_t delay, answer;
+    ngx_uint_t held;
+
+    if (ctx == NULL || ++ctx->store_calls != phase || tf == NULL) {
+        return NGX_ERROR;
+    }
+    ngx_shmtx_lock(&c->file_cache->shpool->mutex);
+    held = c->node && c->node->count;
+    ngx_shmtx_unlock(&c->file_cache->shpool->mutex);
+    if (!held) {
+        ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+                      "probe store lost cache node");
+        return NGX_ERROR;
+    }
+
+    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
+                  "probe store phase %ui %i %V", phase, result, &r->uri);
+    answer = NGX_OK;
+    if (phase == NGX_HTTP_CACHE_STORE_PREPARE && mode(ctx, "store_reject")) {
+        answer = NGX_DECLINED;
+    }
+    if (phase == NGX_HTTP_CACHE_STORE_FINISH && mode(ctx, "store_finish_error")) {
+        answer = NGX_ERROR;
+    }
+    if (ngx_http_arg(r, (u_char *) (phase == NGX_HTTP_CACHE_STORE_PREPARE
+                                  ? "prepare" : "finish"),
+                     phase == NGX_HTTP_CACHE_STORE_PREPARE ? 7 : 6,
+                     &value) != NGX_OK)
+    {
+        return answer;
+    }
+    delay = ngx_atoi(value.data, value.len);
+    if (delay < 0 || delay > 1000) {
+        return NGX_ERROR;
+    }
+    ctx->store_phase = phase;
+    ctx->store_result = answer;
+    ctx->store_event.data = ctx;
+    ctx->store_event.handler = store_complete;
+    ctx->store_event.log = r->connection->log;
+    ngx_add_timer(&ctx->store_event, delay);
+    return NGX_AGAIN;
+}
+
 static ngx_int_t
 state(ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data)
 {
@@ -178,7 +252,7 @@ pre(ngx_conf_t *cf)
 static ngx_int_t
 post(ngx_conf_t *cf)
 {
-    static ngx_http_cache_adapter_t adapter = {identity, lookup, send_response};
+    static ngx_http_cache_adapter_t adapter = {identity, lookup, send_response, store};
     ngx_http_core_main_conf_t *core;
     core = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
     if (core->cache_adapter) {
