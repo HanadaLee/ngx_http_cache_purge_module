@@ -5,14 +5,14 @@ HTTP cache invalidation for nginx proxy, FastCGI, SCGI, and uWSGI caches.
 The module is undergoing a storage and lifecycle redesign. The default build
 implements the legacy PURGE/REFRESH interfaces. An opt-in development build now
 connects RocksDB ownership, durable operations, and shared control publication to
-nginx's cache manager. Native cache file hooks, the new Invalidate/Delete HTTP
+OpenResty's existing privileged agent. Native cache file hooks, the new Invalidate/Delete HTTP
 API, and multilevel cache propagation are still being implemented.
 
 The repository now contains a bounded RocksDB storage bridge and a persistent
 URL/key/file index. They support cross-zone lookup, scoped TAG postings, full
 bytewise prefix scans, shared value storage, and batched fill/retirement records.
 The component executor hosts that index on one thread and accepts bounded local
-IPC independently of the cache-manager event loop. It supports cancellable owner
+IPC independently of nginx's event loops. It supports cancellable owner
 handoff, explicit shutdown, and paged queries without retaining server cursors
 between requests. These are internal building blocks; request handling and cache
 file hooks are still being implemented. Index state changes
@@ -72,7 +72,7 @@ cmake --build /tmp/cache-purge-store
 ctest --test-dir /tmp/cache-purge-store --output-on-failure
 ```
 
-Its blocking APIs belong on the cache-manager component's execution thread.
+Its blocking APIs belong on the index component's execution thread.
 They must not run directly in HTTP workers.
 
 To build the development runtime into nginx, supply the directory containing
@@ -84,8 +84,13 @@ CACHE_PURGE_ROCKSDB_LIB_DIR=/tmp/cache-purge-store \
 make
 ```
 
-This requires Linux, HTTP cache support, and `NGX_HAVE_CACHE_MANAGER_EXIT` from
-nginx-ext or an equivalent core patch. Override `CACHE_PURGE_ROCKSDB_LIBS` to use
+This requires Linux, HTTP cache support, and OpenResty's existing
+`HAVE_PRIVILEGED_PROCESS_PATCH` capability. The module enables the existing agent
+directly from C, starts its component after module initialization, and closes it
+through the normal process exit callback. It does not fork its own daemon or
+require a custom cache-manager exit hook. Bare nginx can still build the default
+legacy runtime, but cannot enable this persistent runtime without the existing
+agent capability. Override `CACHE_PURGE_ROCKSDB_LIBS` to use
 a fixed RocksDB archive and its compression/runtime dependencies. The default
 links the system shared RocksDB library. Static archives linked into a dynamic
 nginx module must be built with PIC.

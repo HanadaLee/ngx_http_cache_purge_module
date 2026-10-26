@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Build the real addon; exercise managed lifecycle and a separate test guard."""
 import argparse
+import fcntl
+import grp
 import hashlib
 import http.server
 import json
 import os
+import pwd
 import signal
 import socket
 import struct
@@ -18,34 +21,64 @@ from pathlib import Path
 
 p = argparse.ArgumentParser()
 p.add_argument('--nginx', type=Path, required=True)
+p.add_argument('--nginx-ref', default='HEAD')
+p.add_argument('--agent-patches', type=Path, help='Existing OpenResty privileged-agent patches; no local nginx-ext patch')
 p.add_argument('--libraries', type=Path, required=True)
 p.add_argument('--output', type=Path, required=True)
 p.add_argument('--build-root', type=Path)
 p.add_argument('--dynamic', action='store_true')
 p.add_argument('--shared-rocksdb', action='store_true', help='Use the system shared engine when its static archive is not PIC')
+p.add_argument('--runtime-only', action='store_true', help='Reuse the verified build for a separate runtime UID test')
+p.add_argument('--worker-user', help='Worker user for tests started by root')
 a = p.parse_args()
 source = Path(__file__).resolve().parents[1]
 root = a.build_root or Path(tempfile.mkdtemp(prefix='ncp-addon-', dir='/tmp'))
 root.mkdir(exist_ok=True)
+root.chmod(0o755)
 addon, probe, build = root / 'addon', root / 'probe', root / 'nginx'
 for path in (addon, probe, build):
     path.mkdir(exist_ok=True)
-for path in [source / 'config', *source.glob('*.c'), *source.glob('*.h')]:
-    (addon / path.name).write_bytes(path.read_bytes().replace(b'\r\n', b'\n'))
-for path in (source / 't/runtime_probe').iterdir():
-    (probe / path.name).write_bytes(path.read_bytes().replace(b'\r\n', b'\n'))
-revision = subprocess.check_output(['git', '-C', str(a.nginx), 'rev-parse', 'HEAD'], text=True).strip()
+for files, destination in [([source / 'config', *source.glob('*.c'), *source.glob('*.h')], addon),
+                           (list((source / 't/runtime_probe').iterdir()), probe)]:
+    for path in files:
+        contents = path.read_bytes().replace(b'\r\n', b'\n')
+        if a.runtime_only:
+            assert (destination / path.name).read_bytes() == contents, ('stale addon', path)
+        else:
+            (destination / path.name).write_bytes(contents)
+git = ['git', '-c', 'safe.directory=' + str(a.nginx), '-C', str(a.nginx)]
+revision = subprocess.check_output(git + ['rev-parse', a.nginx_ref], text=True).strip()
+patches = {}
+if a.agent_patches:
+    for suffix in ('', '_thread_pool', '_connections'):
+        patch = a.agent_patches / f'nginx-1.31.7-privileged_agent_process{suffix}.patch'
+        patches[patch.name] = hashlib.sha256(patch.read_bytes()).hexdigest()
 if not (build / 'src').exists():
     with (root / 'source.tar').open('wb') as f:
-        subprocess.run(['git', '-C', str(a.nginx), 'archive', revision], stdout=f, check=True)
+        subprocess.run(git + ['archive', revision], stdout=f, check=True)
     subprocess.run(['tar', '-xf', str(root / 'source.tar'), '-C', str(build)], check=True)
+    for name in patches:
+        applied = subprocess.run(['patch', '--batch', '--fuzz=2', '-p1'], cwd=build,
+                                 input=(a.agent_patches / name).read_bytes().replace(b'\r\n', b'\n'),
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        with (root / 'patches.log').open('ab') as log:
+            log.write(name.encode() + b'\n' + applied.stdout)
+        assert applied.returncode == 0, (name, applied.stdout.decode())
 env = os.environ.copy()
 env['CACHE_PURGE_ROCKSDB_LIB_DIR'] = str(a.libraries)
 engine = '-lrocksdb' if a.shared_rocksdb else '/usr/lib/x86_64-linux-gnu/librocksdb.a'
 env['CACHE_PURGE_ROCKSDB_LIBS'] = engine + ' -lcrypto -lsnappy -lz -lbz2 -llz4 -lzstd -lstdc++ -lm -pthread'
 env['CACHE_PURGE_PROBE_HEADERS'] = str(addon)
 print('BUILD', root, flush=True)
-with (root / 'build.log').open('w') as f:
+manifest = {'nginx_revision': revision, 'openresty_patches': patches, 'dynamic': a.dynamic,
+            'shared_rocksdb': a.shared_rocksdb,
+            'archives': {name: hashlib.sha256(path.read_bytes()).hexdigest()
+                         for name in ('component', 'coordinator', 'control', 'operations', 'index', 'store')
+                         for path in [a.libraries / f'libngx_cache_purge_{name}.a']}}
+if a.runtime_only:
+    assert json.loads((root / 'build.json').read_text()) == manifest, 'stale build manifest'
+else:
+  with (root / 'build.log').open('w') as f:
     configure = 'auto/configure' if (build / 'auto/configure').exists() else 'configure'
     module_option = '--add-dynamic-module=' if a.dynamic else '--add-module='
     subprocess.run(['sh', configure, '--prefix=' + str(root / 'run'), '--without-http_rewrite_module',
@@ -54,14 +87,27 @@ with (root / 'build.log').open('w') as f:
     subprocess.run(['make', '-j2'], cwd=build, stdout=f, stderr=subprocess.STDOUT, check=True)
     if a.dynamic:
         subprocess.run(['make', 'modules', '-j2'], cwd=build, stdout=f, stderr=subprocess.STDOUT, check=True)
+  (root / 'build.json').write_text(json.dumps(manifest, indent=2) + '\n')
 binary = build / 'objs/nginx'
 checks = []
 negative = subprocess.run(['cc', '-c', '-DNGX_RESTY_EXT=0',
     *[item for path in ('objs', 'src/core', 'src/event', 'src/event/modules', 'src/os/unix', 'src/http', 'src/http/modules')
       for item in ('-I', str(build / path))], '-I', str(addon), str(addon / 'ngx_cache_purge_runtime.c'),
     '-o', str(root / 'without-exit-hook.o')], capture_output=True)
-assert negative.returncode and b'requires the cache manager exit capability' in negative.stderr
-checks.append('build without the required manager-exit capability is rejected')
+if a.agent_patches:
+    assert negative.returncode == 0, negative.stderr.decode()
+    assert 'manager_exit' not in (build / 'src/core/ngx_file.h').read_text()
+    checks.append('existing OpenResty agent builds without any new nginx-ext or manager-exit capability')
+else:
+    assert negative.returncode == 0, negative.stderr.decode()
+shim = root / 'without-agent.h'
+shim.write_text('#include <ngx_config.h>\n#include <ngx_core.h>\n#undef HAVE_PRIVILEGED_PROCESS_PATCH\n')
+unsupported = subprocess.run(['cc', '-include', str(shim), '-c',
+    *[item for path in ('objs', 'src/core', 'src/event', 'src/event/modules', 'src/os/unix', 'src/http', 'src/http/modules')
+      for item in ('-I', str(build / path))], '-I', str(addon), str(addon / 'ngx_cache_purge_runtime.c'),
+    '-o', str(root / 'without-agent.o')], capture_output=True)
+assert unsupported.returncode and b'requires the existing OpenResty privileged agent capability' in unsupported.stderr
+checks.append('persistent build without the agent capability is rejected explicitly')
 origin_calls = {}
 
 
@@ -124,13 +170,17 @@ def until(predicate, timeout=10):
 
 
 class Run:
-    def __init__(self):
+    def __init__(self, enabled=True):
         self.path = Path(tempfile.mkdtemp(prefix='case-', dir=root))
+        self.path.chmod(0o755)
         (self.path / 'logs').mkdir(exist_ok=True)
         with socket.socket() as sock:
             sock.bind(('127.0.0.1', 0))
             self.port = sock.getsockname()[1]
-        user = 'user root;' if os.geteuid() == 0 else ''
+        user = ''
+        if os.geteuid() == 0:
+            account = pwd.getpwnam(a.worker_user or 'root')
+            user = f'user {account.pw_name} {grp.getgrgid(account.pw_gid).gr_name};'
         loads = ''
         if a.dynamic:
             loads = (f'load_module {build}/objs/ngx_http_cache_purge_module.so;\n'
@@ -152,10 +202,15 @@ proxy_pass http://127.0.0.1:{origin.server_port}; add_header X-Cache $upstream_c
 location /other {{ cache_purge_test_reader on; proxy_cache a; proxy_cache_key $uri;
 proxy_pass http://127.0.0.1:{origin.server_port}; add_header X-Cache $upstream_cache_status always; }}
 }} }}'''
+        if not enabled:
+            self.config = self.config.replace(f'cache_purge_store {self.path}/index cache=8m write_buffer=2m;', '')
+            self.config = self.config.replace('cache_purge_state_zone control 4m;', '')
+            self.config = self.config.replace('cache_purge_test_reader on;', 'cache_purge_test_reader off;')
         self.conf = self.path / 'nginx.conf'
         self.conf.write_text(self.config)
         self.command = [str(binary), '-p', str(self.path) + '/', '-c', str(self.conf)]
-        subprocess.run(self.command + ['-t'], capture_output=True, check=True)
+        tested = subprocess.run(self.command + ['-t'], capture_output=True)
+        assert tested.returncode == 0, tested.stderr.decode()
         assert not (self.path / 'index/CURRENT').exists()
         checks.append('real addon config test initializes no database or DB threads')
 
@@ -165,10 +220,10 @@ proxy_pass http://127.0.0.1:{origin.server_port}; add_header X-Cache $upstream_c
         assert result.returncode and expected in result.stderr.decode(), result.stderr
         self.conf.write_text(self.config)
 
-    def start(self):
+    def start(self, wait=True):
         self.err = (self.path / 'stderr.log').open('a')
         self.process = subprocess.Popen(self.command, stderr=self.err)
-        return self.ready()
+        return self.ready() if wait else None
 
     def ready(self, old=0):
         def read():
@@ -185,13 +240,46 @@ proxy_pass http://127.0.0.1:{origin.server_port}; add_header X-Cache $upstream_c
         with response:
             return response.status, response.headers.get('X-Cache'), response.read()
 
-    def stop(self):
-        self.process.send_signal(signal.SIGQUIT)
+    def stop(self, signo=signal.SIGQUIT):
+        self.process.send_signal(signo)
         try:
             assert self.process.wait(timeout=10) == 0
         finally:
             self.err.close()
 
+def process_memory(master):
+    pids = [master] + list(map(int, Path(f'/proc/{master}/task/{master}/children').read_text().split()))
+    members = []
+    for pid in pids:
+        fields = {}
+        for line in Path(f'/proc/{pid}/smaps_rollup').read_text().splitlines():
+            words = line.split()
+            if len(words) >= 2 and words[0] in ('Rss:', 'Pss:', 'Private_Clean:', 'Private_Dirty:'):
+                fields[words[0][:-1]] = int(words[1])
+        members.append({'pid': pid, 'title': Path(f'/proc/{pid}/cmdline').read_bytes().replace(b'\0', b' ').decode().strip(),
+                        'rss_kib': fields['Rss'], 'pss_kib': fields['Pss'],
+                        'private_kib': fields['Private_Clean'] + fields['Private_Dirty']})
+    return {'pss_kib': sum(m['pss_kib'] for m in members), 'members': members}
+
+def warm(case, path):
+    assert case.get(path)[:2] == (200, 'MISS')
+    zone = 'cache-b' if path == '/cache/b' else 'cache-a'
+    until(lambda: (case.path / zone / hashlib.md5(path.encode()).hexdigest()).is_file())
+    assert case.get(path)[:2] == (200, 'HIT')
+
+memory = {}
+baseline = Run(enabled=False)
+baseline.start(wait=False)
+try:
+    until(lambda: baseline.get('/other')[0] == 200)
+    for path in ('/cache/a', '/cache/b'):
+        warm(baseline, path)
+    memory['baseline'] = process_memory(baseline.process.pid)
+    if a.agent_patches:
+        assert all('privileged agent process' not in m['title'] for m in memory['baseline']['members'])
+finally:
+    baseline.stop()
+origin_calls.clear()
 
 case = Run()
 case.invalid(case.config.replace('write_buffer=2m', 'write_buffer=8m'), 'write_buffer <= cache/2')
@@ -202,22 +290,64 @@ alias.symlink_to(case.path / 'cache-a', target_is_directory=True)
 case.invalid(case.config.replace(str(case.path) + '/index', str(alias)), 'outside cache path')
 case.invalid('master_process off;\n' + case.config, 'master_process on')
 checks.append('resource budgets, paired zone, cache-path/symlink overlap and single-process misuse rejected')
+if os.geteuid() == 0 and a.worker_user and pwd.getpwnam(a.worker_user).pw_uid != 0:
+    foreign = case.path / 'foreign-index'
+    foreign.mkdir(mode=0o711)
+    worker_uid = pwd.getpwnam(a.worker_user).pw_uid
+    os.chown(foreign, worker_uid, -1)
+    case.invalid(case.config.replace(str(case.path / 'index'), str(foreign)), 'owned by the agent UID')
+    assert foreign.stat().st_uid == worker_uid and not (foreign / 'CURRENT').exists()
+    checks.append('a foreign-owned DB directory is rejected without changing its ownership or opening a DB')
 owner = case.start()
 try:
-    assert b'cache manager process' in Path(f'/proc/{owner}/cmdline').read_bytes()
+    expected = b'privileged agent process'
+    assert expected in Path(f'/proc/{owner}/cmdline').read_bytes()
     children = list(map(int, Path(f'/proc/{case.process.pid}/task/{case.process.pid}/children').read_text().split()))
     for pid in children + [case.process.pid]:
         if pid != owner:
             assert len(list(Path(f'/proc/{pid}/task').iterdir())) == 1
-    checks.append('real addon opens DB/control publisher only in cache_manager')
+    checks.append('real addon opens DB/control publisher only in ' + expected.decode())
     for path in ('/cache/a', '/cache/b', '/other'):
-        assert case.get(path)[:2] == (200, 'MISS')
-        assert case.get(path)[:2] == (200, 'HIT')
+        warm(case, path)
+    memory['component_empty'] = process_memory(case.process.pid)
+    if a.agent_patches and os.geteuid() == 0 and a.worker_user:
+        worker_uid = pwd.getpwnam(a.worker_user).pw_uid
+        socket_path = case.path / 'index/component.sock'
+        assert socket_path.stat().st_uid == worker_uid and socket_path.stat().st_mode & 0o777 == 0o600
+        directory_mode = (case.path / 'index').stat().st_mode & 0o777
+        assert (case.path / 'index').stat().st_uid == 0 and not directory_mode & 0o022
+        probe_code = '''import socket,struct,sys
+s=socket.socket(socket.AF_UNIX);s.settimeout(2);s.connect(sys.argv[1]);print('connected',flush=True)
+s.sendall(struct.pack('>4sHHQII',b'NCP1',1,1,1,0,0))
+def read(n):
+ b=b''
+ while len(b)<n:
+  p=s.recv(n-len(b));assert p;b+=p
+ return b
+h=read(24);assert struct.unpack('>I',h[20:])[0]==0
+print(struct.unpack('>Q',read(struct.unpack('>I',h[16:20])[0])[:8])[0])
+'''
+        def peer(user):
+            return subprocess.run(['runuser', '-u', user, '--', 'python3', '-c', probe_code, str(socket_path)],
+                                  capture_output=True, text=True)
+        allowed = peer(a.worker_user)
+        assert allowed.returncode == 0 and str(owner) in allowed.stdout, (allowed.stdout, allowed.stderr)
+        # Isolate credential checking from the Unix path permission check.
+        (case.path / 'index').chmod(0o711)
+        socket_path.chmod(0o666)
+        try:
+            denied = peer('daemon')
+            assert denied.returncode != 0 and 'connected' in denied.stdout, (denied.stdout, denied.stderr)
+        finally:
+            socket_path.chmod(0o600)
+            (case.path / 'index').chmod(directory_mode)
+        checks.append('root agent grants socket access to the worker UID and rejects another connected UID with SO_PEERCRED')
     payload = text('native-resource-op') + b'\x01' + struct.pack('>Q', 1000) + b'\x02' + text('/cache/') + text('') + text('probe')
     receipt = ipc(case.path, 14, payload)
     assert receipt[len(payload) + 40] == 1
     assert struct.unpack('>I', receipt[len(payload) + 41:len(payload) + 45])[0] == 300000
     case.ready()
+    memory['component_with_control'] = process_memory(case.process.pid)
     for path in ('/cache/a', '/cache/b'):
         assert case.get(path)[0] == 503 and origin_calls[path] == 1
     assert case.get('/other')[:2] == (200, 'HIT')
@@ -230,6 +360,8 @@ try:
             case.conf.write_text(case.config)
         os.kill(case.process.pid, signal.SIGHUP)
         owner = case.ready(owner)
+        if os.geteuid() == 0:
+            assert (case.path / 'index').stat().st_uid == 0
         assert ipc(case.path, 15, text('native-resource-op')) == receipt
         assert case.get('/cache/a')[0] == 503
     checks.append('three HUP reloads preserve real addon SHM and durable operation')
@@ -242,7 +374,7 @@ try:
     os.kill(owner, signal.SIGKILL)
     owner = case.ready(owner)
     assert case.get('/cache/b')[0] == 503
-    checks.append('manager SIGKILL respawn rebuilds shared controls before opening gate')
+    checks.append('owner SIGKILL respawn rebuilds shared controls before opening gate')
     case.conf.write_text(case.config.replace('control 4m', 'control 8m'))
     os.kill(case.process.pid, signal.SIGHUP)
     until(lambda: 'requires a full restart' in (case.path / 'error.log').read_text())
@@ -252,7 +384,7 @@ try:
 finally:
     case.stop()
 assert not (case.path / 'index/component.sock').exists()
-checks.append('manager exit hook closes real component and removes rendezvous socket')
+checks.append('owner exit closes real component and removes rendezvous socket')
 case.start()
 try:
     assert ipc(case.path, 15, text('native-resource-op')) == receipt
@@ -260,11 +392,44 @@ try:
     checks.append('full nginx restart reconstructs barriers from durable operation ledger')
 finally:
     case.stop()
+if a.agent_patches:
+    failed = Run()
+    failed.conf.write_text(failed.config.replace('http { access_log off;',
+                                               'http { access_log off; cache_purge_test_fail_agent on;'))
+    failed.start(wait=False)
+    try:
+        until(lambda: 'probe rejects agent initialization' in (failed.path / 'error.log').read_text())
+        assert not (failed.path / 'index/CURRENT').exists()
+        assert failed.get('/other')[0] == 503
+        checks.append('a later module init_process failure never starts database threads or opens the database')
+    finally:
+        failed.stop()
+    standby = Run()
+    with (standby.path / 'index/index.lock').open('w') as lease:
+        fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        standby.start(wait=False)
+        def waiting():
+            pids = Path(f'/proc/{standby.process.pid}/task/{standby.process.pid}/children').read_text().split()
+            return any(b'privileged agent process' in Path(f'/proc/{pid}/cmdline').read_bytes()
+                       and len(list(Path(f'/proc/{pid}/task').iterdir())) == 2 for pid in pids)
+        try:
+            until(waiting)
+            assert not (standby.path / 'index/CURRENT').exists()
+        finally:
+            start = time.monotonic()
+            standby.stop(signal.SIGTERM)
+            assert time.monotonic() - start < 3
+        checks.append('agent owner-lock wait is cancelled and joined during TERM without waiting for the lock holder')
 origin.shutdown()
+checks = list(dict.fromkeys(checks))
 result = {'root': str(root), 'nginx_revision': revision, 'dynamic': a.dynamic,
+          'owner_backend': 'openresty-agent',
+          'openresty_patches': patches, 'worker_user': a.worker_user,
           'rocksdb_linkage': 'shared' if a.shared_rocksdb else 'static', 'checks': checks,
+          'process_group_memory': memory,
+          'empty_component_pss_increment_kib': memory['component_empty']['pss_kib'] - memory['baseline']['pss_kib'],
           'library_sha256': {name: hashlib.sha256((a.libraries / f'libngx_cache_purge_{name}.a').read_bytes()).hexdigest()
                              for name in ('component', 'coordinator', 'control', 'operations', 'index', 'store')},
           'scope': 'actual addon resource lifecycle; separate test precontent consumer; no native file/304/write hooks or final purge API'}
 a.output.write_text(json.dumps(result, indent=2) + '\n')
-print('PASS', json.dumps(result), flush=True)
+print('PASS', len(checks), 'agent integration checks;', 'results:', a.output, flush=True)

@@ -121,7 +121,8 @@ struct ngx_cache_purge_component_s {
     void bind_socket() {
         struct stat st;
         if (lstat(socket_path.c_str(), &st) == 0) {
-            if (!S_ISSOCK(st.st_mode) || st.st_uid != geteuid())
+            if (!S_ISSOCK(st.st_mode)
+                || (st.st_uid != geteuid() && st.st_uid != options.client_uid))
                 throw IndexError(NGX_PURGE_STORE_INVALID, "component socket path is not an owned socket");
             if (unlink(socket_path.c_str()) < 0) system_error("remove stale component socket");
         } else if (errno != ENOENT) system_error("inspect component socket");
@@ -134,6 +135,9 @@ struct ngx_cache_purge_component_s {
             system_error("bind component socket");
         if (lstat(socket_path.c_str(), &st) < 0) system_error("inspect bound component socket");
         socket_owned = true; socket_device = st.st_dev; socket_inode = st.st_ino;
+        if (options.client_uid != geteuid()
+            && lchown(socket_path.c_str(), static_cast<uid_t>(options.client_uid), static_cast<gid_t>(-1)) < 0)
+            system_error("set component socket client owner");
         if (chmod(socket_path.c_str(), 0600) < 0 || listen(listener.value, options.max_connections) < 0)
             system_error("listen component socket");
     }
@@ -158,7 +162,8 @@ struct ngx_cache_purge_component_s {
             auto slot = std::find_if(peers.begin(), peers.end(), [](const auto &p) { return !p; });
             struct ucred credentials; socklen_t length = sizeof(credentials);
             if (slot == peers.end() || getsockopt(client.value, SOL_SOCKET, SO_PEERCRED, &credentials, &length) != 0
-                || length != sizeof(credentials) || credentials.uid != geteuid()) { ++rejected; continue; }
+                || length != sizeof(credentials)
+                || (credentials.uid != geteuid() && credentials.uid != options.client_uid)) { ++rejected; continue; }
             nonblocking(client.value);
             auto peer = std::make_unique<Peer>(); peer->fd.value = client.value; client.value = -1;
             peer->deadline = Clock::now() + std::chrono::milliseconds(options.io_timeout_ms);
@@ -399,9 +404,10 @@ extern "C" void ngx_cache_purge_component_options(ngx_cache_purge_component_opti
     *o = {}; o->abi = NGX_CACHE_PURGE_COMPONENT_ABI; ngx_cache_purge_store_options(&o->store);
     o->max_connections = 32; o->max_payload_bytes = 512 * 1024; o->buffer_bytes = 4 * 1024 * 1024;
     o->io_timeout_ms = 30000; o->owner_retry_ms = 50;
+    o->client_uid = UINT32_MAX;
     o->propagation_ms = 300000; o->max_live_operations = 4096; o->live_selector_bytes = 4 * 1024 * 1024;
 }
-extern "C" uint32_t ngx_cache_purge_component_abi_2(void) { return NGX_CACHE_PURGE_COMPONENT_ABI; }
+extern "C" uint32_t ngx_cache_purge_component_abi_3(void) { return NGX_CACHE_PURGE_COMPONENT_ABI; }
 extern "C" int ngx_cache_purge_component_start(const char *path,
     const ngx_cache_purge_component_options_t *options,
     ngx_cache_purge_component_t **output, ngx_cache_purge_store_error_t *error) {
@@ -422,6 +428,10 @@ extern "C" int ngx_cache_purge_component_start(const char *path,
         if (component->path.empty() || component->path[0] != '/' || component->socket_path.size() >= sizeof(sockaddr_un::sun_path))
             return failure(error, NGX_PURGE_STORE_INVALID, "component requires a short absolute Unix socket path");
         component->options = *options;
+        if (component->options.client_uid == UINT32_MAX)
+            component->options.client_uid = static_cast<uint32_t>(geteuid());
+        if (component->options.client_uid != geteuid() && geteuid() != 0)
+            return failure(error, NGX_PURGE_STORE_INVALID, "component client UID requires root creator");
         int descriptors[2]; if (pipe(descriptors) < 0) system_error("component wake pipe");
         component->wake_read.value = descriptors[0]; component->wake_write.value = descriptors[1];
         nonblocking(descriptors[0]); nonblocking(descriptors[1]);

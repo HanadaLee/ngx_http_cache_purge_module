@@ -225,6 +225,12 @@ ngx_http_cache_purge_init_worker(ngx_cycle_t *cycle)
     ngx_flag_t                       use_threads;
 #endif
 
+#if (NGX_CACHE_PURGE_ROCKSDB)
+    if (ngx_http_cache_purge_runtime_process_init(cycle) != NGX_OK) {
+        return NGX_ERROR;
+    }
+#endif
+
     if (ngx_process != NGX_PROCESS_WORKER
         && ngx_process != NGX_PROCESS_SINGLE)
     {

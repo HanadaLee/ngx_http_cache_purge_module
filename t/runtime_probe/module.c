@@ -5,6 +5,7 @@
 
 extern ngx_module_t ngx_http_cache_purge_runtime_probe_module;
 typedef struct { ngx_flag_t enabled; } probe_conf_t;
+typedef struct { ngx_flag_t fail_agent; } probe_main_t;
 typedef struct { unsigned flags; } probe_result_t;
 
 static int
@@ -54,6 +55,30 @@ create(ngx_conf_t *cf)
     return conf;
 }
 
+static void *
+create_main(ngx_conf_t *cf)
+{
+    probe_main_t *conf = ngx_pcalloc(cf->pool, sizeof(*conf));
+    if (conf) { conf->fail_agent = NGX_CONF_UNSET; }
+    return conf;
+}
+
+static ngx_int_t
+init_process(ngx_cycle_t *cycle)
+{
+#if (HAVE_PRIVILEGED_PROCESS_PATCH)
+    probe_main_t *conf;
+    if (!ngx_is_privileged_agent) { return NGX_OK; }
+    conf = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_cache_purge_runtime_probe_module);
+    if (conf && conf->fail_agent == 1) {
+        ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "probe rejects agent initialization");
+        return NGX_ERROR;
+    }
+    ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0, "probe agent module initialized");
+#endif
+    return NGX_OK;
+}
+
 static char *
 merge(ngx_conf_t *cf, void *parent, void *child)
 {
@@ -75,12 +100,14 @@ post(ngx_conf_t *cf)
 }
 
 static ngx_command_t commands[] = {
+    { ngx_string("cache_purge_test_fail_agent"), NGX_HTTP_MAIN_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot, NGX_HTTP_MAIN_CONF_OFFSET, offsetof(probe_main_t, fail_agent), NULL },
     { ngx_string("cache_purge_test_reader"), NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot, NGX_HTTP_LOC_CONF_OFFSET, offsetof(probe_conf_t, enabled), NULL },
     ngx_null_command
 };
-static ngx_http_module_t context = { NULL, post, NULL, NULL, NULL, NULL, create, merge };
+static ngx_http_module_t context = { NULL, post, create_main, NULL, NULL, NULL, create, merge };
 ngx_module_t ngx_http_cache_purge_runtime_probe_module = {
     NGX_MODULE_V1, &context, commands, NGX_HTTP_MODULE,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NGX_MODULE_V1_PADDING
+    NULL, NULL, init_process, NULL, NULL, NULL, NULL, NGX_MODULE_V1_PADDING
 };
