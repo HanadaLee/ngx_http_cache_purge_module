@@ -492,6 +492,62 @@ void ngx_http_cache_purge_operation_free(ngx_http_cache_purge_operation_t *op);
 void ngx_http_cache_purge_operation_page_free(
     ngx_http_cache_purge_operation_page_t *page);
 
+typedef struct ngx_http_cache_purge_control_image_s
+    ngx_http_cache_purge_control_image_t;
+typedef struct ngx_http_cache_purge_coordinator_s
+    ngx_http_cache_purge_coordinator_t;
+
+#define NGX_HTTP_CACHE_PURGE_COORD_CLAIMING   1
+#define NGX_HTTP_CACHE_PURGE_COORD_LOADING    2
+#define NGX_HTTP_CACHE_PURGE_COORD_BUILDING   3
+#define NGX_HTTP_CACHE_PURGE_COORD_PUBLISHING 4
+#define NGX_HTTP_CACHE_PURGE_COORD_DRAINING   5
+#define NGX_HTTP_CACHE_PURGE_COORD_READY      6
+
+/* Prepare copies borrowed operation fields into a bounded private image.
+ * Publish requires a closed gate and the same owner/publication as prepare.
+ * BUSY leaves the image reusable; free releases it even after a failed publish.
+ * These calls neither activate a durable operation nor attest native FENCEs.
+ */
+int ngx_http_cache_purge_control_prepare(
+    ngx_http_cache_purge_control_writer_t *writer,
+    const ngx_http_cache_purge_operation_t *operations, size_t count,
+    ngx_http_cache_purge_control_image_t **image,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_control_publish(
+    ngx_http_cache_purge_control_writer_t *writer,
+    const ngx_http_cache_purge_control_image_t *image, uint64_t *publication,
+    ngx_http_cache_rocksdb_error_t *error);
+void ngx_http_cache_purge_control_image_free(
+    ngx_http_cache_purge_control_image_t **image);
+
+/* Single owning thread/process, while holding the store's owner lease.
+ * The coordinator copies the operations context, borrowing its store and SHM.
+ * Step advances one recovery page or publication transition; BUSY is retryable.
+ * Accept returns a durable PREPARING record, not an effective-purge receipt.
+ */
+int ngx_http_cache_purge_coordinator_open(
+    ngx_http_cache_purge_operations_t *operations, void *shared,
+    size_t shared_bytes, ngx_http_cache_purge_coordinator_t **coordinator,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_coordinator_close(
+    ngx_http_cache_purge_coordinator_t **coordinator,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_coordinator_status(
+    ngx_http_cache_purge_coordinator_t *coordinator, uint32_t *state,
+    uint64_t *publication, ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_coordinator_step(
+    ngx_http_cache_purge_coordinator_t *coordinator,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_coordinator_refresh(
+    ngx_http_cache_purge_coordinator_t *coordinator,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_coordinator_accept(
+    ngx_http_cache_purge_coordinator_t *coordinator,
+    const ngx_http_cache_purge_operation_input_t *input, uint64_t now,
+    uint32_t propagation_ms, ngx_http_cache_purge_operation_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+
 #define NGX_HTTP_CACHE_PURGE_QUERY_SELECT   0
 #define NGX_HTTP_CACHE_PURGE_QUERY_PENDING  1
 #define NGX_HTTP_CACHE_PURGE_QUERY_RETIRED  2

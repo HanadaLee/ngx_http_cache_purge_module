@@ -82,8 +82,8 @@ ngx_http_cache_purge_test_writes(ngx_http_cache_rocksdb_t *store)
 static void
 ngx_http_cache_purge_test_hex(const unsigned char *data, size_t size)
 {
-    size_t             i;
-    static const char  digits[] = "0123456789abcdef";
+    size_t            i;
+    static const char digits[] = "0123456789abcdef";
 
     for (i = 0; i < size; i++) {
         putchar(digits[data[i] >> 4]);
@@ -94,10 +94,10 @@ ngx_http_cache_purge_test_hex(const unsigned char *data, size_t size)
 static void
 ngx_http_cache_purge_test_dump(ngx_http_cache_rocksdb_t *store)
 {
-    ngx_http_cache_rocksdb_cursor_t  *cursor;
-    ngx_http_cache_rocksdb_buffer_t   key, value;
-    ngx_http_cache_rocksdb_bytes_t    empty;
-    int                               rc;
+    ngx_http_cache_rocksdb_cursor_t *cursor;
+    ngx_http_cache_rocksdb_buffer_t  key, value;
+    ngx_http_cache_rocksdb_bytes_t  empty;
+    int                             rc;
 
     empty = ngx_http_cache_purge_test_bytes("");
     cursor = NULL;
@@ -134,6 +134,223 @@ ngx_http_cache_purge_test_dump(ngx_http_cache_rocksdb_t *store)
     free(value.data);
 }
 
+static int
+ngx_http_cache_purge_test_visit(void *data,
+    const ngx_http_cache_purge_control_match_t *match)
+{
+    unsigned *count;
+
+    count = data;
+    ngx_http_cache_purge_test_check(
+        match->value.len == 3 && memcmp(match->value.data, "one", 3) == 0,
+        "prepared image owns selector bytes");
+    (*count)++;
+    return 0;
+}
+
+static int
+ngx_http_cache_purge_test_reject(void *data,
+    const ngx_http_cache_purge_control_match_t *match)
+{
+    (void) data;
+    (void) match;
+    return NGX_HTTP_CACHE_ROCKSDB_LIMIT;
+}
+
+static void
+ngx_http_cache_purge_test_control(ngx_http_cache_purge_operations_t *ops)
+{
+    ngx_http_cache_purge_control_writer_t  *writer;
+    ngx_http_cache_purge_control_reader_t  *reader;
+    ngx_http_cache_purge_control_image_t  *image, *other;
+    ngx_http_cache_purge_coordinator_t     *coordinator;
+    ngx_http_cache_purge_control_context_t  context;
+    ngx_http_cache_purge_operation_t       source[2], accepted, replay;
+    ngx_http_cache_rocksdb_error_t  error;
+    void                           *memory;
+    size_t                          size;
+    uint64_t                               version, current;
+    uint32_t                               state;
+    unsigned                               calls, steps;
+    int                                    rc;
+    char                                   value[] = "one";
+
+    memory = NULL;
+    size = ngx_http_cache_purge_control_size(4096, 8);
+    ngx_http_cache_purge_test_check(posix_memalign(&memory, 64, size) == 0,
+                                    "allocate C controls");
+    ngx_http_cache_purge_test_check(
+        ngx_http_cache_purge_control_init(memory, size, 4096, 8, &error) == 0,
+        "initialize C controls");
+    writer = NULL;
+    reader = NULL;
+    image = NULL;
+    coordinator = NULL;
+    ngx_http_cache_purge_test_check(
+        ngx_http_cache_purge_control_writer_open(memory, size, &writer, &error)
+            == 0,
+        "open C publisher");
+    ngx_http_cache_purge_test_check(
+        ngx_http_cache_purge_control_reader_open(memory, size, &reader, &error)
+            == 0,
+        "open C reader");
+
+    memset(source, 0, sizeof(source));
+    source[0].input.id = ngx_http_cache_purge_test_bytes("c-control");
+    source[0].input.selector.kind = NGX_HTTP_CACHE_PURGE_KEY;
+    source[0].input.selector.value = ngx_http_cache_purge_test_bytes(value);
+    source[0].input.mode = NGX_HTTP_CACHE_PURGE_INVALIDATE;
+    source[0].input.issued_at_ms = 10;
+    source[0].sequence = 1;
+    source[0].stage = NGX_HTTP_CACHE_PURGE_PREPARING;
+    rc = ngx_http_cache_purge_control_prepare(writer, NULL, 1, &image, &error);
+    ngx_http_cache_purge_test_check(rc == NGX_HTTP_CACHE_ROCKSDB_INVALID
+                                        && image == NULL,
+                                    "reject null C operations");
+    rc = ngx_http_cache_purge_control_prepare(writer, source, 65537, &image,
+                                              &error);
+    ngx_http_cache_purge_test_check(rc == NGX_HTTP_CACHE_ROCKSDB_LIMIT
+                                        && image == NULL,
+                                    "bound C operation count");
+    source[1] = source[0];
+    rc =
+        ngx_http_cache_purge_control_prepare(writer, source, 2, &image, &error);
+    ngx_http_cache_purge_test_check(rc == NGX_HTTP_CACHE_ROCKSDB_INVALID
+                                        && image == NULL,
+                                    "reject duplicate C IDs");
+    source[1].input.id = ngx_http_cache_purge_test_bytes("other-control");
+    rc =
+        ngx_http_cache_purge_control_prepare(writer, source, 2, &image, &error);
+    ngx_http_cache_purge_test_check(rc == NGX_HTTP_CACHE_ROCKSDB_INVALID
+                                        && image == NULL,
+                                    "reject duplicate C sequences");
+    source[1] = source[0];
+    source[1].input.selector.value.data = NULL;
+    rc = ngx_http_cache_purge_control_prepare(writer, source + 1, 1, &image,
+                                              &error);
+    ngx_http_cache_purge_test_check(rc == NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                                    "reject null nonempty selector");
+
+    rc =
+        ngx_http_cache_purge_control_prepare(writer, source, 1, &image, &error);
+    ngx_http_cache_purge_test_check(rc == 0, "prepare C image");
+    value[0] = 'X';
+    rc = ngx_http_cache_purge_control_publish(writer, image, &version, &error);
+    ngx_http_cache_purge_test_check(rc == 0, "publish copied C image");
+    ngx_http_cache_purge_control_image_free(&image);
+    ngx_http_cache_purge_control_image_free(&image);
+    ngx_http_cache_purge_test_check(image == NULL,
+                                    "C image free is repeatable");
+    ngx_http_cache_purge_test_check(
+        ngx_http_cache_purge_control_gate_open(writer, &error) == 0,
+        "open C admission gate");
+
+    memset(&context, 0, sizeof(context));
+    context.key = ngx_http_cache_purge_test_bytes("one");
+    calls = 0;
+    rc = ngx_http_cache_purge_control_match(reader, &context, 8, 4096,
+                                            ngx_http_cache_purge_test_visit,
+                                            &calls, &current, &error);
+    ngx_http_cache_purge_test_check(rc == 0 && calls == 1 && current == version,
+                                    "C match copied input");
+    rc = ngx_http_cache_purge_control_match(reader, &context, 8, 4096,
+                                            ngx_http_cache_purge_test_reject,
+                                            NULL, &current, &error);
+    ngx_http_cache_purge_test_check(rc == NGX_HTTP_CACHE_ROCKSDB_LIMIT
+                                        && current == 0,
+                                    "C callback error clears result");
+    ngx_http_cache_purge_test_check(
+        ngx_http_cache_purge_control_guard_begin(reader, version, &error) == 0,
+        "callback error released C pin");
+    rc = ngx_http_cache_purge_control_reader_close(&reader, &error);
+    ngx_http_cache_purge_test_check(rc == NGX_HTTP_CACHE_ROCKSDB_BUSY
+                                        && reader != NULL,
+                                    "pinned reader retained");
+    ngx_http_cache_purge_test_check(
+        ngx_http_cache_purge_control_guard_end(reader, &error) == 0,
+        "release C guard");
+
+    other = NULL;
+    ngx_http_cache_purge_test_check(
+        ngx_http_cache_purge_control_prepare(writer, source, 1, &other, &error)
+            == 0,
+        "prepare C stale image");
+    ngx_http_cache_purge_test_check(
+        ngx_http_cache_purge_control_gate_close(writer, &error) == 0,
+        "close C admission gate");
+    ngx_http_cache_purge_test_check(
+        ngx_http_cache_purge_control_prepare(writer, NULL, 0, &image, &error)
+            == 0,
+        "prepare C empty image");
+    ngx_http_cache_purge_test_check(
+        ngx_http_cache_purge_control_publish(writer, image, &current, &error)
+            == 0,
+        "publish C empty image");
+    version = current;
+    rc = ngx_http_cache_purge_control_publish(writer, other, &current, &error);
+    ngx_http_cache_purge_test_check(rc == NGX_HTTP_CACHE_ROCKSDB_CONFLICT
+                                        && current == 0,
+                                    "reject C stale image");
+    ngx_http_cache_purge_control_image_free(&image);
+    ngx_http_cache_purge_control_image_free(&other);
+    ngx_http_cache_purge_test_check(
+        ngx_http_cache_purge_control_writer_close(&writer, &error) == 0,
+        "release C publisher");
+
+    ngx_http_cache_purge_test_check(ngx_http_cache_purge_coordinator_open(
+                                        ops, memory, size, &coordinator, &error)
+                                        == 0,
+                                    "open C coordinator");
+    for (steps = 0; steps < 10; steps++) {
+        ngx_http_cache_purge_test_check(
+            ngx_http_cache_purge_coordinator_step(coordinator, &error) == 0,
+            "recover C coordinator");
+        ngx_http_cache_purge_test_check(
+            ngx_http_cache_purge_coordinator_status(coordinator, &state,
+                                                    &current, &error)
+                == 0,
+            "C coordinator status");
+        if (state == NGX_HTTP_CACHE_PURGE_COORD_READY) {
+            break;
+        }
+    }
+    ngx_http_cache_purge_test_check(steps < 10 && current > version,
+                                    "C recovery rebuilds publication");
+    value[0] = 'o';
+    rc = ngx_http_cache_purge_coordinator_accept(
+        coordinator, &source[0].input, 100, 300000, &accepted, &error);
+    ngx_http_cache_purge_test_check(
+        rc == 0 && accepted.stage == NGX_HTTP_CACHE_PURGE_PREPARING,
+        "C acceptance remains PREPARING");
+    rc = ngx_http_cache_purge_coordinator_accept(coordinator, &source[0].input,
+                                                 101, 1, &replay, &error);
+    ngx_http_cache_purge_test_check(rc == 0
+                                        && replay.sequence == accepted.sequence,
+                                    "replay while C publication pending");
+    ngx_http_cache_purge_operation_free(&accepted);
+    ngx_http_cache_purge_operation_free(&replay);
+    ngx_http_cache_purge_test_check(
+        ngx_http_cache_purge_coordinator_step(coordinator, &error) == 0,
+        "publish accepted C control");
+    ngx_http_cache_purge_test_check(
+        ngx_http_cache_purge_coordinator_step(coordinator, &error) == 0,
+        "drain C publication");
+    calls = 0;
+    rc = ngx_http_cache_purge_control_match(reader, &context, 8, 4096,
+                                            ngx_http_cache_purge_test_visit,
+                                            &calls, &current, &error);
+    ngx_http_cache_purge_test_check(rc == 0 && calls == 1,
+                                    "accepted C selector is published");
+    ngx_http_cache_purge_test_check(
+        ngx_http_cache_purge_coordinator_close(&coordinator, &error) == 0
+            && coordinator == NULL,
+        "close C coordinator");
+    ngx_http_cache_purge_test_check(
+        ngx_http_cache_purge_control_reader_close(&reader, &error) == 0,
+        "close C control reader");
+    free(memory);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -146,13 +363,13 @@ main(int argc, char **argv)
     ngx_http_cache_purge_checkpoint_t       point;
     ngx_http_cache_rocksdb_buffer_t         saved;
     ngx_http_cache_rocksdb_bytes_t          empty;
-    uint64_t                                writes, revision, sequence;
-    size_t                                  expired;
-    int                                     rc;
+    uint64_t                               writes, revision, sequence;
+    size_t  expired;
+    int     rc;
 
-    unsigned char  raw[1024];
-    char           path[] = "/tmp/ngx-cache-ledger-c-XXXXXX";
-    const char     binding[] = { 'a', '\0', 'b' };
+    unsigned char raw[1024];
+    char          path[] = "/tmp/ngx-cache-ledger-c-XXXXXX";
+    const char    binding[] = { 'a', '\0', 'b' };
 
     if (argc == 3 && strcmp(argv[1], "--dump") == 0) {
         store = ngx_http_cache_purge_test_open(argv[2]);
@@ -311,10 +528,12 @@ main(int argc, char **argv)
         rc == 0 && op.stage == NGX_HTTP_CACHE_PURGE_MATERIALIZED,
         "completed C receipt cannot resurrect work");
     ngx_http_cache_purge_operation_free(&op);
+    ngx_http_cache_purge_test_control(&ops);
     ngx_http_cache_purge_test_check(
         ngx_http_cache_rocksdb_close(&store, &ngx_http_cache_purge_test_error)
             == 0,
         "C calls release all cursors");
-    printf("PASS %u pure C ledger checks\n", ngx_http_cache_purge_test_count);
+    printf("PASS %u pure C ledger/control checks\n",
+           ngx_http_cache_purge_test_count);
     return 0;
 }

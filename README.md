@@ -7,8 +7,9 @@ Both modules remain in this repository. The engine bridge is isolated in
 `rocksdb/`; the migration of the remaining C++ purge implementation to C is in
 progress. File markers, OFD leases, the durable operation ledger, and the entire
 persistent index use C implementations, including dictionary storage, queries,
-fill preparation, metadata updates, and reclamation. Shared control publication
-and the component executor are the remaining C++ purge implementations.
+fill preparation, metadata updates, and reclamation. Shared control matching,
+publication, and durable-operation coordination also run in C. The component
+executor is the remaining C++ purge implementation.
 
 HTTP cache invalidation for nginx proxy, FastCGI, SCGI, and uWSGI caches.
 

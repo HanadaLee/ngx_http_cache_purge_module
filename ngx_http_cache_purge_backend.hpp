@@ -379,6 +379,7 @@ class Operations {
         return result;
     }
 public:
+    ngx_http_cache_purge_operations_t *native() { return &native_; }
     explicit Operations(ngx_http_cache_rocksdb_t *store, OperationLimits limits = {}) {
         ngx_http_cache_purge_operation_limits_t raw{limits.live_records, limits.live_selector_bytes};
         ngx_http_cache_rocksdb_error_t error;
@@ -447,72 +448,102 @@ inline uint64_t operation_control_bytes(const OperationInput &input) {
 namespace ngx_http_cache_purge {
 
 class ControlImage {
+    ngx_http_cache_purge_control_image_t *native_ = nullptr;
+    explicit ControlImage(std::nullptr_t) {}
 public:
-    ControlImage(ControlImage &&) noexcept;
-    ControlImage &operator=(ControlImage &&) noexcept;
-    ~ControlImage();
+    ControlImage(ControlImage &&other) noexcept : native_(other.native_) { other.native_ = nullptr; }
+    ControlImage &operator=(ControlImage &&other) noexcept {
+        if (this != &other) {
+            ngx_http_cache_purge_control_image_free(&native_);
+            native_ = other.native_; other.native_ = nullptr;
+        }
+        return *this;
+    }
+    ~ControlImage() { ngx_http_cache_purge_control_image_free(&native_); }
     ControlImage(const ControlImage &) = delete;
     ControlImage &operator=(const ControlImage &) = delete;
-private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
-    explicit ControlImage(std::unique_ptr<Impl> impl);
     friend ControlImage prepare_controls(ngx_http_cache_purge_control_writer_t *, const std::vector<Operation> &);
     friend uint64_t publish_controls(ngx_http_cache_purge_control_writer_t *, const ControlImage &);
 };
 
-/* Build before closing the serving gate when admission ordering permits it.
- * A prepared image binds its owner and prior publication; it cannot overwrite
- * an intervening update. BUSY publication can retry the same prepared image. */
-ControlImage prepare_controls(ngx_http_cache_purge_control_writer_t *writer,
-                              const std::vector<Operation> &operations);
-uint64_t publish_controls(ngx_http_cache_purge_control_writer_t *writer, const ControlImage &image);
-
-/* Rebuild an immutable, bounded image from live control operations only. The
- * full file index never enters this structure. Publication requires a closed
- * gate. BUSY means the inactive bank is still pinned; retry without opening
- * the gate or discarding the pending operation. No cached key is rewritten. */
-uint64_t publish_controls(ngx_http_cache_purge_control_writer_t *writer,
-                          const std::vector<Operation> &operations);
-
-} // namespace ngx_http_cache_purge
-
-
-/* Copyright (C) Hanada */
-
-
-namespace ngx_http_cache_purge {
+/* Conversion-only bridge; image construction and publication execute in C. */
+inline ControlImage prepare_controls(ngx_http_cache_purge_control_writer_t *writer,
+                                     const std::vector<Operation> &operations) {
+    std::vector<ngx_http_cache_purge_operation_t> raw;
+    raw.reserve(operations.size());
+    for (const auto &op : operations) {
+        ngx_http_cache_purge_operation_t value{};
+        value.input = ngx_http_cache_purge_native_input(op.input);
+        value.sequence = op.sequence; value.stage = static_cast<uint32_t>(op.stage);
+        value.propagation_until_ms = op.propagation_until_ms; value.propagate = op.propagate;
+        raw.push_back(value);
+    }
+    ControlImage result(nullptr); ngx_http_cache_rocksdb_error_t error;
+    int rc = ngx_http_cache_purge_control_prepare(writer, raw.data(), raw.size(), &result.native_, &error);
+    if (rc) throw IndexError(rc, error.message);
+    return result;
+}
+inline uint64_t publish_controls(ngx_http_cache_purge_control_writer_t *writer, const ControlImage &image) {
+    uint64_t publication = 0; ngx_http_cache_rocksdb_error_t error;
+    int rc = ngx_http_cache_purge_control_publish(writer, image.native_, &publication, &error);
+    if (rc) throw IndexError(rc, error.message);
+    return publication;
+}
+inline uint64_t publish_controls(ngx_http_cache_purge_control_writer_t *writer,
+                                 const std::vector<Operation> &operations) {
+    return publish_controls(writer, prepare_controls(writer, operations));
+}
 
 enum class Coordination : uint32_t { claiming = 1, loading, building, publishing, draining, ready };
 
-/* Single executor only, while that executor holds the DB owner lease.
- * A step advances at most one recovery page or one publication transition.
- * Controls may be readable while operations remain PREPARING. This class does
- * not attest native cache hooks, activate operations or complete file work. */
+/* Conversion-only coordinator facade for consumers still being migrated. */
 class Coordinator {
+    ngx_http_cache_purge_coordinator_t *native_ = nullptr;
+    static void checked(int rc, const ngx_http_cache_rocksdb_error_t &error) {
+        if (rc) throw IndexError(rc, error.message);
+    }
 public:
-    Coordinator(Operations &operations, void *shared, size_t shared_bytes);
-    ~Coordinator();
+    Coordinator(Operations &operations, void *shared, size_t shared_bytes) {
+        ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_coordinator_open(operations.native(), shared, shared_bytes, &native_, &error);
+        checked(rc, error);
+    }
+    ~Coordinator() { ngx_http_cache_purge_coordinator_close(&native_, nullptr); }
     Coordinator(const Coordinator &) = delete;
     Coordinator &operator=(const Coordinator &) = delete;
-    bool step(); // false means a live reader/registration still blocks progress.
-    Operation accept(const OperationInput &input, uint64_t now_ms, uint32_t propagation_ms);
-    void refresh(); // Call after durable control changes; old stronger constraints remain until publication.
-    Coordination state() const { return state_; }
-    uint64_t publication() const { return publication_; }
-private:
-    Operations &operations_;
-    void *shared_;
-    size_t shared_bytes_;
-    ngx_http_cache_purge_control_writer_t *writer_ = nullptr;
-    Coordination state_ = Coordination::claiming;
-    OperationUsage expected_{};
-    std::vector<Operation> controls_;
-    std::string after_;
-    uint64_t loaded_bytes_ = 0, publication_ = 0;
-    std::unique_ptr<ControlImage> pending_;
-    void load_begin();
+    bool step() {
+        ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_coordinator_step(native_, &error);
+        if (rc == NGX_HTTP_CACHE_ROCKSDB_BUSY) return false;
+        checked(rc, error); return true;
+    }
+    Operation accept(const OperationInput &input, uint64_t now, uint32_t propagation_ms) {
+        auto raw = ngx_http_cache_purge_native_input(input);
+        struct Result {
+            ngx_http_cache_purge_operation_t value{};
+            ~Result() { ngx_http_cache_purge_operation_free(&value); }
+        } output;
+        ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_coordinator_accept(native_, &raw, now, propagation_ms, &output.value, &error);
+        checked(rc, error); return ngx_http_cache_purge_cpp_operation(output.value);
+    }
+    void refresh() {
+        ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_coordinator_refresh(native_, &error);
+        checked(rc, error);
+    }
+    Coordination state() const {
+        uint32_t state; uint64_t publication; ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_coordinator_status(native_, &state, &publication, &error);
+        checked(rc, error); return static_cast<Coordination>(state);
+    }
+    uint64_t publication() const {
+        uint32_t state; uint64_t publication; ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_coordinator_status(native_, &state, &publication, &error);
+        checked(rc, error); return publication;
+    }
 };
+
 
 } // namespace ngx_http_cache_purge
 
