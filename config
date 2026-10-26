@@ -40,6 +40,7 @@ if [ "$HTTP_UWSGI" = "YES" ]; then
 fi
 
 CACHE_PURGE_SRCS="$ngx_addon_dir/ngx_cache_purge_handler.c \
+                  $ngx_addon_dir/ngx_cache_purge_fill.c \
                   $ngx_addon_dir/ngx_cache_purge_invalidation.c \
                   $ngx_addon_dir/ngx_cache_purge_module.c \
                   $ngx_addon_dir/ngx_cache_purge_queue.c \
@@ -47,6 +48,7 @@ CACHE_PURGE_SRCS="$ngx_addon_dir/ngx_cache_purge_handler.c \
                   $ngx_addon_dir/ngx_cache_purge_response.c \
                   $ngx_addon_dir/ngx_cache_purge_walk.c"
 CACHE_PURGE_DEPS="$ngx_addon_dir/ngx_cache_purge.h \
+                  $ngx_addon_dir/ngx_cache_purge_fill.h \
                   $ngx_addon_dir/ngx_cache_purge_invalidation.h \
                   $ngx_addon_dir/ngx_cache_purge_posix.h \
                   $ngx_addon_dir/ngx_cache_purge_upstream.h \
@@ -94,12 +96,14 @@ fi
 if [ -n "$ngx_module_link" ]; then
     ngx_module_type=HTTP
     ngx_module_name="$ngx_addon_name"
+    ngx_module_incs="$ngx_addon_dir"
     ngx_module_srcs="$CACHE_PURGE_SRCS"
     ngx_module_deps="$CACHE_PURGE_DEPS"
     ngx_module_libs="$CACHE_PURGE_LIBS"
     . auto/module
 else
     HTTP_MODULES="$HTTP_MODULES $ngx_addon_name"
+    HTTP_INCS="$HTTP_INCS $ngx_addon_dir"
     NGX_ADDON_SRCS="$NGX_ADDON_SRCS $CACHE_PURGE_SRCS"
     NGX_ADDON_DEPS="$NGX_ADDON_DEPS $CACHE_PURGE_DEPS"
     CORE_LIBS="$CORE_LIBS $CACHE_PURGE_LIBS"

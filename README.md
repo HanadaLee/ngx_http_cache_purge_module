@@ -34,9 +34,11 @@ a separate precontent consumer to verify the shared barrier against real HITs.
 Native cache read and response-admission adapters are also being developed in
 nginx-ext. The test fixture in `t/cache_adapter_runtime.py` exercises asynchronous
 file metadata reads, stale suppression, Vary/slice handling, and rejection of
-304 reuse before cache-header renewal. It also covers a two-phase native store
-adapter that can suspend before rename and while reconciling its result, retaining
-the request and cache node through cancellation and reload. It is not the
+304 reuse before cache-header renewal. The module-owned fill helper can suspend
+before rename and while reconciling its result, retaining the request and cache
+node through cancellation and reload. The core only dispatches complete bodies
+and reports native update results; it no longer owns the store state machine.
+The fixture is not the
 production purge consumer: persistent index transactions, 304 commits, eviction
 coordination, and background file operations remain to be connected.
 

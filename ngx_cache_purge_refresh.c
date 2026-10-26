@@ -29,6 +29,9 @@
 #include <ngx_config.h>
 #include "ngx_cache_purge.h"
 #include "ngx_cache_purge_upstream.h"
+#if (NGX_RESTY_EXT && NGX_EXPR)
+#include <ngx_http_expr_module.h>
+#endif
 
 #if (NGX_HTTP_CACHE)
 /* -- bounded conditional REFRESH ---------------------------------------- */
@@ -926,8 +929,14 @@ ngx_http_cache_refresh_guard(ngx_http_request_t *r)
     }
     ngx_str_set(&method, "HEAD");
 # if (nginx_version >= 1011006)
+#  if (NGX_RESTY_EXT && NGX_EXPR)
+    if (proxy->method != NULL
+        && ngx_http_get_expr_complex_value(r, proxy->method, &method)
+           == NGX_ERROR)
+#  else
     if (proxy->method != NULL
         && ngx_http_complex_value(r, proxy->method, &method) != NGX_OK)
+#  endif
     {
         reason = "could not evaluate \"proxy_method\"";
         goto invalid;

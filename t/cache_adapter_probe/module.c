@@ -2,6 +2,7 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
+#include "ngx_cache_purge_fill.h"
 
 #if !(NGX_RESTY_EXT && NGX_HTTP_CACHE)
 #error "native cache adapter probe requires extended HTTP cache"
@@ -23,6 +24,7 @@ typedef struct {
     ngx_uint_t           store_phase;
     ngx_uint_t           store_calls;
     ngx_int_t            store_result;
+    ngx_http_cache_purge_fill_t *fill;
 } probe_ctx_t;
 
 extern ngx_module_t ngx_http_cache_adapter_probe_module;
@@ -145,9 +147,9 @@ store_complete(ngx_event_t *ev)
     probe_ctx_t *ctx = ev->data;
 
     if ((mode(ctx, "store_cancel_prepare")
-         && ctx->store_phase == NGX_HTTP_CACHE_STORE_PREPARE)
+         && ctx->store_phase == NGX_CACHE_PURGE_FILL_PREPARE)
         || (mode(ctx, "store_cancel_finish")
-            && ctx->store_phase == NGX_HTTP_CACHE_STORE_FINISH))
+            && ctx->store_phase == NGX_CACHE_PURGE_FILL_FINISH))
     {
         ngx_http_finalize_request(ctx->request, NGX_HTTP_CLIENT_CLOSED_REQUEST);
     }
@@ -155,15 +157,14 @@ store_complete(ngx_event_t *ev)
     ngx_log_error(NGX_LOG_NOTICE, ctx->request->connection->log, 0,
                   "probe store complete %ui %i %V", ctx->store_phase,
                   ctx->store_result, &ctx->request->uri);
-    ngx_http_file_cache_store_complete(ctx->request, ctx->cache,
-                                       ctx->store_result);
+    ngx_http_cache_purge_fill_complete(ctx->fill, ctx->store_result);
 }
 
 static ngx_int_t
-store(ngx_http_request_t *r, ngx_http_cache_t *c, ngx_temp_file_t *tf,
-    ngx_uint_t phase, ngx_int_t result)
+store_step(ngx_http_request_t *r, ngx_http_cache_t *c, ngx_temp_file_t *tf,
+    ngx_uint_t phase, ngx_int_t result, void *data)
 {
-    probe_ctx_t *ctx = c->adapter_ctx;
+    probe_ctx_t *ctx = data;
     ngx_str_t value;
     ngx_int_t delay, answer;
     ngx_uint_t held;
@@ -183,15 +184,15 @@ store(ngx_http_request_t *r, ngx_http_cache_t *c, ngx_temp_file_t *tf,
     ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
                   "probe store phase %ui %i %V", phase, result, &r->uri);
     answer = NGX_OK;
-    if (phase == NGX_HTTP_CACHE_STORE_PREPARE && mode(ctx, "store_reject")) {
+    if (phase == NGX_CACHE_PURGE_FILL_PREPARE && mode(ctx, "store_reject")) {
         answer = NGX_DECLINED;
     }
-    if (phase == NGX_HTTP_CACHE_STORE_FINISH && mode(ctx, "store_finish_error")) {
+    if (phase == NGX_CACHE_PURGE_FILL_FINISH && mode(ctx, "store_finish_error")) {
         answer = NGX_ERROR;
     }
-    if (ngx_http_arg(r, (u_char *) (phase == NGX_HTTP_CACHE_STORE_PREPARE
+    if (ngx_http_arg(r, (u_char *) (phase == NGX_CACHE_PURGE_FILL_PREPARE
                                   ? "prepare" : "finish"),
-                     phase == NGX_HTTP_CACHE_STORE_PREPARE ? 7 : 6,
+                     phase == NGX_CACHE_PURGE_FILL_PREPARE ? 7 : 6,
                      &value) != NGX_OK)
     {
         return answer;
@@ -207,6 +208,13 @@ store(ngx_http_request_t *r, ngx_http_cache_t *c, ngx_temp_file_t *tf,
     ctx->store_event.log = r->connection->log;
     ngx_add_timer(&ctx->store_event, delay);
     return NGX_AGAIN;
+}
+
+static ngx_int_t
+store(ngx_http_request_t *r, ngx_temp_file_t *tf)
+{
+    probe_ctx_t *ctx = r->cache->adapter_ctx;
+    return ngx_http_cache_purge_fill_start(r, tf, &ctx->fill, store_step, ctx);
 }
 
 static ngx_int_t

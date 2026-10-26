@@ -4,10 +4,12 @@ import argparse
 import concurrent.futures
 import hashlib
 import http.server
+import http.client
 import json
 import os
 import signal
 import socket
+import socketserver
 import struct
 import subprocess
 import tempfile
@@ -32,6 +34,9 @@ build, probe = root / 'nginx', root / 'probe'
 build.mkdir(exist_ok=True)
 probe.mkdir(exist_ok=True)
 source = Path(__file__).resolve().parent / 'cache_adapter_probe'
+addon = source.parents[1]
+addon_files = [addon / 'config', *sorted(addon.glob('*.c')), *sorted(addon.glob('*.h'))]
+addon_hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in addon_files}
 for f in source.iterdir():
     (probe / f.name).write_bytes(f.read_bytes().replace(b'\r\n', b'\n'))
 revision = subprocess.check_output(['git', '-C', str(a.nginx), 'rev-parse', 'HEAD'], text=True).strip()
@@ -45,6 +50,7 @@ if patch:
 configure = 'auto/configure' if (build / 'auto/configure').exists() else 'configure'
 args = ['sh', configure, '--prefix=' + str(root / 'default'), '--with-http_ssl_module',
         '--with-http_slice_module', '--with-threads', '--with-debug']
+args.append('--add-module=' + str(source.parents[1]))
 if a.expr:
     args.append('--add-module=' + str(a.expr))
 args.append(('--add-dynamic-module=' if a.dynamic else '--add-module=') + str(probe))
@@ -79,13 +85,13 @@ class Origin(http.server.BaseHTTPRequestHandler):
             return
         version = current.get('version', 1)
         language = self.headers.get('Accept-Language', '') if path == '/vary' else ''
-        entity = current.get('body', body if path == '/slice' else f'{path}:v{version}:{language}'.encode())
+        entity = current.get('body', body if path.startswith('/slice') else f'{path}:v{version}:{language}'.encode())
         etag = '"' + hashlib.sha256(entity).hexdigest() + '"'
         status = current.get('status', 200)
         if status == 200 and self.headers.get('If-None-Match') == etag:
             status = 304
         content_range = None
-        if status == 200 and path == '/slice' and self.headers.get('Range'):
+        if status == 200 and path.startswith('/slice') and self.headers.get('Range'):
             start, end = map(int, self.headers['Range'][6:].split('-'))
             end = min(end, len(entity) - 1)
             content_range = f'bytes {start}-{end}/{len(entity)}'
@@ -99,17 +105,88 @@ class Origin(http.server.BaseHTTPRequestHandler):
             self.send_header('Vary', 'Accept-Language')
         if content_range:
             self.send_header('Content-Range', content_range)
-        if not current.get('eof'):
+        if current.get('chunked'):
+            self.send_header('Transfer-Encoding', 'chunked')
+        elif not current.get('eof'):
             self.send_header('Content-Length', str(len(entity)))
         self.end_headers()
         if status != 304:
             try:
-                self.wfile.write(entity)
+                if current.get('chunked'):
+                    for chunk in (entity[:3], entity[3:]):
+                        if chunk:
+                            self.wfile.write(f'{len(chunk):x}\r\n'.encode() + chunk + b'\r\n')
+                    self.wfile.write(b'0\r\n\r\n')
+                else:
+                    self.wfile.write(entity)
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
 origin = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Origin)
 threading.Thread(target=origin.serve_forever, daemon=True).start()
+
+class ProtocolOrigin(socketserver.BaseRequestHandler):
+    def read_exact(self, length):
+        value = b''
+        while len(value) < length:
+            part = self.request.recv(length - len(value))
+            if not part:
+                raise EOFError('incomplete gateway request')
+            value += part
+        return value
+
+    def handle(self):
+        self.request.settimeout(5)
+        protocol = self.server.protocol
+        request_id = 1
+        if protocol == 'fastcgi':
+            while True:
+                version, kind, request_id, size, padding, _ = struct.unpack('!BBHHBB', self.read_exact(8))
+                assert version == 1
+                self.read_exact(size + padding)
+                if kind == 5 and size == 0:
+                    break
+        elif protocol == 'uwsgi':
+            _, size, _ = struct.unpack('<BHB', self.read_exact(4))
+            self.read_exact(size)
+        else:
+            digits = b''
+            while True:
+                char = self.read_exact(1)
+                if char == b':':
+                    break
+                digits += char
+                assert len(digits) <= 10
+            self.read_exact(int(digits))
+            assert self.read_exact(1) == b','
+        entity = (protocol + ':body').encode()
+        response = (b'Status: 200 OK\r\nContent-Type: text/plain\r\n'
+                    b'Cache-Control: max-age=3600\r\nContent-Length: '
+                    + str(len(entity)).encode() + b'\r\n\r\n' + entity)
+        if protocol == 'fastcgi':
+            def record(kind, value):
+                return struct.pack('!BBHHBB', 1, kind, request_id, len(value), 0, 0) + value
+            response = record(6, response) + record(6, b'') + record(3, b'\0' * 8)
+        try:
+            self.request.sendall(response)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+protocol_servers = {}
+protocol_locations = []
+for name in ('fastcgi', 'uwsgi', 'scgi'):
+    server = socketserver.ThreadingTCPServer(('127.0.0.1', 0), ProtocolOrigin)
+    server.daemon_threads = True
+    server.protocol = name
+    protocol_servers[name] = server
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    protocol_locations.append(f'''
+    location /{name}/ {{
+      {name}_cache {name}_cache; {name}_cache_key $uri; {name}_cache_valid 200 1h;
+      {name}_cache_lock on; {name}_read_timeout 250ms;
+      {name}_param REQUEST_METHOD GET; {name}_param REQUEST_URI $uri;
+      {name}_pass 127.0.0.1:{server.server_address[1]};
+    }}''')
 run = root / ('run-' + str(time.time_ns()))
 run.mkdir()
 (run / 'logs').mkdir()
@@ -127,6 +204,7 @@ http {{
   access_log off; cache_adapter_probe on;
   proxy_cache_path {run}/cache-a keys_zone=a:1m;
   proxy_cache_path {run}/cache-b keys_zone=b:1m;
+  {''.join(f'{name}_cache_path {run}/cache-{name} keys_zone={name}_cache:1m;' for name in protocol_servers)}
   map $http_x_zone $zone {{ default a; b b; }}
   map $arg_offline $origin_port {{ default {origin.server_port}; 1 1; }}
   server {{
@@ -142,7 +220,8 @@ http {{
     add_header X-Probe $cache_adapter_probe_state always;
     location / {{ proxy_pass http://127.0.0.1:{origin.server_port}; }}
     location /native {{ cache_adapter_probe off; proxy_pass http://127.0.0.1:{origin.server_port}; }}
-    location /aio {{ aio threads; proxy_pass http://127.0.0.1:{origin.server_port}; }}
+    location /aio {{ aio threads; aio_write on; proxy_pass http://127.0.0.1:{origin.server_port}; }}
+    {''.join(protocol_locations)}
     location /slice {{
       slice on; slice_size 1024; proxy_cache_key "$uri$slice_range";
       proxy_set_header Range $slice_range;
@@ -325,6 +404,46 @@ try:
     assert get('/store-eof')[1] == 'HIT'
     checks.append('EOF-delimited complete bodies use the same async store lifecycle')
 
+    states['/store-empty'] = {'body': b''}
+    assert get('/store-empty?prepare=25&finish=25')[2] == b''
+    until(lambda: phase_seen('/store-empty', 2, complete=True))
+    assert get('/store-empty')[1:3] == ('HIT', b'')
+    checks.append('empty responses retain their cache header and complete both store phases')
+
+    states['/store-chunked'] = {'chunked': True}
+    assert get('/store-chunked?prepare=25&finish=25')[2] == b'/store-chunked:v1:'
+    until(lambda: phase_seen('/store-chunked', 2, complete=True))
+    assert get('/store-chunked')[1:3] == ('HIT', b'/store-chunked:v1:')
+    checks.append('chunked responses finish after the decoded body and store valid cache files')
+
+    client = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
+    try:
+        client.request('GET', '/store-keepalive?prepare=100&finish=100')
+        response = client.getresponse()
+        assert response.read() == b'/store-keepalive:v1:'
+        connection = client.sock
+        assert connection is not None
+        client.request('GET', '/store-keepalive')
+        response = client.getresponse()
+        assert response.read() == b'/store-keepalive:v1:'
+        assert response.getheader('X-Cache') == 'HIT' and client.sock is connection
+    finally:
+        client.close()
+    assert count('/store-keepalive') == 1
+    checks.append('HTTP/1 keepalive reuses the same connection after asynchronous store completion')
+
+    for protocol in protocol_servers:
+        path = '/' + protocol + '/fill'
+        assert get(path + '?prepare=300&finish=25')[2] == (protocol + ':body').encode()
+        until(lambda: phase_seen(path, 2, complete=True))
+        assert get(path)[1:3] == ('HIT', (protocol + ':body').encode())
+        checks.append(protocol + ': native complete-body store survives a wait longer than its read timeout')
+
+    assert get('/slice-delayed?prepare=30&finish=30')[2] == body
+    until(lambda: (run / 'error.log').read_text().count('probe store complete 2 0 /slice-delayed ') == 3)
+    assert get('/slice-delayed')[2] == body and count('/slice-delayed') == 3
+    checks.append('all three slice subrequests finish asynchronous stores without sharing fill state')
+
     large = body * 128
     states['/aio/large'] = {'body': large}
     assert get('/aio/large?prepare=25&finish=25')[2] == large
@@ -388,12 +507,21 @@ finally:
         raise
     stderr.close()
     origin.shutdown()
+    origin.server_close()
+    for server in protocol_servers.values():
+        server.shutdown()
+        server.server_close()
 assert code == 0, code
 errors = (run / 'error.log').read_text() + (run / 'stderr.log').read_text()
+assert 'http upstream thread:' in errors, 'aio_write did not execute a native upstream thread completion'
+assert addon_hashes == {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in addon_files}
 for marker in ('[alert]', 'AddressSanitizer', 'runtime error:', 'exited on signal'):
     assert marker not in errors, (marker, run)
 result = {'root': str(root), 'run': str(run), 'revision': revision,
           'source_patch_sha256': hashlib.sha256(patch).hexdigest(),
+          'addon_source_sha256': addon_hashes,
+          'fixture_source_sha256': hashlib.sha256((probe / 'module.c').read_bytes()).hexdigest(),
+          'native_aio_write_completion_observed': True,
           'dynamic': a.dynamic, 'expr': bool(a.expr), 'sanitizer': a.sanitize,
           'sanitizer_exclusions': ['nonnull-attribute'] if a.sanitize else [],
           'checks': checks,
