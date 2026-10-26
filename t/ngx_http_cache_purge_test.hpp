@@ -2,10 +2,10 @@
  * Copyright (C) Hanada
  */
 
-#ifndef _NGX_HTTP_CACHE_PURGE_BACKEND_HPP_INCLUDED_
-#define _NGX_HTTP_CACHE_PURGE_BACKEND_HPP_INCLUDED_
+#ifndef _NGX_HTTP_CACHE_PURGE_TEST_HPP_INCLUDED_
+#define _NGX_HTTP_CACHE_PURGE_TEST_HPP_INCLUDED_
 
-/* Transitional C++ contracts, removed as the backend is converted to C. */
+/* Test-only C++ adapters and reference wire encoding for the production C APIs. */
 #include "ngx_http_cache_purge_internal.h"
 
 /* Copyright (C) Hanada */
@@ -722,4 +722,4 @@ inline void operation(Encoder &e, const Operation &op) {
 
 } // namespace ngx_http_cache_purge::protocol
 
-#endif /* _NGX_HTTP_CACHE_PURGE_BACKEND_HPP_INCLUDED_ */
+#endif /* _NGX_HTTP_CACHE_PURGE_TEST_HPP_INCLUDED_ */

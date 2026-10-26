@@ -58,14 +58,14 @@ if [ -n "$CACHE_PURGE_ROCKSDB_LIB_DIR" ]; then
         exit 1
     fi
     CACHE_ROCKSDB_LIBS="$CACHE_ROCKSDB_LIBS ${CACHE_PURGE_ROCKSDB_LIBS:--lrocksdb -lcrypto -lstdc++ -lm -pthread}"
-    for archive in component control files index; do
+    for archive in component files index; do
         if [ ! -f "$CACHE_PURGE_ROCKSDB_LIB_DIR/libngx_http_cache_purge_${archive}.a" ]; then
             echo "missing cache purge archive: $CACHE_PURGE_ROCKSDB_LIB_DIR/libngx_http_cache_purge_${archive}.a"
             exit 1
         fi
         CACHE_PURGE_LIBS="$CACHE_PURGE_LIBS $CACHE_PURGE_ROCKSDB_LIB_DIR/libngx_http_cache_purge_${archive}.a"
     done
-    CACHE_PURGE_LIBS="$CACHE_PURGE_LIBS -lcrypto -lstdc++ -lm -pthread"
+    CACHE_PURGE_LIBS="$CACHE_PURGE_LIBS -lcrypto -lm -pthread"
     ngx_feature="cache purge persistent runtime libraries"
     ngx_feature_name=NGX_HTTP_CACHE_PURGE_ROCKSDB
     ngx_feature_run=no

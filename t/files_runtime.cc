@@ -1,6 +1,6 @@
 /* Real filesystem identity and index-publication checks; not a native consumer. */
 #include "ngx_http_cache_purge_internal.h"
-#include "ngx_http_cache_purge_backend.hpp"
+#include "ngx_http_cache_purge_test.hpp"
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>

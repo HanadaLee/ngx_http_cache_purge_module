@@ -3,13 +3,11 @@
 This repository builds two HTTP modules in persistent mode:
 `ngx_http_cache_rocksdb_module` provides the bounded RocksDB C API, and
 `ngx_http_cache_purge_module` implements HTTP cache indexing and purge behavior.
-Both modules remain in this repository. The engine bridge is isolated in
-`rocksdb/`; the migration of the remaining C++ purge implementation to C is in
-progress. File markers, OFD leases, the durable operation ledger, and the entire
-persistent index use C implementations, including dictionary storage, queries,
-fill preparation, metadata updates, and reclamation. Shared control matching,
-publication, durable-operation coordination, and physical file publication also
-run in C. The component executor is the remaining C++ purge implementation.
+Both modules remain in this repository. Production C++ is confined to the
+RocksDB bridge in `rocksdb/`; the entire purge implementation uses C. Its
+executor, shared controls and operation coordination share one source file.
+The persistent index and filesystem publication logic each have their own C
+implementation. Test-only C++ adapters and wire encoders live under `t/`.
 
 HTTP cache invalidation for nginx proxy, FastCGI, SCGI, and uWSGI caches.
 

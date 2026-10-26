@@ -1,4 +1,4 @@
-#include "ngx_http_cache_purge_backend.hpp"
+#include "ngx_http_cache_purge_test.hpp"
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <signal.h>
