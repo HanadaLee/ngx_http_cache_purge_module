@@ -9,6 +9,8 @@
 #include <thread>
 
 using namespace ngx_http_cache_purge;
+extern "C" unsigned ngx_http_cache_purge_test_query_api(ngx_http_cache_rocksdb_t *,
+    const unsigned char *, size_t, const unsigned char *);
 static unsigned assertions;
 static void check(bool value, const char *message) {
     if (!value) throw std::runtime_error(message);
@@ -205,6 +207,8 @@ int main(int argc, char **argv) {
             auto different = a; different.metadata = "other proof";
             fails(NGX_HTTP_CACHE_ROCKSDB_CONFLICT, [&] { index.prepare(different); });
             check(index.commit(a.id, 1).revision == 2, "commit increments revision");
+            assertions += ngx_http_cache_purge_test_query_api(store,
+                reinterpret_cast<const unsigned char *>(a.key.data()), a.key.size(), a.id.data());
             fails(NGX_HTTP_CACHE_ROCKSDB_CONFLICT, [&] { index.commit(a.id, 1); });
             for (const auto &record : {b, c, d, e, f}) install(index, record);
             auto corrupt = file(7, "/bad-projection");

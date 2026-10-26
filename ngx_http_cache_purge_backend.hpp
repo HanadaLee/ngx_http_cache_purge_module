@@ -72,9 +72,8 @@ public:
     bool next(Match &match);
     std::string bookmark() const; /* persist only after the returned match is handled */
 private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
-    explicit Query(std::unique_ptr<Impl> impl);
+    ngx_http_cache_purge_query_t *native_ = nullptr;
+    Query() = default;
     friend class Index;
 };
 

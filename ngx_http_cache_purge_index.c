@@ -1708,3 +1708,1324 @@ ngx_http_cache_purge_operations_expire(ngx_http_cache_purge_operations_t *ops,
     }
     return ngx_http_cache_purge_op_end(&tx, error);
 }
+
+
+/* Bounded snapshot queries over the file index and its ordered postings. */
+
+#define NGX_HTTP_CACHE_PURGE_QUERY_MEMORY  (1024 * 1024)
+#define NGX_HTTP_CACHE_PURGE_INDEX_STRING  32768
+#define NGX_HTTP_CACHE_PURGE_INDEX_RECORD  524288
+
+typedef struct {
+    unsigned char  *data;
+    size_t          len;
+    size_t          capacity;
+} ngx_http_cache_purge_index_buffer_t;
+
+typedef struct {
+    ngx_http_cache_rocksdb_cursor_t     *handle;
+    ngx_http_cache_purge_index_buffer_t  key;
+    ngx_http_cache_purge_index_buffer_t  value;
+} ngx_http_cache_purge_index_cursor_t;
+
+typedef struct {
+    ngx_http_cache_purge_query_t   *query;
+    ngx_http_cache_rocksdb_bytes_t  data;
+    size_t                          at;
+} ngx_http_cache_purge_index_reader_t;
+
+typedef struct {
+    unsigned char                   id[16];
+    uint32_t                        state;
+    uint64_t                        revision;
+    uint64_t                        refs[8];
+    ngx_http_cache_rocksdb_bytes_t  path;
+    uint64_t                        tags[64];
+    size_t                          tag_count;
+} ngx_http_cache_purge_index_record_t;
+
+struct ngx_http_cache_purge_query_s {
+    ngx_http_cache_rocksdb_t       *store;
+    ngx_http_cache_rocksdb_error_t  error;
+    int                             status;
+    size_t                          bytes;
+    unsigned                        kind;
+    int                             empty;
+    unsigned char                   recovery;
+    unsigned char                   signature[32];
+    ngx_http_cache_rocksdb_cf_e         outer_cf;
+    ngx_http_cache_purge_index_cursor_t  outer;
+    ngx_http_cache_purge_index_cursor_t  links;
+    ngx_http_cache_purge_index_cursor_t  files;
+    ngx_http_cache_purge_index_buffer_t  prefix;
+    ngx_http_cache_purge_index_buffer_t  current_outer;
+    ngx_http_cache_purge_index_buffer_t  current_link;
+    ngx_http_cache_purge_index_buffer_t  token;
+    ngx_http_cache_purge_index_buffer_t  scratch;
+    ngx_http_cache_purge_index_buffer_t  lookup;
+    ngx_http_cache_purge_index_buffer_t  key;
+};
+
+static int
+ngx_http_cache_purge_index_fail(ngx_http_cache_purge_query_t *q, int code,
+    const char *message)
+{
+    if (q->status == 0) {
+        q->status = code;
+        q->error.code = code;
+        snprintf(q->error.message, sizeof(q->error.message), "%s", message);
+    }
+    return q->status;
+}
+
+static int
+ngx_http_cache_purge_index_require(ngx_http_cache_purge_query_t *q, int ok,
+    int code, const char *message)
+{
+    if (!ok) {
+        ngx_http_cache_purge_index_fail(q, code, message);
+    }
+    return q->status == 0;
+}
+
+static ngx_http_cache_rocksdb_bytes_t
+ngx_http_cache_purge_index_bytes(const ngx_http_cache_purge_index_buffer_t *b)
+{
+    ngx_http_cache_rocksdb_bytes_t result;
+
+    result.data = b->data;
+    result.len = b->len;
+    return result;
+}
+
+static int
+ngx_http_cache_purge_index_reserve(ngx_http_cache_purge_query_t *q,
+    ngx_http_cache_purge_index_buffer_t *b, size_t size)
+{
+    unsigned char  *data;
+    size_t          capacity;
+
+    if (q->status != 0) {
+        return 0;
+    }
+    if (size <= b->capacity) {
+        return 1;
+    }
+    capacity = b->capacity != 0 ? b->capacity : 256;
+    if (!ngx_http_cache_purge_index_require(
+            q, size <= NGX_HTTP_CACHE_PURGE_INDEX_RECORD,
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "index buffer exceeds record limit"))
+    {
+        return 0;
+    }
+    while (capacity < size) {
+        capacity *= 2;
+    }
+    if (!ngx_http_cache_purge_index_require(
+            q,
+            capacity
+                <= NGX_HTTP_CACHE_PURGE_QUERY_MEMORY - q->bytes + b->capacity,
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "index query memory budget"))
+    {
+        return 0;
+    }
+    data = realloc(b->data, capacity);
+    if (!ngx_http_cache_purge_index_require(q, data != NULL,
+                                            NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+                                            "index query allocation failed"))
+    {
+        return 0;
+    }
+    q->bytes += capacity - b->capacity;
+    b->data = data;
+    b->capacity = capacity;
+    return 1;
+}
+
+static void
+ngx_http_cache_purge_index_set(ngx_http_cache_purge_query_t *q,
+    ngx_http_cache_purge_index_buffer_t *b,
+    ngx_http_cache_rocksdb_bytes_t value)
+{
+    if (ngx_http_cache_purge_index_reserve(q, b, value.len)) {
+        if (value.len != 0) {
+            memcpy(b->data, value.data, value.len);
+        }
+        b->len = value.len;
+    }
+}
+
+static void
+ngx_http_cache_purge_index_append(ngx_http_cache_purge_query_t *q,
+    ngx_http_cache_purge_index_buffer_t *b, const void *data, size_t size)
+{
+    if (!ngx_http_cache_purge_index_require(
+            q, size <= NGX_HTTP_CACHE_PURGE_INDEX_RECORD - b->len,
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "index encoding exceeds limit"))
+    {
+        return;
+    }
+    if (ngx_http_cache_purge_index_reserve(q, b, b->len + size)) {
+        if (size != 0) {
+            memcpy(b->data + b->len, data, size);
+        }
+        b->len += size;
+    }
+}
+
+static void
+ngx_http_cache_purge_index_number(ngx_http_cache_purge_query_t *q,
+    ngx_http_cache_purge_index_buffer_t *b, uint64_t value)
+{
+    unsigned char  raw[8];
+    unsigned       i;
+
+    for (i = 0; i < 8; i++) {
+        raw[7 - i] = (unsigned char) value;
+        value >>= 8;
+    }
+    ngx_http_cache_purge_index_append(q, b, raw, sizeof(raw));
+}
+
+static void
+ngx_http_cache_purge_index_string(ngx_http_cache_purge_query_t *q,
+    ngx_http_cache_purge_index_buffer_t *b,
+    ngx_http_cache_rocksdb_bytes_t value)
+{
+    ngx_http_cache_purge_index_number(q, b, value.len);
+    ngx_http_cache_purge_index_append(q, b, value.data, value.len);
+}
+
+static void
+ngx_http_cache_purge_index_row(ngx_http_cache_purge_query_t *q,
+    ngx_http_cache_purge_index_buffer_t *b, unsigned char kind, uint64_t id)
+{
+    b->len = 0;
+    ngx_http_cache_purge_index_append(q, b, &kind, 1);
+    ngx_http_cache_purge_index_number(q, b, id);
+}
+
+static ngx_http_cache_rocksdb_bytes_t
+ngx_http_cache_purge_index_take(ngx_http_cache_purge_index_reader_t *r,
+    size_t size)
+{
+    ngx_http_cache_rocksdb_bytes_t value;
+
+    if (!ngx_http_cache_purge_index_require(
+            r->query, size <= r->data.len - r->at,
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "truncated index record"))
+    {
+        return ngx_http_cache_purge_op_empty;
+    }
+    value.data = r->data.data + r->at;
+    value.len = size;
+    r->at += size;
+    return value;
+}
+
+static uint64_t
+ngx_http_cache_purge_index_read_number(ngx_http_cache_purge_index_reader_t *r,
+    size_t size)
+{
+    ngx_http_cache_rocksdb_bytes_t  raw;
+    uint64_t                        value;
+    size_t                          i;
+
+    raw = ngx_http_cache_purge_index_take(r, size);
+    value = 0;
+    for (i = 0; i < raw.len; i++) {
+        value = (value << 8) | raw.data[i];
+    }
+    return value;
+}
+
+static ngx_http_cache_rocksdb_bytes_t
+ngx_http_cache_purge_index_read_string(ngx_http_cache_purge_index_reader_t *r)
+{
+    uint64_t size;
+
+    size = ngx_http_cache_purge_index_read_number(r, 8);
+    if (!ngx_http_cache_purge_index_require(
+            r->query, size <= r->data.len - r->at,
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid index field size"))
+    {
+        return ngx_http_cache_purge_op_empty;
+    }
+    return ngx_http_cache_purge_index_take(r, (size_t) size);
+}
+
+static uint64_t
+ngx_http_cache_purge_index_integer(ngx_http_cache_purge_query_t *q,
+    ngx_http_cache_rocksdb_bytes_t value)
+{
+    ngx_http_cache_purge_index_reader_t r;
+
+    if (!ngx_http_cache_purge_index_require(q, value.len == 8,
+                                            NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                                            "invalid index integer"))
+    {
+        return 0;
+    }
+    r.query = q;
+    r.data = value;
+    r.at = 0;
+    return ngx_http_cache_purge_index_read_number(&r, 8);
+}
+
+static int
+ngx_http_cache_purge_index_cursor_close(ngx_http_cache_purge_query_t *q,
+    ngx_http_cache_purge_index_cursor_t *cursor)
+{
+    ngx_http_cache_rocksdb_error_t  error;
+    int                             rc;
+
+    if (cursor->handle == NULL) {
+        return 0;
+    }
+    rc = ngx_http_cache_rocksdb_cursor_close(&cursor->handle, &error);
+    if (rc != 0) {
+        ngx_http_cache_purge_index_fail(q, rc, error.message);
+    }
+    return rc;
+}
+
+static void
+ngx_http_cache_purge_index_cursor_open(ngx_http_cache_purge_query_t *q,
+    ngx_http_cache_purge_index_cursor_t *cursor, ngx_http_cache_rocksdb_cf_e cf,
+    ngx_http_cache_rocksdb_bytes_t prefix, ngx_http_cache_rocksdb_bytes_t after,
+    ngx_http_cache_rocksdb_cursor_t *view)
+{
+    ngx_http_cache_rocksdb_error_t  error;
+    int                             rc;
+
+    ngx_http_cache_purge_index_cursor_close(q, cursor);
+    if (q->status != 0) {
+        return;
+    }
+    rc = view != NULL ?
+             ngx_http_cache_rocksdb_cursor_fork(view, cf, prefix, after,
+                                                &cursor->handle, &error) :
+             ngx_http_cache_rocksdb_cursor_open(q->store, cf, prefix, after,
+                                                &cursor->handle, &error);
+    if (rc != 0) {
+        ngx_http_cache_purge_index_fail(q, rc, error.message);
+    }
+}
+
+static int
+ngx_http_cache_purge_index_cursor_next(ngx_http_cache_purge_query_t *q,
+    ngx_http_cache_purge_index_cursor_t *cursor)
+{
+    ngx_http_cache_rocksdb_buffer_t key, value;
+    ngx_http_cache_rocksdb_error_t  error;
+    int                             rc;
+
+    if (cursor->handle == NULL) {
+        return 0;
+    }
+    ngx_http_cache_purge_index_reserve(q, &cursor->key, 256);
+    ngx_http_cache_purge_index_reserve(q, &cursor->value, 256);
+    while (q->status == 0) {
+        key.data = cursor->key.data;
+        key.capacity = cursor->key.capacity;
+        key.length = 0;
+        value.data = cursor->value.data;
+        value.capacity = cursor->value.capacity;
+        value.length = 0;
+        rc = ngx_http_cache_rocksdb_cursor_next(cursor->handle, &key, &value,
+                                                &error);
+        if (rc == NGX_HTTP_CACHE_ROCKSDB_DONE) {
+            return 0;
+        }
+        if (rc == NGX_HTTP_CACHE_ROCKSDB_BUFFER) {
+            if (!ngx_http_cache_purge_index_require(
+                    q,
+                    key.length <= NGX_HTTP_CACHE_PURGE_INDEX_RECORD
+                        && value.length
+                               <= NGX_HTTP_CACHE_PURGE_INDEX_RECORD - key.length
+                        && (key.length > key.capacity
+                            || value.length > value.capacity),
+                    NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+                    "index cursor row exceeds budget"))
+            {
+                return 0;
+            }
+            ngx_http_cache_purge_index_reserve(q, &cursor->key, key.length);
+            ngx_http_cache_purge_index_reserve(q, &cursor->value, value.length);
+            continue;
+        }
+        if (rc != 0) {
+            ngx_http_cache_purge_index_fail(q, rc, error.message);
+            return 0;
+        }
+        cursor->key.len = key.length;
+        cursor->value.len = value.length;
+        return 1;
+    }
+    return 0;
+}
+
+/* The returned value is in q->scratch and survives only until the next get. */
+static int
+ngx_http_cache_purge_index_get(ngx_http_cache_purge_query_t *q,
+    ngx_http_cache_rocksdb_cf_e cf, ngx_http_cache_rocksdb_bytes_t key,
+    ngx_http_cache_rocksdb_cursor_t *view)
+{
+    ngx_http_cache_rocksdb_buffer_t  value;
+    ngx_http_cache_rocksdb_error_t   error;
+    int                              rc;
+
+    q->scratch.len = 0;
+    ngx_http_cache_purge_index_reserve(q, &q->scratch, 256);
+    while (q->status == 0) {
+        value.data = q->scratch.data;
+        value.capacity = q->scratch.capacity;
+        value.length = 0;
+        rc = view != NULL ?
+                 ngx_http_cache_rocksdb_cursor_get(view, cf, key, &value,
+                                                   &error) :
+                 ngx_http_cache_rocksdb_get(q->store, cf, key, &value, &error);
+        if (rc == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) {
+            return 0;
+        }
+        if (rc == NGX_HTTP_CACHE_ROCKSDB_BUFFER) {
+            if (!ngx_http_cache_purge_index_require(
+                    q, value.length > value.capacity,
+                    NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid index read size"))
+            {
+                return 0;
+            }
+            ngx_http_cache_purge_index_reserve(q, &q->scratch, value.length);
+            continue;
+        }
+        if (rc != 0) {
+            ngx_http_cache_purge_index_fail(q, rc, error.message);
+            return 0;
+        }
+        q->scratch.len = value.length;
+        return 1;
+    }
+    return 0;
+}
+
+static int
+ngx_http_cache_purge_index_value(ngx_http_cache_purge_query_t *q,
+    ngx_http_cache_rocksdb_cursor_t *view, uint64_t id, int leaf)
+{
+    ngx_http_cache_purge_index_reader_t  r;
+    ngx_http_cache_rocksdb_bytes_t       raw;
+    uint64_t                             parts[5];
+    unsigned                            format, count, i;
+    size_t                              j;
+
+    ngx_http_cache_purge_index_row(q, &q->key, 'V', id);
+    if (!ngx_http_cache_purge_index_get(q, NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+            ngx_http_cache_purge_index_bytes(&q->key), view))
+    {
+        if (leaf) {
+            ngx_http_cache_purge_index_fail(q, NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                                            "missing value component");
+        }
+        return 0;
+    }
+    r.query = q;
+    r.data = ngx_http_cache_purge_index_bytes(&q->scratch);
+    r.at = 0;
+    ngx_http_cache_purge_index_require(
+        q, ngx_http_cache_purge_index_read_number(&r, 1) == 1,
+        NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid value record version");
+    (void) ngx_http_cache_purge_index_read_number(&r, 8);
+    format = ngx_http_cache_purge_index_read_number(&r, 1);
+    if (format == 0) {
+        raw = ngx_http_cache_purge_index_read_string(&r);
+        ngx_http_cache_purge_index_require(
+            q,
+            raw.len <= NGX_HTTP_CACHE_PURGE_INDEX_STRING && r.at == r.data.len,
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid dictionary value");
+        if (!leaf) {
+            ngx_http_cache_purge_index_set(q, &q->lookup, raw);
+        }
+        return q->status == 0;
+    }
+    if (!ngx_http_cache_purge_index_require(
+            q, !leaf && (format == 1 || format == 2),
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid recursive value format"))
+    {
+        return 0;
+    }
+    count = ngx_http_cache_purge_index_read_number(&r, 1);
+    if (!ngx_http_cache_purge_index_require(q, count == (format == 1 ? 5U : 3U),
+                                            NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                                            "invalid value component count"))
+    {
+        return 0;
+    }
+    for (i = 0; i < count; i++) {
+        parts[i] = ngx_http_cache_purge_index_read_number(&r, 8);
+    }
+    ngx_http_cache_purge_index_require(q, r.at == r.data.len,
+                                       NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                                       "unexpected value record suffix");
+    q->lookup.len = 0;
+    for (i = 0; i < count && q->status == 0; i++) {
+        if (!ngx_http_cache_purge_index_value(q, view, parts[i], 1)) {
+            break;
+        }
+        /* A leaf record is version/refcount/format/length followed by bytes. */
+        raw.data = q->scratch.data + 18;
+        raw.len = q->scratch.len - 18;
+        if (format == 1 && i != 0) {
+            ngx_http_cache_purge_index_append(q, &q->lookup, "\x1f", 1);
+        }
+        if (format == 2 && i == 1) {
+            ngx_http_cache_purge_index_append(q, &q->lookup, "://", 3);
+        }
+        for (j = 0; j < raw.len && q->status == 0; j++) {
+            if (format == 1 && raw.data[j] == '\\') {
+                ngx_http_cache_purge_index_append(q, &q->lookup, "\\\\", 2);
+            } else if (format == 1 && raw.data[j] == 31) {
+                ngx_http_cache_purge_index_append(q, &q->lookup, "\\x1F", 4);
+            } else {
+                ngx_http_cache_purge_index_append(q, &q->lookup, raw.data + j,
+                                                  1);
+            }
+            ngx_http_cache_purge_index_require(
+                q, q->lookup.len <= NGX_HTTP_CACHE_PURGE_INDEX_STRING,
+                NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+                "reconstructed index value too long");
+        }
+    }
+    return q->status == 0;
+}
+
+static uint64_t
+ngx_http_cache_purge_index_find(ngx_http_cache_purge_query_t *q,
+    ngx_http_cache_rocksdb_bytes_t text)
+{
+    unsigned char                        prefix[33];
+    ngx_http_cache_rocksdb_bytes_t       range, number;
+    ngx_http_cache_purge_index_cursor_t  *cursor;
+    uint64_t                              id;
+    unsigned                              candidates;
+
+    prefix[0] = 'S';
+    if (!ngx_http_cache_purge_index_require(
+            q, SHA256(text.data, text.len, prefix + 1) != NULL,
+            NGX_HTTP_CACHE_ROCKSDB_IO, "index digest failed"))
+    {
+        return 0;
+    }
+    range.data = prefix;
+    range.len = sizeof(prefix);
+    cursor = &q->files;
+    ngx_http_cache_purge_index_cursor_open(
+        q, cursor, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, range,
+        ngx_http_cache_purge_op_empty, NULL);
+    id = 0;
+    candidates = 0;
+    while (ngx_http_cache_purge_index_cursor_next(q, cursor)) {
+        if (!ngx_http_cache_purge_index_require(q, ++candidates <= 16,
+                                                NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+                                                "index digest bucket limit")
+            || !ngx_http_cache_purge_index_require(
+                q, cursor->key.len == 41, NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                "invalid digest entry"))
+        {
+            break;
+        }
+        number.data = cursor->key.data + 33;
+        number.len = 8;
+        id = ngx_http_cache_purge_index_integer(q, number);
+        if (!ngx_http_cache_purge_index_value(q, cursor->handle, id, 0)) {
+            if (q->status != 0) {
+                break;
+            }
+            id = 0;
+            continue;
+        }
+        if (ngx_http_cache_purge_op_equal(
+                text, ngx_http_cache_purge_index_bytes(&q->lookup)))
+        {
+            break;
+        }
+        id = 0;
+    }
+    ngx_http_cache_purge_index_cursor_close(q, cursor);
+    return q->status == 0 ? id : 0;
+}
+
+static int
+ngx_http_cache_purge_index_record(ngx_http_cache_purge_query_t *q,
+    ngx_http_cache_purge_index_record_t *record)
+{
+    ngx_http_cache_purge_index_reader_t r;
+    ngx_http_cache_rocksdb_bytes_t      id, metadata, digest;
+    size_t                              i, j;
+    unsigned                            nonzero;
+
+    memset(record, 0, sizeof(*record));
+    r.query = q;
+    r.data = ngx_http_cache_purge_index_bytes(&q->scratch);
+    r.at = 0;
+    ngx_http_cache_purge_index_require(
+        q, ngx_http_cache_purge_index_read_number(&r, 1) == 1,
+        NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid file record version");
+    id = ngx_http_cache_purge_index_take(&r, 16);
+    if (id.len != 0) {
+        memcpy(record->id, id.data, 16);
+    }
+    (void) ngx_http_cache_purge_index_take(&r, 16);
+    record->state = ngx_http_cache_purge_index_read_number(&r, 1);
+    record->revision = ngx_http_cache_purge_index_read_number(&r, 8);
+    nonzero = 0;
+    for (i = 0; i < 16; i++) {
+        nonzero |= record->id[i];
+    }
+    ngx_http_cache_purge_index_require(q,
+                                       record->state >= 1 && record->state <= 3
+                                           && record->revision != 0 && nonzero,
+                                       NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                                       "invalid file identity/state/revision");
+    for (i = 0; i < 8; i++) {
+        record->refs[i] = ngx_http_cache_purge_index_read_number(&r, 8);
+        ngx_http_cache_purge_index_require(q, record->refs[i] != 0,
+                                           NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                                           "invalid value reference");
+    }
+    record->path = ngx_http_cache_purge_index_read_string(&r);
+    metadata = ngx_http_cache_purge_index_read_string(&r);
+    digest = ngx_http_cache_purge_index_read_string(&r);
+    ngx_http_cache_purge_index_require(
+        q,
+        record->path.len != 0
+            && record->path.len <= NGX_HTTP_CACHE_PURGE_INDEX_STRING
+            && metadata.len <= 16384 && digest.len == 32,
+        NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid file record fields");
+    record->tag_count = ngx_http_cache_purge_index_read_number(&r, 1);
+    if (!ngx_http_cache_purge_index_require(q, record->tag_count <= 64,
+                                            NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                                            "invalid TAG count"))
+    {
+        return 0;
+    }
+    for (i = 0; i < record->tag_count && q->status == 0; i++) {
+        record->tags[i] = ngx_http_cache_purge_index_read_number(&r, 8);
+        ngx_http_cache_purge_index_require(q, record->tags[i] != 0,
+                                           NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                                           "invalid TAG reference");
+        for (j = 0; j < i; j++) {
+            ngx_http_cache_purge_index_require(
+                q, record->tags[i] != record->tags[j],
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "duplicate TAG reference");
+        }
+    }
+    return ngx_http_cache_purge_index_require(q, r.at == r.data.len,
+                                              NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                                              "unexpected file record suffix");
+}
+
+static int
+ngx_http_cache_purge_index_compatible(ngx_http_cache_rocksdb_bytes_t key,
+    ngx_http_cache_rocksdb_bytes_t prefix, size_t suffix)
+{
+    return key.len == prefix.len + suffix
+           && memcmp(key.data, prefix.data, prefix.len) == 0;
+}
+
+static void
+ngx_http_cache_purge_index_open_files(ngx_http_cache_purge_query_t *q,
+    uint64_t key, ngx_http_cache_rocksdb_bytes_t after)
+{
+    ngx_http_cache_rocksdb_bytes_t range;
+
+    ngx_http_cache_purge_index_row(q, &q->key, 'k', key);
+    if (!ngx_http_cache_purge_index_require(
+            q,
+            ngx_http_cache_purge_index_get(
+                q, NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+                ngx_http_cache_purge_index_bytes(&q->key), q->outer.handle),
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+            "URL/key posting has no key record"))
+    {
+        return;
+    }
+    ngx_http_cache_purge_index_row(q, &q->key, 'F', key);
+    range = ngx_http_cache_purge_index_bytes(&q->key);
+    if (!ngx_http_cache_purge_index_compatible(after, range, 16)) {
+        after = ngx_http_cache_purge_op_empty;
+    }
+    ngx_http_cache_purge_index_cursor_open(q, &q->files,
+                                           NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+                                           range, after, q->outer.handle);
+}
+
+static void
+ngx_http_cache_purge_index_open_links(ngx_http_cache_purge_query_t *q,
+    uint64_t url, ngx_http_cache_rocksdb_bytes_t after,
+    ngx_http_cache_rocksdb_bytes_t file)
+{
+    ngx_http_cache_rocksdb_bytes_t range, number;
+
+    ngx_http_cache_purge_index_row(q, &q->key, 'A', url);
+    range = ngx_http_cache_purge_index_bytes(&q->key);
+    if (!ngx_http_cache_purge_index_compatible(after, range, 8)) {
+        after = ngx_http_cache_purge_op_empty;
+    }
+    ngx_http_cache_purge_index_cursor_open(q, &q->links,
+                                           NGX_HTTP_CACHE_ROCKSDB_URL, range,
+                                           after, q->outer.handle);
+    if (after.len != 0
+        && ngx_http_cache_purge_index_get(q, NGX_HTTP_CACHE_ROCKSDB_URL, after,
+                                          q->outer.handle))
+    {
+        ngx_http_cache_purge_index_set(q, &q->current_link, after);
+        number.data = after.data + 9;
+        number.len = 8;
+        ngx_http_cache_purge_index_open_files(
+            q, ngx_http_cache_purge_index_integer(q, number), file);
+    }
+}
+
+static void
+ngx_http_cache_purge_index_bookmark(ngx_http_cache_purge_query_t *q,
+    ngx_http_cache_rocksdb_bytes_t file)
+{
+    size_t         size;
+    unsigned char  version;
+
+    size = 57 + q->current_outer.len + q->current_link.len + file.len;
+    if (!ngx_http_cache_purge_index_reserve(q, &q->token, size)) {
+        return;
+    }
+    q->token.len = 0;
+    version = 1;
+    ngx_http_cache_purge_index_append(q, &q->token, &version, 1);
+    ngx_http_cache_purge_index_append(q, &q->token, q->signature, 32);
+    ngx_http_cache_purge_index_string(
+        q, &q->token, ngx_http_cache_purge_index_bytes(&q->current_outer));
+    ngx_http_cache_purge_index_string(
+        q, &q->token, ngx_http_cache_purge_index_bytes(&q->current_link));
+    ngx_http_cache_purge_index_string(q, &q->token, file);
+}
+
+static int
+ngx_http_cache_purge_index_candidate(ngx_http_cache_purge_query_t *q,
+    ngx_http_cache_purge_index_cursor_t *cursor, ngx_http_cache_rocksdb_cf_e cf,
+    ngx_http_cache_purge_index_match_t *out)
+{
+    ngx_http_cache_purge_index_record_t record;
+    ngx_http_cache_rocksdb_bytes_t      key, number;
+    unsigned char                       object[17];
+    uint64_t                            scope, tag;
+    size_t                              i;
+    int                                 tagged, found;
+
+    tagged = cf == NGX_HTTP_CACHE_ROCKSDB_TAG;
+    key = ngx_http_cache_purge_index_bytes(&cursor->key);
+    if (!ngx_http_cache_purge_index_require(q, key.len == (tagged ? 33U : 25U),
+                                            NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                                            "invalid file posting"))
+    {
+        return 0;
+    }
+    object[0] = 'O';
+    memcpy(object + 1, key.data + key.len - 16, 16);
+    number.data = object;
+    number.len = sizeof(object);
+    if (!ngx_http_cache_purge_index_require(
+            q,
+            ngx_http_cache_purge_index_get(q, NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+                                           number, cursor->handle),
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "file posting has no object")
+        || !ngx_http_cache_purge_index_record(q, &record))
+    {
+        return 0;
+    }
+    ngx_http_cache_purge_index_require(
+        q, memcmp(record.id, object + 1, 16) == 0,
+        NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "file posting identity mismatch");
+    number.data = key.data + 1;
+    number.len = 8;
+    scope = ngx_http_cache_purge_index_integer(q, number);
+    if (tagged) {
+        ngx_http_cache_purge_index_require(
+            q, record.refs[key.data[0] == 'N' ? 3 : 2] == scope,
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "TAG posting scope mismatch");
+        number.data = key.data + 9;
+        tag = ngx_http_cache_purge_index_integer(q, number);
+        found = 0;
+        for (i = 0; i < record.tag_count; i++) {
+            found |= record.tags[i] == tag;
+        }
+        ngx_http_cache_purge_index_require(q, found,
+                                           NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                                           "TAG posting is absent from file");
+    } else {
+        ngx_http_cache_purge_index_require(
+            q, record.refs[key.data[0] == 'F' ? 0 : 2] == scope,
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "file posting key/host mismatch");
+    }
+    if (q->status != 0 || record.state == 3) {
+        return 0;
+    }
+    ngx_http_cache_purge_index_bookmark(q, key);
+    if (q->status != 0) {
+        return 0;
+    }
+    memcpy(out->id, record.id, 16);
+    out->state = record.state;
+    out->revision = record.revision;
+    return 1;
+}
+
+static int
+ngx_http_cache_purge_index_recover(ngx_http_cache_purge_query_t *q,
+    ngx_http_cache_purge_index_match_t *out)
+{
+    ngx_http_cache_purge_index_record_t record;
+    ngx_http_cache_rocksdb_bytes_t      key, value, object_key;
+    unsigned char                       object[17];
+
+    if (!ngx_http_cache_purge_index_cursor_next(q, &q->outer)) {
+        ngx_http_cache_purge_index_cursor_close(q, &q->outer);
+        q->empty = 1;
+        return 0;
+    }
+    key = ngx_http_cache_purge_index_bytes(&q->outer.key);
+    value = ngx_http_cache_purge_index_bytes(&q->outer.value);
+    if (!ngx_http_cache_purge_index_require(
+            q, q->recovery == 'I' ? value.len == 16 : key.len == 17,
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid recovery queue row"))
+    {
+        return 0;
+    }
+    object[0] = 'O';
+    memcpy(object + 1, q->recovery == 'I' ? value.data : key.data + 1, 16);
+    object_key.data = object;
+    object_key.len = sizeof(object);
+    if (!ngx_http_cache_purge_index_require(
+            q,
+            ngx_http_cache_purge_index_get(q, NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+                                           object_key, q->outer.handle),
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "pending fill has no file record")
+        || !ngx_http_cache_purge_index_record(q, &record))
+    {
+        return 0;
+    }
+    ngx_http_cache_purge_index_require(
+        q, memcmp(record.id, object + 1, 16) == 0,
+        NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "recovery file ID mismatch");
+    if (q->recovery == 'I') {
+        ngx_http_cache_purge_index_row(q, &q->key, 'I', record.refs[4]);
+        ngx_http_cache_purge_index_append(q, &q->key, record.path.data,
+                                          record.path.len);
+        ngx_http_cache_purge_index_require(
+            q,
+            (record.state == 1 || record.state == 2)
+                && ngx_http_cache_purge_op_equal(
+                    key, ngx_http_cache_purge_index_bytes(&q->key)),
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+            "invalid pending-fill relationship");
+        if (q->status == 0 && record.state == 2) {
+            q->key.data[0] = 'P';
+            ngx_http_cache_purge_index_require(
+                q,
+                ngx_http_cache_purge_index_get(
+                    q, NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+                    ngx_http_cache_purge_index_bytes(&q->key), q->outer.handle)
+                    && q->scratch.len == 16
+                    && memcmp(q->scratch.data, record.id, 16) == 0,
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                "unpublished file has no matching current path");
+        }
+    } else {
+        ngx_http_cache_purge_index_require(
+            q,
+            record.state == 3
+                && record.revision
+                       == ngx_http_cache_purge_index_integer(q, value),
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+            "invalid retired-file relationship");
+    }
+    if (q->status != 0) {
+        return 0;
+    }
+    ngx_http_cache_purge_index_bookmark(q, key);
+    if (q->status != 0) {
+        return 0;
+    }
+    memcpy(out->id, record.id, 16);
+    out->state = record.state;
+    out->revision = record.revision;
+    return 1;
+}
+
+static void
+ngx_http_cache_purge_index_select(ngx_http_cache_purge_query_t *q,
+    const ngx_http_cache_purge_selector_t *selector,
+    ngx_http_cache_rocksdb_bytes_t resume)
+{
+    ngx_http_cache_purge_index_reader_t r;
+    ngx_http_cache_rocksdb_bytes_t      saved[3], signature, range, number;
+    uint64_t                            id, scope;
+    unsigned char                       kind;
+    int                                 tagged, url;
+
+    memset(saved, 0, sizeof(saved));
+    if (q->recovery) {
+        ngx_http_cache_purge_index_append(q, &q->key, "index-recovery-v1:", 18);
+        ngx_http_cache_purge_index_append(q, &q->key, &q->recovery, 1);
+        ngx_http_cache_purge_index_append(q, &q->prefix, &q->recovery, 1);
+    } else {
+        if (!ngx_http_cache_purge_index_require(
+                q,
+                selector != NULL
+                    && selector->kind <= NGX_HTTP_CACHE_PURGE_HOST_TAG,
+                NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid index selector"))
+        {
+            return;
+        }
+        q->kind = selector->kind;
+        tagged = q->kind == NGX_HTTP_CACHE_PURGE_NAMESPACE_TAG
+                 || q->kind == NGX_HTTP_CACHE_PURGE_HOST_TAG;
+        if (!ngx_http_cache_purge_index_require(
+                q,
+                (selector->value.len == 0 || selector->value.data != NULL)
+                    && (selector->scope.len == 0
+                        || selector->scope.data != NULL),
+                NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid selector bytes")
+            || !ngx_http_cache_purge_index_require(
+                q,
+                selector->value.len <= NGX_HTTP_CACHE_PURGE_INDEX_STRING
+                    && selector->scope.len <= NGX_HTTP_CACHE_PURGE_INDEX_STRING,
+                NGX_HTTP_CACHE_ROCKSDB_LIMIT, "index selector too long")
+            || !ngx_http_cache_purge_index_require(
+                q,
+                (!tagged || selector->value.len <= 1024)
+                    && (tagged ? selector->scope.len != 0 :
+                                 selector->scope.len == 0)
+                    && (selector->value.len != 0
+                        || q->kind == NGX_HTTP_CACHE_PURGE_KEY_PREFIX
+                        || q->kind == NGX_HTTP_CACHE_PURGE_URL_PREFIX),
+                NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid selector scope/value"))
+        {
+            return;
+        }
+        kind = (unsigned char) q->kind;
+        ngx_http_cache_purge_index_append(q, &q->key, &kind, 1);
+        ngx_http_cache_purge_index_string(q, &q->key, selector->value);
+        ngx_http_cache_purge_index_string(q, &q->key, selector->scope);
+    }
+    if (!ngx_http_cache_purge_index_require(
+            q,
+            q->status == 0
+                && SHA256(q->key.data, q->key.len, q->signature) != NULL,
+            NGX_HTTP_CACHE_ROCKSDB_IO, "index query signature failed"))
+    {
+        return;
+    }
+    if (resume.len != 0) {
+        r.query = q;
+        r.data = resume;
+        r.at = 0;
+        kind = ngx_http_cache_purge_index_read_number(&r, 1);
+        signature = ngx_http_cache_purge_index_take(&r, 32);
+        if (!ngx_http_cache_purge_index_require(
+                q,
+                kind == 1 && signature.len == 32
+                    && memcmp(signature.data, q->signature, 32) == 0,
+                NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                "bookmark belongs to another selector"))
+        {
+            return;
+        }
+        saved[0] = ngx_http_cache_purge_index_read_string(&r);
+        saved[1] = ngx_http_cache_purge_index_read_string(&r);
+        saved[2] = ngx_http_cache_purge_index_read_string(&r);
+        if (!ngx_http_cache_purge_index_require(q, r.at == r.data.len,
+                                                NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                                                "unexpected bookmark suffix"))
+        {
+            return;
+        }
+        ngx_http_cache_purge_index_set(q, &q->token, resume);
+    }
+    q->outer_cf = NGX_HTTP_CACHE_ROCKSDB_DEFAULT;
+    if (q->recovery) {
+        if (resume.len != 0
+            && !ngx_http_cache_purge_index_require(
+                q,
+                saved[0].len == 0 && saved[1].len == 0
+                    && (q->recovery == 'I' ? saved[2].len > 9 :
+                                             saved[2].len == 17)
+                    && saved[2].data[0] == q->recovery,
+                NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid recovery position"))
+        {
+            return;
+        }
+        ngx_http_cache_purge_index_cursor_open(
+            q, &q->outer, q->outer_cf,
+            ngx_http_cache_purge_index_bytes(&q->prefix), saved[2], NULL);
+        return;
+    }
+    switch (q->kind) {
+    case NGX_HTTP_CACHE_PURGE_KEY:
+    case NGX_HTTP_CACHE_PURGE_URL:
+        url = q->kind == NGX_HTTP_CACHE_PURGE_URL;
+        q->outer_cf =
+            url ? NGX_HTTP_CACHE_ROCKSDB_URL : NGX_HTTP_CACHE_ROCKSDB_DEFAULT;
+        q->key.len = 0;
+        kind = url ? 'U' : 'K';
+        ngx_http_cache_purge_index_append(q, &q->key, &kind, 1);
+        ngx_http_cache_purge_index_append(q, &q->key, selector->value.data,
+                                          selector->value.len);
+        if (!ngx_http_cache_purge_index_get(
+                q, q->outer_cf, ngx_http_cache_purge_index_bytes(&q->key),
+                NULL))
+        {
+            q->empty = 1;
+            return;
+        }
+        id = ngx_http_cache_purge_index_integer(
+            q, ngx_http_cache_purge_index_bytes(&q->scratch));
+        ngx_http_cache_purge_index_row(q, &q->prefix, url ? 'A' : 'F', id);
+        break;
+    case NGX_HTTP_CACHE_PURGE_KEY_PREFIX:
+    case NGX_HTTP_CACHE_PURGE_URL_PREFIX:
+        url = q->kind == NGX_HTTP_CACHE_PURGE_URL_PREFIX;
+        kind = url ? 'U' : 'K';
+        q->outer_cf =
+            url ? NGX_HTTP_CACHE_ROCKSDB_URL : NGX_HTTP_CACHE_ROCKSDB_DEFAULT;
+        ngx_http_cache_purge_index_append(q, &q->prefix, &kind, 1);
+        ngx_http_cache_purge_index_append(q, &q->prefix, selector->value.data,
+                                          selector->value.len);
+        break;
+    case NGX_HTTP_CACHE_PURGE_HOST:
+        id = ngx_http_cache_purge_index_find(q, selector->value);
+        if (id == 0) {
+            q->empty = 1;
+            return;
+        }
+        ngx_http_cache_purge_index_row(q, &q->prefix, 'H', id);
+        break;
+    default:
+        scope = ngx_http_cache_purge_index_find(q, selector->scope);
+        id = ngx_http_cache_purge_index_find(q, selector->value);
+        if (scope == 0 || id == 0) {
+            q->empty = 1;
+            return;
+        }
+        ngx_http_cache_purge_index_row(
+            q, &q->prefix,
+            q->kind == NGX_HTTP_CACHE_PURGE_NAMESPACE_TAG ? 'N' : 'H', scope);
+        ngx_http_cache_purge_index_number(q, &q->prefix, id);
+        q->outer_cf = NGX_HTTP_CACHE_ROCKSDB_TAG;
+        break;
+    }
+    range = ngx_http_cache_purge_index_bytes(&q->prefix);
+    if (q->kind == NGX_HTTP_CACHE_PURGE_KEY_PREFIX
+        || q->kind == NGX_HTTP_CACHE_PURGE_URL_PREFIX)
+    {
+        if (!ngx_http_cache_purge_index_require(
+                q,
+                saved[0].len == 0
+                    || (saved[0].len >= range.len
+                        && memcmp(saved[0].data, range.data, range.len) == 0),
+                NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                "bookmark is outside selector prefix"))
+        {
+            return;
+        }
+        ngx_http_cache_purge_index_cursor_open(q, &q->outer, q->outer_cf, range,
+                                               saved[0], NULL);
+        if (saved[0].len != 0
+            && ngx_http_cache_purge_index_get(q, q->outer_cf, saved[0],
+                                              q->outer.handle))
+        {
+            ngx_http_cache_purge_index_set(q, &q->current_outer, saved[0]);
+            id = ngx_http_cache_purge_index_integer(
+                q, ngx_http_cache_purge_index_bytes(&q->scratch));
+            if (q->kind == NGX_HTTP_CACHE_PURGE_KEY_PREFIX) {
+                ngx_http_cache_purge_index_open_files(q, id, saved[2]);
+            } else {
+                ngx_http_cache_purge_index_open_links(q, id, saved[1],
+                                                      saved[2]);
+            }
+        }
+    } else if (q->kind == NGX_HTTP_CACHE_PURGE_URL) {
+        if (!ngx_http_cache_purge_index_require(
+                q, saved[0].len == 0, NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                "unexpected URL bookmark outer key"))
+        {
+            return;
+        }
+        if (!ngx_http_cache_purge_index_compatible(saved[1], range, 8)) {
+            saved[1] = ngx_http_cache_purge_op_empty;
+        }
+        ngx_http_cache_purge_index_cursor_open(q, &q->outer, q->outer_cf, range,
+                                               saved[1], NULL);
+        if (saved[1].len != 0
+            && ngx_http_cache_purge_index_get(q, q->outer_cf, saved[1],
+                                              q->outer.handle))
+        {
+            ngx_http_cache_purge_index_set(q, &q->current_link, saved[1]);
+            number.data = saved[1].data + 9;
+            number.len = 8;
+            ngx_http_cache_purge_index_open_files(
+                q, ngx_http_cache_purge_index_integer(q, number), saved[2]);
+        }
+    } else {
+        if (!ngx_http_cache_purge_index_require(
+                q, saved[0].len == 0 && saved[1].len == 0,
+                NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                "unexpected direct bookmark join"))
+        {
+            return;
+        }
+        if (!ngx_http_cache_purge_index_compatible(saved[2], range, 16)) {
+            saved[2] = ngx_http_cache_purge_op_empty;
+        }
+        ngx_http_cache_purge_index_cursor_open(q, &q->outer, q->outer_cf, range,
+                                               saved[2], NULL);
+    }
+}
+
+int
+ngx_http_cache_purge_query_close(ngx_http_cache_purge_query_t **query,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_query_t         *q;
+    ngx_http_cache_purge_index_buffer_t  *buffers[13];
+    ngx_http_cache_rocksdb_cursor_t     **handles[3];
+    ngx_http_cache_rocksdb_error_t        failure;
+    size_t                                i;
+    int                                   rc;
+
+    if (error != NULL) {
+        memset(error, 0, sizeof(*error));
+    }
+    if (query == NULL || *query == NULL) {
+        return 0;
+    }
+    q = *query;
+    handles[0] = &q->files.handle;
+    handles[1] = &q->links.handle;
+    handles[2] = &q->outer.handle;
+    for (i = 0; i < 3; i++) {
+        if (*handles[i] == NULL) {
+            continue;
+        }
+        rc = ngx_http_cache_rocksdb_cursor_close(handles[i], &failure);
+        if (rc != 0) {
+            if (error != NULL) {
+                *error = failure;
+            }
+            return rc;
+        }
+    }
+    buffers[0] = &q->outer.key;
+    buffers[1] = &q->outer.value;
+    buffers[2] = &q->links.key;
+    buffers[3] = &q->links.value;
+    buffers[4] = &q->files.key;
+    buffers[5] = &q->files.value;
+    buffers[6] = &q->prefix;
+    buffers[7] = &q->current_outer;
+    buffers[8] = &q->current_link;
+    buffers[9] = &q->token;
+    buffers[10] = &q->scratch;
+    buffers[11] = &q->lookup;
+    buffers[12] = &q->key;
+    for (i = 0; i < 13; i++) {
+        free(buffers[i]->data);
+    }
+    free(q);
+    *query = NULL;
+    return 0;
+}
+
+int
+ngx_http_cache_purge_query_open(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_selector_t *selector, unsigned mode,
+    ngx_http_cache_rocksdb_bytes_t bookmark, ngx_http_cache_purge_query_t **out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_query_t  *q;
+    int                            rc;
+
+    if (out != NULL) {
+        *out = NULL;
+    }
+    if (error != NULL) {
+        memset(error, 0, sizeof(*error));
+    }
+    rc = NGX_HTTP_CACHE_ROCKSDB_INVALID;
+    if (store == NULL || out == NULL
+        || mode > NGX_HTTP_CACHE_PURGE_QUERY_RETIRED
+        || (mode != 0 && selector != NULL)
+        || !ngx_http_cache_purge_op_bytes_valid(bookmark, 33024))
+    {
+        if (error != NULL) {
+            error->code = rc;
+            snprintf(error->message, sizeof(error->message),
+                     "invalid index query arguments");
+        }
+        return rc;
+    }
+    q = calloc(1, sizeof(*q));
+    if (q == NULL) {
+        if (error != NULL) {
+            error->code = NGX_HTTP_CACHE_ROCKSDB_LIMIT;
+            snprintf(error->message, sizeof(error->message),
+                     "index query allocation failed");
+        }
+        return NGX_HTTP_CACHE_ROCKSDB_LIMIT;
+    }
+    q->store = store;
+    q->bytes = sizeof(*q);
+    q->recovery = mode == NGX_HTTP_CACHE_PURGE_QUERY_PENDING ? 'I' :
+                  mode == NGX_HTTP_CACHE_PURGE_QUERY_RETIRED ? 'g' :
+                                                               0;
+    ngx_http_cache_purge_index_select(q, selector, bookmark);
+    rc = q->status;
+    if (rc != 0) {
+        if (error != NULL) {
+            *error = q->error;
+        }
+        ngx_http_cache_purge_query_close(&q, NULL);
+        return rc;
+    }
+    *out = q;
+    return 0;
+}
+
+int
+ngx_http_cache_purge_query_next(ngx_http_cache_purge_query_t *q,
+    ngx_http_cache_purge_index_match_t *match,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_rocksdb_bytes_t  number;
+    uint64_t                        id;
+    int                             found;
+
+    if (match != NULL) {
+        memset(match, 0, sizeof(*match));
+    }
+    if (error != NULL) {
+        memset(error, 0, sizeof(*error));
+    }
+    if (q == NULL || match == NULL) {
+        if (error != NULL) {
+            error->code = NGX_HTTP_CACHE_ROCKSDB_INVALID;
+            snprintf(error->message, sizeof(error->message),
+                     "invalid index query output");
+        }
+        return NGX_HTTP_CACHE_ROCKSDB_INVALID;
+    }
+    found = 0;
+    if (q->recovery && !q->empty && q->status == 0) {
+        found = ngx_http_cache_purge_index_recover(q, match);
+    }
+    while (!q->recovery && !q->empty && q->status == 0) {
+        if (q->files.handle != NULL) {
+            while (ngx_http_cache_purge_index_cursor_next(q, &q->files)) {
+                found = ngx_http_cache_purge_index_candidate(
+                    q, &q->files, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, match);
+                if (found) {
+                    break;
+                }
+            }
+            if (found || q->status != 0) {
+                break;
+            }
+            ngx_http_cache_purge_index_cursor_close(q, &q->files);
+        }
+        if (q->links.handle != NULL) {
+            if (ngx_http_cache_purge_index_cursor_next(q, &q->links)) {
+                if (!ngx_http_cache_purge_index_require(
+                        q, q->links.key.len == 17,
+                        NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                        "invalid URL/key posting"))
+                {
+                    break;
+                }
+                ngx_http_cache_purge_index_set(
+                    q, &q->current_link,
+                    ngx_http_cache_purge_index_bytes(&q->links.key));
+                number.data = q->links.key.data + 9;
+                number.len = 8;
+                ngx_http_cache_purge_index_open_files(
+                    q, ngx_http_cache_purge_index_integer(q, number),
+                    ngx_http_cache_purge_op_empty);
+                continue;
+            }
+            ngx_http_cache_purge_index_cursor_close(q, &q->links);
+            q->current_link.len = 0;
+        }
+        if (!ngx_http_cache_purge_index_cursor_next(q, &q->outer)) {
+            ngx_http_cache_purge_index_cursor_close(q, &q->outer);
+            q->empty = 1;
+            break;
+        }
+        switch (q->kind) {
+        case NGX_HTTP_CACHE_PURGE_KEY_PREFIX:
+        case NGX_HTTP_CACHE_PURGE_URL_PREFIX:
+            ngx_http_cache_purge_index_set(
+                q, &q->current_outer,
+                ngx_http_cache_purge_index_bytes(&q->outer.key));
+            q->current_link.len = 0;
+            id = ngx_http_cache_purge_index_integer(
+                q, ngx_http_cache_purge_index_bytes(&q->outer.value));
+            if (q->kind == NGX_HTTP_CACHE_PURGE_KEY_PREFIX) {
+                ngx_http_cache_purge_index_open_files(
+                    q, id, ngx_http_cache_purge_op_empty);
+            } else {
+                ngx_http_cache_purge_index_open_links(
+                    q, id, ngx_http_cache_purge_op_empty,
+                    ngx_http_cache_purge_op_empty);
+            }
+            break;
+        case NGX_HTTP_CACHE_PURGE_URL:
+            if (!ngx_http_cache_purge_index_require(
+                    q, q->outer.key.len == 17, NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                    "invalid URL/key posting"))
+            {
+                break;
+            }
+            ngx_http_cache_purge_index_set(
+                q, &q->current_link,
+                ngx_http_cache_purge_index_bytes(&q->outer.key));
+            number.data = q->outer.key.data + 9;
+            number.len = 8;
+            ngx_http_cache_purge_index_open_files(
+                q, ngx_http_cache_purge_index_integer(q, number),
+                ngx_http_cache_purge_op_empty);
+            break;
+        default:
+            found = ngx_http_cache_purge_index_candidate(q, &q->outer,
+                                                         q->outer_cf, match);
+            break;
+        }
+        if (found) {
+            break;
+        }
+    }
+    if (q->status != 0) {
+        ngx_http_cache_purge_index_cursor_close(q, &q->files);
+        ngx_http_cache_purge_index_cursor_close(q, &q->links);
+        ngx_http_cache_purge_index_cursor_close(q, &q->outer);
+        if (error != NULL) {
+            *error = q->error;
+        }
+        memset(match, 0, sizeof(*match));
+        return q->status;
+    }
+    return found ? NGX_HTTP_CACHE_ROCKSDB_OK : NGX_HTTP_CACHE_ROCKSDB_DONE;
+}
+
+ngx_http_cache_rocksdb_bytes_t
+ngx_http_cache_purge_query_bookmark(const ngx_http_cache_purge_query_t *q)
+{
+    return q != NULL ? ngx_http_cache_purge_index_bytes(&q->token) :
+                       ngx_http_cache_purge_op_empty;
+}

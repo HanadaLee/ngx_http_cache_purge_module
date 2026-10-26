@@ -5,8 +5,9 @@ This repository builds two HTTP modules in persistent mode:
 `ngx_http_cache_purge_module` implements HTTP cache indexing and purge behavior.
 Both modules remain in this repository. The engine bridge is isolated in
 `rocksdb/`; the migration of the remaining C++ purge implementation to C is in
-progress. File markers, OFD leases, and the durable operation ledger already use
-C implementations.
+progress. File markers, OFD leases, the durable operation ledger, and index
+queries already use C implementations. Index mutations still use C++ during
+this migration.
 
 HTTP cache invalidation for nginx proxy, FastCGI, SCGI, and uWSGI caches.
 

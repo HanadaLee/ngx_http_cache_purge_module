@@ -493,6 +493,35 @@ void ngx_http_cache_purge_operation_free(ngx_http_cache_purge_operation_t *op);
 void ngx_http_cache_purge_operation_page_free(
     ngx_http_cache_purge_operation_page_t *page);
 
+#define NGX_HTTP_CACHE_PURGE_QUERY_SELECT   0
+#define NGX_HTTP_CACHE_PURGE_QUERY_PENDING  1
+#define NGX_HTTP_CACHE_PURGE_QUERY_RETIRED  2
+
+typedef struct ngx_http_cache_purge_query_s  ngx_http_cache_purge_query_t;
+
+typedef struct {
+    unsigned char  id[16];
+    uint64_t       revision;
+    uint32_t       state;
+} ngx_http_cache_purge_index_match_t;
+
+/* Executor-only, against an initialized index. Selectors and bookmarks are
+ * borrowed only during open. A query owns bounded buffers and snapshot cursors;
+ * close it even after DONE or EXPIRED. next returns OK, DONE, or an error.
+ * bookmark is borrowed until the next call or close and is advanced only after
+ * a complete match. Persist it after handling that match, not before. */
+int ngx_http_cache_purge_query_open(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_selector_t *selector, unsigned mode,
+    ngx_http_cache_rocksdb_bytes_t bookmark, ngx_http_cache_purge_query_t **out,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_query_next(ngx_http_cache_purge_query_t *query,
+    ngx_http_cache_purge_index_match_t *match,
+    ngx_http_cache_rocksdb_error_t *error);
+ngx_http_cache_rocksdb_bytes_t
+ngx_http_cache_purge_query_bookmark(const ngx_http_cache_purge_query_t *query);
+int ngx_http_cache_purge_query_close(ngx_http_cache_purge_query_t **query,
+    ngx_http_cache_rocksdb_error_t *error);
+
 #ifdef __cplusplus
 }
 #endif

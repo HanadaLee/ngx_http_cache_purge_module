@@ -778,214 +778,49 @@ size_t Index::collect_keys(size_t edge_budget) {
     tx.commit(); return removed + (!remaining ? 1 : 0);
 }
 
-struct Query::Impl {
-    ngx_http_cache_rocksdb_t *store;
-    Selector selector;
-    Cursor outer, links, files;
-    Cf outer_cf = common;
-    std::string prefix, current_outer, current_link, last_file, token, signature;
-    bool empty = false;
-    char recovery = 0;
-
-    Impl(ngx_http_cache_rocksdb_t *s, const std::string &resume, char queue) : store(s), recovery(queue) {
-        prefix.assign(1, queue); signature = digest("index-recovery-v1:" + prefix);
-        std::string after;
-        if (!resume.empty()) {
-            require(resume.size() <= max_string + 256, NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid pending-fill bookmark");
-            Reader r{resume};
-            require(r.byte() == 1 && r.take(32) == signature && r.string().empty() && r.string().empty(),
-                    NGX_HTTP_CACHE_ROCKSDB_INVALID, "bookmark is not for pending fills");
-            after = r.string(); r.end();
-            require((queue == 'I' ? after.size() > 9 : after.size() == 17) && after[0] == queue,
-                    NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid recovery position");
-            token = resume;
-        }
-        outer.open(store, common, prefix, after);
-    }
-
-    Impl(ngx_http_cache_rocksdb_t *s, Selector selected, const std::string &resume)
-        : store(s), selector(std::move(selected)) {
-        require(selector.kind >= SelectorKind::key && selector.kind <= SelectorKind::host_tag,
-                NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid index selector");
-        require(selector.value.size() <= max_string && selector.scope.size() <= max_string,
-                NGX_HTTP_CACHE_ROCKSDB_LIMIT, "index selector too long");
-        bool tag = selector.kind == SelectorKind::namespace_tag || selector.kind == SelectorKind::host_tag;
-        require(!tag || selector.value.size() <= 1024, NGX_HTTP_CACHE_ROCKSDB_INVALID, "TAG selector too long");
-        require(tag ? !selector.scope.empty() : selector.scope.empty(), NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid selector scope");
-        require(!selector.value.empty() || selector.kind == SelectorKind::key_prefix || selector.kind == SelectorKind::url_prefix,
-                NGX_HTTP_CACHE_ROCKSDB_INVALID, "empty index selector");
-        Writer identity; identity.byte(static_cast<unsigned>(selector.kind)); identity.string(selector.value); identity.string(selector.scope);
-        signature = digest(identity.data);
-        std::string saved_outer, saved_link, saved_file;
-        if (!resume.empty()) {
-            require(resume.size() <= max_string + 256, NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid index bookmark size");
-            Reader r{resume};
-            require(r.byte() == 1 && r.take(32) == signature, NGX_HTTP_CACHE_ROCKSDB_INVALID, "bookmark belongs to another selector");
-            saved_outer = r.string(); saved_link = r.string(); saved_file = r.string(); r.end();
-            token = resume;
-        }
-        Transaction tx(store); Values values(tx);
-        uint64_t id = 0;
-        switch (selector.kind) {
-        case SelectorKind::key:
-        case SelectorKind::url: {
-            bool url = selector.kind == SelectorKind::url;
-            auto value = tx.get(url ? urls : common, std::string(1, url ? 'U' : 'K') + selector.value);
-            if (!value) { empty = true; return; }
-            id = integer(*value); prefix = row(url ? 'A' : 'F', id); outer_cf = url ? urls : common;
-            break;
-        }
-        case SelectorKind::key_prefix: prefix = "K" + selector.value; break;
-        case SelectorKind::url_prefix: prefix = "U" + selector.value; outer_cf = urls; break;
-        case SelectorKind::host:
-            id = values.find(selector.value);
-            if (!id) { empty = true; return; }
-            prefix = row('H', id); break;
-        case SelectorKind::namespace_tag:
-        case SelectorKind::host_tag: {
-            uint64_t scope = values.find(selector.scope), value = values.find(selector.value);
-            if (!scope || !value) { empty = true; return; }
-            prefix = row(selector.kind == SelectorKind::namespace_tag ? 'N' : 'H', scope) + number(value);
-            outer_cf = tags; break;
-        }
-        }
-        auto compatible = [](const std::string &key, const std::string &range, size_t size) {
-            return key.empty() || (key.size() == size && key.compare(0, range.size(), range) == 0);
-        };
-        if (selector.kind == SelectorKind::key_prefix || selector.kind == SelectorKind::url_prefix) {
-            require(saved_outer.empty() || saved_outer.compare(0, prefix.size(), prefix) == 0,
-                    NGX_HTTP_CACHE_ROCKSDB_INVALID, "bookmark is outside selector prefix");
-            outer.open(store, outer_cf, prefix, saved_outer);
-            if (!saved_outer.empty()) {
-                auto value = read(store, outer_cf, saved_outer, outer.handle);
-                if (value) {
-                    current_outer = saved_outer;
-                    if (selector.kind == SelectorKind::key_prefix) open_files(integer(*value), saved_file);
-                    else open_links(integer(*value), saved_link, saved_file);
-                }
-            }
-        } else if (selector.kind == SelectorKind::url) {
-            require(saved_outer.empty(), NGX_HTTP_CACHE_ROCKSDB_INVALID, "unexpected URL bookmark outer key");
-            if (!compatible(saved_link, prefix, prefix.size() + 8)) saved_link.clear();
-            outer.open(store, outer_cf, prefix, saved_link);
-            if (!saved_link.empty() && read(store, urls, saved_link, outer.handle)) {
-                current_link = saved_link; open_files(integer(saved_link.substr(9)), saved_file);
-            }
-        } else {
-            require(saved_outer.empty() && saved_link.empty(), NGX_HTTP_CACHE_ROCKSDB_INVALID, "unexpected direct bookmark join");
-            if (!compatible(saved_file, prefix, prefix.size() + 16)) saved_file.clear();
-            outer.open(store, outer_cf, prefix, saved_file);
-        }
-    }
-
-    void open_files(uint64_t key, const std::string &after = "") {
-        auto count = read(store, common, row('k', key), outer.handle);
-        require(count.has_value(), NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "URL/key posting has no key record");
-        const std::string range = row('F', key);
-        std::string resume = after;
-        if (resume.size() != range.size() + 16 || resume.compare(0, range.size(), range) != 0) resume.clear();
-        files.open(store, common, range, resume, outer.handle);
-    }
-    void open_links(uint64_t url, const std::string &after = "", const std::string &file = "") {
-        const std::string range = row('A', url);
-        std::string resume = after;
-        if (resume.size() != range.size() + 8 || resume.compare(0, range.size(), range) != 0) resume.clear();
-        links.open(store, urls, range, resume, outer.handle);
-        if (!resume.empty() && read(store, urls, resume, outer.handle)) {
-            current_link = resume; open_files(integer(resume.substr(9)), file);
-        }
-    }
-    bool candidate(const std::string &key, Cf cf, ngx_http_cache_rocksdb_cursor_t *view, Match &output) {
-        bool tagged = cf == tags;
-        require(key.size() == (tagged ? 33U : 25U), NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid file posting");
-        FileId id = file_id(key.substr(key.size() - 16));
-        auto value = read(store, common, object(id), view);
-        require(value.has_value(), NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "file posting has no object");
-        auto record = decode_record(*value);
-        require(record.id == id, NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "file posting identity mismatch");
-        uint64_t scope = integer(key.substr(1, 8));
-        if (tagged) {
-            require((key[0] == 'N' ? record.ns : record.host) == scope,
-                    NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "TAG posting scope mismatch");
-            uint64_t tag = integer(key.substr(9, 8));
-            require(std::find(record.tag_ids.begin(), record.tag_ids.end(), tag) != record.tag_ids.end(),
-                    NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "TAG posting is absent from file");
-        } else {
-            require((key[0] == 'F' ? record.key : record.host) == scope,
-                    NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "file posting key/host mismatch");
-        }
-        if (record.state == FileState::retired) return false;
-        output = match(record); last_file = key;
-        Writer w; w.byte(1); w.data += signature; w.string(current_outer); w.string(current_link); w.string(last_file);
-        token = std::move(w.data); return true;
-    }
-    bool next(Match &output) {
-        if (empty) return false;
-        std::string key, value;
-        if (recovery) {
-            if (!outer.next(key, value)) { outer.close(); empty = true; return false; }
-            require(recovery == 'I' || key.size() == 17, NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid retired-file queue key");
-            auto id = recovery == 'I' ? file_id(value) : file_id(key.substr(1));
-            auto body = read(store, common, object(id), outer.handle);
-            require(body.has_value(), NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "pending fill has no file record");
-            auto record = decode_record(*body);
-            require(record.id == id, NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "recovery file ID mismatch");
-            if (recovery == 'I') {
-                require((record.state == FileState::prepared || record.state == FileState::committed)
-                        && key == lease(record.root, record.path),
-                        NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid pending-fill relationship");
-                if (record.state == FileState::committed) {
-                    auto current = read(store, common, location(record.root, record.path), outer.handle);
-                    require(current && *current == id_bytes(id), NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
-                            "unpublished file has no matching current path");
-                }
-            }
-            else require(record.state == FileState::retired && record.revision == integer(value),
-                         NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid retired-file relationship");
-            output = match(record);
-            Writer w; w.byte(1); w.data += signature; w.string(""); w.string(""); w.string(key);
-            token = std::move(w.data); return true;
-        }
-        for (;;) {
-            if (files.handle) {
-                while (files.next(key, value)) if (candidate(key, common, files.handle, output)) return true;
-                files.close();
-            }
-            if (links.handle) {
-                if (links.next(key, value)) {
-                    require(key.size() == 17, NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid URL/key posting");
-                    current_link = key; open_files(integer(key.substr(9))); continue;
-                }
-                links.close(); current_link.clear();
-            }
-            if (!outer.next(key, value)) { outer.close(); empty = true; return false; }
-            switch (selector.kind) {
-            case SelectorKind::key_prefix:
-                current_outer = key; current_link.clear(); open_files(integer(value)); break;
-            case SelectorKind::url_prefix:
-                current_outer = key; current_link.clear(); open_links(integer(value)); break;
-            case SelectorKind::url:
-                require(key.size() == 17, NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid URL/key posting");
-                current_link = key; open_files(integer(key.substr(9))); break;
-            default:
-                if (candidate(key, outer_cf, outer.handle, output)) return true;
-            }
-        }
-    }
-};
-
-Query::Query(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
-Query::~Query() = default;
-bool Query::next(Match &match) { return impl_->next(match); }
-std::string Query::bookmark() const { return impl_->token; }
+/* Conversion-only adapter while index mutations migrate to C. */
+Query::~Query() {
+    ngx_http_cache_purge_query_close(&native_, nullptr);
+}
+bool Query::next(Match &match) {
+    ngx_http_cache_purge_index_match_t value{};
+    ngx_http_cache_rocksdb_error_t error;
+    int rc = ngx_http_cache_purge_query_next(native_, &value, &error);
+    if (rc == NGX_HTTP_CACHE_ROCKSDB_DONE) return false;
+    checked(rc, error);
+    std::memcpy(match.id.data(), value.id, match.id.size());
+    match.revision = value.revision;
+    match.state = static_cast<FileState>(value.state);
+    return true;
+}
+std::string Query::bookmark() const {
+    auto value = ngx_http_cache_purge_query_bookmark(native_);
+    return value.len ? std::string(reinterpret_cast<const char *>(value.data), value.len) : std::string{};
+}
 std::unique_ptr<Query> Index::query(const Selector &selector, const std::string &bookmark) {
-    return std::unique_ptr<Query>(new Query(std::make_unique<Query::Impl>(store_, selector, bookmark)));
+    std::unique_ptr<Query> result(new Query);
+    ngx_http_cache_purge_selector_t value{static_cast<uint32_t>(selector.kind), bytes(selector.value), bytes(selector.scope)};
+    ngx_http_cache_rocksdb_error_t error;
+    int rc = ngx_http_cache_purge_query_open(store_, &value, NGX_HTTP_CACHE_PURGE_QUERY_SELECT,
+        bytes(bookmark), &result->native_, &error);
+    checked(rc, error);
+    return result;
 }
 std::unique_ptr<Query> Index::pending_fills(const std::string &bookmark) {
-    return std::unique_ptr<Query>(new Query(std::make_unique<Query::Impl>(store_, bookmark, 'I')));
+    std::unique_ptr<Query> result(new Query);
+    ngx_http_cache_rocksdb_error_t error;
+    int rc = ngx_http_cache_purge_query_open(store_, nullptr, NGX_HTTP_CACHE_PURGE_QUERY_PENDING,
+        bytes(bookmark), &result->native_, &error);
+    checked(rc, error);
+    return result;
 }
 std::unique_ptr<Query> Index::retired_files(const std::string &bookmark) {
-    return std::unique_ptr<Query>(new Query(std::make_unique<Query::Impl>(store_, bookmark, 'g')));
+    std::unique_ptr<Query> result(new Query);
+    ngx_http_cache_rocksdb_error_t error;
+    int rc = ngx_http_cache_purge_query_open(store_, nullptr, NGX_HTTP_CACHE_PURGE_QUERY_RETIRED,
+        bytes(bookmark), &result->native_, &error);
+    checked(rc, error);
+    return result;
 }
 
 } // namespace ngx_http_cache_purge
