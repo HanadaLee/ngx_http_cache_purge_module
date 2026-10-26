@@ -22,6 +22,7 @@ import time
 p = argparse.ArgumentParser()
 p.add_argument('--nginx', type=Path, required=True)
 p.add_argument('--nginx-ref', default='HEAD')
+p.add_argument('--core-working-tree', action='store_true', help='Apply the inspected core source delta to the archived ref')
 p.add_argument('--key', type=Path, required=True)
 p.add_argument('--libraries', type=Path, required=True)
 p.add_argument('--output', type=Path, required=True)
@@ -41,6 +42,11 @@ for source, destination in [(repo, addon), (a.key, key)]:
 revision = subprocess.check_output(['git', '-C', str(a.nginx), 'rev-parse', a.nginx_ref], text=True).strip()
 archive = subprocess.check_output(['git', '-c', 'core.autocrlf=false', '-C', str(a.nginx), 'archive', revision])
 subprocess.run(['tar', '-xf', '-', '-C', str(build)], input=archive, check=True)
+source_patch = b''
+if a.core_working_tree:
+    source_patch = subprocess.check_output(['git', '-c', 'core.autocrlf=true', '-c', 'core.safecrlf=false',
+                                           '-C', str(a.nginx), 'diff', a.nginx_ref, '--', 'src'])
+    subprocess.run(['git', 'apply', '-'], cwd=build, input=source_patch, check=True)
 env = os.environ.copy()
 env['CACHE_PURGE_ROCKSDB_LIB_DIR'] = str(a.libraries)
 env['CACHE_PURGE_ROCKSDB_LIBS'] = ('-lrocksdb' if a.dynamic else '/usr/lib/x86_64-linux-gnu/librocksdb.a') + ' -lcrypto -lsnappy -lz -lbz2 -llz4 -lzstd -lstdc++ -lm -pthread'
@@ -59,7 +65,9 @@ with (root / 'build.log').open('w') as log:
     subprocess.run(['make', '-j2'], cwd=build, stdout=log, stderr=subprocess.STDOUT, check=True)
 with tarfile.open(fileobj=io.BytesIO(archive)) as source:
     sources = [m for m in source if m.isfile() and m.name.startswith('src/')]
-    for member in sources: assert (build / member.name).read_bytes() == source.extractfile(member).read()
+    for member in sources:
+        expected = (a.nginx / member.name).read_bytes().replace(b'\r\n', b'\n') if a.core_working_tree else source.extractfile(member).read()
+        assert (build / member.name).read_bytes() == expected
 
 calls, policies = [], {}
 capacity_gate = threading.Event()
@@ -355,7 +363,10 @@ finally:
     for server in gateways.values(): server.shutdown(); server.server_close()
 logs = (run / 'error.log').read_text() + ''.join(p.read_text() for p in run.glob('stdout-*.log'))
 assert not any(marker in logs for marker in ('[alert]', 'AddressSanitizer', 'LeakSanitizer', 'runtime error:', 'exited on signal'))
-result = {'root': str(root), 'run': str(run), 'nginx_revision': revision, 'core_source_files_unchanged': len(sources),
+result = {'root': str(root), 'run': str(run), 'nginx_revision': revision,
+          'core_source_files_unchanged': len(sources) if not a.core_working_tree else 0,
+          'core_working_tree_files_match': len(sources) if a.core_working_tree else 0,
+          'core_source_patch_sha256': hashlib.sha256(source_patch).hexdigest(),
           'dynamic': a.dynamic, 'sanitizer': a.sanitize, 'expr': bool(a.expr), 'extension': extension,
           'workers': a.workers, 'checks': checks,
           'sources': {group: {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in directory.iterdir()}

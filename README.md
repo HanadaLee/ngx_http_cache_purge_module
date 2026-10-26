@@ -59,14 +59,11 @@ purge API or automatically execute physical cache operations yet.
 The shared control-table library uses bounded immutable images for exact,
 prefix, host, and scoped TAG matching. Normal lookups do not acquire a mutex or
 query RocksDB. FENCE and proxy-only PROPAGATE duties share records but expire
-independently. Native request/cache hook integration is still pending; tests use
+independently. Native read/FENCE integration is still pending; tests use
 a separate precontent consumer to verify the shared barrier against real HITs.
 
-Native cache read and response-admission adapters are also being developed in
-nginx-ext. The test fixture in `t/cache_adapter_runtime.py` exercises asynchronous
-file metadata reads, stale suppression, Vary/slice handling, and rejection of
-304 reuse before cache-header renewal. The module-owned fill helper uses an
-auxiliary header filter and the existing upstream finalizer to defer publication
+The module-owned fill helper uses an auxiliary header filter and the existing
+upstream finalizer to defer publication
 until asynchronous preparation has completed. It retains the request and cache
 node through cancellation and reload, and works on unmodified nginx without a
 custom store hook. FINISH verifies the actual final file because native update
