@@ -34,10 +34,10 @@ struct ngx_http_cache_purge_runtime_s {
 static ngx_msec_t ngx_http_cache_purge_runtime_tick(void *data);
 static void       ngx_http_cache_purge_runtime_exit(void *data);
 static ngx_int_t  ngx_http_cache_purge_runtime_shared(ngx_shm_zone_t *zone,
-                                                      void           *old);
+    void *old);
 static ngx_int_t
 ngx_http_cache_purge_runtime_paths(ngx_http_cache_purge_runtime_t *rt,
-                                   ngx_log_t                      *log);
+    ngx_log_t *log);
 
 ngx_flag_t
 ngx_http_cache_purge_runtime_configured(ngx_conf_t *cf)
@@ -74,11 +74,11 @@ ngx_http_cache_purge_runtime_create(ngx_conf_t *cf)
 char *
 ngx_http_cache_purge_store_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
-    ngx_http_cache_purge_main_conf_t *main = conf;
-    ngx_http_cache_purge_runtime_t   *rt = main->runtime;
-    ngx_str_t                        *value, size;
-    ngx_uint_t                        i, cache_seen = 0, buffer_seen = 0;
-    ssize_t                           parsed;
+    ngx_http_cache_purge_main_conf_t  *main = conf;
+    ngx_http_cache_purge_runtime_t    *rt = main->runtime;
+    ngx_str_t                         *value, size;
+    ngx_uint_t                         i, cache_seen = 0, buffer_seen = 0;
+    ssize_t                            parsed;
 
     if (rt->path != NULL) {
         return "is duplicate";
@@ -176,10 +176,10 @@ invalid:
 char *
 ngx_http_cache_purge_state_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
-    ngx_http_cache_purge_main_conf_t *main = conf;
-    ngx_http_cache_purge_runtime_t   *rt = main->runtime;
-    ngx_str_t                        *value, name;
-    ssize_t                           size;
+    ngx_http_cache_purge_main_conf_t  *main = conf;
+    ngx_http_cache_purge_runtime_t    *rt = main->runtime;
+    ngx_str_t                         *value, name;
+    ssize_t                            size;
 
     if (rt->zone != NULL) {
         return "is duplicate";
@@ -213,10 +213,10 @@ ngx_http_cache_purge_state_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
 char *
 ngx_http_cache_purge_propagation_conf(ngx_conf_t *cf, ngx_command_t *cmd,
-                                      void *conf)
+    void *conf)
 {
-    ngx_http_cache_purge_main_conf_t *main = conf;
-    ngx_command_t                     local = *cmd;
+    ngx_http_cache_purge_main_conf_t  *main = conf;
+    ngx_command_t                      local = *cmd;
     local.offset = offsetof(ngx_http_cache_purge_runtime_t, propagation);
     return ngx_conf_set_msec_slot(cf, &local, main->runtime);
 }
@@ -300,17 +300,17 @@ ngx_http_cache_purge_contains(ngx_str_t *a, ngx_str_t *b)
 ngx_int_t
 ngx_http_cache_purge_runtime_post(ngx_conf_t *cf)
 {
-    ngx_http_cache_purge_main_conf_t *main, *old_main = NULL;
-    ngx_http_cache_purge_runtime_t   *rt, *old;
-    ngx_path_t  **paths;
-    ngx_str_t    *root;
-    ngx_uint_t                        i, j;
-    ngx_http_cache_purge_root_t  *registered;
-    ngx_http_file_cache_t       **caches;
-    ngx_module_t                 *module;
-    ngx_command_t                *command;
-    ngx_array_t                  *configured;
-    void                         *main_conf;
+    ngx_http_cache_purge_main_conf_t  *main, *old_main = NULL;
+    ngx_http_cache_purge_runtime_t    *rt, *old;
+    ngx_path_t                       **paths;
+    ngx_str_t                         *root;
+    ngx_uint_t                         i, j;
+    ngx_http_cache_purge_root_t       *registered;
+    ngx_http_file_cache_t            **caches;
+    ngx_module_t                      *module;
+    ngx_command_t                     *command;
+    ngx_array_t                       *configured;
+    void                              *main_conf;
 
     main = ngx_http_conf_get_module_main_conf(cf, ngx_http_cache_purge_module);
     rt = main->runtime;
@@ -440,11 +440,11 @@ ngx_http_cache_purge_runtime_post(ngx_conf_t *cf)
 
 static ngx_int_t
 ngx_http_cache_purge_runtime_paths(ngx_http_cache_purge_runtime_t *rt,
-                                   ngx_log_t                      *log)
+    ngx_log_t *log)
 {
-    u_char     database[NGX_MAX_PATH], cache[NGX_MAX_PATH];
-    ngx_str_t  db, current, *roots;
-    ngx_uint_t i;
+    u_char      database[NGX_MAX_PATH], cache[NGX_MAX_PATH];
+    ngx_str_t   db, current, *roots;
+    ngx_uint_t  i;
 
     if (ngx_realpath(rt->path->name.data, database) == NULL) {
         ngx_log_error(NGX_LOG_EMERG, log, ngx_errno,
@@ -550,7 +550,7 @@ ngx_http_cache_purge_runtime_module_init(ngx_cycle_t *cycle)
 static ngx_msec_t
 ngx_http_cache_purge_runtime_tick(void *data)
 {
-    ngx_http_cache_purge_runtime_t         *rt = data;
+    ngx_http_cache_purge_runtime_t          *rt = data;
     ngx_http_cache_rocksdb_error_t           error;
     ngx_http_cache_purge_component_status_t  status;
 
@@ -589,8 +589,8 @@ ngx_http_cache_purge_runtime_tick(void *data)
 static void
 ngx_http_cache_purge_worker_owner_tick(ngx_event_t *ev)
 {
-    ngx_http_cache_purge_runtime_t *rt = ev->data;
-    ngx_http_cache_rocksdb_error_t  error;
+    ngx_http_cache_purge_runtime_t  *rt = ev->data;
+    ngx_http_cache_rocksdb_error_t   error;
 
     if (ngx_terminate || ngx_quit || ngx_exiting) {
         /* Let the executor release the DB without blocking an old worker's
@@ -634,8 +634,8 @@ ngx_http_cache_purge_runtime_process_init(ngx_cycle_t *cycle)
 static void
 ngx_http_cache_purge_runtime_exit(void *data)
 {
-    ngx_http_cache_purge_runtime_t *rt = data;
-    ngx_http_cache_rocksdb_error_t  error;
+    ngx_http_cache_purge_runtime_t  *rt = data;
+    ngx_http_cache_rocksdb_error_t   error;
 
     if (rt->component
         && ngx_http_cache_purge_component_stop(&rt->component, &error) != 0)
@@ -646,8 +646,8 @@ ngx_http_cache_purge_runtime_exit(void *data)
 }
 
 int
-ngx_http_cache_purge_runtime_reader(
-    ngx_http_request_t *r, ngx_http_cache_purge_control_reader_t **reader,
+ngx_http_cache_purge_runtime_reader(ngx_http_request_t *r,
+    ngx_http_cache_purge_control_reader_t **reader,
     ngx_http_cache_rocksdb_error_t *error)
 {
     ngx_http_cache_purge_main_conf_t  *main;
@@ -714,8 +714,8 @@ ngx_http_cache_purge_runtime_worker_exit(ngx_cycle_t *cycle)
 }
 
 int
-ngx_http_cache_purge_runtime_client(ngx_http_request_t             *r,
-                                    ngx_http_cache_purge_client_t **client)
+ngx_http_cache_purge_runtime_client(ngx_http_request_t *r,
+    ngx_http_cache_purge_client_t **client)
 {
     ngx_http_cache_purge_main_conf_t      *main;
     ngx_http_cache_purge_runtime_t        *rt;
@@ -763,9 +763,9 @@ struct ngx_http_cache_purge_call_s {
     ngx_http_cache_purge_client_t  *client;
     ngx_event_t                     deadline;
     ngx_http_cache_purge_client_done_pt done;
-    void    *data;
-    u_char  *packet;
-    size_t                              length, sent;
+    void     *data;
+    u_char   *packet;
+    size_t    length, sent;
     uint64_t  id;
     uint16_t  opcode;
     int       fds[2];
@@ -784,15 +784,16 @@ struct ngx_http_cache_purge_client_s {
     ngx_connection_t                      *connection;
     ngx_queue_t                            queue;
     ngx_http_cache_purge_call_t           *current;
-    ngx_event_t                           pump, idle;
-    u_char    header[NGX_HTTP_CACHE_PURGE_FRAME_SIZE];
-    size_t    header_used, received;
-    ngx_str_t  response;
-    uint32_t   result;
-    int        lease_fd;
-    uint64_t   next_id;
-    unsigned   connecting : 1;
-    unsigned   stopped : 1;
+    ngx_event_t                            pump, idle;
+    u_char                header[NGX_HTTP_CACHE_PURGE_FRAME_SIZE];
+
+    size_t                                 header_used, received;
+    ngx_str_t                              response;
+    uint32_t                               result;
+    int                                    lease_fd;
+    uint64_t                               next_id;
+    unsigned                               connecting : 1;
+    unsigned                               stopped : 1;
 };
 
 static void ngx_http_cache_purge_client_pump(ngx_event_t *ev);
@@ -803,9 +804,8 @@ static void ngx_http_cache_purge_client_idle(ngx_event_t *ev);
 static void
 ngx_http_cache_purge_client_close(ngx_http_cache_purge_client_t *client);
 static void
-ngx_http_cache_purge_client_finish(ngx_http_cache_purge_call_t         *call,
-                                   ngx_http_cache_purge_client_result_e result,
-                                   ngx_uint_t                           notify);
+ngx_http_cache_purge_client_finish(ngx_http_cache_purge_call_t *call,
+    ngx_http_cache_purge_client_result_e result, ngx_uint_t notify);
 
 static void
 ngx_http_cache_purge_client_put(u_char *p, uint64_t value, ngx_uint_t width)
@@ -848,9 +848,8 @@ ngx_http_cache_purge_client_options(
 }
 
 ngx_http_cache_purge_client_t *
-ngx_http_cache_purge_client_create(
-    ngx_pool_t *pool, ngx_log_t *log, const ngx_str_t *path,
-    const ngx_http_cache_purge_client_options_t *options)
+ngx_http_cache_purge_client_create(ngx_pool_t *pool, ngx_log_t *log,
+    const ngx_str_t *path, const ngx_http_cache_purge_client_options_t *options)
 {
     ngx_http_cache_purge_client_t *client;
 
@@ -899,8 +898,8 @@ ngx_http_cache_purge_client_submit_internal(
     ngx_http_cache_purge_client_done_pt done, void *data,
     ngx_http_cache_purge_call_t **out, const int *fds, size_t fd_count)
 {
-    ngx_http_cache_purge_call_t *call;
-    size_t                       length, i;
+    ngx_http_cache_purge_call_t  *call;
+    size_t                        length, i;
 
     if (out != NULL) {
         *out = NULL;
@@ -982,20 +981,17 @@ ngx_http_cache_purge_client_submit_internal(
 
 ngx_int_t
 ngx_http_cache_purge_client_submit(ngx_http_cache_purge_client_t *client,
-                                   uint16_t opcode, const ngx_str_t *payload,
-                                   ngx_msec_t                          timeout,
-                                   ngx_http_cache_purge_client_done_pt done,
-                                   void                               *data,
-                                   ngx_http_cache_purge_call_t       **out)
+    uint16_t opcode, const ngx_str_t *payload, ngx_msec_t timeout,
+    ngx_http_cache_purge_client_done_pt done, void *data,
+    ngx_http_cache_purge_call_t **out)
 {
     return ngx_http_cache_purge_client_submit_internal(
         client, opcode, payload, timeout, done, data, out, NULL, 0);
 }
 
 ngx_int_t
-ngx_http_cache_purge_client_submit_files(
-    ngx_http_cache_purge_client_t *client, const ngx_str_t *payload,
-    const int fds[2], ngx_msec_t timeout,
+ngx_http_cache_purge_client_submit_files(ngx_http_cache_purge_client_t *client,
+    const ngx_str_t *payload, const int fds[2], ngx_msec_t timeout,
     ngx_http_cache_purge_client_done_pt done, void *data,
     ngx_http_cache_purge_call_t **out)
 {
@@ -1005,10 +1001,10 @@ ngx_http_cache_purge_client_submit_files(
 }
 
 ngx_int_t
-ngx_http_cache_purge_client_finish_file(
-    ngx_http_cache_purge_client_t *client, const ngx_str_t *payload,
-    int lease_fd, ngx_msec_t timeout, ngx_http_cache_purge_client_done_pt done,
-    void *data, ngx_http_cache_purge_call_t **out)
+ngx_http_cache_purge_client_finish_file(ngx_http_cache_purge_client_t *client,
+    const ngx_str_t *payload, int lease_fd, ngx_msec_t timeout,
+    ngx_http_cache_purge_client_done_pt done, void *data,
+    ngx_http_cache_purge_call_t **out)
 {
     return ngx_http_cache_purge_client_submit_internal(
         client, NGX_HTTP_CACHE_PURGE_OP_FINISH_FILE, payload, timeout, done,
@@ -1045,9 +1041,9 @@ ngx_http_cache_purge_client_connected(ngx_http_cache_purge_client_t *client)
 static void
 ngx_http_cache_purge_client_pump(ngx_event_t *ev)
 {
-    ngx_http_cache_purge_client_t *client = ev->data;
-    ngx_connection_t  *c;
-    ngx_int_t          rc;
+    ngx_http_cache_purge_client_t  *client = ev->data;
+    ngx_connection_t               *c;
+    ngx_int_t                       rc;
 
     if (client->stopped || client->current || ngx_queue_empty(&client->queue)) {
         return;
@@ -1095,12 +1091,13 @@ ngx_http_cache_purge_client_pump(ngx_event_t *ev)
 static void
 ngx_http_cache_purge_client_write(ngx_event_t *ev)
 {
-    ngx_connection_t              *c = ev->data;
-    ngx_http_cache_purge_client_t *client = c->data;
-    ngx_http_cache_purge_call_t   *call = client->current;
-    size_t    budget = NGX_HTTP_CACHE_PURGE_CLIENT_IO_BUDGET, amount;
-    ssize_t    n;
-    ngx_int_t  rc;
+    ngx_connection_t               *c = ev->data;
+    ngx_http_cache_purge_client_t  *client = c->data;
+    ngx_http_cache_purge_call_t    *call = client->current;
+    size_t                          budget =
+        NGX_HTTP_CACHE_PURGE_CLIENT_IO_BUDGET, amount;
+    ssize_t                         n;
+    ngx_int_t                       rc;
 
     if (call == NULL) {
         return;
@@ -1169,15 +1166,17 @@ ngx_http_cache_purge_client_write(ngx_event_t *ev)
 static void
 ngx_http_cache_purge_client_read(ngx_event_t *ev)
 {
-    ngx_connection_t              *c = ev->data;
-    ngx_http_cache_purge_client_t *client = c->data;
-    ngx_http_cache_purge_call_t   *call = client->current;
-    u_char                         byte, *destination;
-    size_t     budget = NGX_HTTP_CACHE_PURGE_CLIENT_IO_BUDGET, remaining;
-    ssize_t    n;
-    int        rights[NGX_HTTP_CACHE_PURGE_TRANSPORT_FDS], saved;
-    size_t     count, i;
-    ngx_uint_t lease_reply;
+    ngx_connection_t               *c = ev->data;
+    ngx_http_cache_purge_client_t  *client = c->data;
+    ngx_http_cache_purge_call_t    *call = client->current;
+    u_char                          byte, *destination;
+    size_t                          budget =
+        NGX_HTTP_CACHE_PURGE_CLIENT_IO_BUDGET, remaining;
+    ssize_t                         n;
+    int                             rights[NGX_HTTP_CACHE_PURGE_TRANSPORT_FDS],
+                                    saved;
+    size_t                          count, i;
+    ngx_uint_t                      lease_reply;
 
     if (call == NULL) {
         if (c->close || c->recv(c, &byte, 1) != NGX_AGAIN) {
@@ -1313,14 +1312,13 @@ ngx_http_cache_purge_client_close(ngx_http_cache_purge_client_t *client)
 }
 
 static void
-ngx_http_cache_purge_client_finish(ngx_http_cache_purge_call_t         *call,
-                                   ngx_http_cache_purge_client_result_e result,
-                                   ngx_uint_t                           notify)
+ngx_http_cache_purge_client_finish(ngx_http_cache_purge_call_t *call,
+    ngx_http_cache_purge_client_result_e result, ngx_uint_t notify)
 {
-    ngx_http_cache_purge_client_t *client = call->client;
-    ngx_http_cache_purge_reply_t   reply;
-    u_char                        *response = NULL;
-    int                            lease_fd = -1;
+    ngx_http_cache_purge_client_t  *client = call->client;
+    ngx_http_cache_purge_reply_t    reply;
+    u_char                         *response = NULL;
+    int                             lease_fd = -1;
 
     call->completing = 1;
     ngx_memzero(&reply, sizeof(reply));
@@ -1421,8 +1419,8 @@ ngx_http_cache_purge_client_stop(ngx_http_cache_purge_client_t *client)
 }
 
 void
-ngx_http_cache_purge_client_stats(ngx_http_cache_purge_client_t       *client,
-                                  ngx_http_cache_purge_client_stats_t *stats)
+ngx_http_cache_purge_client_stats(ngx_http_cache_purge_client_t *client,
+    ngx_http_cache_purge_client_stats_t *stats)
 {
     *stats = client->stats;
 }

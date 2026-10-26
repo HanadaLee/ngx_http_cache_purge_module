@@ -79,9 +79,9 @@ typedef struct {
 } ngx_http_cache_purge_client_options_t;
 
 typedef struct {
-    uint64_t   accepted, completed, cancelled, rejected, connections;
-    ngx_uint_t pending;
-    size_t     request_bytes, response_bytes, peak_bytes;
+    uint64_t    accepted, completed, cancelled, rejected, connections;
+    ngx_uint_t  pending;
+    size_t      request_bytes, response_bytes, peak_bytes;
 } ngx_http_cache_purge_client_stats_t;
 
 typedef struct {
@@ -144,8 +144,8 @@ void ngx_http_cache_purge_client_cancel(ngx_http_cache_purge_call_t *call);
  * synchronously with STOPPED. Invoke from exit_process, not from a thread. */
 void ngx_http_cache_purge_client_stop(ngx_http_cache_purge_client_t *client);
 void
-ngx_http_cache_purge_client_stats(ngx_http_cache_purge_client_t       *client,
-                                  ngx_http_cache_purge_client_stats_t *stats);
+ngx_http_cache_purge_client_stats(ngx_http_cache_purge_client_t *client,
+    ngx_http_cache_purge_client_stats_t *stats);
 
 /* Copyright (C) Hanada */
 
@@ -156,11 +156,11 @@ ngx_http_cache_purge_runtime_t *
 ngx_http_cache_purge_runtime_create(ngx_conf_t *cf);
 ngx_flag_t ngx_http_cache_purge_runtime_configured(ngx_conf_t *cf);
 char      *ngx_http_cache_purge_store_conf(ngx_conf_t *cf, ngx_command_t *cmd,
-                                           void *conf);
+    void *conf);
 char      *ngx_http_cache_purge_state_conf(ngx_conf_t *cf, ngx_command_t *cmd,
-                                           void *conf);
+    void *conf);
 char *ngx_http_cache_purge_propagation_conf(ngx_conf_t *cf, ngx_command_t *cmd,
-                                            void *conf);
+    void *conf);
 ngx_int_t ngx_http_cache_purge_runtime_post(ngx_conf_t *cf);
 ngx_int_t ngx_http_cache_purge_runtime_module_init(ngx_cycle_t *cycle);
 ngx_int_t ngx_http_cache_purge_runtime_process_init(ngx_cycle_t *cycle);
@@ -169,14 +169,14 @@ void      ngx_http_cache_purge_runtime_worker_exit(ngx_cycle_t *cycle);
 /* Internal native-hook entry: lazily register this worker's reader. No DB I/O.
  * NOT_FOUND means the persistent runtime was not configured; BUSY must never
  * be interpreted as a cache miss or as permission to serve an unchecked HIT. */
-int ngx_http_cache_purge_runtime_reader(
-    ngx_http_request_t *r, ngx_http_cache_purge_control_reader_t **reader,
+int ngx_http_cache_purge_runtime_reader(ngx_http_request_t *r,
+    ngx_http_cache_purge_control_reader_t **reader,
     ngx_http_cache_rocksdb_error_t *error);
 
 /* Lazily create this worker's bounded IPC client; no connect or DB I/O here.
  * Returns NOT_FOUND when no persistent runtime is configured. */
-int ngx_http_cache_purge_runtime_client(ngx_http_request_t             *r,
-                                        ngx_http_cache_purge_client_t **client);
+int ngx_http_cache_purge_runtime_client(ngx_http_request_t *r,
+    ngx_http_cache_purge_client_t **client);
 #endif
 /* Generation state is separate from the task deduplication rbtree. */
 typedef struct ngx_http_cache_purge_generation_s
@@ -194,23 +194,21 @@ typedef struct {
 
 ngx_http_cache_purge_namespace_t *
 ngx_http_cache_purge_namespace_create(ngx_conf_t *cf, ngx_str_t *name,
-                                      size_t size, const ngx_str_t *state_path);
+    size_t size, const ngx_str_t *state_path);
 ngx_int_t
-ngx_http_cache_purge_generation_key(ngx_http_request_t               *r,
-                                    ngx_http_cache_purge_namespace_t *ns,
-                                    ngx_http_complex_value_t *expression,
-                                    ngx_str_t *logical, ngx_str_t *encoded);
+ngx_http_cache_purge_generation_key(ngx_http_request_t *r,
+    ngx_http_cache_purge_namespace_t *ns, ngx_http_complex_value_t *expression,
+    ngx_str_t *logical, ngx_str_t *encoded);
 ngx_int_t
 ngx_http_cache_purge_generation_invalidate(ngx_http_cache_purge_namespace_t *ns,
-                                           ngx_str_t *key, ngx_flag_t all,
-                                           ngx_str_t *expected);
+    ngx_str_t *key, ngx_flag_t all, ngx_str_t *expected);
 ngx_int_t
 ngx_http_cache_purge_generation_stale(ngx_http_cache_purge_namespace_t *ns,
-                                      ngx_str_t                        *key);
+    ngx_str_t *key);
 
 ngx_int_t
 ngx_http_cache_purge_generation_current(ngx_http_cache_purge_namespace_t *ns,
-                                        ngx_str_t *key, ngx_str_t *logical);
+    ngx_str_t *key, ngx_str_t *logical);
 
 /* Consistent copy of the namespace generation state, for status reporting. */
 typedef struct {
@@ -220,8 +218,7 @@ typedef struct {
     ngx_flag_t  rules;
 } ngx_http_cache_purge_generation_view_t;
 
-void ngx_http_cache_purge_generation_view(
-    ngx_http_cache_purge_namespace_t       *ns,
+void ngx_http_cache_purge_generation_view(ngx_http_cache_purge_namespace_t *ns,
     ngx_http_cache_purge_generation_view_t *view);
 #if (NGX_WIN32)
 /* Windows filesystem helpers. */
@@ -272,7 +269,7 @@ ngx_http_cache_purge_path_min_length(const ngx_str_t *path)
 /* Directory entries carry metadata; reparse points are skipped. */
 static ngx_inline ngx_int_t
 ngx_http_cache_purge_de_info(ngx_str_t *path, ngx_dir_t *dir,
-                             const char **failed)
+    const char **failed)
 {
     (void) path;
     (void) failed;
@@ -287,7 +284,7 @@ ngx_http_cache_purge_de_info(ngx_str_t *path, ngx_dir_t *dir,
 
 static ngx_inline ngx_int_t
 ngx_http_cache_purge_file_info(ngx_str_t *path, ngx_dir_t *dir,
-                               const char **failed)
+    const char **failed)
 {
     return ngx_http_cache_purge_de_info(path, dir, failed) == NGX_OK
                    && ngx_de_is_file(dir) ?
@@ -298,7 +295,7 @@ ngx_http_cache_purge_file_info(ngx_str_t *path, ngx_dir_t *dir,
 
 static ngx_inline ngx_int_t
 ngx_http_cache_purge_open_dir(ngx_str_t *path, ngx_dir_t *parent,
-                              ngx_dir_t *dir, const char **failed)
+    ngx_dir_t *dir, const char **failed)
 {
     ngx_file_info_t info;
 
@@ -321,7 +318,7 @@ ngx_http_cache_purge_open_dir(ngx_str_t *path, ngx_dir_t *parent,
 
 static ngx_inline ngx_fd_t
 ngx_http_cache_purge_open_entry(ngx_str_t *path, ngx_dir_t *parent,
-                                const char **failed)
+    const char **failed)
 {
     (void) parent;
 
@@ -332,7 +329,7 @@ ngx_http_cache_purge_open_entry(ngx_str_t *path, ngx_dir_t *parent,
 
 static ngx_inline ngx_int_t
 ngx_http_cache_purge_delete_entry(u_char *name, ngx_dir_t *parent,
-                                  const char **failed)
+    const char **failed)
 {
     (void) parent;
 
@@ -378,7 +375,7 @@ ngx_http_cache_purge_path_min_length(const ngx_str_t *path)
 /* Known entry types avoid stat calls; links are never followed. */
 static ngx_inline ngx_int_t
 ngx_http_cache_purge_de_info(ngx_str_t *path, ngx_dir_t *dir,
-                             const char **failed)
+    const char **failed)
 {
 #if (NGX_HAVE_OPENAT && NGX_HTTP_CACHE_PURGE_HAVE_AT)
     (void) path;
@@ -410,7 +407,7 @@ ngx_http_cache_purge_de_info(ngx_str_t *path, ngx_dir_t *dir,
 
 static ngx_inline ngx_int_t
 ngx_http_cache_purge_file_info(ngx_str_t *path, ngx_dir_t *dir,
-                               const char **failed)
+    const char **failed)
 {
     if (!dir->valid_info) {
         dir->type = 0;
@@ -425,7 +422,7 @@ ngx_http_cache_purge_file_info(ngx_str_t *path, ngx_dir_t *dir,
 /* Only the explicitly configured root may resolve through a symbolic link. */
 static ngx_inline ngx_int_t
 ngx_http_cache_purge_open_dir(ngx_str_t *path, ngx_dir_t *parent,
-                              ngx_dir_t *dir, const char **failed)
+    ngx_dir_t *dir, const char **failed)
 {
 #if (NGX_HAVE_OPENAT && NGX_HTTP_CACHE_PURGE_HAVE_AT)
     ngx_fd_t   fd;
@@ -475,7 +472,7 @@ ngx_http_cache_purge_open_dir(ngx_str_t *path, ngx_dir_t *parent,
 
 static ngx_inline ngx_fd_t
 ngx_http_cache_purge_open_entry(ngx_str_t *path, ngx_dir_t *parent,
-                                const char **failed)
+    const char **failed)
 {
 #if (NGX_HAVE_OPENAT && NGX_HTTP_CACHE_PURGE_HAVE_AT)
     if (parent != NULL) {
@@ -496,7 +493,7 @@ ngx_http_cache_purge_open_entry(ngx_str_t *path, ngx_dir_t *parent,
 
 static ngx_inline ngx_int_t
 ngx_http_cache_purge_delete_entry(u_char *name, ngx_dir_t *parent,
-                                  const char **failed)
+    const char **failed)
 {
 #if (NGX_HAVE_OPENAT && NGX_HTTP_CACHE_PURGE_HAVE_AT)
     if (parent != NULL) {
@@ -607,11 +604,11 @@ typedef struct {
 } ngx_http_cache_purge_stats_t;
 
 typedef struct {
-    uint64_t pending, pending_full, active;
-    uint64_t overflow, deleted, deduplicated, waiting;
-    uint64_t errors, bytes, hits, misses;
-    uint64_t invalidated;
-    uint64_t scan_errors, retries, exhausted;
+    uint64_t  pending, pending_full, active;
+    uint64_t  overflow, deleted, deduplicated, waiting;
+    uint64_t  errors, bytes, hits, misses;
+    uint64_t  invalidated;
+    uint64_t  scan_errors, retries, exhausted;
 } ngx_http_cache_purge_cache_stat_t;
 
 /* The zone owns names independently of pending tasks. */
@@ -727,8 +724,8 @@ typedef struct {
 } ngx_http_cache_purge_loc_conf_t;
 
 typedef struct {
-    u_char                             *key_partial;
-    ngx_uint_t                          key_len;
+    u_char     *key_partial;
+    ngx_uint_t  key_len;
 
     u_char  key_buffer[NGX_HTTP_CACHE_PURGE_ENTRY_KEY_MAX + 1];
 
@@ -857,60 +854,57 @@ ngx_http_cache_purge_path_contains(const ngx_str_t *path, const ngx_str_t *root)
 
 ngx_int_t ngx_http_cache_purge_access_handler(ngx_http_request_t *r);
 ngx_int_t
-ngx_http_cache_purge_delete_variants(ngx_http_request_t              *r,
-                                     ngx_http_file_cache_t           *cache,
-                                     ngx_http_cache_purge_walk_ctx_t *ctx);
+ngx_http_cache_purge_delete_variants(ngx_http_request_t *r,
+    ngx_http_file_cache_t *cache, ngx_http_cache_purge_walk_ctx_t *ctx);
 #if (NGX_HTTP_FASTCGI || NGX_HTTP_PROXY || NGX_HTTP_SCGI || NGX_HTTP_UWSGI)
-ngx_int_t ngx_http_cache_purge_enqueue(ngx_http_request_t    *r,
-                                       ngx_http_file_cache_t *cache,
-                                       ngx_str_t *key, ngx_flag_t purge_all,
-                                       ngx_str_t *expected);
+ngx_int_t ngx_http_cache_purge_enqueue(ngx_http_request_t *r,
+    ngx_http_file_cache_t *cache, ngx_str_t *key, ngx_flag_t purge_all,
+    ngx_str_t *expected);
 #endif
 void       ngx_http_cache_purge_exit_worker(ngx_cycle_t *cycle);
 ngx_int_t  ngx_http_cache_purge_init_shm_zone(ngx_shm_zone_t *shm_zone,
-                                              void           *data);
+    void *data);
 ngx_int_t  ngx_http_cache_purge_init_worker(ngx_cycle_t *cycle);
 ngx_uint_t ngx_http_cache_purge_is_cache_file(ngx_str_t *path);
 ngx_uint_t
 ngx_http_cache_purge_is_protected_path(ngx_http_cache_purge_walk_ctx_t *ctx,
-                                       ngx_str_t                       *path);
+    ngx_str_t *path);
 ngx_int_t ngx_http_cache_purge_log(ngx_http_request_t *r);
 ngx_int_t ngx_http_cache_purge_probe_credit(ngx_http_cache_purge_queue_t *queue,
-                                            ngx_flag_t                    take);
+    ngx_flag_t take);
 ngx_int_t ngx_http_cache_purge_queue_status_handler(ngx_http_request_t *r);
 ssize_t   ngx_http_cache_purge_read_key(ngx_http_cache_purge_walk_ctx_t *ctx,
-                                        ngx_str_t *path, size_t len);
+    ngx_str_t *path, size_t len);
 ngx_int_t
-ngx_http_cache_purge_send_result(ngx_http_request_t            *r,
-                                 ngx_http_cache_purge_result_t *result);
-ngx_int_t ngx_http_cache_purge_reply(ngx_http_request_t                *r,
-                                     ngx_http_cache_purge_result_code_e code);
+ngx_http_cache_purge_send_result(ngx_http_request_t *r,
+    ngx_http_cache_purge_result_t *result);
+ngx_int_t ngx_http_cache_purge_reply(ngx_http_request_t *r,
+    ngx_http_cache_purge_result_code_e code);
 ngx_int_t
-ngx_http_cache_purge_response_headers(ngx_http_request_t                *r,
-                                      ngx_http_cache_purge_result_code_e code);
+ngx_http_cache_purge_response_headers(ngx_http_request_t *r,
+    ngx_http_cache_purge_result_code_e code);
 ngx_int_t ngx_http_cache_purge_method_response(ngx_http_request_t *r,
-                                               ngx_str_t          *allow);
+    ngx_str_t *allow);
 void      ngx_http_cache_purge_stat_add(ngx_http_cache_purge_path_t *path,
-                                        ngx_uint_t field, uint64_t value);
+    ngx_uint_t field, uint64_t value);
 #if (NGX_HTTP_FASTCGI || NGX_HTTP_PROXY || NGX_HTTP_SCGI || NGX_HTTP_UWSGI)
 void ngx_http_cache_purge_stat_wait(ngx_http_cache_purge_path_t *path,
-                                    ngx_int_t                    delta);
+    ngx_int_t delta);
 #endif
 ngx_flag_t ngx_http_cache_purge_threaded(void);
 ngx_int_t  ngx_http_cache_purge_unlink(ngx_log_t *log, u_char *name,
-                                       ngx_dir_t *parent);
+    ngx_dir_t *parent);
 ngx_int_t  ngx_http_cache_purge_walk(ngx_http_cache_purge_walk_ctx_t *ctx);
 void ngx_http_cache_purge_walk_close(ngx_http_cache_purge_cursor_t *cursor);
 void
-ngx_http_cache_purge_walk_init(ngx_http_cache_purge_walk_ctx_t   *ctx,
-                               ngx_str_t                         *root,
-                               ngx_http_cache_purge_protection_t *protection,
-                               ngx_array_t *paths, ngx_log_t *log);
+ngx_http_cache_purge_walk_init(ngx_http_cache_purge_walk_ctx_t *ctx,
+    ngx_str_t *root, ngx_http_cache_purge_protection_t *protection,
+    ngx_array_t *paths, ngx_log_t *log);
 ngx_int_t ngx_http_cache_purge_walk_step(ngx_http_cache_purge_cursor_t *cursor,
-                                         ngx_uint_t                     limit);
+    ngx_uint_t limit);
 #if (NGX_HTTP_PROXY)
 char *ngx_http_cache_refresh_conf(ngx_conf_t *cf, ngx_command_t *cmd,
-                                  void *conf);
+    void *conf);
 #endif
 #if (NGX_HTTP_PROXY)
 ngx_int_t ngx_http_cache_refresh_guard(ngx_http_request_t *r);
@@ -920,22 +914,21 @@ ngx_int_t ngx_http_cache_refresh_handler(ngx_http_request_t *r);
 #endif
 #if (NGX_HTTP_PROXY)
 char *ngx_http_cache_refresh_profile(ngx_conf_t *cf, ngx_command_t *cmd,
-                                     void *conf);
+    void *conf);
 #endif
 #if (NGX_HTTP_PROXY)
 ngx_int_t ngx_http_cache_refresh_start(ngx_http_request_t *r);
 #endif
 #if (NGX_HTTP_PROXY)
-ngx_int_t ngx_http_cache_refresh_variable(ngx_http_request_t        *r,
-                                          ngx_http_variable_value_t *v,
-                                          uintptr_t                  data);
+ngx_int_t ngx_http_cache_refresh_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
 #endif
 #if (NGX_HTTP_FASTCGI)
 ngx_int_t ngx_http_fastcgi_cache_purge_handler(ngx_http_request_t *r);
 #endif
 #if (NGX_HTTP_PROXY)
 char *ngx_http_proxy_cache_purge_conf(ngx_conf_t *cf, ngx_command_t *cmd,
-                                      void *conf);
+    void *conf);
 #endif
 #if (NGX_HTTP_PROXY)
 ngx_int_t ngx_http_proxy_cache_purge_handler(ngx_http_request_t *r);
@@ -969,10 +962,9 @@ typedef ngx_int_t (*ngx_http_cache_purge_fill_step_pt)(
  * Callbacks must not replace r->cache, finalize the request, or update/free c.
  * This lifecycle uses existing interfaces on native nginx, with no core hook.
  * Consumers still own durable indexing, bounded deadlines and file leases. */
-ngx_int_t ngx_http_cache_purge_fill_arm(ngx_http_request_t               *r,
-                                        ngx_http_cache_purge_fill_t     **slot,
-                                        ngx_http_cache_purge_fill_step_pt step,
-                                        void                             *data);
+ngx_int_t ngx_http_cache_purge_fill_arm(ngx_http_request_t *r,
+    ngx_http_cache_purge_fill_t **slot, ngx_http_cache_purge_fill_step_pt step,
+    void *data);
 void      ngx_http_cache_purge_fill_complete(ngx_http_cache_purge_fill_t *fill,
     ngx_int_t result);
 

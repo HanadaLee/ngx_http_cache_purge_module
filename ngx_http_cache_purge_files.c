@@ -16,7 +16,7 @@ static const uint64_t ngx_http_cache_purge_last_offset =
     UINT64_C(0x3fffffffffffffff);
 static int
 ngx_http_cache_purge_result(ngx_http_cache_rocksdb_error_t *error, int code,
-                            const char *message)
+    const char *message)
 {
     if (error) {
         error->code = code;
@@ -26,7 +26,7 @@ ngx_http_cache_purge_result(ngx_http_cache_rocksdb_error_t *error, int code,
 }
 static int
 ngx_http_cache_purge_io(ngx_http_cache_rocksdb_error_t *error,
-                        const char                     *operation)
+    const char *operation)
 {
     int saved = errno;
     int code = saved == EMFILE || saved == ENFILE || saved == ENOMEM
@@ -54,7 +54,7 @@ ngx_http_cache_purge_zero(const unsigned char *id)
 }
 static int
 ngx_http_cache_purge_sync_file(int fd, int durable,
-                               ngx_http_cache_rocksdb_error_t *error)
+    ngx_http_cache_rocksdb_error_t *error)
 {
     if (durable && fsync(fd) != 0) {
         return ngx_http_cache_purge_io(error, "sync file marker");
@@ -63,7 +63,7 @@ ngx_http_cache_purge_sync_file(int fd, int durable,
 }
 static void
 ngx_http_cache_purge_encode(
-    unsigned char        raw[NGX_HTTP_CACHE_PURGE_FILE_MARKER_SIZE],
+    unsigned char raw[NGX_HTTP_CACHE_PURGE_FILE_MARKER_SIZE],
     const unsigned char *id, const unsigned char *address, unsigned state)
 {
     memcpy(raw, "NCF1", 4);
@@ -74,7 +74,7 @@ ngx_http_cache_purge_encode(
 }
 static int
 ngx_http_cache_purge_lock_request(int fd, uint64_t offset,
-                                  ngx_http_cache_rocksdb_error_t *error)
+    ngx_http_cache_rocksdb_error_t *error)
 {
 #if (defined(F_OFD_SETLK))
     struct flock  lock;
@@ -113,7 +113,7 @@ ngx_http_cache_purge_lock_request(int fd, uint64_t offset,
 }
 static int
 ngx_http_cache_purge_inspect_locks(int fd, struct stat *st,
-                                   ngx_http_cache_rocksdb_error_t *error)
+    ngx_http_cache_rocksdb_error_t *error)
 {
     int  flags;
 
@@ -146,8 +146,8 @@ ngx_http_cache_purge_inspect_locks(int fd, struct stat *st,
 
 int
 ngx_http_cache_purge_file_address(ngx_http_cache_rocksdb_bytes_t address,
-                                  unsigned char digest[16], uint64_t *offset,
-                                  ngx_http_cache_rocksdb_error_t *error)
+    unsigned char digest[16], uint64_t *offset,
+    ngx_http_cache_rocksdb_error_t *error)
 {
     size_t         i;
     uint64_t       value;
@@ -175,8 +175,8 @@ ngx_http_cache_purge_file_address(ngx_http_cache_rocksdb_bytes_t address,
 }
 
 int
-ngx_http_cache_purge_file_marker_read(
-    int fd, ngx_http_cache_purge_file_marker_t *marker,
+ngx_http_cache_purge_file_marker_read(int fd,
+    ngx_http_cache_purge_file_marker_t *marker,
     ngx_http_cache_rocksdb_error_t *error)
 {
     ssize_t        n;
@@ -217,9 +217,8 @@ ngx_http_cache_purge_file_marker_read(
 
 int
 ngx_http_cache_purge_file_marker_prepare(int fd, const unsigned char id[16],
-                                         const unsigned char address[16],
-                                         int                 durable,
-                                         ngx_http_cache_rocksdb_error_t *error)
+    const unsigned char address[16], int durable,
+    ngx_http_cache_rocksdb_error_t *error)
 {
     int                                 rc;
     ngx_http_cache_purge_file_marker_t  current;
@@ -266,9 +265,8 @@ ngx_http_cache_purge_file_marker_prepare(int fd, const unsigned char id[16],
 
 int
 ngx_http_cache_purge_file_marker_publish(int fd, const unsigned char id[16],
-                                         const unsigned char address[16],
-                                         int                 durable,
-                                         ngx_http_cache_rocksdb_error_t *error)
+    const unsigned char address[16], int durable,
+    ngx_http_cache_rocksdb_error_t *error)
 {
     int                                 rc;
     ngx_http_cache_purge_file_marker_t  current;
@@ -312,8 +310,7 @@ ngx_http_cache_purge_file_marker_publish(int fd, const unsigned char id[16],
 
 int
 ngx_http_cache_purge_file_locks_open(const char *path, uint32_t owner,
-                                     int create, int *output,
-                                     ngx_http_cache_rocksdb_error_t *error)
+    int create, int *output, ngx_http_cache_rocksdb_error_t *error)
 {
     int          created, fd, rc;
     struct stat  st;
@@ -369,8 +366,7 @@ ngx_http_cache_purge_file_locks_open(const char *path, uint32_t owner,
 
 int
 ngx_http_cache_purge_file_lease_acquire(const char *path, int anchor_fd,
-                                        uint64_t offset, int *output,
-                                        ngx_http_cache_rocksdb_error_t *error)
+    uint64_t offset, int *output, ngx_http_cache_rocksdb_error_t *error)
 {
     int          fd, rc;
     struct stat  anchor;
@@ -403,7 +399,7 @@ ngx_http_cache_purge_file_lease_acquire(const char *path, int anchor_fd,
 
 int
 ngx_http_cache_purge_file_lease_adopt(int anchor_fd, int fd, uint64_t offset,
-                                      ngx_http_cache_rocksdb_error_t *error)
+    ngx_http_cache_rocksdb_error_t *error)
 {
     int          flags, rc;
     struct stat  anchor, received;
@@ -435,8 +431,8 @@ ngx_http_cache_purge_file_lease_adopt(int anchor_fd, int fd, uint64_t offset,
 }
 
 int
-ngx_http_cache_purge_file_lease_release(int                            *fd,
-                                        ngx_http_cache_rocksdb_error_t *error)
+ngx_http_cache_purge_file_lease_release(int *fd,
+    ngx_http_cache_rocksdb_error_t *error)
 {
     int  value;
 
@@ -456,20 +452,19 @@ ngx_http_cache_purge_file_lease_release(int                            *fd,
 
 ssize_t
 ngx_http_cache_purge_transport_recv(int socket, void *data, size_t size,
-                                    int allow_rights,
-                                    int fds[NGX_HTTP_CACHE_PURGE_TRANSPORT_FDS],
-                                    size_t *count)
+    int allow_rights, int fds[NGX_HTTP_CACHE_PURGE_TRANSPORT_FDS],
+    size_t *count)
 {
     union {
         struct cmsghdr aligned;
         unsigned char  bytes[CMSG_SPACE(3 * sizeof(int))];
     } control;
-    struct iovec    iov = { data, size };
+    struct iovec     iov = { data, size };
     struct msghdr    message;
     struct cmsghdr  *header;
     ssize_t          n;
-    size_t          i, number;
-    int             bad = 0, fd;
+    size_t           i, number;
+    int              bad = 0, fd;
 
     if (!count || !fds || !data || !size || (allow_rights && size != 1)) {
         errno = EINVAL;
@@ -526,7 +521,7 @@ ngx_http_cache_purge_transport_recv(int socket, void *data, size_t size,
 
 ssize_t
 ngx_http_cache_purge_transport_send(int socket, const void *data, size_t size,
-                                    const int *fds, size_t count)
+    const int *fds, size_t count)
 {
     union {
         struct cmsghdr aligned;

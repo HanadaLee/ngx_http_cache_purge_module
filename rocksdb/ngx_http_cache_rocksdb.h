@@ -109,25 +109,22 @@ uint32_t ngx_http_cache_rocksdb_abi_1(void);
  * A handle belongs to its opening process/thread and must never cross fork,
  * IPC or SHM. The directory must already exist and be writable (nginx creates
  * it through ngx_add_path). No C++ exception crosses this boundary. */
-int ngx_http_cache_rocksdb_open(const char                             *path,
-                                const ngx_http_cache_rocksdb_options_t *options,
-                                ngx_http_cache_rocksdb_t              **store,
-                                ngx_http_cache_rocksdb_error_t         *error);
+int ngx_http_cache_rocksdb_open(const char *path,
+    const ngx_http_cache_rocksdb_options_t *options,
+    ngx_http_cache_rocksdb_t **store, ngx_http_cache_rocksdb_error_t *error);
 
 /* BUSY with open cursors; otherwise consumes *store even on close error. */
-int ngx_http_cache_rocksdb_close(ngx_http_cache_rocksdb_t      **store,
-                                 ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_rocksdb_close(ngx_http_cache_rocksdb_t **store,
+    ngx_http_cache_rocksdb_error_t *error);
 
-int ngx_http_cache_rocksdb_get(ngx_http_cache_rocksdb_t        *store,
-                               ngx_http_cache_rocksdb_cf_e      cf,
-                               ngx_http_cache_rocksdb_bytes_t   key,
-                               ngx_http_cache_rocksdb_buffer_t *value,
-                               ngx_http_cache_rocksdb_error_t  *error);
+int ngx_http_cache_rocksdb_get(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_rocksdb_cf_e cf, ngx_http_cache_rocksdb_bytes_t key,
+    ngx_http_cache_rocksdb_buffer_t *value,
+    ngx_http_cache_rocksdb_error_t *error);
 
 /* Atomic cross-CF WriteBatch with WAL and sync=true. Conditions are evaluated
  * before any mutation by the single authorized writer. No partial success. */
-int ngx_http_cache_rocksdb_write(
-    ngx_http_cache_rocksdb_t                *store,
+int ngx_http_cache_rocksdb_write(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_rocksdb_mutation_t *mutations, size_t count,
     const ngx_http_cache_rocksdb_condition_t *conditions,
     size_t condition_count, ngx_http_cache_rocksdb_error_t *error);
@@ -136,38 +133,35 @@ int ngx_http_cache_rocksdb_write(
  * An empty prefix scans the whole CF, including the reserved schema marker.
  * No prefix truncation or fixed-length prefix extractor is used. next/get use
  * a bounded-lifetime snapshot; forked cursors share its original deadline. */
-int ngx_http_cache_rocksdb_cursor_open(ngx_http_cache_rocksdb_t         *store,
-                                       ngx_http_cache_rocksdb_cf_e       cf,
-                                       ngx_http_cache_rocksdb_bytes_t    prefix,
-                                       ngx_http_cache_rocksdb_bytes_t    after,
-                                       ngx_http_cache_rocksdb_cursor_t **cursor,
-                                       ngx_http_cache_rocksdb_error_t   *error);
+int ngx_http_cache_rocksdb_cursor_open(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_rocksdb_cf_e cf, ngx_http_cache_rocksdb_bytes_t prefix,
+    ngx_http_cache_rocksdb_bytes_t after,
+    ngx_http_cache_rocksdb_cursor_t **cursor,
+    ngx_http_cache_rocksdb_error_t *error);
 /* Open a related range using the parent's exact snapshot and deadline. A child
  * remains valid after its parent closes, until that shared deadline expires.
  * Every cursor consumes one bounded slot and must be closed, even on EXPIRED.
  * */
-int ngx_http_cache_rocksdb_cursor_fork(ngx_http_cache_rocksdb_cursor_t  *parent,
-                                       ngx_http_cache_rocksdb_cf_e       cf,
-                                       ngx_http_cache_rocksdb_bytes_t    prefix,
-                                       ngx_http_cache_rocksdb_bytes_t    after,
-                                       ngx_http_cache_rocksdb_cursor_t **cursor,
-                                       ngx_http_cache_rocksdb_error_t   *error);
+int ngx_http_cache_rocksdb_cursor_fork(ngx_http_cache_rocksdb_cursor_t *parent,
+    ngx_http_cache_rocksdb_cf_e cf, ngx_http_cache_rocksdb_bytes_t prefix,
+    ngx_http_cache_rocksdb_bytes_t after,
+    ngx_http_cache_rocksdb_cursor_t **cursor,
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_rocksdb_cursor_next(ngx_http_cache_rocksdb_cursor_t *cursor,
-                                       ngx_http_cache_rocksdb_buffer_t *key,
-                                       ngx_http_cache_rocksdb_buffer_t *value,
-                                       ngx_http_cache_rocksdb_error_t  *error);
+    ngx_http_cache_rocksdb_buffer_t *key,
+    ngx_http_cache_rocksdb_buffer_t *value,
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_rocksdb_cursor_get(ngx_http_cache_rocksdb_cursor_t *cursor,
-                                      ngx_http_cache_rocksdb_cf_e      cf,
-                                      ngx_http_cache_rocksdb_bytes_t   key,
-                                      ngx_http_cache_rocksdb_buffer_t *value,
-                                      ngx_http_cache_rocksdb_error_t  *error);
+    ngx_http_cache_rocksdb_cf_e cf, ngx_http_cache_rocksdb_bytes_t key,
+    ngx_http_cache_rocksdb_buffer_t *value,
+    ngx_http_cache_rocksdb_error_t *error);
 int
 ngx_http_cache_rocksdb_cursor_close(ngx_http_cache_rocksdb_cursor_t **cursor,
-                                    ngx_http_cache_rocksdb_error_t   *error);
+    ngx_http_cache_rocksdb_error_t *error);
 
-int ngx_http_cache_rocksdb_stats(ngx_http_cache_rocksdb_t       *store,
-                                 ngx_http_cache_rocksdb_stats_t *stats,
-                                 ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_rocksdb_stats(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_rocksdb_stats_t *stats,
+    ngx_http_cache_rocksdb_error_t *error);
 
 #ifdef __cplusplus
 }

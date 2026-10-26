@@ -19,12 +19,12 @@ def main():
     source = Path(os.environ["NGINX_SOURCE"])
     build = source / "objs"
     # Use production declarations so this report follows layout changes.
-    generation = (repo / "ngx_http_cache_purge_invalidation.c").read_text()
-    generation = generation[generation.index("typedef struct ngx_http_cache_purge_rule_s"):
-                            generation.index("static ngx_int_t")]
+    generation = (repo / "ngx_http_cache_purge_module.c").read_text()
+    generation = generation[generation.index("typedef struct ngx_http_cache_purge_rule_s"):]
+    generation = generation[:generation.index("static ngx_int_t")]
     refresh = re.search(r"(typedef struct \{\n    u_char\s+hash\[32\];.*?"
                         r"\} ngx_http_cache_refresh_t;)",
-                        (repo / "ngx_http_cache_purge_refresh.c").read_text(), re.S)
+                        (repo / "ngx_http_cache_purge_request.c").read_text(), re.S)
     if refresh is None:
         raise RuntimeError("REFRESH declarations changed; update the layout probe")
     types = ["ngx_pool_t", "ngx_http_request_t", "ngx_http_cache_t",

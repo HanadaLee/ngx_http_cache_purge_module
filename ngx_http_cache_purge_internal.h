@@ -62,8 +62,8 @@ typedef enum {
 #define NGX_HTTP_CACHE_PURGE_ROOT_CACHE 1
 #define NGX_HTTP_CACHE_PURGE_ROOT_TEMP  2
 typedef struct {
-    ngx_http_cache_rocksdb_bytes_t path, zone;
-    uint32_t                       kind;
+    ngx_http_cache_rocksdb_bytes_t  path, zone;
+    uint32_t                        kind;
 } ngx_http_cache_purge_root_t;
 
 typedef struct {
@@ -73,25 +73,25 @@ typedef struct {
     uint32_t                          max_payload_bytes;
 
     /* total retained connection payloads */
-    uint32_t                          buffer_bytes;
+    uint32_t buffer_bytes;
 
 
     /* frame or response deadline, not idle extension */
-    uint32_t                          io_timeout_ms;
+    uint32_t io_timeout_ms;
 
-    uint32_t                          owner_retry_ms;
+    uint32_t owner_retry_ms;
 
     /* UINT32_MAX: creator UID; socket owner/client */
-    uint32_t                          client_uid;
+    uint32_t client_uid;
 
-    uint32_t                          propagation_ms;
-    uint32_t                          max_live_operations;
-    uint64_t                          live_selector_bytes;
+    uint32_t  propagation_ms;
+    uint32_t  max_live_operations;
+    uint64_t  live_selector_bytes;
 
     /* shared mapping owned by nginx, valid until stop */
-    void                             *control_memory;
+    void *control_memory;
 
-    size_t                            control_bytes;
+    size_t control_bytes;
     const ngx_http_cache_purge_root_t
             *roots; /* Copied by start; opened only on executor. */
     uint32_t root_count;
@@ -111,8 +111,8 @@ typedef struct {
 
 void ngx_http_cache_purge_component_options(
     ngx_http_cache_purge_component_options_t *options);
-uint32_t ngx_http_cache_purge_component_abi_5(
-    void); /* Link-time header/archive compatibility marker. */
+/* Link-time header/archive compatibility marker. */
+uint32_t ngx_http_cache_purge_component_abi_5(void);
 
 /* Only start after fork in the selected nginx worker, never while parsing
  * configuration or in master. Copies its inputs and starts one executor thread.
@@ -121,10 +121,10 @@ uint32_t ngx_http_cache_purge_component_abi_5(
  * Only the creator UID and client_uid may connect. A different client_uid
  * requires a root creator and receives ownership of the socket, not the DB.
  * No nginx request, pool, log or configuration pointers cross the thread. */
-int ngx_http_cache_purge_component_start(
-    const char *path, const ngx_http_cache_purge_component_options_t *options,
+int ngx_http_cache_purge_component_start(const char *path,
+    const ngx_http_cache_purge_component_options_t *options,
     ngx_http_cache_purge_component_t **component,
-    ngx_http_cache_rocksdb_error_t    *error);
+    ngx_http_cache_rocksdb_error_t *error);
 
 /* These calls belong to the starting thread/process. status never queries DB.
  * request_stop only signals/wakes the executor; it neither joins nor does I/O
@@ -134,15 +134,15 @@ int ngx_http_cache_purge_component_start(
  * A lost response is ambiguous: query/retry by durable identity, never assume
  * that disconnect or shutdown rolled back an acknowledged database write. */
 int ngx_http_cache_purge_component_status(
-    ngx_http_cache_purge_component_t        *component,
+    ngx_http_cache_purge_component_t *component,
     ngx_http_cache_purge_component_status_t *status,
-    ngx_http_cache_rocksdb_error_t          *error);
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_component_request_stop(
     ngx_http_cache_purge_component_t *component,
-    ngx_http_cache_rocksdb_error_t   *error);
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_component_stop(
     ngx_http_cache_purge_component_t **component,
-    ngx_http_cache_rocksdb_error_t    *error);
+    ngx_http_cache_rocksdb_error_t *error);
 
 #ifdef __cplusplus
 }
@@ -168,7 +168,7 @@ typedef struct ngx_http_cache_purge_control_writer_s
     ngx_http_cache_purge_control_writer_t;
 
 typedef struct {
-    ngx_http_cache_rocksdb_bytes_t        key, url, host, tag_namespace;
+    ngx_http_cache_rocksdb_bytes_t         key, url, host, tag_namespace;
     const ngx_http_cache_rocksdb_bytes_t  *tags;
     size_t                                 tag_count;
     uint64_t                               now_ms;
@@ -176,9 +176,10 @@ typedef struct {
 } ngx_http_cache_purge_control_context_t;
 
 typedef struct {
-    uint64_t                       sequence, issued_at_ms, propagation_until_ms;
-    uint32_t                       flags, mode, kind;
-    ngx_http_cache_rocksdb_bytes_t operation_id, value, scope;
+    uint64_t                        sequence, issued_at_ms,
+                                    propagation_until_ms;
+    uint32_t                        flags, mode, kind;
+    ngx_http_cache_rocksdb_bytes_t  operation_id, value, scope;
 } ngx_http_cache_purge_control_match_t;
 
 /* Called synchronously while the immutable image is pinned. Copy any required
@@ -192,16 +193,15 @@ size_t ngx_http_cache_purge_control_size(size_t bank_bytes, uint32_t readers);
 /* The caller owns shared mmap/SHM storage and must initialize it exactly once,
  * before concurrent attachment. The address must be 64-byte aligned. */
 int ngx_http_cache_purge_control_init(void *memory, size_t bytes,
-                                      size_t bank_bytes, uint32_t readers,
-                                      ngx_http_cache_rocksdb_error_t *error);
-int ngx_http_cache_purge_control_reader_open(
-    void *memory, size_t bytes, ngx_http_cache_purge_control_reader_t **reader,
+    size_t bank_bytes, uint32_t readers, ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_control_reader_open(void *memory, size_t bytes,
+    ngx_http_cache_purge_control_reader_t **reader,
     ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_control_reader_close(
     ngx_http_cache_purge_control_reader_t **reader,
-    ngx_http_cache_rocksdb_error_t         *error);
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_control_match(
-    ngx_http_cache_purge_control_reader_t        *reader,
+    ngx_http_cache_purge_control_reader_t *reader,
     const ngx_http_cache_purge_control_context_t *context, size_t max_matches,
     size_t max_bytes, ngx_http_cache_purge_control_visit_pt visit, void *data,
     uint64_t *publication, ngx_http_cache_rocksdb_error_t *error);
@@ -214,26 +214,26 @@ int ngx_http_cache_purge_control_guard_begin(
     ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_control_guard_end(
     ngx_http_cache_purge_control_reader_t *reader,
-    ngx_http_cache_rocksdb_error_t        *error);
+    ngx_http_cache_rocksdb_error_t *error);
 
 /* Claim only while holding the durable database's exclusive owner lease.
  * Claim closes the serving gate until controls and native file state recover.
  * Reader registration and publishing use a robust process-shared mutex;
  * normal matching takes no mutex and performs no allocation or DB I/O. */
-int ngx_http_cache_purge_control_writer_open(
-    void *memory, size_t bytes, ngx_http_cache_purge_control_writer_t **writer,
+int ngx_http_cache_purge_control_writer_open(void *memory, size_t bytes,
+    ngx_http_cache_purge_control_writer_t **writer,
     ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_control_writer_close(
     ngx_http_cache_purge_control_writer_t **writer,
-    ngx_http_cache_rocksdb_error_t         *error);
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_control_gate_close(
     ngx_http_cache_purge_control_writer_t *writer,
-    ngx_http_cache_rocksdb_error_t        *error);
+    ngx_http_cache_rocksdb_error_t *error);
 /* Open only after the new image and durable activation/recovery are complete.
  * BUSY while old image readers are still inside synchronous admission work. */
 int ngx_http_cache_purge_control_gate_open(
     ngx_http_cache_purge_control_writer_t *writer,
-    ngx_http_cache_rocksdb_error_t        *error);
+    ngx_http_cache_rocksdb_error_t *error);
 
 #ifdef __cplusplus
 }
@@ -263,29 +263,27 @@ typedef struct {
  * Lock collisions only serialize unrelated files; marker matching compares
  * the independent 128-bit address digest as well as the full instance ID. */
 int ngx_http_cache_purge_file_address(ngx_http_cache_rocksdb_bytes_t address,
-                                      unsigned char                  digest[16],
-                                      uint64_t *lock_offset,
-                                      ngx_http_cache_rocksdb_error_t *error);
-int ngx_http_cache_purge_file_marker_read(
-    int fd, ngx_http_cache_purge_file_marker_t *marker,
+    unsigned char digest[16], uint64_t *lock_offset,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_file_marker_read(int fd,
+    ngx_http_cache_purge_file_marker_t *marker,
     ngx_http_cache_rocksdb_error_t *error);
 /* Caller must hold the path lease. These descriptor operations may block and
  * belong on a bounded filesystem executor, never under an nginx SHM mutex.
  * durable=1 fsyncs the file; the caller separately syncs renamed directories.
  * Readiness must be written only after durable index commit_pending(). */
-int ngx_http_cache_purge_file_marker_prepare(
-    int fd, const unsigned char id[16], const unsigned char address[16],
-    int durable, ngx_http_cache_rocksdb_error_t *error);
-int ngx_http_cache_purge_file_marker_publish(
-    int fd, const unsigned char id[16], const unsigned char address[16],
-    int durable, ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_file_marker_prepare(int fd, const unsigned char id[16],
+    const unsigned char address[16], int durable,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_file_marker_publish(int fd, const unsigned char id[16],
+    const unsigned char address[16], int durable,
+    ngx_http_cache_rocksdb_error_t *error);
 
 /* The lock file is persistent and must never be replaced/unlinked while any
  * worker can hold it. Only a newly created file may be chowned. The caller
  * validates the configured parent directory before enabling this resource. */
 int ngx_http_cache_purge_file_locks_open(const char *path, uint32_t owner_uid,
-                                         int create, int *fd,
-                                         ngx_http_cache_rocksdb_error_t *error);
+    int create, int *fd, ngx_http_cache_rocksdb_error_t *error);
 /* Linux open-file-description leases. Each acquisition opens an independent
  * description, so separate writers conflict even in the same process.
  * anchor_fd is the validated persistent lock file opened at initialization;
@@ -294,8 +292,7 @@ int ngx_http_cache_purge_file_locks_open(const char *path, uint32_t owner_uid,
  * bound live transactions/descriptors, not retain one lease per cached file. */
 int
 ngx_http_cache_purge_file_lease_acquire(const char *path, int anchor_fd,
-                                        uint64_t offset, int *lease_fd,
-                                        ngx_http_cache_rocksdb_error_t *error);
+    uint64_t offset, int *lease_fd, ngx_http_cache_rocksdb_error_t *error);
 /* Adopt an owned descriptor received with SCM_RIGHTS or duplicated in-process.
  * This checks the anchor inode/access mode and acquires the requested OFD lock
  * if necessary; it does NOT attest which PID previously held it. Peer UID,
@@ -304,15 +301,14 @@ ngx_http_cache_purge_file_lease_acquire(const char *path, int anchor_fd,
  * */
 int
 ngx_http_cache_purge_file_lease_adopt(int anchor_fd, int lease_fd,
-                                      uint64_t                        offset,
-                                      ngx_http_cache_rocksdb_error_t *error);
+    uint64_t offset, ngx_http_cache_rocksdb_error_t *error);
 /* Consume one descriptor reference. Never issue F_UNLCK: other references may
  * still be doing filesystem work. The kernel releases the lease only when
  * the last reference closes, including references queued in a Unix socket.
  * After fork inherited references must be closed before unrelated work. */
 int
 ngx_http_cache_purge_file_lease_release(int *lease_fd,
-                                        ngx_http_cache_rocksdb_error_t *error);
+    ngx_http_cache_rocksdb_error_t *error);
 
 #ifdef __cplusplus
 }
@@ -330,12 +326,173 @@ extern "C" {
  * A successful receive transfers ownership of count descriptors to the caller.
  * Invalid/truncated ancillary data closes all received rights and sets EPROTO.
  * Sending borrows descriptors; callers must not resend rights after n > 0. */
-ssize_t ngx_http_cache_purge_transport_recv(
-    int socket, void *data, size_t size, int allow_rights,
-    int fds[NGX_HTTP_CACHE_PURGE_TRANSPORT_FDS], size_t *count);
+ssize_t ngx_http_cache_purge_transport_recv(int socket, void *data, size_t size,
+    int allow_rights, int fds[NGX_HTTP_CACHE_PURGE_TRANSPORT_FDS],
+    size_t *count);
 ssize_t ngx_http_cache_purge_transport_send(int socket, const void *data,
-                                            size_t size, const int *fds,
-                                            size_t count);
+    size_t size, const int *fds, size_t count);
+#ifdef __cplusplus
+}
+#endif
+
+/*
+ * Copyright (C) Hanada
+ */
+
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define NGX_HTTP_CACHE_PURGE_INVALIDATE    1
+#define NGX_HTTP_CACHE_PURGE_DELETE        2
+
+#define NGX_HTTP_CACHE_PURGE_PREPARING     1
+#define NGX_HTTP_CACHE_PURGE_ACTIVE        2
+#define NGX_HTTP_CACHE_PURGE_DRAINING      3
+#define NGX_HTTP_CACHE_PURGE_MATERIALIZED  4
+
+#define NGX_HTTP_CACHE_PURGE_KEY           0
+#define NGX_HTTP_CACHE_PURGE_URL           1
+#define NGX_HTTP_CACHE_PURGE_KEY_PREFIX    2
+#define NGX_HTTP_CACHE_PURGE_URL_PREFIX    3
+#define NGX_HTTP_CACHE_PURGE_HOST          4
+#define NGX_HTTP_CACHE_PURGE_NAMESPACE_TAG 5
+#define NGX_HTTP_CACHE_PURGE_HOST_TAG      6
+
+
+typedef struct {
+    uint32_t                        kind;
+    ngx_http_cache_rocksdb_bytes_t  value;
+    ngx_http_cache_rocksdb_bytes_t  scope;
+} ngx_http_cache_purge_selector_t;
+
+
+typedef struct {
+    ngx_http_cache_rocksdb_bytes_t   id;
+    ngx_http_cache_purge_selector_t  selector;
+    uint32_t                         mode;
+    uint64_t                         issued_at_ms;
+    ngx_http_cache_rocksdb_bytes_t   binding;
+} ngx_http_cache_purge_operation_input_t;
+
+
+typedef struct {
+    ngx_http_cache_purge_operation_input_t  input;
+    uint64_t                                sequence;
+    uint64_t                                revision;
+    uint32_t                                stage;
+    uint64_t                                accepted_at_ms;
+    uint64_t                                effective_at_ms;
+    uint64_t                                propagation_until_ms;
+    uint32_t                                propagation_ms;
+    int                                     propagate;
+    ngx_http_cache_rocksdb_bytes_t          bookmark;
+    int                                     scan_done;
+    uint64_t                                next_run_ms;
+    uint64_t                                visits;
+    uint64_t                                pending;
+    uint64_t                                failed;
+    uint64_t                                checkpoint_id;
+    ngx_http_cache_rocksdb_bytes_t          last_error;
+
+    /* Owned result bytes; free once, and do not copy this ownership field. */
+    void *storage;
+} ngx_http_cache_purge_operation_t;
+
+
+typedef struct {
+    uint64_t                        id;
+    ngx_http_cache_rocksdb_bytes_t  bookmark;
+    int                             scan_done;
+    uint64_t                        next_run_ms;
+    uint64_t                        visits_delta;
+    uint64_t                        pending;
+    uint64_t                        failed;
+    ngx_http_cache_rocksdb_bytes_t  last_error;
+} ngx_http_cache_purge_checkpoint_t;
+
+
+typedef struct {
+    uint32_t  live_records;
+    uint64_t  live_selector_bytes;
+} ngx_http_cache_purge_operation_limits_t;
+
+
+typedef struct {
+    uint64_t  live_records;
+    uint64_t  live_selector_bytes;
+    uint64_t  last_sequence;
+} ngx_http_cache_purge_operation_usage_t;
+
+
+typedef struct {
+    ngx_http_cache_purge_operation_t  *items;
+    size_t                             count;
+    size_t                             after_len;
+    int                                done;
+    unsigned char                      after[17];
+} ngx_http_cache_purge_operation_page_t;
+
+
+typedef struct {
+    ngx_http_cache_rocksdb_t                *store;
+    ngx_http_cache_purge_operation_limits_t  limits;
+} ngx_http_cache_purge_operations_t;
+
+
+/* Executor-only C API. Results own their bytes and must be freed before reuse.
+ * Failure returns an empty result. Inputs are borrowed for the duration of the
+ * call. No function publishes a FENCE or proves file/reader/writer quiescence.
+ */
+int ngx_http_cache_purge_operations_init(ngx_http_cache_purge_operations_t *ops,
+    ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_operation_limits_t *limits,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_operations_preview(
+    ngx_http_cache_purge_operations_t *ops,
+    const ngx_http_cache_purge_operation_input_t *input, uint64_t now,
+    uint32_t propagation_ms, ngx_http_cache_purge_operation_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_operations_accept(
+    ngx_http_cache_purge_operations_t *ops,
+    const ngx_http_cache_purge_operation_input_t *input, uint64_t now,
+    uint32_t propagation_ms, ngx_http_cache_purge_operation_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_operations_get(ngx_http_cache_purge_operations_t *ops,
+    ngx_http_cache_rocksdb_bytes_t id, ngx_http_cache_purge_operation_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_operations_usage(
+    ngx_http_cache_purge_operations_t *ops,
+    ngx_http_cache_purge_operation_usage_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_operations_activate(
+    ngx_http_cache_purge_operations_t *ops, ngx_http_cache_rocksdb_bytes_t id,
+    uint64_t revision, uint64_t now, ngx_http_cache_purge_operation_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_operations_checkpoint(
+    ngx_http_cache_purge_operations_t *ops, ngx_http_cache_rocksdb_bytes_t id,
+    uint64_t revision, const ngx_http_cache_purge_checkpoint_t *point,
+    ngx_http_cache_purge_operation_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_operations_materialize(
+    ngx_http_cache_purge_operations_t *ops, ngx_http_cache_rocksdb_bytes_t id,
+    uint64_t revision, uint64_t quiescent_sequence,
+    ngx_http_cache_purge_operation_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_operations_page(ngx_http_cache_purge_operations_t *ops,
+    int due, uint64_t now, ngx_http_cache_rocksdb_bytes_t after, size_t limit,
+    ngx_http_cache_purge_operation_page_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_operations_expire(
+    ngx_http_cache_purge_operations_t *ops, uint64_t now, size_t limit,
+    size_t *expired, ngx_http_cache_rocksdb_error_t *error);
+uint64_t ngx_http_cache_purge_operation_charge(
+    const ngx_http_cache_purge_operation_input_t *input);
+void ngx_http_cache_purge_operation_free(ngx_http_cache_purge_operation_t *op);
+void ngx_http_cache_purge_operation_page_free(
+    ngx_http_cache_purge_operation_page_t *page);
+
 #ifdef __cplusplus
 }
 #endif

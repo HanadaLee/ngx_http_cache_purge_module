@@ -29,24 +29,21 @@ set_target_properties(ngx_http_cache_purge_files PROPERTIES POSITION_INDEPENDENT
 target_link_libraries(ngx_http_cache_purge_files PUBLIC OpenSSL::Crypto)
 target_compile_options(ngx_http_cache_purge_files PRIVATE -Wall -Wextra -Werror -Wdeclaration-after-statement)
 
-add_library(ngx_http_cache_purge_operations STATIC ngx_http_cache_purge_operations.cc)
+add_library(ngx_http_cache_purge_operations STATIC ngx_http_cache_purge_operations.c)
+target_compile_features(ngx_http_cache_purge_operations PUBLIC c_std_99)
 set_target_properties(ngx_http_cache_purge_operations PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(ngx_http_cache_purge_operations PUBLIC ngx_http_cache_purge_index)
-target_compile_options(ngx_http_cache_purge_operations PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(ngx_http_cache_purge_operations PUBLIC ngx_http_cache_rocksdb OpenSSL::Crypto)
+target_compile_options(ngx_http_cache_purge_operations PRIVATE -Wall -Wextra -Werror -Wdeclaration-after-statement)
 
 add_library(ngx_http_cache_purge_control STATIC ngx_http_cache_purge_control.cc)
+target_compile_features(ngx_http_cache_purge_control PUBLIC cxx_std_17)
 set_target_properties(ngx_http_cache_purge_control PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(ngx_http_cache_purge_control PUBLIC ngx_http_cache_purge_operations)
 target_compile_options(ngx_http_cache_purge_control PRIVATE -Wall -Wextra -Werror)
 
-add_library(ngx_http_cache_purge_coordinator STATIC ngx_http_cache_purge_coordinator.cc)
-set_target_properties(ngx_http_cache_purge_coordinator PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(ngx_http_cache_purge_coordinator PUBLIC ngx_http_cache_purge_control)
-target_compile_options(ngx_http_cache_purge_coordinator PRIVATE -Wall -Wextra -Werror)
-
-add_library(ngx_http_cache_purge_component STATIC ngx_http_cache_purge_component.cc ngx_http_cache_purge_publication.cc)
+add_library(ngx_http_cache_purge_component STATIC ngx_http_cache_purge_component.cc)
 set_target_properties(ngx_http_cache_purge_component PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(ngx_http_cache_purge_component PUBLIC ngx_http_cache_purge_coordinator ngx_http_cache_purge_files)
+target_link_libraries(ngx_http_cache_purge_component PUBLIC ngx_http_cache_purge_control ngx_http_cache_purge_index ngx_http_cache_purge_files)
 target_compile_options(ngx_http_cache_purge_component PRIVATE -Wall -Wextra -Werror)
 
 option(CACHE_PURGE_STORE_TESTS "Build cache index storage regression tests" OFF)
@@ -93,9 +90,14 @@ if(CACHE_PURGE_STORE_TESTS)
     --binary $<TARGET_FILE:cache_purge_component_test>
     --output ${CMAKE_CURRENT_BINARY_DIR}/component-process-results.json)
   add_executable(cache_purge_operations_test t/operations_runtime.cc)
-  target_link_libraries(cache_purge_operations_test PRIVATE ngx_http_cache_purge_operations)
+  target_link_libraries(cache_purge_operations_test PRIVATE ngx_http_cache_purge_operations ngx_http_cache_purge_index)
   target_compile_options(cache_purge_operations_test PRIVATE -Wall -Wextra -Werror)
   add_test(NAME operations_runtime COMMAND cache_purge_operations_test)
+  add_executable(cache_purge_operations_c_test t/ngx_http_cache_purge_operations_test.c)
+  target_compile_definitions(cache_purge_operations_c_test PRIVATE _GNU_SOURCE)
+  target_compile_options(cache_purge_operations_c_test PRIVATE -std=gnu89 -Wall -Wextra -Werror -Wdeclaration-after-statement)
+  target_link_libraries(cache_purge_operations_c_test PRIVATE ngx_http_cache_purge_operations)
+  add_test(NAME operations_c_api COMMAND cache_purge_operations_c_test)
   add_test(NAME operations_process_runtime COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/t/operations_process_runtime.py
     --binary $<TARGET_FILE:cache_purge_operations_test>
@@ -116,7 +118,7 @@ if(CACHE_PURGE_STORE_TESTS)
   target_link_libraries(cache_purge_control_benchmark PRIVATE ngx_http_cache_purge_control)
   target_compile_options(cache_purge_control_benchmark PRIVATE -Wall -Wextra -Werror)
   add_executable(cache_purge_coordinator_test t/coordinator_runtime.cc)
-  target_link_libraries(cache_purge_coordinator_test PRIVATE ngx_http_cache_purge_coordinator)
+  target_link_libraries(cache_purge_coordinator_test PRIVATE ngx_http_cache_purge_control ngx_http_cache_purge_index)
   target_compile_options(cache_purge_coordinator_test PRIVATE -Wall -Wextra -Werror)
   add_test(NAME coordinator_runtime COMMAND cache_purge_coordinator_test)
   add_test(NAME coordinator_process_runtime COMMAND ${Python3_EXECUTABLE}
@@ -124,6 +126,6 @@ if(CACHE_PURGE_STORE_TESTS)
     --binary $<TARGET_FILE:cache_purge_coordinator_test>
     --output ${CMAKE_CURRENT_BINARY_DIR}/coordinator-process-results.json)
   set_tests_properties(store_runtime index_runtime index_process_runtime files_runtime files_process_runtime file_leases_runtime component_process_runtime
-    operations_runtime operations_process_runtime control_runtime control_fault_runtime
+    operations_runtime operations_c_api operations_process_runtime control_runtime control_fault_runtime
     coordinator_runtime coordinator_process_runtime PROPERTIES TIMEOUT 120)
 endif()

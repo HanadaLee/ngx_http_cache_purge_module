@@ -182,25 +182,126 @@ struct OperationUsage {
  * insufficient. Do not expose these transitions as client assertions in HTTP.
  * All accepted operations retain their idempotency record on disk, even after
  * their bounded resident-control slot is released. */
+/* Conversion-only bridge for backend consumers still being migrated to C. */
+inline ngx_http_cache_rocksdb_bytes_t ngx_http_cache_purge_native_bytes(const std::string &s) {
+    return {reinterpret_cast<const unsigned char *>(s.data()), s.size()};
+}
+inline std::string ngx_http_cache_purge_cpp_bytes(ngx_http_cache_rocksdb_bytes_t s) {
+    return s.len ? std::string(reinterpret_cast<const char *>(s.data), s.len) : std::string{};
+}
+inline ngx_http_cache_purge_operation_input_t ngx_http_cache_purge_native_input(const OperationInput &input) {
+    return {ngx_http_cache_purge_native_bytes(input.id),
+            {static_cast<uint32_t>(input.selector.kind), ngx_http_cache_purge_native_bytes(input.selector.value),
+             ngx_http_cache_purge_native_bytes(input.selector.scope)},
+            static_cast<uint32_t>(input.mode), input.issued_at_ms, ngx_http_cache_purge_native_bytes(input.binding)};
+}
+inline Operation ngx_http_cache_purge_cpp_operation(const ngx_http_cache_purge_operation_t &input) {
+    Operation out;
+    out.input.id = ngx_http_cache_purge_cpp_bytes(input.input.id);
+    out.input.selector = {static_cast<SelectorKind>(input.input.selector.kind),
+                         ngx_http_cache_purge_cpp_bytes(input.input.selector.value),
+                         ngx_http_cache_purge_cpp_bytes(input.input.selector.scope)};
+    out.input.mode = static_cast<PurgeMode>(input.input.mode);
+    out.input.issued_at_ms = input.input.issued_at_ms;
+    out.input.binding = ngx_http_cache_purge_cpp_bytes(input.input.binding);
+    out.sequence = input.sequence; out.revision = input.revision;
+    out.stage = static_cast<OperationStage>(input.stage);
+    out.accepted_at_ms = input.accepted_at_ms; out.effective_at_ms = input.effective_at_ms;
+    out.propagation_until_ms = input.propagation_until_ms; out.propagation_ms = input.propagation_ms;
+    out.propagate = input.propagate != 0; out.bookmark = ngx_http_cache_purge_cpp_bytes(input.bookmark);
+    out.scan_done = input.scan_done != 0; out.next_run_ms = input.next_run_ms;
+    out.visits = input.visits; out.pending = input.pending; out.failed = input.failed;
+    out.checkpoint_id = input.checkpoint_id; out.last_error = ngx_http_cache_purge_cpp_bytes(input.last_error);
+    return out;
+}
 class Operations {
+    ngx_http_cache_purge_operations_t native_{};
+    struct Result {
+        ngx_http_cache_purge_operation_t value{};
+        Result() = default;
+        Result(const Result &) = delete;
+        ~Result() { ngx_http_cache_purge_operation_free(&value); }
+    };
+    struct Page {
+        ngx_http_cache_purge_operation_page_t value{};
+        Page() = default;
+        Page(const Page &) = delete;
+        ~Page() { ngx_http_cache_purge_operation_page_free(&value); }
+    };
+    static void checked(int rc, const ngx_http_cache_rocksdb_error_t &error) {
+        if (rc) throw IndexError(rc, error.message);
+    }
+    OperationPage page(bool due, uint64_t now, const std::string &after, size_t limit) {
+        Page output; ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_operations_page(&native_, due, now,
+            ngx_http_cache_purge_native_bytes(after), limit, &output.value, &error);
+        checked(rc, error);
+        OperationPage result; result.done = output.value.done != 0;
+        result.after.assign(reinterpret_cast<char *>(output.value.after), output.value.after_len);
+        result.items.reserve(output.value.count);
+        for (size_t i = 0; i < output.value.count; i++)
+            result.items.push_back(ngx_http_cache_purge_cpp_operation(output.value.items[i]));
+        return result;
+    }
 public:
-    explicit Operations(ngx_http_cache_rocksdb_t *store, OperationLimits limits = {});
-    Operation preview(const OperationInput &input, uint64_t now_ms, uint32_t propagation_ms = 300000);
-    Operation accept(const OperationInput &input, uint64_t now_ms, uint32_t propagation_ms = 300000);
-    Operation get(const std::string &id);
-    OperationUsage usage(); // Recovery verifies this budget against paged live records.
-    Operation activate(const std::string &id, uint64_t revision, uint64_t now_ms);
-    Operation checkpoint(const std::string &id, uint64_t revision, const OperationCheckpoint &checkpoint);
-    Operation materialize(const std::string &id, uint64_t revision, uint64_t quiescent_sequence);
-    OperationPage live(const std::string &after = "", size_t limit = 32);
-    OperationPage due(uint64_t now_ms, const std::string &after = "", size_t limit = 32);
-    size_t expire_propagation(uint64_t now_ms, size_t limit = 32);
-private:
-    ngx_http_cache_rocksdb_t *store_;
-    OperationLimits limits_;
+    explicit Operations(ngx_http_cache_rocksdb_t *store, OperationLimits limits = {}) {
+        ngx_http_cache_purge_operation_limits_t raw{limits.live_records, limits.live_selector_bytes};
+        ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_operations_init(&native_, store, &raw, &error);
+        checked(rc, error);
+    }
+    Operation preview(const OperationInput &input, uint64_t now, uint32_t propagation_ms = 300000) {
+        auto raw = ngx_http_cache_purge_native_input(input);
+        Result output; ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_operations_preview(&native_, &raw, now, propagation_ms, &output.value, &error);
+        checked(rc, error); return ngx_http_cache_purge_cpp_operation(output.value);
+    }
+    Operation accept(const OperationInput &input, uint64_t now, uint32_t propagation_ms = 300000) {
+        auto raw = ngx_http_cache_purge_native_input(input);
+        Result output; ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_operations_accept(&native_, &raw, now, propagation_ms, &output.value, &error);
+        checked(rc, error); return ngx_http_cache_purge_cpp_operation(output.value);
+    }
+    Operation get(const std::string &id) {
+        Result output; ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_operations_get(&native_, ngx_http_cache_purge_native_bytes(id), &output.value, &error);
+        checked(rc, error); return ngx_http_cache_purge_cpp_operation(output.value);
+    }
+    OperationUsage usage() {
+        ngx_http_cache_purge_operation_usage_t output{}; ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_operations_usage(&native_, &output, &error);
+        checked(rc, error); return {output.live_records, output.live_selector_bytes, output.last_sequence};
+    }
+    Operation activate(const std::string &id, uint64_t revision, uint64_t now) {
+        Result output; ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_operations_activate(&native_, ngx_http_cache_purge_native_bytes(id), revision, now, &output.value, &error);
+        checked(rc, error); return ngx_http_cache_purge_cpp_operation(output.value);
+    }
+    Operation checkpoint(const std::string &id, uint64_t revision, const OperationCheckpoint &point) {
+        ngx_http_cache_purge_checkpoint_t raw{point.id, ngx_http_cache_purge_native_bytes(point.bookmark), point.scan_done,
+            point.next_run_ms, point.visits_delta, point.pending, point.failed, ngx_http_cache_purge_native_bytes(point.last_error)};
+        Result output; ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_operations_checkpoint(&native_, ngx_http_cache_purge_native_bytes(id), revision, &raw, &output.value, &error);
+        checked(rc, error); return ngx_http_cache_purge_cpp_operation(output.value);
+    }
+    Operation materialize(const std::string &id, uint64_t revision, uint64_t quiescent_sequence) {
+        Result output; ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_operations_materialize(&native_, ngx_http_cache_purge_native_bytes(id), revision, quiescent_sequence, &output.value, &error);
+        checked(rc, error); return ngx_http_cache_purge_cpp_operation(output.value);
+    }
+    OperationPage live(const std::string &after = "", size_t limit = 32) { return page(false, 0, after, limit); }
+    OperationPage due(uint64_t now, const std::string &after = "", size_t limit = 32) { return page(true, now, after, limit); }
+    size_t expire_propagation(uint64_t now, size_t limit = 32) {
+        size_t output = 0; ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_operations_expire(&native_, now, limit, &output, &error);
+        checked(rc, error); return output;
+    }
 };
+inline uint64_t operation_control_bytes(const OperationInput &input) {
+    auto raw = ngx_http_cache_purge_native_input(input);
+    return ngx_http_cache_purge_operation_charge(&raw);
+}
 
-uint64_t operation_control_bytes(const OperationInput &input);
 
 } // namespace ngx_http_cache_purge
 

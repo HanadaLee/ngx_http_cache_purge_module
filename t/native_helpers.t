@@ -272,7 +272,7 @@ subtest 'generation rules and conditional invalidation' => sub {
               qw(src/core src/event src/event/modules src/os/unix objs
                  src/http src/http/modules src/http/v2 src/http/v3);
     unshift @inc, "-I$ENV{NGINX_BUILD_DIR}" if $ENV{NGINX_BUILD_DIR};
-    my $generation = read_file("$root/ngx_http_cache_purge_invalidation.c");
+    my $generation = read_file("$root/ngx_http_cache_purge_module.c");
     $generation =~ /(typedef struct ngx_http_cache_purge_rule_s.*?)(?=typedef struct ngx_http_cache_purge_snapshot_s)/s
         or die 'missing generation state';
     my $state = $1;
