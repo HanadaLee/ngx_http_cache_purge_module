@@ -88,8 +88,8 @@ if [ -n "$CACHE_PURGE_ROCKSDB_LIB_DIR" ]; then
         echo "cache purge persistent runtime libraries could not link"
         exit 1
     fi
-    CACHE_PURGE_SRCS="$CACHE_PURGE_SRCS $ngx_addon_dir/ngx_cache_purge_runtime.c"
-    CACHE_PURGE_DEPS="$CACHE_PURGE_DEPS $ngx_addon_dir/ngx_cache_purge_runtime.h $ngx_addon_dir/ngx_cache_purge_component.h $ngx_addon_dir/ngx_cache_purge_control.h"
+    CACHE_PURGE_SRCS="$CACHE_PURGE_SRCS $ngx_addon_dir/ngx_cache_purge_runtime.c $ngx_addon_dir/ngx_cache_purge_client.c"
+    CACHE_PURGE_DEPS="$CACHE_PURGE_DEPS $ngx_addon_dir/ngx_cache_purge_runtime.h $ngx_addon_dir/ngx_cache_purge_component.h $ngx_addon_dir/ngx_cache_purge_control.h $ngx_addon_dir/ngx_cache_purge_client.h"
 fi
 
 # auto/module supports static and dynamic registration since NGINX 1.9.11.

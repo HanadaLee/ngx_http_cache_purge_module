@@ -25,6 +25,8 @@ struct ngx_http_cache_purge_runtime_s {
     ngx_cache_purge_component_options_t options;
     ngx_cache_purge_component_t      *component;
     ngx_cache_purge_control_reader_t *reader;
+    ngx_cache_purge_client_t         *client;
+    uid_t                            owner_uid;
     ngx_msec_t                       propagation;
     ngx_uint_t                       started;
     ngx_uint_t                       failed;
@@ -369,6 +371,7 @@ ngx_http_cache_purge_runtime_module_init(ngx_cycle_t *cycle)
             (geteuid() == 0 ? core->user : geteuid());
 #endif
         rt = main->runtime;
+        rt->owner_uid = geteuid();
         access = rt->options.client_uid == (uint32_t) geteuid() ? 0700 : 0711;
         /* DB storage is not a native cache path: ngx_create_paths() would
          * chown it to the HTTP worker UID, including on every reload. */
@@ -525,10 +528,53 @@ ngx_http_cache_purge_runtime_worker_exit(ngx_cycle_t *cycle)
 
     if (ngx_process != NGX_PROCESS_WORKER) { return; }
     main = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_cache_purge_module);
+    if (main && main->runtime) {
+        ngx_cache_purge_client_stop(main->runtime->client);
+    }
     if (main && main->runtime->reader) {
         rc = ngx_cache_purge_control_reader_close(&main->runtime->reader, &error);
         if (rc && rc != NGX_PURGE_STORE_BUSY) {
             ngx_log_error(NGX_LOG_ALERT, cycle->log, 0, "cache purge reader close: %s", error.message);
         }
     }
+}
+
+int
+ngx_http_cache_purge_runtime_client(ngx_http_request_t *r,
+    ngx_cache_purge_client_t **client)
+{
+    ngx_http_cache_purge_main_conf_t *main;
+    ngx_http_cache_purge_runtime_t *rt;
+    ngx_cache_purge_client_options_t options;
+    ngx_str_t path;
+    u_char socket_path[sizeof(((struct sockaddr_un *) 0)->sun_path)];
+    u_char *p;
+
+    if (r == NULL || client == NULL || ngx_process != NGX_PROCESS_WORKER) {
+        return NGX_PURGE_STORE_INVALID;
+    }
+    *client = NULL;
+    main = ngx_http_get_module_main_conf(r, ngx_http_cache_purge_module);
+    rt = main ? main->runtime : NULL;
+    if (rt == NULL || rt->path == NULL) {
+        return NGX_PURGE_STORE_NOT_FOUND;
+    }
+    if (rt->client == NULL) {
+        path.len = rt->path->name.len + sizeof("/component.sock") - 1;
+        if (path.len >= sizeof(socket_path)) {
+            return NGX_PURGE_STORE_LIMIT;
+        }
+        path.data = socket_path;
+        p = ngx_cpymem(path.data, rt->path->name.data, rt->path->name.len);
+        ngx_memcpy(p, "/component.sock", sizeof("/component.sock") - 1);
+        ngx_cache_purge_client_options(&options);
+        options.server_uid = rt->owner_uid;
+        rt->client = ngx_cache_purge_client_create(ngx_cycle->pool,
+            ngx_cycle->log, &path, &options);
+        if (rt->client == NULL) {
+            return NGX_PURGE_STORE_LIMIT;
+        }
+    }
+    *client = rt->client;
+    return NGX_PURGE_STORE_OK;
 }

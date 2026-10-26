@@ -18,6 +18,13 @@ between requests. These are internal building blocks; request handling and cache
 file hooks are still being implemented. Index state changes
 do not perform filesystem operations or provide immediate invalidation by themselves.
 
+HTTP workers now have an event-driven Unix IPC client with a reusable connection,
+bounded queues and buffers, absolute deadlines, peer UID verification, and explicit
+cancellation/shutdown. It preserves application errors and reports uncertain
+outcomes after a lost reply without replaying requests automatically. The client
+does not retain nginx requests implicitly; its consumers own that lifecycle.
+The real agent and fault-injection peers are exercised by `t/runtime_nginx.py`.
+
 A durable operation ledger now stores selectors, idempotency identities,
 checkpoints, retry scheduling, and independent materialization/propagation states.
 Acceptance remains `preparing` until native cache integration can attest effective

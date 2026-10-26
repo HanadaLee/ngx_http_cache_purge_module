@@ -12,6 +12,7 @@ import signal
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -28,6 +29,7 @@ p.add_argument('--output', type=Path, required=True)
 p.add_argument('--build-root', type=Path)
 p.add_argument('--dynamic', action='store_true')
 p.add_argument('--shared-rocksdb', action='store_true', help='Use the system shared engine when its static archive is not PIC')
+p.add_argument('--sanitize', action='store_true')
 p.add_argument('--runtime-only', action='store_true', help='Reuse the verified build for a separate runtime UID test')
 p.add_argument('--worker-user', help='Worker user for tests started by root')
 a = p.parse_args()
@@ -35,6 +37,14 @@ source = Path(__file__).resolve().parents[1]
 root = a.build_root or Path(tempfile.mkdtemp(prefix='ncp-addon-', dir='/tmp'))
 root.mkdir(exist_ok=True)
 root.chmod(0o755)
+validation = Path(tempfile.mkdtemp(prefix='validation-', dir=root))
+validation.chmod(0o755)
+if a.sanitize:
+    # Existing OpenResty agent exit retains native event connection arrays.
+    # Keep leak checks for client/component allocations; do not disable LSan.
+    suppressions = validation / 'native-event-arrays.lsan'
+    suppressions.write_text('leak:ngx_event_process_init\n')
+    os.environ['LSAN_OPTIONS'] = 'suppressions=' + str(suppressions)
 addon, probe, build = root / 'addon', root / 'probe', root / 'nginx'
 for path in (addon, probe, build):
     path.mkdir(exist_ok=True)
@@ -72,6 +82,7 @@ env['CACHE_PURGE_PROBE_HEADERS'] = str(addon)
 print('BUILD', root, flush=True)
 manifest = {'nginx_revision': revision, 'openresty_patches': patches, 'dynamic': a.dynamic,
             'shared_rocksdb': a.shared_rocksdb,
+            'sanitizer': a.sanitize,
             'archives': {name: hashlib.sha256(path.read_bytes()).hexdigest()
                          for name in ('component', 'coordinator', 'control', 'operations', 'index', 'store')
                          for path in [a.libraries / f'libngx_cache_purge_{name}.a']}}
@@ -81,8 +92,12 @@ else:
   with (root / 'build.log').open('w') as f:
     configure = 'auto/configure' if (build / 'auto/configure').exists() else 'configure'
     module_option = '--add-dynamic-module=' if a.dynamic else '--add-module='
-    subprocess.run(['sh', configure, '--prefix=' + str(root / 'run'), '--without-http_rewrite_module',
-                    '--without-http_gzip_module', module_option + str(addon), module_option + str(probe)],
+    args = ['sh', configure, '--prefix=' + str(root / 'run'), '--without-http_rewrite_module',
+            '--without-http_gzip_module', module_option + str(addon), module_option + str(probe)]
+    if a.sanitize:
+        args += ['--with-cc-opt=-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize=nonnull-attribute -fno-pie',
+                 '--with-ld-opt=-fsanitize=address,undefined -no-pie']
+    subprocess.run(args,
                    cwd=build, env=env, stdout=f, stderr=subprocess.STDOUT, check=True)
     subprocess.run(['make', '-j2'], cwd=build, stdout=f, stderr=subprocess.STDOUT, check=True)
     if a.dynamic:
@@ -93,19 +108,19 @@ checks = []
 negative = subprocess.run(['cc', '-c', '-DNGX_RESTY_EXT=0',
     *[item for path in ('objs', 'src/core', 'src/event', 'src/event/modules', 'src/os/unix', 'src/http', 'src/http/modules')
       for item in ('-I', str(build / path))], '-I', str(addon), str(addon / 'ngx_cache_purge_runtime.c'),
-    '-o', str(root / 'without-exit-hook.o')], capture_output=True)
+    '-o', str(validation / 'without-ext.o')], capture_output=True)
 if a.agent_patches:
     assert negative.returncode == 0, negative.stderr.decode()
     assert 'manager_exit' not in (build / 'src/core/ngx_file.h').read_text()
     checks.append('existing OpenResty agent builds without any new nginx-ext or manager-exit capability')
 else:
     assert negative.returncode == 0, negative.stderr.decode()
-shim = root / 'without-agent.h'
+shim = validation / 'without-agent.h'
 shim.write_text('#include <ngx_config.h>\n#include <ngx_core.h>\n#undef HAVE_PRIVILEGED_PROCESS_PATCH\n')
 unsupported = subprocess.run(['cc', '-include', str(shim), '-c',
     *[item for path in ('objs', 'src/core', 'src/event', 'src/event/modules', 'src/os/unix', 'src/http', 'src/http/modules')
       for item in ('-I', str(build / path))], '-I', str(addon), str(addon / 'ngx_cache_purge_runtime.c'),
-    '-o', str(root / 'without-agent.o')], capture_output=True)
+    '-o', str(validation / 'without-agent.o')], capture_output=True)
 assert unsupported.returncode and b'requires the existing OpenResty privileged agent capability' in unsupported.stderr
 checks.append('persistent build without the agent capability is rejected explicitly')
 origin_calls = {}
@@ -169,8 +184,11 @@ def until(predicate, timeout=10):
     raise AssertionError('runtime deadline')
 
 
+runtime_cases = []
+
 class Run:
-    def __init__(self, enabled=True):
+    def __init__(self, enabled=True, workers=2, rpc_socket=None):
+        runtime_cases.append(self)
         self.path = Path(tempfile.mkdtemp(prefix='case-', dir=root))
         self.path.chmod(0o755)
         (self.path / 'logs').mkdir(exist_ok=True)
@@ -185,8 +203,15 @@ class Run:
         if a.dynamic:
             loads = (f'load_module {build}/objs/ngx_http_cache_purge_module.so;\n'
                      f'load_module {build}/objs/ngx_http_cache_purge_runtime_probe_module.so;\n')
+        rpc_locations = '' if rpc_socket is None else f'''
+client_body_buffer_size 1m;
+location /rpc/ {{ cache_purge_test_rpc runtime; }}
+location /rpc-fake/ {{ cache_purge_test_rpc {rpc_socket}; }}
+location /rpc-wrong/ {{ cache_purge_test_rpc {rpc_socket}; cache_purge_test_rpc_wrong_uid on; }}
+location /rpc-missing/ {{ cache_purge_test_rpc {self.path}/missing.sock; }}
+'''
         self.config = loads + user + f'''
-daemon off; worker_processes 2; pid {self.path}/pid;
+daemon off; worker_processes {workers}; pid {self.path}/pid;
 error_log {self.path}/error.log notice;
 events {{ worker_connections 128; }}
 http {{ access_log off;
@@ -195,6 +220,7 @@ cache_purge_state_zone control 4m;
 proxy_cache_path {self.path}/cache-a keys_zone=a:1m;
 proxy_cache_path {self.path}/cache-b keys_zone=b:1m;
 server {{ listen 127.0.0.1:{self.port};
+{rpc_locations}
 location /cache/a {{ cache_purge_test_reader on; proxy_cache a; proxy_cache_key $uri;
 proxy_pass http://127.0.0.1:{origin.server_port}; add_header X-Cache $upstream_cache_status always; }}
 location /cache/b {{ cache_purge_test_reader on; proxy_cache b; proxy_cache_key $uri;
@@ -420,9 +446,20 @@ if a.agent_patches:
             standby.stop(signal.SIGTERM)
             assert time.monotonic() - start < 3
         checks.append('agent owner-lock wait is cancelled and joined during TERM without waiting for the lock holder')
+sys.dont_write_bytecode = True
+from client_cases import run_client_cases
+client_result = run_client_cases(Run, root, checks)
+for instance in runtime_cases:
+    for name in ('error.log', 'stderr.log'):
+        path = instance.path / name
+        if path.exists():
+            log = path.read_text()
+            assert not any(marker in log for marker in ('AddressSanitizer', 'LeakSanitizer', 'runtime error:')), path
 origin.shutdown()
 checks = list(dict.fromkeys(checks))
 result = {'root': str(root), 'nginx_revision': revision, 'dynamic': a.dynamic,
+          'sanitizer': a.sanitize,
+          'sanitizer_exclusions': ['nonnull-attribute', 'leak:ngx_event_process_init'] if a.sanitize else [],
           'owner_backend': 'openresty-agent',
           'openresty_patches': patches, 'worker_user': a.worker_user,
           'rocksdb_linkage': 'shared' if a.shared_rocksdb else 'static', 'checks': checks,
@@ -430,6 +467,10 @@ result = {'root': str(root), 'nginx_revision': revision, 'dynamic': a.dynamic,
           'empty_component_pss_increment_kib': memory['component_empty']['pss_kib'] - memory['baseline']['pss_kib'],
           'library_sha256': {name: hashlib.sha256((a.libraries / f'libngx_cache_purge_{name}.a').read_bytes()).hexdigest()
                              for name in ('component', 'coordinator', 'control', 'operations', 'index', 'store')},
-          'scope': 'actual addon resource lifecycle; separate test precontent consumer; no native file/304/write hooks or final purge API'}
+          'addon_sha256': {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in addon.iterdir() if path.is_file()},
+          'probe_sha256': {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in probe.iterdir() if path.is_file()},
+          'runtime_paths': [str(instance.path) for instance in runtime_cases],
+          'worker_client': client_result,
+          'scope': 'actual addon resource lifecycle and worker IPC; separate test consumers; no native file/304/index transaction or final purge API'}
 a.output.write_text(json.dumps(result, indent=2) + '\n')
 print('PASS', len(checks), 'agent integration checks;', 'results:', a.output, flush=True)

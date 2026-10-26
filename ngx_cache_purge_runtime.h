@@ -6,6 +6,7 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 #include "ngx_cache_purge_control.h"
+#include "ngx_cache_purge_client.h"
 
 typedef struct ngx_http_cache_purge_runtime_s ngx_http_cache_purge_runtime_t;
 
@@ -23,5 +24,10 @@ void ngx_http_cache_purge_runtime_worker_exit(ngx_cycle_t *cycle);
  * be interpreted as a cache miss or as permission to serve an unchecked HIT. */
 int ngx_http_cache_purge_runtime_reader(ngx_http_request_t *r,
     ngx_cache_purge_control_reader_t **reader, ngx_cache_purge_store_error_t *error);
+
+/* Lazily create this worker's bounded IPC client; no connect or DB I/O here.
+ * Returns NOT_FOUND when no persistent runtime is configured. */
+int ngx_http_cache_purge_runtime_client(ngx_http_request_t *r,
+    ngx_cache_purge_client_t **client);
 
 #endif
