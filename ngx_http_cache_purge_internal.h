@@ -58,7 +58,10 @@ typedef enum {
      * lease FD */
     NGX_HTTP_CACHE_PURGE_OP_ACQUIRE_PUBLICATION,
     /* root, zone, selected path; one FD -> GET-format verified file record */
-    NGX_HTTP_CACHE_PURGE_OP_INSPECT_FILE
+    NGX_HTTP_CACHE_PURGE_OP_INSPECT_FILE,
+    /* ID, revision, transaction, before/after, TAG mode/count/values;
+     * two FDs: lease, selected file -> verified GET-format record */
+    NGX_HTTP_CACHE_PURGE_OP_VALIDATE_FILE
 } ngx_http_cache_purge_opcode_e;
 
 #define NGX_HTTP_CACHE_PURGE_ROOT_CACHE 1
@@ -670,6 +673,15 @@ int ngx_http_cache_purge_index_publish_update(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_add_url(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_bytes_t key, ngx_http_cache_rocksdb_bytes_t url,
+    ngx_http_cache_rocksdb_error_t *error);
+/* Visits every persisted URL for the file's key, without retaining the set.
+ * The callback borrows each URL until it returns. Exceeding either bound fails
+ * with LIMIT; callers must not treat partial enumeration as full coverage. */
+typedef int (*ngx_http_cache_purge_index_url_pt)(void *data,
+    ngx_http_cache_rocksdb_bytes_t url, ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_visit_urls(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file, size_t max_urls,
+    size_t max_bytes, ngx_http_cache_purge_index_url_pt visit, void *data,
     ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_collect(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_expected_t *files, size_t count,

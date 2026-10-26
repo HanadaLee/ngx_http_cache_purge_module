@@ -101,12 +101,13 @@ def identity(value):
     return value.to_bytes(16, 'big')
 
 
-def record(n, root='/cache/a', uri='/dir/a', misc='', metadata='proof-v1', zone=None, path=None):
+def record(n, root='/cache/a', uri='/dir/a', misc='', metadata='proof-v1', zone=None, path=None,
+           tags=('photo', 'common')):
     fields = ['team\x1fhttps\x1fa.test\x1f' + uri + '\x1f' + misc,
               'https://a.test' + uri, 'business.test', 'team', root,
               zone or ('zone-a' if root == '/cache/a' else 'zone-b'), path or f'a/00/{n}', 'bytes=0-99', 'lang']
     return (identity(n) + b''.join(map(string, fields)) + string(metadata)
-            + b'\x02' + string('photo') + string('common') + b'\0\0'
+            + bytes([len(tags)]) + b''.join(map(string, tags)) + b'\0\0'
             + string('') * 6 + identity(0))
 
 
@@ -203,6 +204,13 @@ class Client:
         assert self.socket.sendmsg([packet[:1]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [fd]))]) == 1
         self.socket.sendall(packet[1:])
         return self.reply(21, code)
+
+    def validate_file(self, data, lease, selected, code=0):
+        packet = self.packet(22, data)
+        assert self.socket.sendmsg([packet[:1]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                                  array.array('i', [lease, selected]))]) == 1
+        self.socket.sendall(packet[1:])
+        return self.reply(22, code)
 
     def page(self, kind, value, scope='', bookmark=b'', limit=32):
         data = self.call(8, query(kind, value, scope, bookmark, limit))
@@ -637,6 +645,122 @@ try:
     check(c.call(14, operation_input('guarded-operation')) == accepted, 'recovered control keeps original durable identity')
     c.close()
     restored.stop()
+
+    validation_cache, validation_temp = root / 'validation-cache', root / 'validation-temp'
+    validation_cache.mkdir(); validation_temp.mkdir()
+    validation_shared = root / 'validation.shm'
+    validating = Component(root / 'validating', shared=validation_shared,
+                           roots=(validation_cache, validation_temp))
+    validating.opened(); v = Client(validating.path)
+    wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+
+    def make_validation_file(n, uri):
+        target = validation_cache / f'a/00/{n}'
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source = validation_temp / str(n)
+        source.write_bytes(b'old-head' + b'body' * 16384)
+        lease = v.lease(str(target))
+        fd = os.open(source, os.O_RDWR | os.O_CLOEXEC)
+        v.prepare_file(record(n, root=str(validation_cache), zone='zone-a', uri=uri,
+                              tags=(f'tag-{n}', 'shared')) + string(str(source)), [lease, fd])
+        source.rename(target); v.finish_file(n, lease)
+        os.close(fd)
+        return target, lease, os.open(target, os.O_RDONLY | os.O_CLOEXEC)
+
+    def validation_packet(n, revision=2, token=1, before=b'old-head', after=b'new-head', tags=None):
+        return (identity(n) + struct.pack('>Q', revision) + identity(token) + string(before) + string(after)
+                + bytes([tags is not None, len(tags or [])]) + b''.join(map(string, tags or [])))
+
+    def validation_operation(name, kind, value, scope=''):
+        data = (string(name) + b'\x01' + struct.pack('>Q', 1000) + bytes([kind])
+                + string(value) + string(scope) + string('validation-test'))
+        v.call(14, data)
+
+    target, lease, selected = make_validation_file(601, '/validate')
+    packet = validation_packet(601, tags=['new-tag'])
+    outcome = v.validate_file(packet, lease, selected)
+    assert outcome[:9] == b'\x02' + struct.pack('>Q', 4)
+    assert target.read_bytes() == b'new-head' + b'body' * 16384
+    assert v.page(5, 'new-tag', 'team')[0] == [601]
+    assert v.page(5, 'tag-601', 'team')[0] == []
+    assert v.inspect_file((str(validation_cache), 'zone-a', 'a/00/601'), selected) == outcome
+    writes = struct.unpack('>9Q', v.call(1))[1]
+    assert v.validate_file(packet, lease, selected) == outcome
+    v.validate_file(validation_packet(601, after=b'bad-head', tags=['new-tag']), lease, selected, code=7)
+    assert struct.unpack('>9Q', v.call(1))[1] == writes
+    check(True, 'VALIDATE_FILE atomically changes TAGs and the bounded header, preserves the body and retries without writes')
+
+    validation_operation('unrelated-validation-rule', 1, 'https://a.test/unrelated')
+    wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+    packet = validation_packet(601, revision=4, token=2, before=b'new-head')
+    assert v.validate_file(packet, lease, selected)[:9] == b'\x02' + struct.pack('>Q', 6)
+    check(True, 'an unrelated accepted rule permits validation through the bounded URL visitor')
+
+    key = 'team\x1fhttps\x1fa.test\x1f/validate\x1f'
+    v.call(12, string(key) + string('https://a.test/alias'))
+    assert validating.match()[0] == 0
+    validating.guard()
+    validation_operation('alias-before-validation', 1, 'https://a.test/alias')
+    wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 5)
+    packet = validation_packet(601, revision=6, token=3, before=b'new-head', tags=[])
+    previous = v.call(2, identity(601))
+    v.validate_file(packet, lease, selected, code=6)
+    assert v.call(2, identity(601)) == previous
+    validating.guard(release=True)
+    wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+    v.validate_file(packet, lease, selected, code=7)
+    assert v.call(2, identity(601)) == previous and v.page(5, 'new-tag', 'team')[0] == [601]
+    check(True, 'accepted but unpublished controls stop validation; a persisted alias FENCE blocks TAG removal after publication')
+    os.close(lease); os.close(selected)
+
+    # Each operation uses a distinct file/tag until the final broad host rule.
+    cases = [(610, 0, 'team\x1fhttps\x1fa.test\x1f/scope-610\x1f', ''),
+             (611, 2, 'team\x1fhttps\x1fa.test\x1f/scope-611', ''),
+             (612, 3, 'https://a.test/scope-612', ''),
+             (613, 5, 'tag-613', 'team'), (614, 6, 'tag-614', 'business.test')]
+    for n, kind, value, scope in cases:
+        target, lease, selected = make_validation_file(n, f'/scope-{n}')
+        if kind in (5, 6):
+            validation_operation(f'wrong-scope-{n}', kind, value, 'other')
+            wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+            v.validate_file(validation_packet(n), lease, selected)
+            revision, before = 4, b'new-head'
+        else:
+            revision, before = 2, b'old-head'
+        validation_operation(f'validation-rule-{n}', kind, value, scope)
+        wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+        previous = v.call(2, identity(n)); contents = target.read_bytes()
+        v.validate_file(validation_packet(n, revision, token=2, before=before, tags=[]), lease, selected, code=7)
+        assert v.call(2, identity(n)) == previous and target.read_bytes() == contents
+        os.close(lease); os.close(selected)
+    check(True, 'validation checks exact/prefix keys, URL prefixes and scoped old TAGs before catalogue mutation')
+
+    target, lease, selected = make_validation_file(620, '/alias-limit')
+    key = 'team\x1fhttps\x1fa.test\x1f/alias-limit\x1f'
+    for i in range(64):
+        v.call(12, string(key) + string(f'https://a.test/many/{i}'))
+    previous = v.call(2, identity(620))
+    v.validate_file(validation_packet(620), lease, selected, code=5)
+    assert v.call(2, identity(620)) == previous and target.read_bytes().startswith(b'old-head')
+    os.close(lease); os.close(selected)
+    check(True, 'excess URL aliases fail validation without partial TAG or header mutation')
+
+    target, lease, selected = make_validation_file(621, '/host-rule')
+    validation_operation('validation-host', 4, 'business.test')
+    wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+    previous = v.call(2, identity(621))
+    v.validate_file(validation_packet(621), lease, selected, code=7)
+    assert v.call(2, identity(621)) == previous
+    v.close(); validating.process.kill(); validating.process.wait(timeout=5)
+    validating = Component(validating.path, shared=validation_shared,
+                           roots=(validation_cache, validation_temp))
+    validating.opened(); v = Client(validating.path)
+    wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+    v.validate_file(validation_packet(621), lease, selected, code=7)
+    assert v.call(2, identity(621)) == previous
+    os.close(lease); os.close(selected)
+    check(True, 'host FENCE rejection survives owner crash and control recovery')
+    v.close(); validating.stop()
 finally:
     for component in processes:
         if component.process.poll() is None:

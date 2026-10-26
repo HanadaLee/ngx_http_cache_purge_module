@@ -5389,6 +5389,78 @@ ngx_http_cache_purge_index_add_url(ngx_http_cache_rocksdb_t *store,
     return ngx_http_cache_purge_index_tx_end(tx, error);
 }
 
+int
+ngx_http_cache_purge_index_visit_urls(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file, size_t max_urls,
+    size_t max_bytes, ngx_http_cache_purge_index_url_pt visit, void *data,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_index_tx_t      *tx;
+    ngx_http_cache_purge_query_t         *q;
+    ngx_http_cache_purge_index_record_t   record;
+    ngx_http_cache_rocksdb_bytes_t        number, url;
+    ngx_http_cache_rocksdb_error_t        failure;
+    size_t                                count, bytes;
+    int                                   rc;
+
+    if (store == NULL || file == NULL || visit == NULL || max_urls == 0
+        || max_urls > 256 || max_bytes == 0 || max_bytes > 1048576)
+    {
+        return ngx_http_cache_purge_index_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid URL visit budget");
+    }
+    tx = ngx_http_cache_purge_index_tx_begin(store, error);
+    if (tx == NULL) {
+        return NGX_HTTP_CACHE_ROCKSDB_LIMIT;
+    }
+    q = tx->context;
+    if (!ngx_http_cache_purge_index_load(tx, file, &record)
+        || !ngx_http_cache_purge_index_require(q, record.state == 2,
+            NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "URL owner is not committed"))
+    {
+        return ngx_http_cache_purge_index_tx_end(tx, error);
+    }
+    ngx_http_cache_purge_index_cursor_open(q, &q->links,
+        NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+        ngx_http_cache_purge_index_row_key(q, 'a', record.refs[0]),
+        ngx_http_cache_purge_op_empty, NULL);
+    count = 0;
+    bytes = 0;
+    while (q->status == 0
+           && ngx_http_cache_purge_index_cursor_next(q, &q->links))
+    {
+        if (!ngx_http_cache_purge_index_require(q, count < max_urls,
+                NGX_HTTP_CACHE_ROCKSDB_LIMIT, "too many URL aliases")
+            || !ngx_http_cache_purge_index_require(q, q->links.key.len == 17,
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid reverse URL relation"))
+        {
+            break;
+        }
+        number.data = q->links.key.data + 9;
+        number.len = 8;
+        url = ngx_http_cache_purge_index_dict_text(tx,
+            ngx_http_cache_purge_index_integer(q, number));
+        if (q->status != 0
+            || !ngx_http_cache_purge_index_require(q,
+                url.len <= max_bytes - bytes, NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+                "URL aliases exceed byte budget"))
+        {
+            break;
+        }
+        count++;
+        bytes += url.len;
+        memset(&failure, 0, sizeof(failure));
+        rc = visit(data, url, &failure);
+        if (rc != 0) {
+            ngx_http_cache_purge_index_fail(q, rc,
+                failure.message[0] ? failure.message : "URL visitor failed");
+        }
+    }
+    ngx_http_cache_purge_index_require(q, count != 0,
+        NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "committed key has no URL aliases");
+    return ngx_http_cache_purge_index_tx_end(tx, error);
+}
+
 static void
 ngx_http_cache_purge_index_collect_one(ngx_http_cache_purge_index_tx_t *tx,
     const ngx_http_cache_purge_index_expected_t *file)

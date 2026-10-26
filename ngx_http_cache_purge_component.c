@@ -104,6 +104,10 @@ struct ngx_http_cache_purge_component_s {
     uint64_t                                  recovery_at;
 };
 
+static int ngx_http_cache_purge_component_validation_guard(void *data,
+    const ngx_http_cache_purge_index_file_t *file,
+    ngx_http_cache_rocksdb_error_t *error);
+
 static int
 ngx_http_cache_purge_component_error(ngx_http_cache_rocksdb_error_t *error,
     int code, const char *message)
@@ -704,6 +708,7 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
     ngx_http_cache_purge_index_expected_t     expected[32];
     ngx_http_cache_purge_index_action_e       action;
     ngx_http_cache_purge_publication_target_t  target;
+    ngx_http_cache_purge_validation_t          validation;
     ngx_http_cache_purge_operation_input_t     input;
     ngx_http_cache_purge_operation_t           operation;
     ngx_http_cache_purge_selector_t            selector;
@@ -746,6 +751,57 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
     rc = 0;
 
     switch (p->request.opcode) {
+    case NGX_HTTP_CACHE_PURGE_OP_VALIDATE_FILE:
+        memset(&validation, 0, sizeof(validation));
+        ngx_http_cache_purge_component_id(&d, validation.file.id);
+        validation.file.revision =
+            ngx_http_cache_purge_component_integer(&d, 8);
+        ngx_http_cache_purge_component_id(&d, validation.transaction);
+        validation.before = ngx_http_cache_purge_component_string(&d, 4096);
+        validation.after = ngx_http_cache_purge_component_string(&d, 4096);
+        validation.replace_tags =
+            (int) ngx_http_cache_purge_component_integer(&d, 1);
+        validation.tag_count = ngx_http_cache_purge_component_integer(&d, 1);
+        validation.tags = tags;
+        if (validation.tag_count > 64 || validation.replace_tags > 1
+            || (!validation.replace_tags && validation.tag_count))
+        {
+            rc = ngx_http_cache_purge_component_error(error,
+                NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid validation TAG mode");
+            break;
+        }
+        for (i = 0; i < validation.tag_count; i++) {
+            tags[i] = ngx_http_cache_purge_component_string(&d, 1024);
+        }
+        if ((rc = ngx_http_cache_purge_component_end(&d)) != 0) {
+            break;
+        }
+        rc = ngx_http_cache_purge_component_anchor(c, error);
+        if (rc == 0) {
+            rc = ngx_http_cache_purge_publications_validate_prepare(
+                c->publications, store, &validation, c->lease_anchor,
+                p->input_rights[0], p->input_rights[1], p->uid,
+                ngx_http_cache_purge_component_validation_guard,
+                c->coordinator, &matches[0], error);
+        }
+        if (rc == 0) {
+            rc = ngx_http_cache_purge_publications_validate_finish(
+                c->publications, store, validation.file.id,
+                validation.transaction, validation.file.revision,
+                c->lease_anchor, p->input_rights[0], p->uid,
+                &matches[0], error);
+        }
+        if (rc == 0) {
+            rc = ngx_http_cache_purge_index_get_file(store, matches[0].id,
+                                                      &file, error);
+        }
+        if (rc == 0) {
+            ngx_http_cache_purge_component_put_integer(e, file.state, 1);
+            ngx_http_cache_purge_component_put_integer(e, file.revision, 8);
+            ngx_http_cache_purge_component_put_file(e, &file);
+        }
+        break;
+
     case NGX_HTTP_CACHE_PURGE_OP_INSPECT_FILE:
         root = ngx_http_cache_purge_component_string(&d, 32768);
         zone = ngx_http_cache_purge_component_string(&d, 32768);
@@ -1499,6 +1555,7 @@ ngx_http_cache_purge_component_read(ngx_http_cache_purge_component_t *c,
                 "invalid component request size/result");
         }
         expected =
+            p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_VALIDATE_FILE ? 2 :
             p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_PREPARE_FILE ? 2 :
             p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_FINISH_FILE  ? 1 :
             p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_INSPECT_FILE ? 1 :
@@ -4204,6 +4261,7 @@ struct ngx_http_cache_purge_coordinator_s {
     void                                   *shared;
     size_t                                  shared_bytes;
     ngx_http_cache_purge_control_writer_t  *writer;
+    ngx_http_cache_purge_control_reader_t  *validation_reader;
     ngx_http_cache_purge_control_image_t   *pending;
     ngx_http_cache_purge_operation_usage_t  expected;
     ngx_http_cache_purge_operation_t       *controls;
@@ -4231,6 +4289,88 @@ ngx_http_cache_purge_control_coordinator_owner(
             "control coordinator owner mismatch");
     }
     return 0;
+}
+
+typedef struct {
+    ngx_http_cache_purge_coordinator_t     *coordinator;
+    ngx_http_cache_purge_control_context_t  context;
+} ngx_http_cache_purge_validation_context_t;
+
+static int
+ngx_http_cache_purge_component_validation_match(void *data,
+    const ngx_http_cache_purge_control_match_t *match)
+{
+    (void) data;
+    return (match->flags & NGX_HTTP_CACHE_PURGE_CONTROL_FENCE) ?
+               NGX_HTTP_CACHE_ROCKSDB_CONFLICT : 0;
+}
+
+static int
+ngx_http_cache_purge_component_validation_url(void *data,
+    ngx_http_cache_rocksdb_bytes_t url, ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_validation_context_t  *v;
+    uint64_t                                    publication;
+    int                                         rc;
+
+    v = data;
+    v->context.url = url;
+    rc = ngx_http_cache_purge_control_match(
+        v->coordinator->validation_reader, &v->context, 64, 65536,
+        ngx_http_cache_purge_component_validation_match, NULL,
+        &publication, error);
+    if (rc == 0 && publication != v->coordinator->publication) {
+        rc = ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_BUSY, "validation control image changed");
+    }
+    return rc;
+}
+
+static int
+ngx_http_cache_purge_component_validation_guard(void *data,
+    const ngx_http_cache_purge_index_file_t *file,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_coordinator_t        *c;
+    ngx_http_cache_purge_validation_context_t  v;
+    ngx_http_cache_purge_index_expected_t      expected;
+    int                                        rc;
+
+    c = data;
+    rc = ngx_http_cache_purge_control_coordinator_owner(c, error);
+    if (rc != 0) {
+        return rc;
+    }
+    if (c->state != NGX_HTTP_CACHE_PURGE_COORD_READY) {
+        return ngx_http_cache_purge_control_error(
+            error, NGX_HTTP_CACHE_ROCKSDB_BUSY,
+            "validation awaits control publication");
+    }
+    if (c->count == 0) {
+        return 0;
+    }
+    if (c->validation_reader == NULL) {
+        rc = ngx_http_cache_purge_control_reader_open(c->shared,
+            c->shared_bytes, &c->validation_reader, error);
+        if (rc != 0) {
+            return rc;
+        }
+    }
+    memset(&v, 0, sizeof(v));
+    v.coordinator = c;
+    v.context.key = file->key;
+    v.context.host = file->host;
+    v.context.tag_namespace = file->tag_namespace;
+    v.context.tags = file->tags;
+    v.context.tag_count = file->tag_count;
+    memcpy(expected.id, file->id, 16);
+    expected.revision = file->revision;
+
+    /* Each match unpins its image before the next database read. Acceptance
+     * and metadata updates share this executor, so none can interleave here. */
+    return ngx_http_cache_purge_index_visit_urls(c->operations.store,
+        &expected, 64, 65536, ngx_http_cache_purge_component_validation_url,
+        &v, error);
 }
 
 static void
@@ -4409,6 +4549,13 @@ ngx_http_cache_purge_coordinator_close(ngx_http_cache_purge_coordinator_t **p,
     rc = ngx_http_cache_purge_control_coordinator_owner(c, error);
     if (rc != 0) {
         return rc;
+    }
+    if (c->validation_reader != NULL) {
+        rc = ngx_http_cache_purge_control_reader_close(&c->validation_reader,
+                                                       error);
+        if (rc != 0) {
+            return rc;
+        }
     }
     if (c->writer != NULL) {
         rc = ngx_http_cache_purge_control_writer_close(&c->writer, error);

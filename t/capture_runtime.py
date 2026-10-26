@@ -74,6 +74,9 @@ with tarfile.open(fileobj=io.BytesIO(archive)) as source:
         assert (build / member.name).read_bytes() == expected
 
 calls, policies = [], {}
+validation_tags = {'/revalidate-replace': 'new-tag', '/revalidate-clear': ''}
+validation_waiting, validation_release = threading.Event(), threading.Event()
+fresh_bodies = {}
 redirects = {'/redirect-cache': '/redirect-old', '/redirect-tag': '/redirect-old',
              '/redirect-unknown': '/redirect-old', '/redirect-named': '@redirect_named',
              '/redirect-stale': '/redirect-old', '/redirect-revalidated': '/redirect-old'}
@@ -91,10 +94,18 @@ class Origin(http.server.BaseHTTPRequestHandler):
             return
         if path in origin_failures:
             self.send_response(500); self.send_header('Content-Length', '0'); self.end_headers(); return
+        if path.startswith('/revalidate-') and self.headers.get('If-None-Match') == '"capture-v1"':
+            if path == '/revalidate-race':
+                validation_waiting.set()
+                assert validation_release.wait(15)
+            self.send_response(304); self.send_header('Cache-Control', 'max-age=60')
+            if path in validation_tags: self.send_header('Cache-Tag', validation_tags[path])
+            self.end_headers(); return
         if path == '/redirect-revalidated' and self.headers.get('If-None-Match') == '"capture-v1"':
             self.send_response(304); self.send_header('Cache-Control', 'max-age=60'); self.end_headers(); return
         if path == '/capacity': capacity_gate.wait(20)
         body = path.encode() if not path.startswith('/slice') else slice_body
+        body = fresh_bodies.get(path, body)
         if path == '/vary': body += self.headers.get('Accept-Language', '').encode()
         if path == '/large': body *= 40000
         status, content_range = 200, None
@@ -102,7 +113,7 @@ class Origin(http.server.BaseHTTPRequestHandler):
             start, end = map(int, self.headers['Range'][6:].split('-')); end = min(end, len(body) - 1)
             content_range = f'bytes {start}-{end}/{len(body)}'; body = body[start:end + 1]; status = 206
         self.send_response(status)
-        self.send_header('Cache-Control', 'max-age=' + ('1' if path in ('/redirect-stale', '/redirect-revalidated') else '3600'))
+        self.send_header('Cache-Control', 'max-age=' + ('1' if path.startswith('/revalidate-') or path in ('/redirect-stale', '/redirect-revalidated') else '3600'))
         self.send_header('Accept-Ranges', 'bytes')
         self.send_header('ETag', '"capture-v1"')
         if path in redirects:
@@ -206,6 +217,11 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
   location /raw {{ proxy_cache_key "$uri|$arg_m"; cache_purge_key $uri;
                   cache_purge_tag_namespace rawtenant;
                   proxy_pass http://127.0.0.1:{origin.server_port}; }}
+  location /revalidate- {{ cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+                          proxy_cache_revalidate on; proxy_pass http://127.0.0.1:{origin.server_port}; }}
+  location /revalidate-expression {{ cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+                          cache_purge_tag "$upstream_http_cache_tag, expression";
+                          proxy_cache_revalidate on; proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location = /negative-cache {{
       cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
       proxy_cache_valid 502 1h; error_page 502 = /negative-error;
@@ -465,6 +481,42 @@ try:
     assert {x[0] for x in query('http://cache.test/asset')} == before
     assert get('/asset')[1] == 'HIT'
     checks.append('full nginx restart reuses persisted file relations without rebuilding the index')
+    validation_files = {}
+    policies['/revalidate-race'] = 'race-old'
+    assert get('/revalidate-race') == (200, 'MISS', b'/revalidate-race')
+    race_original = records('/revalidate-race', 1)[0]
+    for path in ('/revalidate-retain', '/revalidate-replace', '/revalidate-clear', '/revalidate-expression'):
+        assert get(path) == (200, 'MISS', path.encode())
+        item = records(path, 1)[0]
+        target = ready_file(item)
+        validation_files[path] = item, target, target.stat().st_ino, target.read_bytes()
+    time.sleep(2.1)
+    for path, (original, target, inode, contents) in validation_files.items():
+        result = get(path)
+        assert result == (200, 'REVALIDATED', path.encode()), (path, result)
+        item = records(path, 1)[0]
+        assert item['id'] == original['id'] and item['revision'] == original['revision'] + 2
+        assert item['metadata'].startswith(b'NFR1') and target.stat().st_ino == inode
+        header_size = contents.index(b'\nKEY:')
+        assert target.read_bytes()[header_size:] == contents[header_size:]
+        expected = ({b'new-tag'} if path.endswith('-replace') else set() if path.endswith('-clear')
+                    else {b'expression'} if path.endswith('-expression') else set(original['tags']))
+        assert set(item['tags']) == expected, (path, item['tags'])
+        assert get(path) == (200, 'HIT', path.encode()) and calls.count(path) == 2
+    checks.append('304 validation preserves the file/entity, durably refreshes TTL and handles absent, replaced, empty and expression TAGs')
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        request = pool.submit(get, '/revalidate-race')
+        assert validation_waiting.wait(5)
+        fence('invalidate-during-304', 5, 'race-old', 'tenant')
+        policies['/revalidate-race'] = 'race-new'
+        validation_tags['/revalidate-race'] = 'race-new'
+        fresh_bodies['/revalidate-race'] = b'fresh-entity'
+        validation_release.set()
+        assert request.result(timeout=15) == (200, 'BYPASS', b'fresh-entity')
+    until(lambda: records('/revalidate-race', 1)[0]['id'] != race_original['id'])
+    assert get('/revalidate-race') == (200, 'HIT', b'fresh-entity')
+    assert calls.count('/revalidate-race') == 3
+    checks.append('a TAG FENCE accepted while origin 304 is pending forces a fresh entity even when the 304 replaces that TAG')
     assert get('/fenced-url')[1] == 'MISS'; records('/fenced-url', 1)
     assert get('/fenced-url?z=b')[1] == 'MISS'; records('/fenced-url', 2)
     assert get('/fenced-url')[1] == 'HIT'
@@ -525,9 +577,11 @@ try:
     assert get('/redirect-stale') == (200, 'STALE', b'redirect-old')
     assert calls.count('/redirect-stale') == 2
     checks.append('cached redirect admission safely closes a failed origin attempt before resuming native stale redirect behavior')
-    assert get('/redirect-revalidated') == (200, 'BYPASS', b'redirect-new')
-    assert calls.count('/redirect-revalidated') == 3
-    checks.append('cached redirect after upstream 304 uses the explicit temporary unconditional-refill path until durable validation is implemented')
+    result = get('/redirect-revalidated')
+    assert result == (200, 'REVALIDATED', b'redirect-old'), result
+    assert get('/redirect-revalidated') == (200, 'HIT', b'redirect-old')
+    assert calls.count('/redirect-revalidated') == 2
+    checks.append('durable 304 validation reuses the verified cached redirect and later serves HIT without an extra origin fetch')
     unknown = records('/redirect-unknown', 1)[0]
     os.removexattr(ready_file(unknown), 'user.ngx_cache_purge.id')
     redirects['/redirect-unknown'] = '/redirect-new'
@@ -550,6 +604,7 @@ try:
     checks.append('native read admission applies host FENCEs; receipts still remain PREPARING pending complete protocol coverage')
 finally:
     capacity_gate.set()
+    validation_release.set()
     for process, log in processes: stop(process); log.close()
     origin.shutdown(); origin.server_close()
     for server in gateways.values(): server.shutdown(); server.server_close()

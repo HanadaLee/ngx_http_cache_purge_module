@@ -143,6 +143,14 @@ ngx_int_t ngx_http_cache_purge_client_inspect_file(
     int cache_fd, ngx_msec_t timeout, ngx_http_cache_purge_client_done_pt done,
     void *data, ngx_http_cache_purge_call_t **call);
 
+/* VALIDATE_FILE copies the lease and selected cache FD. A lost reply can leave
+ * an accepted transaction for recovery; cancellation does not roll it back. */
+ngx_int_t ngx_http_cache_purge_client_validate_file(
+    ngx_http_cache_purge_client_t *client, const ngx_str_t *payload,
+    const int fds[2], ngx_msec_t timeout,
+    ngx_http_cache_purge_client_done_pt done, void *data,
+    ngx_http_cache_purge_call_t **call);
+
 /* Cancel consumes the handle and suppresses its callback. Cancellation does
  * not roll back a request already sent. Clear the caller's handle afterwards.
  * */

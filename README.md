@@ -43,8 +43,11 @@ It atomically reserves the existing path intent with TAG and metadata changes,
 writes and fsyncs only a supplied header prefix, then publishes the new physical
 proof. Inspection excludes the pending instance. Retries and automatic recovery
 share the same OFD lease protocol; completed receipts remain bounded across
-repeated validation. This backend API is not yet connected to native upstream
-304 responses or a validation IPC operation.
+repeated validation. `VALIDATE_FILE` connects this transaction to native upstream
+304 handling. It transfers the lease and selected descriptor, verifies accepted
+controls before changing old TAG membership, and returns the durable record.
+Control publication must be ready; persisted URL aliases are visited within
+explicit count and byte budgets, with no complete alias set retained in memory.
 
 `INSPECT_FILE` checks the actual cache descriptor on the executor through bounded
 IPC. It requires a READY marker, a committed current index record with no pending
@@ -69,10 +72,14 @@ No new nginx core hook or private protocol configuration layout is used.
 Read checks are bounded to 64 concurrent waits per worker, with a three-second
 overall deadline. A PREPARED marker can wait for publication within that deadline.
 No complete file index is loaded into worker memory. Successful upstream 304
-responses currently cause an unconditional refill until the durable validation
-backend and TAG updates are connected to native requests. Complete persistent-alias
-matching and TAG/alias
-provenance for memory-only cached errors remain unfinished. Operation receipts
+responses capture TTL and TAG metadata before native cached-header parsing,
+persist the validation transaction, and pass final FENCE admission before
+reusing the entity. An absent direct upstream TAG header retains the old set;
+a present empty header clears it. General expressions replace the set. Matching
+FENCEs and unverified transactions still force an unconditional refill until
+freshness watermarks are implemented. Complete persistent-alias discovery and
+read matching, and TAG/alias provenance for memory-only cached errors, remain
+unfinished. Operation receipts
 remain PREPARING; these partial consumers do not expose reliable public 202
 acceptance or completed immediate purge semantics yet.
 
@@ -129,8 +136,8 @@ does not return a rename result. `t/native_fill_runtime.py` covers the native
 lifecycle separately. `t/capture_runtime.py` exercises real native fills through
 the companion key module, worker IPC, durable preparation, rename and READY
 publication. Selected-descriptor admission is connected for native file responses;
-304 commits, special response paths, eviction coordination and background
-invalidation remain to be connected.
+304 commits are connected; complete special-response coverage, eviction
+coordination and background invalidation remain unfinished.
 
 The persistent build provides `cache_purge_key`, `cache_purge_url`,
 `cache_purge_tag`, and `cache_purge_tag_namespace` as independently inherited
