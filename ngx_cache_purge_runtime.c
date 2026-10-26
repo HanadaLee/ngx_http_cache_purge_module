@@ -4,9 +4,6 @@
 #include "ngx_cache_purge_component.h"
 #include <sys/un.h>
 
-#if (!HAVE_PRIVILEGED_PROCESS_PATCH)
-#error "persistent cache purge requires the existing OpenResty privileged agent capability"
-#endif
 
 #define NGX_PURGE_RUNTIME_READERS  1024
 #define NGX_PURGE_RUNTIME_VERSION 1
@@ -31,18 +28,13 @@ struct ngx_http_cache_purge_runtime_s {
     ngx_uint_t                       started;
     ngx_uint_t                       failed;
     ngx_array_t                      roots;
-#if (HAVE_PRIVILEGED_PROCESS_PATCH)
-    ngx_event_t                      event;
-#endif
+    ngx_event_t                      owner_event;
 };
 
 static ngx_msec_t ngx_http_cache_purge_runtime_tick(void *data);
 static void ngx_http_cache_purge_runtime_exit(void *data);
 static ngx_int_t ngx_http_cache_purge_runtime_shared(ngx_shm_zone_t *zone, void *old);
 static ngx_int_t ngx_http_cache_purge_runtime_paths(ngx_http_cache_purge_runtime_t *rt, ngx_log_t *log);
-#if (HAVE_PRIVILEGED_PROCESS_PATCH)
-static void ngx_http_cache_purge_runtime_agent(ngx_event_t *ev);
-#endif
 
 ngx_http_cache_purge_runtime_t *
 ngx_http_cache_purge_runtime_create(ngx_conf_t *cf)
@@ -55,7 +47,7 @@ ngx_http_cache_purge_runtime_create(ngx_conf_t *cf)
     }
     ngx_cache_purge_component_options(&rt->options);
     if (rt->options.abi != NGX_CACHE_PURGE_COMPONENT_ABI
-        || ngx_cache_purge_component_abi_3() != NGX_CACHE_PURGE_COMPONENT_ABI
+        || ngx_cache_purge_component_abi_4() != NGX_CACHE_PURGE_COMPONENT_ABI
         || ngx_array_init(&rt->roots, cf->pool, 2, sizeof(ngx_str_t)) != NGX_OK)
     {
         return NULL;
@@ -355,51 +347,62 @@ ngx_http_cache_purge_runtime_module_init(ngx_cycle_t *cycle)
     ngx_http_cache_purge_runtime_t *rt;
     ngx_file_info_t info;
     ngx_err_t err;
-    ngx_uint_t access;
+    ngx_fd_t fd;
+    gid_t group;
 
     main = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_cache_purge_module);
-    if (main && main->runtime->path) {
-        core = (ngx_core_conf_t *) ngx_get_conf(cycle->conf_ctx, ngx_core_module);
-        if (!core->master) {
-            ngx_log_error(NGX_LOG_EMERG, cycle->log, 0, "persistent cache purge requires master_process on");
-            return NGX_ERROR;
-        }
-#if (HAVE_PRIVILEGED_PROCESS_PATCH)
-        /* Enable the existing core process; no DB or threads before fork. */
-        core->privileged_agent = 1;
-        main->runtime->options.client_uid = (uint32_t)
-            (geteuid() == 0 ? core->user : geteuid());
-#endif
-        rt = main->runtime;
-        rt->owner_uid = geteuid();
-        access = rt->options.client_uid == (uint32_t) geteuid() ? 0700 : 0711;
-        /* DB storage is not a native cache path: ngx_create_paths() would
-         * chown it to the HTTP worker UID, including on every reload. */
-        err = ngx_create_full_path(rt->path->name.data, access);
-        if (err != 0) {
-            ngx_log_error(NGX_LOG_EMERG, cycle->log, err, "cannot create cache purge store parents");
-            return NGX_ERROR;
-        }
-        if (ngx_create_dir(rt->path->name.data, access) == NGX_FILE_ERROR
-            && ngx_errno != NGX_EEXIST)
-        {
-            ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno, "cannot create cache purge store directory");
-            return NGX_ERROR;
-        }
-        if (ngx_http_cache_purge_runtime_paths(rt, cycle->log) != NGX_OK) {
-            return NGX_ERROR;
-        }
-        if (ngx_link_info(rt->path->name.data, &info) == NGX_FILE_ERROR
-            || !ngx_is_dir(&info) || info.st_uid != geteuid()
-            || (info.st_mode & 0022) != 0
-            || (access == 0711 && (info.st_mode & 0001) == 0))
-        {
-            ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
-                          "cache purge store requires a real directory owned by the agent UID, "
-                          "without group/other write access and with worker traversal access");
-            return NGX_ERROR;
-        }
+    if (main == NULL || main->runtime->path == NULL) {
         return NGX_OK;
+    }
+    core = (ngx_core_conf_t *) ngx_get_conf(cycle->conf_ctx, ngx_core_module);
+    if (!core->master) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+                      "persistent cache purge requires master_process on");
+        return NGX_ERROR;
+    }
+    rt = main->runtime;
+    rt->owner_uid = geteuid() == 0 ? core->user : geteuid();
+    group = geteuid() == 0 ? core->group : getegid();
+    rt->options.client_uid = (uint32_t) rt->owner_uid;
+
+    /* Create only new storage for the worker UID. Existing storage
+     * is never recursively chowned, including on reload or an agent migration. */
+    err = ngx_create_full_path(rt->path->name.data,
+                              rt->owner_uid == geteuid() ? 0700 : 0711);
+    if (err != 0) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, err,
+                      "cannot create cache purge store parents");
+        return NGX_ERROR;
+    }
+    if (ngx_create_dir(rt->path->name.data, 0700) != NGX_FILE_ERROR) {
+        fd = open((char *) rt->path->name.data, O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+        if (fd == -1) {
+            return NGX_ERROR;
+        }
+        if (fchown(fd, rt->owner_uid, group) == -1) {
+            err = ngx_errno;
+            (void) close(fd);
+            ngx_log_error(NGX_LOG_EMERG, cycle->log, err,
+                          "cannot assign new cache purge store to worker UID");
+            return NGX_ERROR;
+        }
+        (void) close(fd);
+    } else if (ngx_errno != NGX_EEXIST) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
+                      "cannot create cache purge store directory");
+        return NGX_ERROR;
+    }
+    if (ngx_http_cache_purge_runtime_paths(rt, cycle->log) != NGX_OK) {
+        return NGX_ERROR;
+    }
+    if (ngx_link_info(rt->path->name.data, &info) == NGX_FILE_ERROR
+        || !ngx_is_dir(&info) || info.st_uid != rt->owner_uid
+        || (info.st_mode & 0077) != 0)
+    {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+                      "cache purge store requires a private directory owned by the worker UID; "
+                      "migrate existing agent-owned storage while stopped");
+        return NGX_ERROR;
     }
     return NGX_OK;
 }
@@ -433,39 +436,43 @@ ngx_http_cache_purge_runtime_tick(void *data)
     return 1000;
 }
 
+static void
+ngx_cache_purge_worker_owner_tick(ngx_event_t *ev)
+{
+    ngx_http_cache_purge_runtime_t *rt = ev->data;
+    ngx_cache_purge_store_error_t error;
+
+    if (ngx_terminate || ngx_quit || ngx_exiting) {
+        /* Let the executor release the DB without blocking an old worker's
+         * still-active HTTP connections. Join only in exit_process. */
+        if (rt->component
+            && ngx_cache_purge_component_request_stop(rt->component, &error) != 0)
+        {
+            ngx_log_error(NGX_LOG_ALERT, ev->log, 0,
+                          "cache purge owner shutdown: %s", error.message);
+        }
+        return;
+    }
+    ngx_add_timer(ev, ngx_http_cache_purge_runtime_tick(rt));
+}
+
 ngx_int_t
 ngx_http_cache_purge_runtime_process_init(ngx_cycle_t *cycle)
 {
-#if (HAVE_PRIVILEGED_PROCESS_PATCH)
     ngx_http_cache_purge_main_conf_t *main;
     ngx_http_cache_purge_runtime_t *rt;
-
-    if (!ngx_is_privileged_agent) { return NGX_OK; }
+    if (ngx_process != NGX_PROCESS_WORKER || ngx_worker != 0) { return NGX_OK; }
     main = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_cache_purge_module);
-    rt = main ? main->runtime : NULL;
-    if (rt == NULL || rt->path == NULL) { return NGX_OK; }
-
-    /* Later module init_process failures may exit without exit_process.
-     * Delay thread creation until all initialization callbacks succeeded. */
-    rt->event.handler = ngx_http_cache_purge_runtime_agent;
-    rt->event.data = rt;
-    rt->event.log = cycle->log;
-    rt->event.cancelable = 1;
-    ngx_add_timer(&rt->event, 0);
-#endif
+    if (main == NULL || main->runtime->path == NULL) { return NGX_OK; }
+    rt = main->runtime;
+    rt->owner_event.handler = ngx_cache_purge_worker_owner_tick;
+    rt->owner_event.data = rt;
+    rt->owner_event.log = cycle->log;
+    /* Later init_process failures must not leave a running DB thread. */
+    rt->owner_event.cancelable = 1;
+    ngx_add_timer(&rt->owner_event, 0);
     return NGX_OK;
 }
-
-#if (HAVE_PRIVILEGED_PROCESS_PATCH)
-static void
-ngx_http_cache_purge_runtime_agent(ngx_event_t *ev)
-{
-    ngx_http_cache_purge_runtime_t *rt = ev->data;
-
-    if (ngx_terminate || ngx_quit || ngx_exiting) { return; }
-    ngx_add_timer(ev, ngx_http_cache_purge_runtime_tick(rt));
-}
-#endif
 
 static void
 ngx_http_cache_purge_runtime_exit(void *data)
@@ -513,22 +520,12 @@ ngx_http_cache_purge_runtime_worker_exit(ngx_cycle_t *cycle)
     ngx_cache_purge_store_error_t error;
     int rc;
 
-#if (HAVE_PRIVILEGED_PROCESS_PATCH)
-    if (ngx_is_privileged_agent) {
-        main = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_cache_purge_module);
-        if (main && main->runtime) {
-            if (main->runtime->event.timer_set) {
-                ngx_del_timer(&main->runtime->event);
-            }
-            ngx_http_cache_purge_runtime_exit(main->runtime);
-        }
-        return;
-    }
-#endif
 
     if (ngx_process != NGX_PROCESS_WORKER) { return; }
     main = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_cache_purge_module);
     if (main && main->runtime) {
+        if (main->runtime->owner_event.timer_set) { ngx_del_timer(&main->runtime->owner_event); }
+        ngx_http_cache_purge_runtime_exit(main->runtime);
         ngx_cache_purge_client_stop(main->runtime->client);
     }
     if (main && main->runtime->reader) {

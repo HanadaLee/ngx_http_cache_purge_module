@@ -5,7 +5,7 @@ HTTP cache invalidation for nginx proxy, FastCGI, SCGI, and uWSGI caches.
 The module is undergoing a storage and lifecycle redesign. The default build
 implements the legacy PURGE/REFRESH interfaces. An opt-in development build now
 connects RocksDB ownership, durable operations, and shared control publication to
-OpenResty's existing privileged agent. Native cache file hooks, the new Invalidate/Delete HTTP
+one executor in ordinary nginx worker 0. Native cache file integration, the new Invalidate/Delete HTTP
 API, and multilevel cache propagation are still being implemented.
 
 The repository now contains a bounded RocksDB storage bridge and a persistent
@@ -23,7 +23,7 @@ bounded queues and buffers, absolute deadlines, peer UID verification, and expli
 cancellation/shutdown. It preserves application errors and reports uncertain
 outcomes after a lost reply without replaying requests automatically. The client
 does not retain nginx requests implicitly; its consumers own that lifecycle.
-The real agent and fault-injection peers are exercised by `t/runtime_nginx.py`.
+The real worker owner and fault-injection peers are exercised by `t/runtime_nginx.py`.
 
 A durable operation ledger now stores selectors, idempotency identities,
 checkpoints, retry scheduling, and independent materialization/propagation states.
@@ -93,13 +93,19 @@ CACHE_PURGE_ROCKSDB_LIB_DIR=/tmp/cache-purge-store \
 make
 ```
 
-This requires Linux, HTTP cache support, and OpenResty's existing
-`HAVE_PRIVILEGED_PROCESS_PATCH` capability. The module enables the existing agent
-directly from C, starts its component after module initialization, and closes it
-through the normal process exit callback. It does not fork its own daemon or
-require a custom cache-manager exit hook. Bare nginx can still build the default
-legacy runtime, but cannot enable this persistent runtime without the existing
-agent capability. Override `CACHE_PURGE_ROCKSDB_LIBS` to use
+This requires Linux, HTTP cache support, and `master_process on`. The persistent
+runtime uses standard worker initialization, timers, and exit callbacks. It does
+not require privileged-agent support or an additional nginx core patch. Only
+worker 0 starts the component executor; all workers access it through bounded
+asynchronous IPC. The executor shares that worker's address space and failure
+domain. Database handles and threads are never created before fork.
+
+On graceful reload, the old worker requests asynchronous executor shutdown so
+long-lived HTTP responses do not keep the database owner indefinitely. Its
+executor finishes the current operation and closes the DB before the replacement
+opens it. The old worker can continue sending its response and joins the stopped
+executor when it exits. The component C ABI is 4; rebuild its archives together
+with the addon. Override `CACHE_PURGE_ROCKSDB_LIBS` to use
 a fixed RocksDB archive and its compression/runtime dependencies. The default
 links the system shared RocksDB library. Static archives linked into a dynamic
 nginx module must be built with PIC.
@@ -116,7 +122,10 @@ http {
 
 `cache` is the shared database cache budget, including the write-buffer charge;
 it is not a process RSS limit. The database directory must be outside cache-file
-directories. Store and state-zone identity changes require a full restart.
+directories and be a private directory owned by the configured worker UID.
+New storage is created for that UID; existing agent-owned storage must be migrated
+while stopped. Existing directories are not recursively chowned. Store and
+state-zone identity changes require a full restart.
 These directives initialize the component and its resources. They do not yet
 install a complete purge handler or replace native cache read/write behavior.
 

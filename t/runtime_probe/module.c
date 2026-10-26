@@ -10,7 +10,7 @@ typedef struct {
     ngx_cache_purge_client_t *client;
 } probe_conf_t;
 typedef struct {
-    ngx_flag_t fail_agent;
+    ngx_flag_t enable_agent;
     uid_t owner_uid;
     ngx_array_t clients;
 } probe_main_t;
@@ -258,7 +258,7 @@ create_main(ngx_conf_t *cf)
 {
     probe_main_t *conf = ngx_pcalloc(cf->pool, sizeof(*conf));
     if (conf) {
-        conf->fail_agent = NGX_CONF_UNSET;
+        conf->enable_agent = NGX_CONF_UNSET;
         conf->owner_uid = geteuid();
         if (ngx_array_init(&conf->clients, cf->pool, 2, sizeof(ngx_cache_purge_client_t *)) != NGX_OK) { return NULL; }
     }
@@ -266,18 +266,24 @@ create_main(ngx_conf_t *cf)
 }
 
 static ngx_int_t
-init_process(ngx_cycle_t *cycle)
+init_module(ngx_cycle_t *cycle)
 {
 #if (HAVE_PRIVILEGED_PROCESS_PATCH)
     probe_main_t *conf;
-    if (!ngx_is_privileged_agent) { return NGX_OK; }
+    ngx_core_conf_t *core;
     conf = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_cache_purge_runtime_probe_module);
-    if (conf && conf->fail_agent == 1) {
-        ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "probe rejects agent initialization");
-        return NGX_ERROR;
+    if (conf && conf->enable_agent == 1) {
+        core = (ngx_core_conf_t *) ngx_get_conf(cycle->conf_ctx, ngx_core_module);
+        core->privileged_agent = 1;
     }
-    ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0, "probe agent module initialized");
 #endif
+    return NGX_OK;
+}
+
+static ngx_int_t
+init_process(ngx_cycle_t *cycle)
+{
+    ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0, "probe HTTP init_process called");
     return NGX_OK;
 }
 
@@ -308,8 +314,8 @@ static ngx_command_t commands[] = {
       rpc_conf, NGX_HTTP_LOC_CONF_OFFSET, offsetof(probe_conf_t, rpc), NULL },
     { ngx_string("cache_purge_test_rpc_wrong_uid"), NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot, NGX_HTTP_LOC_CONF_OFFSET, offsetof(probe_conf_t, wrong_uid), NULL },
-    { ngx_string("cache_purge_test_fail_agent"), NGX_HTTP_MAIN_CONF|NGX_CONF_FLAG,
-      ngx_conf_set_flag_slot, NGX_HTTP_MAIN_CONF_OFFSET, offsetof(probe_main_t, fail_agent), NULL },
+    { ngx_string("cache_purge_test_enable_agent"), NGX_HTTP_MAIN_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot, NGX_HTTP_MAIN_CONF_OFFSET, offsetof(probe_main_t, enable_agent), NULL },
     { ngx_string("cache_purge_test_reader"), NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot, NGX_HTTP_LOC_CONF_OFFSET, offsetof(probe_conf_t, enabled), NULL },
     ngx_null_command
@@ -328,5 +334,5 @@ exit_process(ngx_cycle_t *cycle)
 }
 ngx_module_t ngx_http_cache_purge_runtime_probe_module = {
     NGX_MODULE_V1, &context, commands, NGX_HTTP_MODULE,
-    NULL, NULL, init_process, NULL, NULL, exit_process, NULL, NGX_MODULE_V1_PADDING
+    NULL, init_module, init_process, NULL, NULL, exit_process, NULL, NGX_MODULE_V1_PADDING
 };

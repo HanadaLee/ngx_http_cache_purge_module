@@ -5,6 +5,7 @@ import fcntl
 import grp
 import hashlib
 import http.server
+import http.client
 import json
 import os
 import pwd
@@ -40,8 +41,8 @@ root.chmod(0o755)
 validation = Path(tempfile.mkdtemp(prefix='validation-', dir=root))
 validation.chmod(0o755)
 if a.sanitize:
-    # Existing OpenResty agent exit retains native event connection arrays.
-    # Keep leak checks for client/component allocations; do not disable LSan.
+    # Native worker exit retains three ngx_event_process_init arrays. Keep
+    # leak detection for the executor and IPC; suppress only that known origin.
     suppressions = validation / 'native-event-arrays.lsan'
     suppressions.write_text('leak:ngx_event_process_init\n')
     os.environ['LSAN_OPTIONS'] = 'suppressions=' + str(suppressions)
@@ -74,6 +75,7 @@ if not (build / 'src').exists():
         with (root / 'patches.log').open('ab') as log:
             log.write(name.encode() + b'\n' + applied.stdout)
         assert applied.returncode == 0, (name, applied.stdout.decode())
+
 env = os.environ.copy()
 env['CACHE_PURGE_ROCKSDB_LIB_DIR'] = str(a.libraries)
 engine = '-lrocksdb' if a.shared_rocksdb else '/usr/lib/x86_64-linux-gnu/librocksdb.a'
@@ -94,6 +96,8 @@ else:
     module_option = '--add-dynamic-module=' if a.dynamic else '--add-module='
     args = ['sh', configure, '--prefix=' + str(root / 'run'), '--without-http_rewrite_module',
             '--without-http_gzip_module', module_option + str(addon), module_option + str(probe)]
+    if not a.sanitize:
+        args += ['--with-cc-opt=-O2']
     if a.sanitize:
         args += ['--with-cc-opt=-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize=nonnull-attribute -fno-pie',
                  '--with-ld-opt=-fsanitize=address,undefined -no-pie']
@@ -105,30 +109,23 @@ else:
   (root / 'build.json').write_text(json.dumps(manifest, indent=2) + '\n')
 binary = build / 'objs/nginx'
 checks = []
-negative = subprocess.run(['cc', '-c', '-DNGX_RESTY_EXT=0',
-    *[item for path in ('objs', 'src/core', 'src/event', 'src/event/modules', 'src/os/unix', 'src/http', 'src/http/modules')
-      for item in ('-I', str(build / path))], '-I', str(addon), str(addon / 'ngx_cache_purge_runtime.c'),
-    '-o', str(validation / 'without-ext.o')], capture_output=True)
-if a.agent_patches:
-    assert negative.returncode == 0, negative.stderr.decode()
-    assert 'manager_exit' not in (build / 'src/core/ngx_file.h').read_text()
-    checks.append('existing OpenResty agent builds without any new nginx-ext or manager-exit capability')
-else:
-    assert negative.returncode == 0, negative.stderr.decode()
-shim = validation / 'without-agent.h'
-shim.write_text('#include <ngx_config.h>\n#include <ngx_core.h>\n#undef HAVE_PRIVILEGED_PROCESS_PATCH\n')
-unsupported = subprocess.run(['cc', '-include', str(shim), '-c',
-    *[item for path in ('objs', 'src/core', 'src/event', 'src/event/modules', 'src/os/unix', 'src/http', 'src/http/modules')
-      for item in ('-I', str(build / path))], '-I', str(addon), str(addon / 'ngx_cache_purge_runtime.c'),
-    '-o', str(validation / 'without-agent.o')], capture_output=True)
-assert unsupported.returncode and b'requires the existing OpenResty privileged agent capability' in unsupported.stderr
-checks.append('persistent build without the agent capability is rejected explicitly')
+checks.append('worker lifecycle needs no new core capability or privileged agent')
 origin_calls = {}
+hold_gates = {}
 
 
 class Origin(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         origin_calls[self.path] = origin_calls.get(self.path, 0) + 1
+        if self.path in hold_gates:
+            self.send_response(200)
+            self.send_header('Content-Length', '2')
+            self.end_headers()
+            self.wfile.write(b'A')
+            self.wfile.flush()
+            hold_gates[self.path].wait(15)
+            self.wfile.write(b'B')
+            return
         body = f'origin:{self.path}:{origin_calls[self.path]}'.encode()
         self.send_response(200)
         self.send_header('Content-Length', str(len(body)))
@@ -151,24 +148,38 @@ def text(value):
 
 
 def ipc(path, op, data=b''):
-    with socket.socket(socket.AF_UNIX) as client:
-        client.settimeout(3)
-        client.connect(str(path / 'index/component.sock'))
-        client.sendall(struct.pack('>4sHHQII', b'NCP1', 1, op, 1, len(data), 0) + data)
-
-        def read(n):
-            result = b''
-            while n:
-                chunk = client.recv(n)
-                assert chunk, 'unexpected IPC EOF'
-                result += chunk
-                n -= len(chunk)
-            return result
-
-        _, _, actual, _, size, code = struct.unpack('>4sHHQII', read(24))
-        result = read(size)
-        assert actual == op and code == 0, (code, result)
-        return result
+    request = struct.pack('>4sHHQII', b'NCP1', 1, op, 1, len(data), 0) + data
+    if os.geteuid() == 0 and a.worker_user and pwd.getpwnam(a.worker_user).pw_uid != 0:
+        script = """import socket,sys
+s=socket.socket(socket.AF_UNIX);s.settimeout(3);s.connect(sys.argv[1]);s.sendall(sys.stdin.buffer.read())
+def read(n):
+ b=b''
+ while len(b)<n:
+  part=s.recv(n-len(b));assert part;b+=part
+ return b
+h=read(24);sys.stdout.buffer.write(h+read(int.from_bytes(h[16:20],'big')))
+"""
+        response = subprocess.check_output(['runuser', '-u', a.worker_user, '--',
+            'python3', '-c', script, str(path / 'index/component.sock')], input=request, stderr=subprocess.PIPE)
+    else:
+        with socket.socket(socket.AF_UNIX) as client:
+            client.settimeout(3)
+            client.connect(str(path / 'index/component.sock'))
+            client.sendall(request)
+            def read(n):
+                result = b''
+                while n:
+                    chunk = client.recv(n)
+                    assert chunk, 'unexpected IPC EOF'
+                    result += chunk
+                    n -= len(chunk)
+                return result
+            header = read(24)
+            response = header + read(struct.unpack('>I', header[16:20])[0])
+    _, _, actual, _, size, code = struct.unpack('>4sHHQII', response[:24])
+    result = response[24:]
+    assert actual == op and code == 0 and len(result) == size, (code, result)
+    return result
 
 
 def until(predicate, timeout=10):
@@ -178,7 +189,7 @@ def until(predicate, timeout=10):
             value = predicate()
             if value:
                 return value
-        except (OSError, AssertionError):
+        except (OSError, AssertionError, subprocess.CalledProcessError):
             pass
         time.sleep(.01)
     raise AssertionError('runtime deadline')
@@ -221,6 +232,7 @@ proxy_cache_path {self.path}/cache-a keys_zone=a:1m;
 proxy_cache_path {self.path}/cache-b keys_zone=b:1m;
 server {{ listen 127.0.0.1:{self.port};
 {rpc_locations}
+location /hold/ {{ proxy_pass http://127.0.0.1:{origin.server_port}; proxy_buffering off; }}
 location /cache/a {{ cache_purge_test_reader on; proxy_cache a; proxy_cache_key $uri;
 proxy_pass http://127.0.0.1:{origin.server_port}; add_header X-Cache $upstream_cache_status always; }}
 location /cache/b {{ cache_purge_test_reader on; proxy_cache b; proxy_cache_key $uri;
@@ -249,7 +261,13 @@ proxy_pass http://127.0.0.1:{origin.server_port}; add_header X-Cache $upstream_c
     def start(self, wait=True):
         self.err = (self.path / 'stderr.log').open('a')
         self.process = subprocess.Popen(self.command, stderr=self.err)
-        return self.ready() if wait else None
+        if not wait:
+            return None
+        try:
+            return self.ready()
+        except BaseException:
+            self.stop(signal.SIGTERM)
+            raise
 
     def ready(self, old=0):
         def read():
@@ -301,8 +319,8 @@ try:
     for path in ('/cache/a', '/cache/b'):
         warm(baseline, path)
     memory['baseline'] = process_memory(baseline.process.pid)
-    if a.agent_patches:
-        assert all('privileged agent process' not in m['title'] for m in memory['baseline']['members'])
+    assert all('privileged agent process' not in m['title'] and 'cache purge process' not in m['title']
+               for m in memory['baseline']['members'])
 finally:
     baseline.stop()
 origin_calls.clear()
@@ -320,14 +338,25 @@ if os.geteuid() == 0 and a.worker_user and pwd.getpwnam(a.worker_user).pw_uid !=
     foreign = case.path / 'foreign-index'
     foreign.mkdir(mode=0o711)
     worker_uid = pwd.getpwnam(a.worker_user).pw_uid
-    os.chown(foreign, worker_uid, -1)
-    case.invalid(case.config.replace(str(case.path / 'index'), str(foreign)), 'owned by the agent UID')
-    assert foreign.stat().st_uid == worker_uid and not (foreign / 'CURRENT').exists()
+    os.chown(foreign, 0, -1)
+    case.invalid(case.config.replace(str(case.path / 'index'), str(foreign)), 'owned by the worker UID')
+    assert foreign.stat().st_uid == 0 and not (foreign / 'CURRENT').exists()
     checks.append('a foreign-owned DB directory is rejected without changing its ownership or opening a DB')
 owner = case.start()
 try:
-    expected = b'privileged agent process'
+    expected = b'worker process'
     assert expected in Path(f'/proc/{owner}/cmdline').read_bytes()
+    credentials = dict(line.split(':', 1) for line in Path(f'/proc/{owner}/status').read_text().splitlines())
+    expected_uid = pwd.getpwnam(a.worker_user or 'root').pw_uid if os.geteuid() == 0 else os.geteuid()
+    expected_gid = pwd.getpwnam(a.worker_user or 'root').pw_gid if os.geteuid() == 0 else os.getegid()
+    assert list(map(int, credentials['Uid'].split())) == [expected_uid] * 4
+    assert list(map(int, credentials['Gid'].split())) == [expected_gid] * 4
+    assert all(int(credentials[key], 16) == 0 for key in ('CapInh', 'CapPrm', 'CapEff', 'CapAmb'))
+    assert int(credentials['PPid']) == case.process.pid
+    assert any(f'] {owner}#' in line and 'probe HTTP init_process called' in line
+                   for line in (case.path / 'error.log').read_text().splitlines())
+    checks.append('one ordinary HTTP worker owns the executor; other workers have no DB threads')
+
     children = list(map(int, Path(f'/proc/{case.process.pid}/task/{case.process.pid}/children').read_text().split()))
     for pid in children + [case.process.pid]:
         if pid != owner:
@@ -336,12 +365,12 @@ try:
     for path in ('/cache/a', '/cache/b', '/other'):
         warm(case, path)
     memory['component_empty'] = process_memory(case.process.pid)
-    if a.agent_patches and os.geteuid() == 0 and a.worker_user:
+    if os.geteuid() == 0 and a.worker_user:
         worker_uid = pwd.getpwnam(a.worker_user).pw_uid
         socket_path = case.path / 'index/component.sock'
         assert socket_path.stat().st_uid == worker_uid and socket_path.stat().st_mode & 0o777 == 0o600
         directory_mode = (case.path / 'index').stat().st_mode & 0o777
-        assert (case.path / 'index').stat().st_uid == 0 and not directory_mode & 0o022
+        assert (case.path / 'index').stat().st_uid == worker_uid and directory_mode == 0o700
         probe_code = '''import socket,struct,sys
 s=socket.socket(socket.AF_UNIX);s.settimeout(2);s.connect(sys.argv[1]);print('connected',flush=True)
 s.sendall(struct.pack('>4sHHQII',b'NCP1',1,1,1,0,0))
@@ -367,7 +396,7 @@ print(struct.unpack('>Q',read(struct.unpack('>I',h[16:20])[0])[:8])[0])
         finally:
             socket_path.chmod(0o600)
             (case.path / 'index').chmod(directory_mode)
-        checks.append('root agent grants socket access to the worker UID and rejects another connected UID with SO_PEERCRED')
+        checks.append('worker executor owns DB/socket as worker UID and rejects another connected UID with SO_PEERCRED')
     payload = text('native-resource-op') + b'\x01' + struct.pack('>Q', 1000) + b'\x02' + text('/cache/') + text('') + text('probe')
     receipt = ipc(case.path, 14, payload)
     assert receipt[len(payload) + 40] == 1
@@ -387,10 +416,28 @@ print(struct.unpack('>Q',read(struct.unpack('>I',h[16:20])[0])[:8])[0])
         os.kill(case.process.pid, signal.SIGHUP)
         owner = case.ready(owner)
         if os.geteuid() == 0:
-            assert (case.path / 'index').stat().st_uid == 0
+            assert (case.path / 'index').stat().st_uid == (pwd.getpwnam(a.worker_user).pw_uid if a.worker_user else 0)
         assert ipc(case.path, 15, text('native-resource-op')) == receipt
         assert case.get('/cache/a')[0] == 503
     checks.append('three HUP reloads preserve real addon SHM and durable operation')
+    # New worker channel descriptors must not accumulate in the long-lived helper.
+    before_fds = len(list(Path(f'/proc/{owner}/fd').iterdir()))
+    for _ in range(3):
+        children = list(map(int, Path(f'/proc/{case.process.pid}/task/{case.process.pid}/children').read_text().split()))
+        worker = next(pid for pid in children if pid != owner and b'worker process' in Path(f'/proc/{pid}/cmdline').read_bytes())
+        os.kill(worker, signal.SIGKILL)
+        def worker_replaced():
+            current = list(map(int, Path(f'/proc/{case.process.pid}/task/{case.process.pid}/children').read_text().split()))
+            return worker not in current and sum(b'worker process' in Path(f'/proc/{pid}/cmdline').read_bytes() for pid in current) == 2
+        until(worker_replaced)
+    assert case.ready() == owner
+    until(lambda: len(list(Path(f'/proc/{owner}/fd').iterdir())) <= before_fds)
+    checks.append('non-owner worker respawns preserve owner identity without descriptor growth')
+    os.kill(case.process.pid, signal.SIGUSR1)
+    until(lambda: 'reopening logs' in (case.path / 'error.log').read_text())
+    assert case.ready() == owner
+    checks.append('master USR1 reopens worker logs without restarting DB')
+
     custom = text('custom-window') + b'\x01' + struct.pack('>Q', 1000) + b'\x02' + text('/never/') + text('') + text('probe')
     custom_receipt = ipc(case.path, 14, custom)
     assert struct.unpack('>I', custom_receipt[len(custom) + 41:len(custom) + 45])[0] == 123000
@@ -418,34 +465,100 @@ try:
     checks.append('full nginx restart reconstructs barriers from durable operation ledger')
 finally:
     case.stop()
-if a.agent_patches:
-    failed = Run()
-    failed.conf.write_text(failed.config.replace('http { access_log off;',
-                                               'http { access_log off; cache_purge_test_fail_agent on;'))
-    failed.start(wait=False)
+draining = Run(workers=1)
+old_owner = draining.start()
+held = '/hold/' + str(draining.port)
+hold_gates[held] = threading.Event()
+connection = http.client.HTTPConnection('127.0.0.1', draining.port, timeout=10)
+try:
+    connection.request('GET', held)
+    response = connection.getresponse()
+    assert response.status == 200 and response.read(1) == b'A'
+    os.kill(draining.process.pid, signal.SIGHUP)
+    replacement = draining.ready(old_owner)
+    assert replacement != old_owner and Path(f'/proc/{old_owner}').exists()
+    assert b'shutting down' in Path(f'/proc/{old_owner}/cmdline').read_bytes()
+    hold_gates[held].set()
+    assert response.read() == b'B'
+    connection.close()
+    until(lambda: not Path(f'/proc/{old_owner}').exists())
+    checks.append('owner releases DB during graceful drain without waiting for or interrupting a long-lived HTTP response')
+finally:
+    hold_gates[held].set()
+    connection.close()
+    draining.stop()
+standby = Run()
+with (standby.path / 'index/index.lock').open('w') as lease:
+    if os.geteuid() == 0 and a.worker_user:
+        os.chown(lease.name, pwd.getpwnam(a.worker_user).pw_uid, -1)
+    fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    standby.start(wait=False)
+    def waiting():
+        pids = Path(f'/proc/{standby.process.pid}/task/{standby.process.pid}/children').read_text().split()
+        return any(b'worker process' in Path(f'/proc/{pid}/cmdline').read_bytes()
+                   and len(list(Path(f'/proc/{pid}/task').iterdir())) == 2 for pid in pids)
     try:
-        until(lambda: 'probe rejects agent initialization' in (failed.path / 'error.log').read_text())
-        assert not (failed.path / 'index/CURRENT').exists()
-        assert failed.get('/other')[0] == 503
-        checks.append('a later module init_process failure never starts database threads or opens the database')
+        until(waiting)
+        assert not (standby.path / 'index/CURRENT').exists()
     finally:
-        failed.stop()
-    standby = Run()
-    with (standby.path / 'index/index.lock').open('w') as lease:
-        fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        standby.start(wait=False)
-        def waiting():
-            pids = Path(f'/proc/{standby.process.pid}/task/{standby.process.pid}/children').read_text().split()
-            return any(b'privileged agent process' in Path(f'/proc/{pid}/cmdline').read_bytes()
-                       and len(list(Path(f'/proc/{pid}/task').iterdir())) == 2 for pid in pids)
-        try:
-            until(waiting)
-            assert not (standby.path / 'index/CURRENT').exists()
-        finally:
-            start = time.monotonic()
-            standby.stop(signal.SIGTERM)
-            assert time.monotonic() - start < 3
-        checks.append('agent owner-lock wait is cancelled and joined during TERM without waiting for the lock holder')
+        start = time.monotonic()
+        standby.stop(signal.SIGTERM)
+        assert time.monotonic() - start < 3
+    checks.append('owner executor lock wait is cancelled and joined during TERM')
+if a.agent_patches:
+    coexist = Run()
+    coexist.conf.write_text(coexist.config.replace('http { access_log off;',
+        'http { access_log off; cache_purge_test_enable_agent on;'))
+    coexist_owner = coexist.start()
+    try:
+        def agent_pid():
+            children = Path(f'/proc/{coexist.process.pid}/task/{coexist.process.pid}/children').read_text().split()
+            return next((int(pid) for pid in children if b'privileged agent process' in Path(f'/proc/{pid}/cmdline').read_bytes()), 0)
+        agent = until(agent_pid)
+        assert agent != coexist_owner and len(list(Path(f'/proc/{agent}/task').iterdir())) == 1
+        assert b'worker process' in Path(f'/proc/{coexist_owner}/cmdline').read_bytes()
+        checks.append('independently enabled privileged agent coexists without opening DB or running its executor')
+    finally:
+        coexist.stop()
+daemon = Run()
+daemon.conf.write_text(daemon.config.replace('daemon off;', 'daemon on;'))
+subprocess.run(daemon.command, check=True, capture_output=True)
+master = until(lambda: int((daemon.path / 'pid').read_text()))
+try:
+    daemon_owner = daemon.ready()
+    fields = dict(line.split(':', 1) for line in Path(f'/proc/{daemon_owner}/status').read_text().splitlines())
+    assert int(fields['PPid']) == master
+    os.kill(master, signal.SIGHUP)
+    daemon_owner = daemon.ready(daemon_owner)
+    checks.append('daemonized master directly owns the worker and replaces its executor on reload')
+    os.kill(master, signal.SIGUSR2)
+    def upgraded():
+        pid = int((daemon.path / 'pid').read_text())
+        return pid if pid != master else 0
+    successor = until(upgraded)
+    assert int((daemon.path / 'pid.oldbin').read_text()) == master
+    def standby_successor():
+        children = Path(f'/proc/{successor}/task/{successor}/children').read_text().split()
+        for pid in children:
+            if b'worker process' in Path(f'/proc/{pid}/cmdline').read_bytes():
+                return int(pid) if len(list(Path(f'/proc/{pid}/task').iterdir())) == 2 else 0
+        return 0
+    until(standby_successor)
+    assert daemon.ready() == daemon_owner
+    os.kill(master, signal.SIGWINCH)
+    daemon_owner = daemon.ready(daemon_owner)
+    fields = dict(line.split(':', 1) for line in Path(f'/proc/{daemon_owner}/status').read_text().splitlines())
+    assert int(fields['PPid']) == successor
+    checks.append('binary upgrade starts a standby worker executor and transfers DB ownership when old workers drain')
+    os.kill(successor, signal.SIGQUIT)
+    until(lambda: int((daemon.path / 'pid').read_text()) == master)
+    daemon.ready(daemon_owner)
+    checks.append('binary upgrade rollback restores the old master worker executor through native restart')
+
+finally:
+    os.kill(master, signal.SIGQUIT)
+    until(lambda: not (daemon.path / 'pid').exists())
+    until(lambda: not (daemon.path / 'index/component.sock').exists())
 sys.dont_write_bytecode = True
 from client_cases import run_client_cases
 client_result = run_client_cases(Run, root, checks)
@@ -460,7 +573,7 @@ checks = list(dict.fromkeys(checks))
 result = {'root': str(root), 'nginx_revision': revision, 'dynamic': a.dynamic,
           'sanitizer': a.sanitize,
           'sanitizer_exclusions': ['nonnull-attribute', 'leak:ngx_event_process_init'] if a.sanitize else [],
-          'owner_backend': 'openresty-agent',
+          'owner_backend': 'worker-zero',
           'openresty_patches': patches, 'worker_user': a.worker_user,
           'rocksdb_linkage': 'shared' if a.shared_rocksdb else 'static', 'checks': checks,
           'process_group_memory': memory,
@@ -473,4 +586,4 @@ result = {'root': str(root), 'nginx_revision': revision, 'dynamic': a.dynamic,
           'worker_client': client_result,
           'scope': 'actual addon resource lifecycle and worker IPC; separate test consumers; no native file/304/index transaction or final purge API'}
 a.output.write_text(json.dumps(result, indent=2) + '\n')
-print('PASS', len(checks), 'agent integration checks;', 'results:', a.output, flush=True)
+print('PASS', len(checks), 'worker owner checks;', 'results:', a.output, flush=True)

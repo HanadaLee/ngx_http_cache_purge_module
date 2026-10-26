@@ -103,7 +103,7 @@ def run_client_cases(Run, root, checks):
         value = rpc('/rpc/')
         assert value[0] == 200 and int(value[1]['X-IPC-Transport']) == 0
         assert struct.unpack('>9Q', value[2])[0] == owner
-        checks.append('HTTP worker asynchronously queries the real agent with verified server UID')
+        checks.append('HTTP worker asynchronously queries the real owner with verified server UID')
 
         payload = text('worker-client-op') + b'\x01' + struct.pack('>Q', 1000) + b'\x02' + text('/worker-test/') + text('') + text('probe')
         receipt = rpc('/rpc/?op=14', payload)
@@ -226,7 +226,7 @@ def run_client_cases(Run, root, checks):
         owner = case.ready(owner)
         until(lambda: rpc('/rpc/')[2][:8] == struct.pack('>Q', owner))
         assert rpc('/rpc/?op=15', text('worker-client-op'))[2] == receipt[2]
-        checks.append('agent respawn reconnects the worker client and preserves the durable operation')
+        checks.append('owner respawn reconnects the worker client and preserves the durable operation')
 
         final = stats()
         assert final['pending'] == final['request_bytes'] == final['response_bytes'] == 0, final
@@ -260,7 +260,7 @@ def run_client_cases(Run, root, checks):
             assert pending.result()[2] == b'reload'
         owner = case.ready(owner)
         assert rpc('/rpc/?op=15', text('worker-client-op'))[2] == receipt[2]
-        checks.append('HUP drains the old worker call and new workers reconnect to the replacement agent')
+        checks.append('HUP drains the old worker call and new workers reconnect to the replacement owner')
     finally:
         gate.set()
         case.stop()
@@ -268,7 +268,7 @@ def run_client_cases(Run, root, checks):
         server.server_close()
         path.unlink()
     logs = (case.path / 'error.log').read_text() + (case.path / 'stderr.log').read_text()
-    expected = f'privileged agent process {killed_owner} exited on signal 9'
+    expected = f'worker process {killed_owner} exited on signal 9'
     assert logs.count(expected) == 1
     unexpected = '\n'.join(line for line in logs.splitlines() if expected not in line)
     assert '[alert]' not in unexpected and 'AddressSanitizer' not in unexpected and 'runtime error:' not in unexpected, case.path

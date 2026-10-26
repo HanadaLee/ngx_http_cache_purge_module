@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define NGX_CACHE_PURGE_COMPONENT_ABI 3
+#define NGX_CACHE_PURGE_COMPONENT_ABI 4
 #define NGX_CACHE_PURGE_PROTOCOL_VERSION 1
 #define NGX_CACHE_PURGE_FRAME_SIZE 24
 
@@ -71,10 +71,10 @@ typedef struct {
 } ngx_cache_purge_component_status_t;
 
 void ngx_cache_purge_component_options(ngx_cache_purge_component_options_t *options);
-uint32_t ngx_cache_purge_component_abi_3(void); /* Link-time header/archive compatibility marker. */
+uint32_t ngx_cache_purge_component_abi_4(void); /* Link-time header/archive compatibility marker. */
 
-/* Only start after fork in the nginx-managed owner, never while parsing configuration or
- * in master/HTTP workers. Copies its inputs and starts one executor thread.
+/* Only start after fork in the selected nginx worker, never while parsing
+ * configuration or in master. Copies its inputs and starts one executor thread.
  * OPEN means index transport is available, not that unfinished cache writes or
  * purge fences have been recovered. Socket: <path>/component.sock, mode 0600.
  * Only the creator UID and client_uid may connect. A different client_uid
@@ -84,13 +84,17 @@ int ngx_cache_purge_component_start(const char *path,
     const ngx_cache_purge_component_options_t *options,
     ngx_cache_purge_component_t **component, ngx_cache_purge_store_error_t *error);
 
-/* Both calls belong to the starting thread/process. status never queries DB.
+/* These calls belong to the starting thread/process. status never queries DB.
+ * request_stop only signals/wakes the executor; it neither joins nor does I/O
+ * on the DB. Use it while an HTTP worker is draining long-lived requests.
  * stop wakes STANDBY/poll, joins the executor and closes DB before returning.
  * It can wait for a running sync write; it does not finish an entire purge job.
  * A lost response is ambiguous: query/retry by durable identity, never assume
  * that disconnect or shutdown rolled back an acknowledged database write. */
 int ngx_cache_purge_component_status(ngx_cache_purge_component_t *component,
     ngx_cache_purge_component_status_t *status, ngx_cache_purge_store_error_t *error);
+int ngx_cache_purge_component_request_stop(ngx_cache_purge_component_t *component,
+    ngx_cache_purge_store_error_t *error);
 int ngx_cache_purge_component_stop(ngx_cache_purge_component_t **component,
     ngx_cache_purge_store_error_t *error);
 

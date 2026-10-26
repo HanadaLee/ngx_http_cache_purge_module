@@ -72,8 +72,7 @@ if [ -n "$CACHE_PURGE_ROCKSDB_LIB_DIR" ]; then
     ngx_feature="cache purge persistent runtime libraries"
     ngx_feature_name=NGX_CACHE_PURGE_ROCKSDB
     ngx_feature_run=no
-    # nginx-ext finalizes its extension macros after addon configuration.
-    # The runtime checks existing privileged-agent support at compile time.
+    # The executor uses ordinary nginx worker init/exit callbacks.
     ngx_feature_incs='#include "ngx_cache_purge_component.h"
                       #if !defined(__linux__)
                       #error Linux is required
@@ -82,7 +81,7 @@ if [ -n "$CACHE_PURGE_ROCKSDB_LIB_DIR" ]; then
     ngx_feature_libs="$CACHE_PURGE_LIBS"
     ngx_feature_test='ngx_cache_purge_component_options_t o;
                       ngx_cache_purge_component_options(&o);
-                      if (o.abi != ngx_cache_purge_component_abi_3()) return 1;'
+                      if (o.abi != ngx_cache_purge_component_abi_4()) return 1;'
     . auto/feature
     if [ "$ngx_found" != yes ]; then
         echo "cache purge persistent runtime libraries could not link"

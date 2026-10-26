@@ -407,7 +407,7 @@ extern "C" void ngx_cache_purge_component_options(ngx_cache_purge_component_opti
     o->client_uid = UINT32_MAX;
     o->propagation_ms = 300000; o->max_live_operations = 4096; o->live_selector_bytes = 4 * 1024 * 1024;
 }
-extern "C" uint32_t ngx_cache_purge_component_abi_3(void) { return NGX_CACHE_PURGE_COMPONENT_ABI; }
+extern "C" uint32_t ngx_cache_purge_component_abi_4(void) { return NGX_CACHE_PURGE_COMPONENT_ABI; }
 extern "C" int ngx_cache_purge_component_start(const char *path,
     const ngx_cache_purge_component_options_t *options,
     ngx_cache_purge_component_t **output, ngx_cache_purge_store_error_t *error) {
@@ -469,5 +469,14 @@ extern "C" int ngx_cache_purge_component_stop(ngx_cache_purge_component_t **outp
         int code = component->error_code.load();
         if (code && error) *error = component->terminal_error;
         delete component; *output = nullptr; return code;
+    });
+}
+
+extern "C" int ngx_cache_purge_component_request_stop(ngx_cache_purge_component_t *c,
+    ngx_cache_purge_store_error_t *error) {
+    return boundary(error, [&]() -> int {
+        if (!c) return failure(error, NGX_PURGE_STORE_INVALID, "null component stop request");
+        if (!c->owner()) return failure(error, NGX_PURGE_STORE_OWNER, "component creator mismatch");
+        c->stopping.store(true); c->wake(); return 0;
     });
 }
