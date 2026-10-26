@@ -13,6 +13,7 @@
 #include "rocksdb/ngx_http_cache_rocksdb.h"
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -64,53 +65,194 @@ struct Selector {
     std::string scope; /* namespace or host for the two TAG selectors */
 };
 
+inline ngx_http_cache_rocksdb_bytes_t ngx_http_cache_purge_native_bytes(const std::string &s) {
+    return {reinterpret_cast<const unsigned char *>(s.data()), s.size()};
+}
+inline std::string ngx_http_cache_purge_cpp_bytes(ngx_http_cache_rocksdb_bytes_t s) {
+    return s.len ? std::string(reinterpret_cast<const char *>(s.data), s.len) : std::string{};
+}
+
+/* Conversion-only adapters: all index policy, schema and mutations are C. */
+inline void ngx_http_cache_purge_index_checked(int rc, const ngx_http_cache_rocksdb_error_t &error) {
+    if (rc) throw IndexError(rc, error.message);
+}
+inline Match ngx_http_cache_purge_cpp_match(const ngx_http_cache_purge_index_match_t &value) {
+    Match result;
+    std::memcpy(result.id.data(), value.id, result.id.size());
+    result.revision = value.revision; result.state = static_cast<FileState>(value.state);
+    return result;
+}
+inline ngx_http_cache_purge_index_expected_t ngx_http_cache_purge_native_expected(const FileId &id, uint64_t revision) {
+    ngx_http_cache_purge_index_expected_t result{};
+    std::memcpy(result.id, id.data(), id.size()); result.revision = revision;
+    return result;
+}
+inline ngx_http_cache_purge_index_file_t ngx_http_cache_purge_native_file(const File &file) {
+    ngx_http_cache_purge_index_file_t out{};
+    std::memcpy(out.id, file.id.data(), file.id.size());
+    out.state = static_cast<uint32_t>(file.state); out.revision = file.revision;
+    out.key = ngx_http_cache_purge_native_bytes(file.key);
+    out.url = ngx_http_cache_purge_native_bytes(file.url);
+    out.host = ngx_http_cache_purge_native_bytes(file.host);
+    out.tag_namespace = ngx_http_cache_purge_native_bytes(file.tag_namespace);
+    out.root = ngx_http_cache_purge_native_bytes(file.root);
+    out.zone = ngx_http_cache_purge_native_bytes(file.zone);
+    out.path = ngx_http_cache_purge_native_bytes(file.path);
+    out.range = ngx_http_cache_purge_native_bytes(file.range);
+    out.vary = ngx_http_cache_purge_native_bytes(file.vary);
+    out.metadata = ngx_http_cache_purge_native_bytes(file.metadata);
+    out.structured_key = file.structured_key; out.structured_url = file.structured_url;
+    for (size_t i = 0; i < 6; i++) out.components[i] = ngx_http_cache_purge_native_bytes(file.components[i]);
+    out.tag_count = file.tags.size();
+    for (size_t i = 0; i < file.tags.size() && i < 64; i++) out.tags[i] = ngx_http_cache_purge_native_bytes(file.tags[i]);
+    return out;
+}
 class Query {
 public:
-    ~Query();
+    ~Query() { ngx_http_cache_purge_query_close(&native_, nullptr); }
     Query(const Query &) = delete;
     Query &operator=(const Query &) = delete;
-    bool next(Match &match);
-    std::string bookmark() const; /* persist only after the returned match is handled */
+    bool next(Match &match) {
+        ngx_http_cache_purge_index_match_t value{}; ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_query_next(native_, &value, &error);
+        if (rc == NGX_HTTP_CACHE_ROCKSDB_DONE) return false;
+        ngx_http_cache_purge_index_checked(rc, error); match = ngx_http_cache_purge_cpp_match(value); return true;
+    }
+    std::string bookmark() const { return ngx_http_cache_purge_cpp_bytes(ngx_http_cache_purge_query_bookmark(native_)); }
 private:
     ngx_http_cache_purge_query_t *native_ = nullptr;
     Query() = default;
     friend class Index;
 };
-
-/* Internal C++ API, used on the component executor thread. The store outlives
- * Index and Query. IndexError carries a store result code; the component's C
- * entry point must catch it (and allocation failures) before returning to C. */
 class Index {
-public:
-    explicit Index(ngx_http_cache_rocksdb_t *store);
-    Match prepare(const File &file, const FileId &expected_previous = {});
-    std::vector<Match> prepare_batch(const std::vector<Fill> &files);
-    Match commit(const FileId &id, uint64_t expected_revision);
-    std::vector<Match> commit_batch(const std::vector<ExpectedFile> &files);
-    /* Native file publication keeps its durable lease after the DB commit.
-     * Publish only after the file's readable marker is durable. These APIs
-     * perform no filesystem operations and do not prove writer quiescence. */
-    Match commit_pending(const FileId &id, uint64_t expected_revision);
-    Match publish(const FileId &id, uint64_t expected_revision);
-    Match discard_publication(const FileId &id, uint64_t expected_revision);
-    std::optional<Match> current(const std::string &root, const std::string &path);
-    bool has_fill_intent(const FileId &id);
-    Match abort_prepare(const FileId &id, uint64_t expected_revision);
-    Match retire(const FileId &id, uint64_t expected_revision);
-    std::vector<Match> retire_batch(const std::vector<ExpectedFile> &files);
-    Match update_metadata(const FileId &id, uint64_t expected_revision,
-                          const std::string &metadata, const std::vector<std::string> &tags);
-    File get(const FileId &id);
-    void add_url(const std::string &key, const std::string &url);
-    void collect_file(const FileId &id, uint64_t expected_revision);
-    void collect_files(const std::vector<ExpectedFile> &files);
-    size_t collect_keys(size_t edge_budget = 8);
-    std::unique_ptr<Query> query(const Selector &selector, const std::string &bookmark = "");
-    /* Includes PREPARED and COMMITTED-but-unpublished instances. */
-    std::unique_ptr<Query> pending_fills(const std::string &bookmark = "");
-    std::unique_ptr<Query> retired_files(const std::string &bookmark = "");
-private:
     ngx_http_cache_rocksdb_t *store_;
+    struct OwnedFile {
+        ngx_http_cache_purge_index_file_t value{};
+        OwnedFile() = default;
+        OwnedFile(const OwnedFile &) = delete;
+        ~OwnedFile() { ngx_http_cache_purge_index_file_free(&value); }
+    };
+    static void count(size_t size) {
+        if (!size || size > 32) throw IndexError(NGX_HTTP_CACHE_ROCKSDB_LIMIT, "index batch must contain 1-32 files");
+    }
+    Match apply(ngx_http_cache_purge_index_action_e action, const FileId &id, uint64_t revision) {
+        auto input = ngx_http_cache_purge_native_expected(id, revision);
+        ngx_http_cache_purge_index_match_t output{}; ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_index_apply(store_, action, &input, 1, &output, &error);
+        ngx_http_cache_purge_index_checked(rc, error); return ngx_http_cache_purge_cpp_match(output);
+    }
+    std::vector<Match> apply_batch(ngx_http_cache_purge_index_action_e action, const std::vector<ExpectedFile> &files) {
+        count(files.size());
+        std::array<ngx_http_cache_purge_index_expected_t, 32> input{};
+        std::array<ngx_http_cache_purge_index_match_t, 32> output{};
+        std::vector<Match> result(files.size());
+        for (size_t i = 0; i < files.size(); i++) input[i] = ngx_http_cache_purge_native_expected(files[i].id, files[i].revision);
+        ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_index_apply(store_, action, input.data(), files.size(), output.data(), &error);
+        ngx_http_cache_purge_index_checked(rc, error);
+        for (size_t i = 0; i < files.size(); i++) result[i] = ngx_http_cache_purge_cpp_match(output[i]);
+        return result;
+    }
+    std::unique_ptr<Query> open_query(const Selector *selector, unsigned mode, const std::string &bookmark) {
+        std::unique_ptr<Query> result(new Query);
+        ngx_http_cache_purge_selector_t input{};
+        if (selector) input = {static_cast<uint32_t>(selector->kind), ngx_http_cache_purge_native_bytes(selector->value), ngx_http_cache_purge_native_bytes(selector->scope)};
+        ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_query_open(store_, selector ? &input : nullptr, mode,
+            ngx_http_cache_purge_native_bytes(bookmark), &result->native_, &error);
+        ngx_http_cache_purge_index_checked(rc, error); return result;
+    }
+public:
+    explicit Index(ngx_http_cache_rocksdb_t *store) : store_(store) {
+        ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_index_init(store, &error); ngx_http_cache_purge_index_checked(rc, error);
+    }
+    Match prepare(const File &file, const FileId &previous = {}) {
+        auto input = ngx_http_cache_purge_native_file(file);
+        ngx_http_cache_purge_index_match_t output{}; ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_index_prepare(store_, &input, previous.data(), &output, &error);
+        ngx_http_cache_purge_index_checked(rc, error); return ngx_http_cache_purge_cpp_match(output);
+    }
+    std::vector<Match> prepare_batch(const std::vector<Fill> &files) {
+        count(files.size());
+        std::vector<ngx_http_cache_purge_index_fill_t> input(files.size());
+        std::array<ngx_http_cache_purge_index_match_t, 32> output{};
+        std::vector<Match> result(files.size());
+        for (size_t i = 0; i < files.size(); i++) {
+            input[i].file = ngx_http_cache_purge_native_file(files[i].file);
+            std::memcpy(input[i].previous, files[i].previous.data(), files[i].previous.size());
+        }
+        ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_index_prepare_batch(store_, input.data(), files.size(), output.data(), &error);
+        ngx_http_cache_purge_index_checked(rc, error);
+        for (size_t i = 0; i < files.size(); i++) result[i] = ngx_http_cache_purge_cpp_match(output[i]);
+        return result;
+    }
+    Match commit(const FileId &id, uint64_t revision) { return apply(NGX_HTTP_CACHE_PURGE_INDEX_COMMIT, id, revision); }
+    std::vector<Match> commit_batch(const std::vector<ExpectedFile> &files) { return apply_batch(NGX_HTTP_CACHE_PURGE_INDEX_COMMIT, files); }
+    Match commit_pending(const FileId &id, uint64_t revision) { return apply(NGX_HTTP_CACHE_PURGE_INDEX_COMMIT_PENDING, id, revision); }
+    Match publish(const FileId &id, uint64_t revision) { return apply(NGX_HTTP_CACHE_PURGE_INDEX_PUBLISH, id, revision); }
+    Match discard_publication(const FileId &id, uint64_t revision) { return apply(NGX_HTTP_CACHE_PURGE_INDEX_DISCARD, id, revision); }
+    Match abort_prepare(const FileId &id, uint64_t revision) { return apply(NGX_HTTP_CACHE_PURGE_INDEX_ABORT, id, revision); }
+    Match retire(const FileId &id, uint64_t revision) { return apply(NGX_HTTP_CACHE_PURGE_INDEX_RETIRE, id, revision); }
+    std::vector<Match> retire_batch(const std::vector<ExpectedFile> &files) { return apply_batch(NGX_HTTP_CACHE_PURGE_INDEX_RETIRE, files); }
+    std::optional<Match> current(const std::string &root, const std::string &path) {
+        ngx_http_cache_purge_index_match_t output{}; ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_index_current(store_, ngx_http_cache_purge_native_bytes(root), ngx_http_cache_purge_native_bytes(path), &output, &error);
+        if (rc == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) return {};
+        ngx_http_cache_purge_index_checked(rc, error); return ngx_http_cache_purge_cpp_match(output);
+    }
+    bool has_fill_intent(const FileId &id) {
+        int output = 0; ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_index_has_intent(store_, id.data(), &output, &error);
+        ngx_http_cache_purge_index_checked(rc, error); return output != 0;
+    }
+    Match update_metadata(const FileId &id, uint64_t revision, const std::string &metadata, const std::vector<std::string> &tags) {
+        auto input = ngx_http_cache_purge_native_expected(id, revision);
+        std::array<ngx_http_cache_rocksdb_bytes_t, 64> values{};
+        for (size_t i = 0; i < tags.size() && i < 64; i++) values[i] = ngx_http_cache_purge_native_bytes(tags[i]);
+        ngx_http_cache_purge_index_match_t output{}; ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_index_update(store_, &input, ngx_http_cache_purge_native_bytes(metadata), values.data(), tags.size(), &output, &error);
+        ngx_http_cache_purge_index_checked(rc, error); return ngx_http_cache_purge_cpp_match(output);
+    }
+    File get(const FileId &id) {
+        OwnedFile output; ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_index_get_file(store_, id.data(), &output.value, &error);
+        ngx_http_cache_purge_index_checked(rc, error);
+        const auto &value = output.value;
+        File result; std::memcpy(result.id.data(), value.id, result.id.size());
+        result.revision = value.revision; result.state = static_cast<FileState>(value.state);
+        result.key = ngx_http_cache_purge_cpp_bytes(value.key); result.url = ngx_http_cache_purge_cpp_bytes(value.url);
+        result.host = ngx_http_cache_purge_cpp_bytes(value.host); result.tag_namespace = ngx_http_cache_purge_cpp_bytes(value.tag_namespace);
+        result.root = ngx_http_cache_purge_cpp_bytes(value.root); result.zone = ngx_http_cache_purge_cpp_bytes(value.zone);
+        result.path = ngx_http_cache_purge_cpp_bytes(value.path); result.range = ngx_http_cache_purge_cpp_bytes(value.range);
+        result.vary = ngx_http_cache_purge_cpp_bytes(value.vary); result.metadata = ngx_http_cache_purge_cpp_bytes(value.metadata);
+        result.tags.reserve(value.tag_count);
+        for (size_t i = 0; i < value.tag_count; i++) result.tags.push_back(ngx_http_cache_purge_cpp_bytes(value.tags[i]));
+        return result;
+    }
+    void add_url(const std::string &key, const std::string &url) {
+        ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_index_add_url(store_, ngx_http_cache_purge_native_bytes(key), ngx_http_cache_purge_native_bytes(url), &error);
+        ngx_http_cache_purge_index_checked(rc, error);
+    }
+    void collect_file(const FileId &id, uint64_t revision) {
+        auto input = ngx_http_cache_purge_native_expected(id, revision); ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_index_collect(store_, &input, 1, &error); ngx_http_cache_purge_index_checked(rc, error);
+    }
+    void collect_files(const std::vector<ExpectedFile> &files) {
+        count(files.size()); std::array<ngx_http_cache_purge_index_expected_t, 32> input{};
+        for (size_t i = 0; i < files.size(); i++) input[i] = ngx_http_cache_purge_native_expected(files[i].id, files[i].revision);
+        ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_index_collect(store_, input.data(), files.size(), &error); ngx_http_cache_purge_index_checked(rc, error);
+    }
+    size_t collect_keys(size_t budget = 8) {
+        size_t output = 0; ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_index_collect_keys(store_, budget, &output, &error); ngx_http_cache_purge_index_checked(rc, error); return output;
+    }
+    std::unique_ptr<Query> query(const Selector &selector, const std::string &bookmark = "") { return open_query(&selector, NGX_HTTP_CACHE_PURGE_QUERY_SELECT, bookmark); }
+    std::unique_ptr<Query> pending_fills(const std::string &bookmark = "") { return open_query(nullptr, NGX_HTTP_CACHE_PURGE_QUERY_PENDING, bookmark); }
+    std::unique_ptr<Query> retired_files(const std::string &bookmark = "") { return open_query(nullptr, NGX_HTTP_CACHE_PURGE_QUERY_RETIRED, bookmark); }
 };
 
 } // namespace ngx_http_cache_purge
@@ -182,12 +324,6 @@ struct OperationUsage {
  * All accepted operations retain their idempotency record on disk, even after
  * their bounded resident-control slot is released. */
 /* Conversion-only bridge for backend consumers still being migrated to C. */
-inline ngx_http_cache_rocksdb_bytes_t ngx_http_cache_purge_native_bytes(const std::string &s) {
-    return {reinterpret_cast<const unsigned char *>(s.data()), s.size()};
-}
-inline std::string ngx_http_cache_purge_cpp_bytes(ngx_http_cache_rocksdb_bytes_t s) {
-    return s.len ? std::string(reinterpret_cast<const char *>(s.data), s.len) : std::string{};
-}
 inline ngx_http_cache_purge_operation_input_t ngx_http_cache_purge_native_input(const OperationInput &input) {
     return {ngx_http_cache_purge_native_bytes(input.id),
             {static_cast<uint32_t>(input.selector.kind), ngx_http_cache_purge_native_bytes(input.selector.value),

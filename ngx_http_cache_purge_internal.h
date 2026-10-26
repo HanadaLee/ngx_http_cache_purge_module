@@ -62,8 +62,8 @@ typedef enum {
 #define NGX_HTTP_CACHE_PURGE_ROOT_CACHE 1
 #define NGX_HTTP_CACHE_PURGE_ROOT_TEMP  2
 typedef struct {
-    ngx_http_cache_rocksdb_bytes_t  path, zone;
-    uint32_t                        kind;
+    ngx_http_cache_rocksdb_bytes_t path, zone;
+    uint32_t                       kind;
 } ngx_http_cache_purge_root_t;
 
 typedef struct {
@@ -168,7 +168,7 @@ typedef struct ngx_http_cache_purge_control_writer_s
     ngx_http_cache_purge_control_writer_t;
 
 typedef struct {
-    ngx_http_cache_rocksdb_bytes_t         key, url, host, tag_namespace;
+    ngx_http_cache_rocksdb_bytes_t        key, url, host, tag_namespace;
     const ngx_http_cache_rocksdb_bytes_t  *tags;
     size_t                                 tag_count;
     uint64_t                               now_ms;
@@ -176,10 +176,9 @@ typedef struct {
 } ngx_http_cache_purge_control_context_t;
 
 typedef struct {
-    uint64_t                        sequence, issued_at_ms,
-                                    propagation_until_ms;
-    uint32_t                        flags, mode, kind;
-    ngx_http_cache_rocksdb_bytes_t  operation_id, value, scope;
+    uint64_t                       sequence, issued_at_ms, propagation_until_ms;
+    uint32_t                       flags, mode, kind;
+    ngx_http_cache_rocksdb_bytes_t operation_id, value, scope;
 } ngx_http_cache_purge_control_match_t;
 
 /* Called synchronously while the immutable image is pinned. Copy any required
@@ -546,6 +545,66 @@ int ngx_http_cache_purge_index_apply(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_expected_t *files, size_t count,
     ngx_http_cache_purge_index_match_t *matches,
     ngx_http_cache_rocksdb_error_t *error);
+
+typedef struct {
+    unsigned char  id[16];
+    uint32_t       state;
+    uint64_t       revision;
+    ngx_http_cache_rocksdb_bytes_t key, url, host, tag_namespace;
+    ngx_http_cache_rocksdb_bytes_t root, zone, path, range, vary, metadata;
+    ngx_http_cache_rocksdb_bytes_t  components[6];
+    ngx_http_cache_rocksdb_bytes_t  tags[64];
+    size_t                          tag_count;
+    int                             structured_key;
+    int                             structured_url;
+    void                           *storage;
+} ngx_http_cache_purge_index_file_t;
+
+typedef struct {
+    ngx_http_cache_purge_index_file_t  file;
+    unsigned char                      previous[16];
+} ngx_http_cache_purge_index_fill_t;
+
+/* Inputs borrow bytes during the call. prepare requires state=1, revision=0;
+ * NULL previous means no current instance is expected at the target path.
+ * get returns one owned allocation; free it before reuse. Batch outputs have
+ * count caller-owned entries and are populated only after atomic commit. */
+int ngx_http_cache_purge_index_prepare(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_file_t *file,
+    const unsigned char previous[16], ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_prepare_batch(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_fill_t *files, size_t count,
+    ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_get_file(ngx_http_cache_rocksdb_t *store,
+    const unsigned char id[16], ngx_http_cache_purge_index_file_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+void
+ngx_http_cache_purge_index_file_free(ngx_http_cache_purge_index_file_t *file);
+int ngx_http_cache_purge_index_current(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_rocksdb_bytes_t root, ngx_http_cache_rocksdb_bytes_t path,
+    ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+int
+ngx_http_cache_purge_index_has_intent(ngx_http_cache_rocksdb_t *store,
+    const unsigned char id[16], int *owned,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_update(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file,
+    ngx_http_cache_rocksdb_bytes_t metadata,
+    const ngx_http_cache_rocksdb_bytes_t *tags, size_t count,
+    ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_add_url(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_rocksdb_bytes_t key, ngx_http_cache_rocksdb_bytes_t url,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_collect(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *files, size_t count,
+    ngx_http_cache_rocksdb_error_t *error);
+int
+ngx_http_cache_purge_index_collect_keys(ngx_http_cache_rocksdb_t *store,
+    size_t budget, size_t *removed, ngx_http_cache_rocksdb_error_t *error);
 
 #ifdef __cplusplus
 }

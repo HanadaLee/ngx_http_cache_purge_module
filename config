@@ -58,7 +58,7 @@ if [ -n "$CACHE_PURGE_ROCKSDB_LIB_DIR" ]; then
         exit 1
     fi
     CACHE_ROCKSDB_LIBS="$CACHE_ROCKSDB_LIBS ${CACHE_PURGE_ROCKSDB_LIBS:--lrocksdb -lcrypto -lstdc++ -lm -pthread}"
-    for archive in component control index operations files; do
+    for archive in component control index files; do
         if [ ! -f "$CACHE_PURGE_ROCKSDB_LIB_DIR/libngx_http_cache_purge_${archive}.a" ]; then
             echo "missing cache purge archive: $CACHE_PURGE_ROCKSDB_LIB_DIR/libngx_http_cache_purge_${archive}.a"
             exit 1
