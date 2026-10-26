@@ -31,6 +31,13 @@ query RocksDB. FENCE and proxy-only PROPAGATE duties share records but expire
 independently. Native request/cache hook integration is still pending; tests use
 a separate precontent consumer to verify the shared barrier against real HITs.
 
+Native cache read and response-admission adapters are also being developed in
+nginx-ext. The test fixture in `t/cache_adapter_runtime.py` exercises asynchronous
+file metadata reads, stale suppression, Vary/slice handling, and rejection of
+304 reuse before cache-header renewal. It is not the production purge consumer:
+durable file writes, 304 commits, eviction coordination, and background file
+operations remain to be connected.
+
 ## Current features
 
 - Exact-key and trailing-wildcard cache removal.
