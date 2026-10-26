@@ -40,7 +40,7 @@ static ngx_int_t
 decision(probe_ctx_t *ctx)
 {
     if (mode(ctx, "expire") || mode(ctx, "deny304")) {
-        ctx->cache->invalidated = 1;
+        ctx->cache->must_revalidate |= NGX_HTTP_CACHE_REVALIDATE_PURGE;
     }
     if (mode(ctx, "miss")) {
         return NGX_DECLINED;
@@ -235,8 +235,9 @@ state(ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data)
     v->data = p;
     p = ngx_snprintf(p, 128, "%V:%ui:%d:%d:%d",
                      &r->cache->file_cache->shm_zone->shm.name, ctx->lookups,
-                     r->cache->secondary, r->cache->invalidated,
-                     r->cache->must_revalidate);
+                     r->cache->secondary,
+                     !!(r->cache->must_revalidate & NGX_HTTP_CACHE_REVALIDATE_PURGE),
+                     !!(r->cache->must_revalidate & NGX_HTTP_CACHE_REVALIDATE_ORIGIN));
     v->len = p - v->data;
     v->valid = 1;
     v->no_cacheable = 1;
