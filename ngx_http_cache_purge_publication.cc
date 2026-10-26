@@ -1,7 +1,6 @@
 /* Copyright (C) Hanada */
-#include "ngx_http_cache_purge_publication.hpp"
-#include "ngx_http_cache_purge_component.h"
-#include "ngx_http_cache_purge_files.h"
+#include "ngx_http_cache_purge_backend.hpp"
+#include "ngx_http_cache_purge_internal.h"
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>

@@ -1,5 +1,5 @@
 /* Copyright (C) Hanada */
-#include "ngx_http_cache_purge_coordinator.hpp"
+#include "ngx_http_cache_purge_backend.hpp"
 
 namespace ngx_http_cache_purge {
 namespace {

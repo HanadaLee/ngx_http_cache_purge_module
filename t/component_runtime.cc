@@ -1,5 +1,4 @@
-#include "ngx_http_cache_purge_component.h"
-#include "ngx_http_cache_purge_control.h"
+#include "ngx_http_cache_purge_internal.h"
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>

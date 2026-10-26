@@ -1,5 +1,5 @@
 /* Copyright (C) Hanada */
-#include "ngx_http_cache_purge_control.hpp"
+#include "ngx_http_cache_purge_backend.hpp"
 #include <pthread.h>
 #include <signal.h>
 #include <sys/random.h>

@@ -1,7 +1,7 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
-#include "ngx_http_cache_purge_runtime.h"
+#include "ngx_http_cache_purge.h"
 
 extern ngx_module_t ngx_http_cache_purge_runtime_probe_module;
 typedef struct {

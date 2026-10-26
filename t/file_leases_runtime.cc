@@ -1,5 +1,5 @@
 /* Kernel-backed leases across threads, descriptor handoff, and process death. */
-#include "ngx_http_cache_purge_files.h"
+#include "ngx_http_cache_purge_internal.h"
 #include <atomic>
 #include <cerrno>
 #include <cstring>

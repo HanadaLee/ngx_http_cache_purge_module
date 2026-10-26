@@ -3,7 +3,7 @@
  * Distributed under the same BSD license as ngx_http_cache_purge_module.c.
  */
 #include <ngx_config.h>
-#include "ngx_http_cache_purge_invalidation.h"
+#include "ngx_http_cache_purge.h"
 
 #if (NGX_HTTP_CACHE)
 

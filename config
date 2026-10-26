@@ -40,19 +40,14 @@ if [ "$HTTP_UWSGI" = "YES" ]; then
 fi
 
 CACHE_PURGE_SRCS="$ngx_addon_dir/ngx_http_cache_purge_handler.c \
-                  $ngx_addon_dir/ngx_http_cache_purge_fill.c \
+                  $ngx_addon_dir/ngx_http_cache_purge_request.c \
                   $ngx_addon_dir/ngx_http_cache_purge_invalidation.c \
                   $ngx_addon_dir/ngx_http_cache_purge_module.c \
                   $ngx_addon_dir/ngx_http_cache_purge_queue.c \
                   $ngx_addon_dir/ngx_http_cache_purge_refresh.c \
                   $ngx_addon_dir/ngx_http_cache_purge_response.c \
                   $ngx_addon_dir/ngx_http_cache_purge_walk.c"
-CACHE_PURGE_DEPS="$ngx_addon_dir/ngx_http_cache_purge.h \
-                  $ngx_addon_dir/ngx_http_cache_purge_fill.h \
-                  $ngx_addon_dir/ngx_http_cache_purge_invalidation.h \
-                  $ngx_addon_dir/ngx_http_cache_purge_posix.h \
-                  $ngx_addon_dir/ngx_http_cache_purge_upstream.h \
-                  $ngx_addon_dir/ngx_http_cache_purge_win32.h"
+CACHE_PURGE_DEPS="$ngx_addon_dir/ngx_http_cache_purge.h"
 
 # Optional persistent-runtime build. nginx still compiles its sources as C.
 CACHE_PURGE_LIBS=
@@ -80,7 +75,7 @@ if [ -n "$CACHE_PURGE_ROCKSDB_LIB_DIR" ]; then
     ngx_feature_name=NGX_HTTP_CACHE_PURGE_ROCKSDB
     ngx_feature_run=no
     # The executor uses ordinary nginx worker init/exit callbacks.
-    ngx_feature_incs='#include "ngx_http_cache_purge_component.h"
+    ngx_feature_incs='#include "ngx_http_cache_purge_internal.h"
                       #if !defined(__linux__)
                       #error Linux is required
                       #endif'
@@ -108,8 +103,8 @@ if [ -n "$CACHE_PURGE_ROCKSDB_LIB_DIR" ]; then
         NGX_ADDON_DEPS="$NGX_ADDON_DEPS $ngx_addon_dir/rocksdb/ngx_http_cache_rocksdb.h"
         CORE_LIBS="$CORE_LIBS $CACHE_ROCKSDB_LIBS"
     fi
-    CACHE_PURGE_SRCS="$CACHE_PURGE_SRCS $ngx_addon_dir/ngx_http_cache_purge_runtime.c $ngx_addon_dir/ngx_http_cache_purge_client.c $ngx_addon_dir/ngx_http_cache_purge_capture.c"
-    CACHE_PURGE_DEPS="$CACHE_PURGE_DEPS $ngx_addon_dir/ngx_http_cache_purge_runtime.h $ngx_addon_dir/ngx_http_cache_purge_component.h $ngx_addon_dir/ngx_http_cache_purge_control.h $ngx_addon_dir/ngx_http_cache_purge_client.h $ngx_addon_dir/ngx_http_cache_purge_transport.h"
+    CACHE_PURGE_SRCS="$CACHE_PURGE_SRCS $ngx_addon_dir/ngx_http_cache_purge_runtime.c"
+    CACHE_PURGE_DEPS="$CACHE_PURGE_DEPS $ngx_addon_dir/ngx_http_cache_purge_internal.h $ngx_addon_dir/rocksdb/ngx_http_cache_rocksdb.h"
 fi
 
 # auto/module supports static and dynamic registration since NGINX 1.9.11.

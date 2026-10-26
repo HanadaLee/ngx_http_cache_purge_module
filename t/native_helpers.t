@@ -67,14 +67,28 @@ sub function {
 
 sub platform_function {
     my ($name) = @_;
+    my $header = read_file("$root/ngx_http_cache_purge.h");
+    my ($windows, $posix) = $header =~ m{
+        /\*\ Windows\ filesystem\ helpers\.\ \*/(.*?)
+        /\*\ POSIX\ filesystem\ helpers\.\ \*/(.*?)
+        /\*\ End\ filesystem\ helpers\.\ \*/
+    }sx;
+    die 'missing platform helper sections' unless defined $posix;
     return "#if (NGX_WIN32)\n"
-           . function($name, read_file("$root/ngx_http_cache_purge_win32.h"))
+           . function($name, $windows)
            . "#else\n"
-           . function($name, read_file("$root/ngx_http_cache_purge_posix.h"))
+           . function($name, $posix)
            . "#endif\n\n";
 }
 
 sub fixture { read_file("$root/t/fixtures/$_[0].c"); }
+
+sub generation_contracts {
+    my $header = read_file("$root/ngx_http_cache_purge.h");
+    $header =~ m{(/\* Generation state.*?)(?=\n#if \(NGX_WIN32\))}s
+        or die 'missing generation contracts';
+    return "$1\n";
+}
 
 subtest 'LeakSanitizer core exception keeps unrelated leaks fatal' => sub {
     plan skip_all => 'requires process-capable LeakSanitizer'
@@ -220,7 +234,7 @@ subtest 'pending/running deduplication, admission, metrics and recovery' => sub 
     die 'missing queue types' unless defined $types;
     my $code = "#include <ngx_config.h>\n#include <ngx_core.h>\n"
                . "#include <ngx_http.h>\n#include <assert.h>\n"
-               . "#include \"$root/ngx_http_cache_purge_invalidation.h\"\n";
+               . generation_contracts();
     $code .= "$1\n" while $source =~ /^(#define NGX_HTTP_CACHE_PURGE_\w+[^\n]*)/mg;
     $code .= $types . "\n" . fixture('queue_state_shim');
     my $strings = read_file("$nginx/src/core/ngx_string.c");
@@ -261,8 +275,10 @@ subtest 'generation rules and conditional invalidation' => sub {
     my $generation = read_file("$root/ngx_http_cache_purge_invalidation.c");
     $generation =~ /(typedef struct ngx_http_cache_purge_rule_s.*?)(?=typedef struct ngx_http_cache_purge_snapshot_s)/s
         or die 'missing generation state';
-    my $code = "#include <ngx_config.h>\n#include <assert.h>\n#include <stdio.h>\n"
-               . "#include \"$root/ngx_http_cache_purge_invalidation.h\"\n" . $1
+    my $state = $1;
+    my $code = "#include <ngx_config.h>\n#include <ngx_core.h>\n"
+               . "#include <ngx_http.h>\n#include <assert.h>\n#include <stdio.h>\n"
+               . generation_contracts() . $state
                . fixture('generation_shim');
     my $strings = read_file("$nginx/src/core/ngx_string.c");
     $strings =~ /(ngx_int_t\nngx_hextoi\(.*?\n})/s or die 'missing hextoi';

@@ -1,10 +1,6 @@
 /* Copyright (C) Hanada */
-#include "ngx_http_cache_purge_component.h"
-#include "ngx_http_cache_purge_protocol.hpp"
-#include "ngx_http_cache_purge_coordinator.hpp"
-#include "ngx_http_cache_purge_files.h"
-#include "ngx_http_cache_purge_transport.h"
-#include "ngx_http_cache_purge_publication.hpp"
+#include "ngx_http_cache_purge_internal.h"
+#include "ngx_http_cache_purge_backend.hpp"
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>

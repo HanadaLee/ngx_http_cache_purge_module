@@ -1,6 +1,5 @@
 /* Copyright (C) Hanada */
-#include "ngx_http_cache_purge_operations.hpp"
-#include "ngx_http_cache_purge_protocol.hpp"
+#include "ngx_http_cache_purge_backend.hpp"
 #include <openssl/sha.h>
 #include <map>
 #include <optional>

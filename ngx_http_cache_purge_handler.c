@@ -28,7 +28,6 @@
 
 #include <ngx_config.h>
 #include "ngx_http_cache_purge.h"
-#include "ngx_http_cache_purge_upstream.h"
 
 #if (NGX_HTTP_CACHE)
 

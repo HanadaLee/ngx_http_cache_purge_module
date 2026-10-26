@@ -1,4 +1,4 @@
-#include "ngx_http_cache_purge_index.hpp"
+#include "ngx_http_cache_purge_backend.hpp"
 #include <unistd.h>
 #include <algorithm>
 #include <chrono>

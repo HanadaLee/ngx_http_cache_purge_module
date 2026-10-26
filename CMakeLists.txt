@@ -21,7 +21,7 @@ set_target_properties(ngx_http_cache_purge_index PROPERTIES POSITION_INDEPENDENT
 target_link_libraries(ngx_http_cache_purge_index PUBLIC ngx_http_cache_rocksdb OpenSSL::Crypto)
 target_compile_options(ngx_http_cache_purge_index PRIVATE -Wall -Wextra -Werror)
 
-add_library(ngx_http_cache_purge_files STATIC ngx_http_cache_purge_files.c ngx_http_cache_purge_transport.c)
+add_library(ngx_http_cache_purge_files STATIC ngx_http_cache_purge_files.c)
 target_compile_features(ngx_http_cache_purge_files PUBLIC c_std_99)
 target_compile_definitions(ngx_http_cache_purge_files PRIVATE _GNU_SOURCE)
 target_include_directories(ngx_http_cache_purge_files PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
