@@ -74,6 +74,11 @@ with tarfile.open(fileobj=io.BytesIO(archive)) as source:
         assert (build / member.name).read_bytes() == expected
 
 calls, policies = [], {}
+redirects = {'/redirect-cache': '/redirect-old', '/redirect-tag': '/redirect-old',
+             '/redirect-unknown': '/redirect-old', '/redirect-named': '@redirect_named',
+             '/redirect-stale': '/redirect-old', '/redirect-revalidated': '/redirect-old'}
+negative_outage = True
+origin_failures = set()
 capacity_gate = threading.Event()
 slice_body = b'0123456789' * 300
 class Origin(http.server.BaseHTTPRequestHandler):
@@ -81,6 +86,13 @@ class Origin(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split('?', 1)[0]
         calls.append(path)
+        if path == '/negative-cache' and negative_outage:
+            self.connection.shutdown(socket.SHUT_RDWR)
+            return
+        if path in origin_failures:
+            self.send_response(500); self.send_header('Content-Length', '0'); self.end_headers(); return
+        if path == '/redirect-revalidated' and self.headers.get('If-None-Match') == '"capture-v1"':
+            self.send_response(304); self.send_header('Cache-Control', 'max-age=60'); self.end_headers(); return
         if path == '/capacity': capacity_gate.wait(20)
         body = path.encode() if not path.startswith('/slice') else slice_body
         if path == '/vary': body += self.headers.get('Accept-Language', '').encode()
@@ -90,9 +102,12 @@ class Origin(http.server.BaseHTTPRequestHandler):
             start, end = map(int, self.headers['Range'][6:].split('-')); end = min(end, len(body) - 1)
             content_range = f'bytes {start}-{end}/{len(body)}'; body = body[start:end + 1]; status = 206
         self.send_response(status)
-        self.send_header('Cache-Control', 'max-age=3600')
+        self.send_header('Cache-Control', 'max-age=' + ('1' if path in ('/redirect-stale', '/redirect-revalidated') else '3600'))
         self.send_header('Accept-Ranges', 'bytes')
         self.send_header('ETag', '"capture-v1"')
+        if path in redirects:
+            self.send_header('X-Accel-Redirect', redirects[path])
+            self.send_header('X-Cached-Only', 'hidden-on-redirect')
         self.send_header('Cache-Tag', policies.get(path, 'news, red, news'))
         if path == '/vary': self.send_header('Vary', 'Accept-Language')
         if content_range: self.send_header('Content-Range', content_range)
@@ -191,6 +206,22 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
   location /raw {{ proxy_cache_key "$uri|$arg_m"; cache_purge_key $uri;
                   cache_purge_tag_namespace rawtenant;
                   proxy_pass http://127.0.0.1:{origin.server_port}; }}
+  location = /negative-cache {{
+      cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+      proxy_cache_valid 502 1h; error_page 502 = /negative-error;
+      proxy_pass http://127.0.0.1:{origin.server_port};
+  }}
+  location = /negative-error {{ return 200 "negative-old"; }}
+  location ~ ^/redirect-(cache|tag|unknown|named|stale|revalidated)$ {{
+      cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+      proxy_ignore_headers X-Accel-Redirect;
+      proxy_cache_revalidate on;
+      proxy_cache_use_stale error timeout http_500 updating;
+      proxy_pass http://127.0.0.1:{origin.server_port};
+  }}
+  location = /redirect-old {{ return 200 "redirect-old"; }}
+  location = /redirect-new {{ return 200 "redirect-new"; }}
+  location @redirect_named {{ return 200 "redirect-named"; }}
  }}
 }}
 '''
@@ -220,10 +251,10 @@ def until(fn, timeout=8):
         if value: return value
         time.sleep(.01)
     raise AssertionError('condition timeout')
-def get(path, headers=None, method='GET'):
+def get(path, headers=None, method='GET', details=False):
     conn = http.client.HTTPConnection('127.0.0.1', port, timeout=25)
     conn.request(method, path, headers={'Host': 'cache.test', **(headers or {})})
-    response = conn.getresponse(); result = response.status, response.getheader('X-Status'), response.read()
+    response = conn.getresponse(); result = response.status, (dict(response.getheaders()) if details else response.getheader('X-Status')), response.read()
     conn.close(); return result
 def string(value):
     if isinstance(value, str): value = value.encode()
@@ -455,6 +486,61 @@ try:
     assert get('/fenced-tag')[1] == 'BYPASS'
     assert get('/asset')[1] == 'HIT'
     checks.append('native TAG admission uses persisted entity tags with namespace isolation')
+    assert get('/negative-cache') == (200, 'MISS', b'negative-old')
+    assert get('/negative-cache') == (200, 'HIT', b'negative-old')
+    assert calls.count('/negative-cache') == 1
+    negative_outage = False
+    fence('read-negative', 1, 'http://cache.test/negative-cache')
+    negative_result = get('/negative-cache')
+    assert negative_result == (200, 'BYPASS', b'/negative-cache'), negative_result
+    assert calls.count('/negative-cache') == 2
+    checks.append('URL FENCE bypasses a memory-only cached upstream error before error_page can execute')
+    assert get('/redirect-cache') == (200, 'MISS', b'/redirect-cache')
+    ready_file(records('/redirect-cache', 1)[0])
+    policies['/redirect-tag'] = 'redirect-tag'
+    for uri in ('/redirect-tag', '/redirect-unknown', '/redirect-named', '/redirect-stale', '/redirect-revalidated'):
+        assert get(uri) == (200, 'MISS', uri.encode())
+        ready_file(records(uri, 1)[0])
+    stop(process)
+    (run / 'nginx.conf').write_text(config.replace('proxy_ignore_headers X-Accel-Redirect;', ''))
+    process = start()
+    until(lambda: (run / 'index/component.sock').exists())
+    until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
+    redirected = get('/redirect-cache', details=True)
+    assert redirected[0] == 200 and redirected[2] == b'redirect-old', redirected
+    assert redirected[1]['X-Status'] == 'HIT' and redirected[1]['Cache-Control'] == 'max-age=3600'
+    assert 'X-Cached-Only' not in redirected[1] and 'ETag' not in redirected[1], redirected
+    assert calls.count('/redirect-cache') == 1
+    assert get('/redirect-named') == (200, 'HIT', b'redirect-named')
+    assert get('/redirect-named', method='HEAD') == (200, 'HIT', b'')
+    assert calls.count('/redirect-named') == 1
+    checks.append('verified cached redirects preserve named locations, HEAD and the native redirect-header allowlist')
+    origin_failures.add('/redirect-stale')
+    redirects['/redirect-revalidated'] = '/redirect-new'
+    time.sleep(2.1)
+    assert get('/redirect-stale') == (200, 'STALE', b'redirect-old')
+    assert calls.count('/redirect-stale') == 2
+    checks.append('cached redirect admission safely closes a failed origin attempt before resuming native stale redirect behavior')
+    assert get('/redirect-revalidated') == (200, 'BYPASS', b'redirect-new')
+    assert calls.count('/redirect-revalidated') == 3
+    checks.append('cached redirect after upstream 304 uses the explicit temporary unconditional-refill path until durable validation is implemented')
+    unknown = records('/redirect-unknown', 1)[0]
+    os.removexattr(ready_file(unknown), 'user.ngx_cache_purge.id')
+    redirects['/redirect-unknown'] = '/redirect-new'
+    assert get('/redirect-unknown') == (200, 'BYPASS', b'redirect-new')
+    assert calls.count('/redirect-unknown') == 2
+    checks.append('an unmarked cached redirect cannot select its old target before descriptor inspection')
+    redirects['/redirect-tag'] = '/redirect-new'
+    fence('read-redirect-tag', 5, 'redirect-tag', 'tenant')
+    assert get('/redirect-tag') == (200, 'BYPASS', b'redirect-new')
+    assert calls.count('/redirect-tag') == 2
+    checks.append('scoped TAG FENCE matches persisted metadata before a cached redirect executes')
+    redirects['/redirect-cache'] = '/redirect-new'
+    fence('read-redirect', 1, 'http://cache.test/redirect-cache')
+    redirect_result = get('/redirect-cache')
+    assert redirect_result == (200, 'BYPASS', b'redirect-new'), redirect_result
+    assert calls.count('/redirect-cache') == 2
+    checks.append('URL FENCE bypasses a cached X-Accel-Redirect before it selects the old target')
     fence('read-host', 4, 'cache.test')
     assert get('/asset')[1] == 'BYPASS'
     checks.append('native read admission applies host FENCEs; receipts still remain PREPARING pending complete protocol coverage')

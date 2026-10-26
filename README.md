@@ -48,12 +48,20 @@ control guard. It waits before slice, Range and client-conditional filters run.
 No shared guard spans IPC or asynchronous body streaming. Unknown files and
 matching FENCEs cause an unconditional upstream retry using the original key.
 
+Known request selectors are also checked before native cache lookup. This covers
+memory-only cached upstream errors before `error_page` runs. Cached
+`X-Accel-Redirect` responses wait for descriptor and TAG admission before selecting
+their target. The module composes the existing per-request upstream parsing and
+reinitialization callbacks, then uses native header-copy handlers and URI/named
+location dispatch. Ignored redirects retain their ordinary cached-body behavior.
+No new nginx core hook or private protocol configuration layout is used.
+
 Read checks are bounded to 64 concurrent waits per worker, with a three-second
 overall deadline. A PREPARED marker can wait for publication within that deadline.
 No complete file index is loaded into worker memory. Successful upstream 304
 responses currently cause an unconditional refill until durable validation and
-TAG updates are implemented. Cached redirects, memory-only cached errors and
-complete URL-alias coverage still need admission handling. Operation receipts
+TAG updates are implemented. Complete persistent-alias matching and TAG/alias
+provenance for memory-only cached errors remain unfinished. Operation receipts
 remain PREPARING; these partial consumers do not expose reliable public 202
 acceptance or completed immediate purge semantics yet.
 

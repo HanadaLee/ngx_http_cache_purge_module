@@ -3,6 +3,8 @@
  * Copyright (c) 2009-2014, Piotr Sikora <piotr.sikora@frickle.com>
  * Copyright (C) 2016-2026, Denys Denysov
  * Copyright (C) Hanada
+ * Copyright (C) Igor Sysoev
+ * Copyright (C) Nginx, Inc.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -267,6 +269,10 @@ ngx_http_cache_purge_fill_complete(ngx_http_cache_purge_fill_t *f, ngx_int_t rc)
 #include <ngx_http_cache_key_module.h>
 #endif
 
+#if (NGX_RESTY_EXT && NGX_EXPR)
+#include <ngx_http_expr_module.h>
+#endif
+
 #define NGX_HTTP_CACHE_PURGE_CAPTURE_BYTES   (2 * 1024 * 1024)
 #define NGX_HTTP_CACHE_PURGE_CAPTURE_COUNT   64
 #define NGX_HTTP_CACHE_PURGE_CAPTURE_RECORD  (128 * 1024)
@@ -306,6 +312,17 @@ typedef struct {
                        ngx_http_cache_key_field_t, ngx_str_t *);
 #endif
 } ngx_http_cache_purge_capture_main_t;
+
+typedef struct {
+    ngx_table_elt_t        *target;
+    ngx_list_t              headers;
+    ngx_http_headers_out_t  output;
+    unsigned                ignored : 1;
+    unsigned                allow_ranges : 1;
+    unsigned                single_range : 1;
+    unsigned                disable_not_modified : 1;
+} ngx_http_cache_purge_redirect_t;
+
 typedef struct {
     ngx_http_request_t             *request;
     ngx_http_cache_t               *cache;
@@ -314,9 +331,12 @@ typedef struct {
     ngx_http_cache_purge_call_t    *call;
     ngx_http_upstream_t            *read_upstream;
     ngx_http_event_handler_pt       read_resume;
-    ngx_event_t       read_event;
-    ngx_pool_t       *publication_pool;
-    ngx_temp_file_t  *temporary;
+    ngx_int_t                    (*read_process_header)(ngx_http_request_t *);
+    ngx_int_t                    (*read_reinit)(ngx_http_request_t *);
+    ngx_http_cache_purge_redirect_t  *redirect;
+    ngx_event_t                       read_event;
+    ngx_pool_t                       *publication_pool;
+    ngx_temp_file_t                  *temporary;
     ngx_str_t                       key, url, host, namespace, root, zone, path;
     ngx_str_t                       components[6], tags[64];
     ngx_uint_t                      tag_count, rpc;
@@ -350,6 +370,11 @@ static ngx_uint_t ngx_http_cache_purge_read_count;
 static void ngx_http_cache_purge_read_event(ngx_event_t *event);
 static ngx_int_t ngx_http_cache_purge_read_header(
     ngx_http_cache_purge_capture_t *ctx);
+static ngx_int_t ngx_http_cache_purge_read_request(
+    ngx_http_cache_purge_capture_t *ctx);
+static ngx_int_t ngx_http_cache_purge_read_process_header(
+    ngx_http_request_t *r);
+static ngx_int_t ngx_http_cache_purge_read_reinit(ngx_http_request_t *r);
 static u_char *ngx_http_cache_purge_capture_string(u_char *p, ngx_str_t value);
 static uint64_t ngx_http_cache_purge_capture_read_number(u_char *p,
     unsigned width);
@@ -731,13 +756,19 @@ ngx_http_cache_purge_capture_guard_value(ngx_http_script_engine_t *engine)
         r = engine->request;
         ctx = ngx_http_get_module_ctx(r, ngx_http_cache_purge_index_module);
         if (ctx && ctx->read_state == NGX_HTTP_CACHE_PURGE_READ_OFF) {
-            if (r->main->blocked >= NGX_HTTP_MAX_BLOCKED
+            if (ngx_http_cache_purge_read_request(ctx) != NGX_OK
+                || r->main->blocked >= NGX_HTTP_MAX_BLOCKED
                 || r->main->count == 65535)
             {
                 rc = NGX_DECLINED;
             } else {
                 ctx->read_state = NGX_HTTP_CACHE_PURGE_READ_START;
                 ctx->read_upstream = r->upstream;
+                ctx->read_process_header = r->upstream->process_header;
+                ctx->read_reinit = r->upstream->reinit_request;
+                r->upstream->process_header =
+                    ngx_http_cache_purge_read_process_header;
+                r->upstream->reinit_request = ngx_http_cache_purge_read_reinit;
                 ctx->read_event.data = ctx;
                 ctx->read_event.handler = ngx_http_cache_purge_read_event;
                 ctx->read_event.log = r->connection->log;
@@ -872,6 +903,142 @@ ngx_http_cache_purge_capture_string(u_char *p, ngx_str_t value)
     return value.len ? ngx_cpymem(p, value.data, value.len) : p;
 }
 static ngx_int_t
+ngx_http_cache_purge_read_reinit(ngx_http_request_t *r)
+{
+    ngx_http_cache_purge_capture_t  *ctx;
+    ngx_int_t                        rc;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_cache_purge_index_module);
+    if (ctx == NULL || ctx->read_reinit == NULL) {
+        return NGX_ERROR;
+    }
+    rc = ctx->read_reinit(r);
+    if (r->upstream->process_header != ngx_http_cache_purge_read_process_header)
+    {
+        ctx->read_process_header = r->upstream->process_header;
+        r->upstream->process_header = ngx_http_cache_purge_read_process_header;
+    }
+    return rc;
+}
+
+static ngx_int_t
+ngx_http_cache_purge_read_process_header(ngx_http_request_t *r)
+{
+    ngx_http_cache_purge_capture_t   *ctx;
+    ngx_http_cache_purge_redirect_t  *redirect;
+    ngx_http_upstream_t              *u;
+    ngx_uint_t                        ignored;
+    ngx_int_t                         rc;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_cache_purge_index_module);
+    if (ctx == NULL || ctx->read_process_header == NULL) {
+        return NGX_ERROR;
+    }
+    u = r->upstream;
+    rc = ctx->read_process_header(r);
+    if (u->process_header != ngx_http_cache_purge_read_process_header) {
+        ctx->read_process_header = u->process_header;
+        u->process_header = ngx_http_cache_purge_read_process_header;
+    }
+    if (rc != NGX_OK || !r->cached || u->headers_in.x_accel_redirect == NULL) {
+        return rc;
+    }
+    redirect = ngx_pcalloc(r->pool, sizeof(*redirect));
+    if (redirect == NULL) {
+        return NGX_ERROR;
+    }
+    ignored = u->conf->ignore_headers;
+#if (NGX_RESTY_EXT && NGX_EXPR)
+    if (u->conf->ignore_headers_conf != NULL
+        && u->conf->ignore_headers_conf != NGX_CONF_UNSET_PTR)
+    {
+        ignored = ngx_http_get_expr_bitmask_value(r,
+                                                  u->conf->ignore_headers_conf);
+    }
+#endif
+    redirect->ignored = (ignored & NGX_HTTP_UPSTREAM_IGN_XA_REDIRECT) != 0;
+    redirect->target = u->headers_in.x_accel_redirect;
+    redirect->headers = u->headers_in.headers;
+    redirect->output = r->headers_out;
+    redirect->allow_ranges = r->allow_ranges;
+    redirect->single_range = r->single_range;
+    redirect->disable_not_modified = r->disable_not_modified;
+    ctx->redirect = redirect;
+    u->headers_in.x_accel_redirect = NULL;
+    if (!redirect->ignored
+        && ngx_list_init(&u->headers_in.headers, r->pool, 1,
+                         sizeof(ngx_table_elt_t)) != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+    return NGX_OK;
+}
+
+static void
+ngx_http_cache_purge_read_redirect(ngx_http_cache_purge_capture_t *ctx)
+{
+    ngx_http_request_t               *r;
+    ngx_http_upstream_main_conf_t    *main;
+    ngx_http_upstream_header_t       *header;
+    ngx_http_cache_purge_redirect_t  *redirect;
+    ngx_list_part_t                  *part;
+    ngx_table_elt_t                  *h;
+    ngx_connection_t                 *connection;
+    ngx_str_t                          uri, args;
+    ngx_uint_t                         i, flags;
+
+    r = ctx->request;
+    redirect = ctx->redirect;
+    connection = r->connection;
+    r->headers_out = redirect->output;
+    r->allow_ranges = redirect->allow_ranges;
+    r->single_range = redirect->single_range;
+    r->disable_not_modified = redirect->disable_not_modified;
+    main = ngx_http_get_module_main_conf(r, ngx_http_upstream_module);
+    part = &redirect->headers.part;
+    h = part->elts;
+    for (i = 0; /* void */; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+        if (h[i].hash == 0) {
+            continue;
+        }
+        header = ngx_hash_find(&main->headers_in_hash, h[i].hash,
+                               h[i].lowcase_key, h[i].key.len);
+        if (header && header->redirect
+            && header->copy_handler(r, &h[i], header->conf) != NGX_OK)
+        {
+            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+            return;
+        }
+    }
+    uri = redirect->target->value;
+    if (uri.len && uri.data[0] == '@') {
+        (void) ngx_http_named_location(r, &uri);
+    } else {
+        ngx_str_null(&args);
+        flags = NGX_HTTP_LOG_UNSAFE;
+        if (ngx_http_parse_unsafe_uri(r, &uri, &args, &flags) != NGX_OK) {
+            ngx_http_finalize_request(r, NGX_HTTP_NOT_FOUND);
+            return;
+        }
+        if (r->method != NGX_HTTP_HEAD) {
+            r->method = NGX_HTTP_GET;
+            r->method_name = ngx_http_core_get_method;
+        }
+        (void) ngx_http_internal_redirect(r, &uri, &args);
+    }
+    ngx_http_finalize_request(r, NGX_DONE);
+    ngx_http_run_posted_requests(connection);
+}
+
+static ngx_int_t
 ngx_http_cache_purge_read_send(ngx_http_request_t *r)
 {
     ngx_buf_t         *b;
@@ -943,6 +1110,11 @@ ngx_http_cache_purge_read_complete(ngx_http_cache_purge_capture_t *ctx,
         return;
     }
     if (allowed) {
+        if (ctx->redirect && !ctx->redirect->ignored) {
+            ngx_http_file_cache_free(ctx->cache, NULL);
+            ngx_http_cache_purge_read_redirect(ctx);
+            return;
+        }
         rc = ngx_http_cache_purge_read_send(r);
         ngx_http_file_cache_free(ctx->cache, NULL);
         ngx_http_finalize_request(r, rc);
@@ -1016,6 +1188,47 @@ ngx_http_cache_purge_read_match(void *data,
         *fenced = 1;
     }
     return 0;
+}
+
+static ngx_int_t
+ngx_http_cache_purge_read_request(ngx_http_cache_purge_capture_t *ctx)
+{
+    ngx_http_cache_purge_control_reader_t  *reader;
+    ngx_http_cache_purge_control_context_t  context;
+    ngx_http_cache_rocksdb_error_t          error;
+    uint64_t                                publication;
+    ngx_int_t                               fenced;
+    int                                     rc;
+
+    if (ngx_http_cache_purge_runtime_reader(ctx->request, &reader, &error)
+        != 0)
+    {
+        return NGX_DECLINED;
+    }
+    ngx_memzero(&context, sizeof(context));
+    context.key.data = ctx->key.data;
+    context.key.len = ctx->key.len;
+    context.url.data = ctx->url.data;
+    context.url.len = ctx->url.len;
+    context.host.data = ctx->host.data;
+    context.host.len = ctx->host.len;
+    context.tag_namespace.data = ctx->namespace.data;
+    context.tag_namespace.len = ctx->namespace.len;
+    context.now_ms = (uint64_t) ngx_time() * 1000;
+    fenced = 0;
+    rc = ngx_http_cache_purge_control_match(reader, &context, 64, 65536,
+        ngx_http_cache_purge_read_match, &fenced, &publication, &error);
+    if (rc != 0 || fenced) {
+        return NGX_DECLINED;
+    }
+    rc = ngx_http_cache_purge_control_guard_begin(reader, publication, &error);
+    if (rc != 0) {
+        return NGX_DECLINED;
+    }
+    /* Cover known request selectors before native cached-error/redirect
+     * dispatch. Entity TAGs and persistent aliases require the file gate. */
+    rc = ngx_http_cache_purge_control_guard_end(reader, &error);
+    return rc == 0 ? NGX_OK : NGX_DECLINED;
 }
 
 static ngx_int_t
@@ -1222,6 +1435,12 @@ ngx_http_cache_purge_read_header(ngx_http_cache_purge_capture_t *ctx)
     ngx_uint_t           updated;
 
     r = ctx->request;
+    if (ctx->redirect) {
+        ctx->read_upstream->headers_in.x_accel_redirect = ctx->redirect->target;
+        if (!ctx->redirect->ignored) {
+            ctx->read_upstream->headers_in.headers = ctx->redirect->headers;
+        }
+    }
     if (r->main->blocked >= NGX_HTTP_MAX_BLOCKED || r->main->count == 65535
         || ngx_http_cache_purge_read_count
            >= NGX_HTTP_CACHE_PURGE_CAPTURE_COUNT)
