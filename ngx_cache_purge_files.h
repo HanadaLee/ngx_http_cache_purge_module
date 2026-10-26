@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define NGX_CACHE_PURGE_FILES_ABI 1
+#define NGX_CACHE_PURGE_FILES_ABI 2
 #define NGX_CACHE_PURGE_FILE_PREPARED 1
 #define NGX_CACHE_PURGE_FILE_READY 2
 #define NGX_CACHE_PURGE_FILE_MARKER_SIZE 40
@@ -43,18 +43,27 @@ int ngx_cache_purge_file_marker_publish(int fd, const unsigned char id[16],
  * validates the configured parent directory before enabling this resource. */
 int ngx_cache_purge_file_locks_open(const char *path, uint32_t owner_uid,
     int create, int *fd, ngx_cache_purge_store_error_t *error);
-/* POSIX process locks: keep exactly one lock-file descriptor per process.
- * Closing any descriptor for that inode releases all of that process's locks.
- * A worker must also reject duplicate active offsets in its bounded local
- * lease set; acquiring a second lease in the same process is not exclusive. */
-int ngx_cache_purge_file_lock(int fd, uint64_t offset,
+/* Linux open-file-description leases. Each acquisition opens an independent
+ * description, so separate writers conflict even in the same process.
+ * anchor_fd is the validated persistent lock file opened at initialization;
+ * path must still name that inode. No process-lock fallback is safe here.
+ * Opening/validating a lease belongs on the filesystem executor. Callers must
+ * bound live transactions/descriptors, not retain one lease per cached file. */
+int ngx_cache_purge_file_lease_acquire(const char *path, int anchor_fd,
+    uint64_t offset, int *lease_fd, ngx_cache_purge_store_error_t *error);
+/* Adopt an owned descriptor received with SCM_RIGHTS or duplicated in-process.
+ * This checks the anchor inode/access mode and acquires the requested OFD lock
+ * if necessary; it does NOT attest which PID previously held it. Peer UID,
+ * operation identity and file marker still require independent validation.
+ * Success retains the caller's fd and sets CLOEXEC; failure does not close it. */
+int ngx_cache_purge_file_lease_adopt(int anchor_fd, int lease_fd, uint64_t offset,
     ngx_cache_purge_store_error_t *error);
-int ngx_cache_purge_file_unlock(int fd, uint64_t offset,
+/* Consume one descriptor reference. Never issue F_UNLCK: other references may
+ * still be doing filesystem work. The kernel releases the lease only when
+ * the last reference closes, including references queued in a Unix socket.
+ * After fork inherited references must be closed before unrelated work. */
+int ngx_cache_purge_file_lease_release(int *lease_fd,
     ngx_cache_purge_store_error_t *error);
-/* Called by the agent, a different process, to verify the RPC peer owns the
- * requested lock. expected_pid comes from SO_PEERCRED, not the request body. */
-int ngx_cache_purge_file_lock_owner(int fd, uint64_t offset,
-    uint32_t expected_pid, ngx_cache_purge_store_error_t *error);
 
 #ifdef __cplusplus
 }

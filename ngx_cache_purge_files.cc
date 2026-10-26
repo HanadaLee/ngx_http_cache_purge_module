@@ -43,19 +43,35 @@ void encode(unsigned char raw[NGX_CACHE_PURGE_FILE_MARKER_SIZE],
     raw[4] = raw[5] = raw[6] = 0; raw[7] = state;
     std::memcpy(raw + 8, id, 16); std::memcpy(raw + 24, address, 16);
 }
-int lock_request(int fd, uint64_t offset, short type, int command,
-                 struct flock *output, ngx_cache_purge_store_error_t *error) {
-    if (fd < 0 || offset > last_offset)
+int lock_request(int fd, uint64_t offset, ngx_cache_purge_store_error_t *error) {
+    if (fd < 0 || offset > last_offset
+        || offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max()))
         return result(error, NGX_PURGE_STORE_INVALID, "invalid file lease descriptor/offset");
+#if defined(F_OFD_SETLK)
     struct flock lock{};
-    lock.l_type = type; lock.l_whence = SEEK_SET;
+    lock.l_type = F_WRLCK; lock.l_whence = SEEK_SET;
     lock.l_start = static_cast<off_t>(offset); lock.l_len = 1;
-    if (fcntl(fd, command, &lock) != 0) {
+    if (fcntl(fd, F_OFD_SETLK, &lock) != 0) {
         if (errno == EAGAIN || errno == EACCES)
             return result(error, NGX_PURGE_STORE_BUSY, "cache path lease is held");
+        if (errno == EINVAL || errno == EOPNOTSUPP)
+            return result(error, NGX_PURGE_STORE_INVALID, "filesystem/kernel lacks OFD cache leases");
         return io(error, "file lease operation");
     }
-    if (output) *output = lock;
+    return result(error, NGX_PURGE_STORE_OK);
+#else
+    return result(error, NGX_PURGE_STORE_INVALID, "build lacks OFD cache leases");
+#endif
+}
+int inspect_locks(int fd, struct stat *st, ngx_cache_purge_store_error_t *error) {
+    if (fd < 0) return result(error, NGX_PURGE_STORE_INVALID, "invalid lease file descriptor");
+    if (fstat(fd, st) != 0) return io(error, "inspect lease file");
+    if (!S_ISREG(st->st_mode) || st->st_nlink != 1 || st->st_size != 0 || (st->st_mode & 0077))
+        return result(error, NGX_PURGE_STORE_INVALID, "lease file type, mode or links are invalid");
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0) return io(error, "inspect lease file access");
+    if ((flags & O_ACCMODE) != O_RDWR)
+        return result(error, NGX_PURGE_STORE_INVALID, "lease file is not read/write");
     return result(error, NGX_PURGE_STORE_OK);
 }
 }
@@ -160,20 +176,47 @@ extern "C" int ngx_cache_purge_file_locks_open(const char *path, uint32_t owner,
     return result(error, NGX_PURGE_STORE_OK);
 }
 
-extern "C" int ngx_cache_purge_file_lock(int fd, uint64_t offset, ngx_cache_purge_store_error_t *error) {
-    return lock_request(fd, offset, F_WRLCK, F_SETLK, nullptr, error);
-}
-extern "C" int ngx_cache_purge_file_unlock(int fd, uint64_t offset, ngx_cache_purge_store_error_t *error) {
-    return lock_request(fd, offset, F_UNLCK, F_SETLK, nullptr, error);
-}
-extern "C" int ngx_cache_purge_file_lock_owner(int fd, uint64_t offset, uint32_t pid,
-    ngx_cache_purge_store_error_t *error) {
-    if (!pid || pid > static_cast<uint32_t>(std::numeric_limits<pid_t>::max()) || pid == static_cast<uint32_t>(getpid()))
-        return result(error, NGX_PURGE_STORE_INVALID, "lease owner check requires another process");
-    struct flock lock{};
-    int rc = lock_request(fd, offset, F_WRLCK, F_GETLK, &lock, error);
+extern "C" int ngx_cache_purge_file_lease_acquire(const char *path, int anchor_fd,
+    uint64_t offset, int *output, ngx_cache_purge_store_error_t *error) {
+    if (output) *output = -1;
+    if (!output || offset > last_offset)
+        return result(error, NGX_PURGE_STORE_INVALID, "invalid lease output/offset");
+    struct stat anchor{};
+    int rc = inspect_locks(anchor_fd, &anchor, error);
     if (rc) return rc;
-    if (lock.l_type != F_WRLCK || lock.l_pid != static_cast<pid_t>(pid))
-        return result(error, NGX_PURGE_STORE_OWNER, "RPC peer does not own the cache path lease");
+    int fd;
+    rc = ngx_cache_purge_file_locks_open(path, anchor.st_uid, 0, &fd, error);
+    if (rc) return rc;
+    rc = ngx_cache_purge_file_lease_adopt(anchor_fd, fd, offset, error);
+    if (rc) { close(fd); return rc; }
+    *output = fd;
+    return result(error, NGX_PURGE_STORE_OK);
+}
+
+extern "C" int ngx_cache_purge_file_lease_adopt(int anchor_fd, int fd, uint64_t offset,
+    ngx_cache_purge_store_error_t *error) {
+    if (offset > last_offset)
+        return result(error, NGX_PURGE_STORE_INVALID, "invalid lease offset");
+    struct stat anchor{}, received{};
+    int rc = inspect_locks(anchor_fd, &anchor, error);
+    if (rc) return rc;
+    rc = inspect_locks(fd, &received, error);
+    if (rc) return rc;
+    if (anchor.st_dev != received.st_dev || anchor.st_ino != received.st_ino
+        || anchor.st_uid != received.st_uid)
+        return result(error, NGX_PURGE_STORE_OWNER, "lease descriptor names another lock file");
+    int flags = fcntl(fd, F_GETFD);
+    if (flags < 0 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) != 0)
+        return io(error, "set lease close-on-exec");
+    return lock_request(fd, offset, error);
+}
+
+extern "C" int ngx_cache_purge_file_lease_release(int *fd, ngx_cache_purge_store_error_t *error) {
+    if (!fd || *fd < 0)
+        return result(error, NGX_PURGE_STORE_INVALID, "invalid lease reference");
+    int value = *fd;
+    *fd = -1;
+    /* On Linux close consumes the descriptor even on EINTR; never retry it. */
+    if (close(value) != 0) return io(error, "close lease reference");
     return result(error, NGX_PURGE_STORE_OK);
 }

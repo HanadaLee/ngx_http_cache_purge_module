@@ -6,9 +6,7 @@
 #include <stdexcept>
 #include <cstring>
 #include <fcntl.h>
-#include <signal.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 
@@ -23,12 +21,6 @@ struct Descriptor {
     int fd = -1;
     explicit Descriptor(int value) : fd(value) { check(fd >= 0, "open descriptor"); }
     ~Descriptor() { if (fd >= 0) close(fd); }
-};
-struct Child {
-    pid_t pid;
-    ~Child() {
-        if (pid > 0) { kill(pid, SIGKILL); while (waitpid(pid, nullptr, 0) == -1 && errno == EINTR) {} }
-    }
 };
 static FileId id(unsigned value) { FileId result{}; result[15] = value; return result; }
 static ngx_cache_purge_bytes_t bytes(const std::string &value) {
@@ -47,6 +39,10 @@ static void intact(int fd) {
 static int publication(const std::string &mode, const std::string &path) {
     std::filesystem::create_directories(path + "/cache");
     std::filesystem::create_directories(path + "/db");
+    int lock_fd;
+    check(ngx_cache_purge_file_locks_open((path + "/locks").c_str(), getuid(), 1, &lock_fd, &error) == 0,
+          "open publication lock file");
+    Descriptor anchor(lock_fd);
     ngx_cache_purge_store_options_t options; ngx_cache_purge_store_options(&options);
     ngx_cache_purge_store_t *store = nullptr;
     check(ngx_cache_purge_store_open((path + "/db").c_str(), &options, &store, &error) == 0, "open publication DB");
@@ -57,6 +53,10 @@ static int publication(const std::string &mode, const std::string &path) {
     auto target = file.root + '/' + file.path;
     unsigned char address[16]; uint64_t offset;
     check(ngx_cache_purge_file_address(bytes(target), address, &offset, &error) == 0, "file address identity");
+    int lease_fd;
+    check(ngx_cache_purge_file_lease_acquire((path + "/locks").c_str(), anchor.fd, offset, &lease_fd, &error) == 0,
+          "hold publication/recovery lease");
+    Descriptor lease(lease_fd);
     if (mode != "--recover") {
         Descriptor fd(open((file.root + "/temporary").c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600));
         body(fd.fd);
@@ -167,30 +167,12 @@ int main(int argc, char **argv) {
         std::string locks = path + "/locks";
         int lock_fd;
         check(ngx_cache_purge_file_locks_open(locks.c_str(), getuid(), 1, &lock_fd, &error) == 0, "create persistent lock file");
-        Descriptor lease(lock_fd);
-        int pipefd[2]; check(pipe(pipefd) == 0, "lease handoff pipe");
-        pid_t child = fork(); check(child >= 0, "lease child");
-        if (child == 0) {
-            close(pipefd[0]); close(lease.fd);
-            int worker_fd;
-            if (ngx_cache_purge_file_locks_open(locks.c_str(), getuid(), 0, &worker_fd, &error)
-                || ngx_cache_purge_file_lock(worker_fd, offset, &error)) _exit(2);
-            char ready = '1'; if (write(pipefd[1], &ready, 1) != 1) _exit(3);
-            for (;;) pause();
-        }
-        Child guard{child};
-        close(pipefd[1]); char ready;
-        check(read(pipefd[0], &ready, 1) == 1 && ready == '1', "worker acquired lease"); close(pipefd[0]);
-        check(ngx_cache_purge_file_lock(lease.fd, offset, &error) == NGX_PURGE_STORE_BUSY, "another process cannot acquire a live writer lease");
-        check(ngx_cache_purge_file_lock_owner(lease.fd, offset, child, &error) == 0, "agent verifies RPC peer PID");
-        check(ngx_cache_purge_file_lock_owner(lease.fd, second, child, &error) == NGX_PURGE_STORE_OWNER, "another address is not owned by that peer");
-        check(ngx_cache_purge_file_lock(lease.fd, second, &error) == 0
-              && ngx_cache_purge_file_unlock(lease.fd, second, &error) == 0, "unrelated paths remain independent");
-        check(kill(child, SIGKILL) == 0, "terminate writer"); int status;
-        check(waitpid(child, &status, 0) == child && WIFSIGNALED(status), "writer exited");
-        guard.pid = -1;
-        check(ngx_cache_purge_file_lock(lease.fd, offset, &error) == 0, "kernel releases crashed writer lease");
-        check(ngx_cache_purge_file_unlock(lease.fd, offset, &error) == 0, "release recovery lease");
+        Descriptor anchor(lock_fd);
+        int lease_fd;
+        check(ngx_cache_purge_file_lease_acquire(locks.c_str(), anchor.fd, offset, &lease_fd, &error) == 0,
+              "acquire independent OFD lease");
+        check(ngx_cache_purge_file_lease_release(&lease_fd, &error) == 0 && lease_fd == -1,
+              "consume lease reference");
         auto alias = path + "/alias";
         check(symlink(locks.c_str(), alias.c_str()) == 0, "lease symlink fixture");
         int invalid;

@@ -15,7 +15,7 @@ The component executor hosts that index on one thread and accepts bounded local
 IPC independently of nginx's event loops. It supports cancellable owner
 handoff, explicit shutdown, and paged queries without retaining server cursors
 between requests. These are internal building blocks; request handling and cache
-file hooks are still being implemented. Index state changes
+file lifecycle integration is still being implemented. Index state changes
 do not perform filesystem operations or provide immediate invalidation by themselves.
 
 HTTP workers now have an event-driven Unix IPC client with a reusable connection,
@@ -24,6 +24,16 @@ cancellation/shutdown. It preserves application errors and reports uncertain
 outcomes after a lost reply without replaying requests automatically. The client
 does not retain nginx requests implicitly; its consumers own that lifecycle.
 The real worker owner and fault-injection peers are exercised by `t/runtime_nginx.py`.
+
+The standalone filesystem library provides durable file-instance markers and
+Linux open-file-description leases. Separate writers conflict even in the same
+process; duplicated or transferred lease descriptors keep a transaction protected
+until its last reference closes. The file API is version 2 and requires OFD-lock
+support. Its tests cover real descriptor handoff, sender death, same-process
+contention, and unfinished index publication recovery. The production IPC client
+does not transfer file descriptors yet; these primitives are not connected to
+native cache writes. Consumers must bound live lease descriptors and execute
+blocking file operations outside the HTTP event loop.
 
 A durable operation ledger now stores selectors, idempotency identities,
 checkpoints, retry scheduling, and independent materialization/propagation states.
