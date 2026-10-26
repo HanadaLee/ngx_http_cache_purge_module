@@ -55,9 +55,14 @@ def run_client_cases(Run, root, checks):
                     magic, version, op, label, size, result = struct.unpack('>4sHHQII', first + self.take(23))
                     assert magic == b'NCP1' and version == 1 and result == 0 and size <= 524288
                     data = self.take(size)
-                    assert len(rights) == (2 if op == 18 else 0)
+                    assert len(rights) == (2 if op == 18 else 1 if op == 21 else 0)
                     with lock:
                         frames.append(op)
+                    if op == 21:
+                        body = os.pread(rights[0], 32, 0)
+                        self.request.sendall(struct.pack('>4sHHQII', magic, version, op, label, len(body), 0) + body)
+                        os.close(rights.pop())
+                        continue
                     if op == 18:
                         entity = os.pread(rights[1], 16, 0)
                         if entity.startswith(b'slow'):
@@ -204,6 +209,13 @@ def run_client_cases(Run, root, checks):
         assert os.getxattr(final_path, 'user.ngx_cache_purge.id')[7] == 2
         assert rpc('/rpc-files/?' + query + '&finish=1', b'retry')[2] == value[2]
         checks.append('worker FINISH_FILE sends one lease descriptor, publishes READY after rename and tolerates a lost-reply retry')
+        value = rpc('/rpc-files/?' + query + '&inspect=1', b'inspect')
+        assert value[0] == 200 and value[1]['X-IPC-Result'] == '0', value
+        assert value[1]['X-IPC-Lease'] == '0'
+        assert value[2] == rpc('/rpc/?op=2', (501).to_bytes(16, 'big'))[2]
+        value = rpc('/rpc-files-fake/?' + query + '&inspect=1', b'inspect')
+        assert value[0] == 200 and value[2] == b'complete native temporary body', value
+        checks.append('worker INSPECT_FILE retains a duplicate after the caller closes its FD and returns the verified record without a response lease')
         for number, directory, zone in ((502, 'cache-fcgi', 'f'), (503, 'cache-uwsgi', 'u'), (504, 'cache-scgi', 's')):
             value = rpc(f'/rpc-files/?files=1&root={case.path}/{directory}&zone={zone}&id={number}', b'registered root')
             assert value[0] == 200 and value[1]['X-IPC-Result'] == '0', value

@@ -35,6 +35,15 @@ Verified renamed files become READY; abandoned preparations are retired without
 deleting unrelated files. Changed identities and inaccessible roots remain
 pending. This recovery does not yet provide native read admission or purge FENCEs.
 
+`INSPECT_FILE` checks the actual cache descriptor on the executor through bounded
+IPC. It requires a READY marker, a committed current index record with no pending
+intent, and matching root/zone/path and same-filesystem publication identity.
+Unknown, unfinished, changed, replaced and evicted instances are rejected without
+repairing files or writing the database. The worker client duplicates and transfers
+one descriptor; the caller keeps its original. This inspection does not attest
+purge freshness or authorize response delivery. Native read admission and its
+final shared-control guard are still being integrated.
+
 HTTP workers now have an event-driven Unix IPC client with a reusable connection,
 bounded queues and buffers, absolute deadlines, peer UID verification, and explicit
 cancellation/shutdown. It preserves application errors and reports uncertain
@@ -117,8 +126,7 @@ requests. Request inputs and each publication payload are separately bounded
 to 128 KiB; these limits exclude allocator overhead and native nginx buffers.
 The persistent build replaces the legacy generation form of `cache_purge_key`
 with its single-expression index meaning and does not register generation
-namespace directives or variables. Automatic recovery of unfinished native
-publications and URL aliases first seen on HITs are still pending.
+namespace directives or variables. URL aliases first seen on HITs are still pending.
 
 ## Current features
 

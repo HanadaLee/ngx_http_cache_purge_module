@@ -1183,6 +1183,185 @@ ngx_http_cache_purge_publication_apply(ngx_http_cache_rocksdb_t *store,
 }
 
 int
+ngx_http_cache_purge_publications_inspect(
+    ngx_http_cache_purge_publications_t *p, ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_rocksdb_bytes_t root, ngx_http_cache_rocksdb_bytes_t zone,
+    ngx_http_cache_rocksdb_bytes_t path, int fd, uint32_t peer_uid,
+    ngx_http_cache_purge_index_file_t *out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_publication_root_t   *target;
+    ngx_http_cache_purge_publication_proof_t   proof;
+    ngx_http_cache_purge_index_file_t          file;
+    ngx_http_cache_purge_index_match_t         current;
+    ngx_http_cache_purge_file_marker_t         marker, after;
+    ngx_http_cache_rocksdb_bytes_t             address;
+    struct stat                              received, named;
+    unsigned char                            digest[16];
+    uint64_t                                 offset;
+    int                                      rc, flags, intent, named_fd;
+
+    ngx_http_cache_purge_result(error, 0, "");
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (out == NULL || store == NULL
+        || !ngx_http_cache_purge_publication_valid(root, 32768)
+        || !ngx_http_cache_purge_publication_valid(zone, 32768)
+        || !ngx_http_cache_purge_publication_relative(path))
+    {
+        return ngx_http_cache_purge_result(error,
+                                           NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                                           "invalid cache file inspection");
+    }
+    rc = ngx_http_cache_purge_publication_owner(p, error);
+    if (rc != 0) {
+        return rc;
+    }
+    target = ngx_http_cache_purge_publication_find(p, root, zone, 1);
+    if (target == NULL) {
+        return ngx_http_cache_purge_result(error,
+                                           NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                                           "unregistered cache root/zone");
+    }
+    rc = ngx_http_cache_purge_publication_verify(target, error);
+    if (rc != 0) {
+        return rc;
+    }
+    flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || (flags & O_ACCMODE) == O_WRONLY || (flags & O_PATH)) {
+        return ngx_http_cache_purge_result(error,
+                                           NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                                           "cache descriptor is not readable");
+    }
+    if (fstat(fd, &received) != 0) {
+        return ngx_http_cache_purge_io(error, "inspect cache descriptor");
+    }
+    if (!S_ISREG(received.st_mode) || received.st_uid != peer_uid) {
+        return ngx_http_cache_purge_result(error,
+                                           NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                                           "cache file type or owner mismatch");
+    }
+    if (received.st_nlink != 1) {
+        return ngx_http_cache_purge_result(error,
+                                           NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+                                           "cache descriptor is not exclusive");
+    }
+    memset(&file, 0, sizeof(file));
+    memset(&address, 0, sizeof(address));
+    named_fd = -1;
+    rc = ngx_http_cache_purge_file_marker_read(fd, &marker, error);
+    if (rc == NGX_HTTP_CACHE_ROCKSDB_CORRUPT) {
+        rc = ngx_http_cache_purge_result(error,
+                                           NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+                                           "cache file marker is malformed");
+    }
+    if (rc != 0) {
+        goto done;
+    }
+    if (marker.state != NGX_HTTP_CACHE_PURGE_FILE_READY) {
+        rc = ngx_http_cache_purge_result(error, NGX_HTTP_CACHE_ROCKSDB_BUSY,
+                                           "cache file publication is pending");
+        goto done;
+    }
+    rc = ngx_http_cache_purge_publication_address(target, path, &address,
+                                                  error);
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_file_address(address, digest, &offset, error);
+    }
+    if (rc != 0) {
+        goto done;
+    }
+    if (memcmp(marker.address, digest, 16) != 0) {
+        goto mismatch;
+    }
+    rc = ngx_http_cache_purge_index_get_file(store, marker.id, &file, error);
+    if (rc != 0) {
+        goto done;
+    }
+    if (file.state != NGX_HTTP_CACHE_PURGE_INDEX_COMMITTED
+        || !ngx_http_cache_purge_publication_equal(
+            file.root, ngx_http_cache_purge_publication_bytes(target->path))
+        || !ngx_http_cache_purge_publication_equal(file.zone, zone)
+        || !ngx_http_cache_purge_publication_equal(file.path, path))
+    {
+        goto mismatch;
+    }
+    rc = ngx_http_cache_purge_index_has_intent(store, marker.id, &intent,
+                                               error);
+    if (rc != 0) {
+        goto done;
+    }
+    if (intent) {
+        rc = ngx_http_cache_purge_result(
+            error, NGX_HTTP_CACHE_ROCKSDB_BUSY,
+            "cache index publication is pending");
+        goto done;
+    }
+    rc = ngx_http_cache_purge_index_current(store, file.root, path, &current,
+                                             error);
+    if (rc != 0) {
+        goto done;
+    }
+    if (memcmp(current.id, marker.id, 16) != 0
+        || current.revision != file.revision || current.state != file.state)
+    {
+        goto mismatch;
+    }
+    rc = ngx_http_cache_purge_publication_proof(file.metadata, &proof, error);
+    if (rc != 0) {
+        goto done;
+    }
+    rc = ngx_http_cache_purge_publication_beneath(target->fd, path, 1, 0,
+                                                  &named_fd, error);
+    if (rc != 0) {
+        goto done;
+    }
+    if (named_fd < 0) {
+        goto mismatch;
+    }
+    if (fstat(fd, &received) != 0 || fstat(named_fd, &named) != 0) {
+        rc = ngx_http_cache_purge_io(error, "recheck selected cache instance");
+        goto done;
+    }
+    if (!ngx_http_cache_purge_publication_same(&proof, &received)
+        || !ngx_http_cache_purge_publication_same(&proof, &named)
+        || received.st_nlink != 1 || named.st_nlink != 1
+        || received.st_uid != peer_uid || named.st_uid != peer_uid)
+    {
+        goto mismatch;
+    }
+    rc = ngx_http_cache_purge_file_marker_read(fd, &after, error);
+    if (rc == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND
+        || rc == NGX_HTTP_CACHE_ROCKSDB_CORRUPT)
+    {
+        goto mismatch;
+    }
+    if (rc != 0) {
+        goto done;
+    }
+    if (after.state != marker.state || memcmp(after.id, marker.id, 16)
+        || memcmp(after.address, marker.address, 16))
+    {
+        goto mismatch;
+    }
+    *out = file;
+    memset(&file, 0, sizeof(file));
+    goto done;
+
+mismatch:
+    rc = ngx_http_cache_purge_result(error, NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+                                       "cache descriptor and index disagree");
+done:
+    if (named_fd >= 0) {
+        close(named_fd);
+    }
+    free((void *) address.data);
+    ngx_http_cache_purge_index_file_free(&file);
+    return rc;
+}
+
+int
 ngx_http_cache_purge_publications_prepare(
     ngx_http_cache_purge_publications_t *p, ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_fill_t *fill,

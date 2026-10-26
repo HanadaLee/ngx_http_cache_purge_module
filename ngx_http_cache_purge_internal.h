@@ -56,7 +56,9 @@ typedef enum {
     NGX_HTTP_CACHE_PURGE_OP_FINISH_FILE,
     /* root, zone, path -> canonical root, prior ID, digest/offset +
      * lease FD */
-    NGX_HTTP_CACHE_PURGE_OP_ACQUIRE_PUBLICATION
+    NGX_HTTP_CACHE_PURGE_OP_ACQUIRE_PUBLICATION,
+    /* root, zone, selected path; one FD -> GET-format verified file record */
+    NGX_HTTP_CACHE_PURGE_OP_INSPECT_FILE
 } ngx_http_cache_purge_opcode_e;
 
 #define NGX_HTTP_CACHE_PURGE_ROOT_CACHE 1
@@ -718,6 +720,20 @@ int ngx_http_cache_purge_publications_finish(
     ngx_http_cache_rocksdb_t *store, const unsigned char id[16],
     uint64_t prepared_revision, int anchor_fd, int lease_fd, uint32_t peer_uid,
     ngx_http_cache_purge_index_match_t *match,
+    ngx_http_cache_rocksdb_error_t *error);
+
+/* Read-only executor check of the actual native cache descriptor. Success
+ * returns an owned, committed record whose READY marker, current address and
+ * same-filesystem publication proof match. Free it with index_file_free().
+ * This neither repairs unknown files nor proves purge freshness. A consumer
+ * still needs the final shared-control admission guard and 304 validation.
+ * The descriptor is borrowed; no path lease or database snapshot is retained.
+ */
+int ngx_http_cache_purge_publications_inspect(
+    ngx_http_cache_purge_publications_t *publications,
+    ngx_http_cache_rocksdb_t *store, ngx_http_cache_rocksdb_bytes_t root,
+    ngx_http_cache_rocksdb_bytes_t zone, ngx_http_cache_rocksdb_bytes_t path,
+    int fd, uint32_t peer_uid, ngx_http_cache_purge_index_file_t *file,
     ngx_http_cache_rocksdb_error_t *error);
 
 #ifdef __cplusplus

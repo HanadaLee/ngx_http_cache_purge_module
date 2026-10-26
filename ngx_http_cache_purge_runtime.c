@@ -911,6 +911,7 @@ ngx_http_cache_purge_client_submit_internal(
         || fd_count
                != (opcode == NGX_HTTP_CACHE_PURGE_OP_PREPARE_FILE ? 2U :
                    opcode == NGX_HTTP_CACHE_PURGE_OP_FINISH_FILE  ? 1U :
+                   opcode == NGX_HTTP_CACHE_PURGE_OP_INSPECT_FILE ? 1U :
                                                                     0U)
         || (fd_count && fds == NULL))
     {
@@ -1009,6 +1010,17 @@ ngx_http_cache_purge_client_finish_file(ngx_http_cache_purge_client_t *client,
     return ngx_http_cache_purge_client_submit_internal(
         client, NGX_HTTP_CACHE_PURGE_OP_FINISH_FILE, payload, timeout, done,
         data, out, &lease_fd, 1);
+}
+
+ngx_int_t
+ngx_http_cache_purge_client_inspect_file(ngx_http_cache_purge_client_t *client,
+    const ngx_str_t *payload, int cache_fd, ngx_msec_t timeout,
+    ngx_http_cache_purge_client_done_pt done, void *data,
+    ngx_http_cache_purge_call_t **out)
+{
+    return ngx_http_cache_purge_client_submit_internal(
+        client, NGX_HTTP_CACHE_PURGE_OP_INSPECT_FILE, payload, timeout, done,
+        data, out, &cache_fd, 1);
 }
 
 static ngx_int_t

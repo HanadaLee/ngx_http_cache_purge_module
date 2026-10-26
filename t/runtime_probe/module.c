@@ -231,6 +231,7 @@ rpc_prepare_body(ngx_http_request_t *r, ngx_http_cache_purge_client_t *client,
     ngx_int_t           id, rc;
     ngx_uint_t  i;
     u_char     *p;
+    ngx_fd_t    selected_fd;
     if (!r->request_body || !r->request_body->temp_file
         || ngx_http_arg(r, (u_char *) "root", 4, &root) != NGX_OK
         || ngx_http_arg(r, (u_char *) "id", 2, &value) != NGX_OK
@@ -262,6 +263,36 @@ rpc_prepare_body(ngx_http_request_t *r, ngx_http_cache_purge_client_t *client,
     address.data = ngx_pnalloc(r->pool, 4 + root.len + 1 + target.len);
     if (!ctx->prepare.data || !address.data) {
         ngx_http_finalize_request(r, 500);
+        return;
+    }
+    if (ngx_http_arg(r, (u_char *) "inspect", 7, &value) == NGX_OK) {
+        p = rpc_string(ctx->prepare.data, root);
+        p = rpc_string(p, zone);
+        p = rpc_string(p, target);
+        ctx->prepare.len = p - ctx->prepare.data;
+        p = ngx_cpymem(address.data, root.data, root.len);
+        *p++ = '/';
+        p = ngx_cpymem(p, target.data, target.len);
+        *p = '\0';
+        /* Test-only open; the production consumer supplies r->cache->file.fd. */
+        selected_fd = ngx_open_file(address.data, NGX_FILE_RDONLY,
+                                    NGX_FILE_OPEN, 0);
+        if (selected_fd == NGX_INVALID_FILE) {
+            ngx_http_finalize_request(r, 404);
+            return;
+        }
+        rc = ngx_http_cache_purge_client_inspect_file(
+            client, &ctx->prepare, selected_fd, timeout, rpc_done, ctx,
+            &ctx->call);
+        ngx_close_file(selected_fd);
+        if (rc != NGX_OK) {
+            ngx_http_finalize_request(r, 503);
+            return;
+        }
+        r->read_event_handler = ngx_http_test_reading;
+        if (ngx_handle_read_event(r->connection->read, 0) != NGX_OK) {
+            ngx_http_finalize_request(r, NGX_ERROR);
+        }
         return;
     }
     p = ctx->prepare.data;

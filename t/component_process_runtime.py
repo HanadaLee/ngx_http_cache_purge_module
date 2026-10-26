@@ -198,6 +198,12 @@ class Client:
         self.socket.sendall(packet[1:])
         return self.reply(19, code)
 
+    def inspect_file(self, target, fd, code=0):
+        packet = self.packet(21, b''.join(map(string, target)))
+        assert self.socket.sendmsg([packet[:1]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [fd]))]) == 1
+        self.socket.sendall(packet[1:])
+        return self.reply(21, code)
+
     def page(self, kind, value, scope='', bookmark=b'', limit=32):
         data = self.call(8, query(kind, value, scope, bookmark, limit))
         count, done, size = struct.unpack('>BBI', data[:6])
@@ -278,14 +284,82 @@ try:
     check(True, 'owner crash preserves a lease-held PREPARE_FILE intent and permits an identical file retry without index rebuild')
     target.parent.mkdir(parents=True, exist_ok=True)
     temp.rename(target)
+    selected = (str(cache_root), 'zone-a', 'a/00/401')
+    client.inspect_file(selected, temporary, code=6)
+    check(True, 'a renamed PREPARED descriptor is not admitted before durable publication')
     finished = client.finish_file(401, lease)
     assert finished == identity(401) + struct.pack('>QB', 2, 2)
     assert os.getxattr(target, 'user.ngx_cache_purge.id')[7] == 2
     assert client.finish_file(401, lease) == finished
     assert client.call(9, string('') + bytes([32]))[0] == 0
     check(True, 'FINISH_FILE publishes the renamed instance and clears its durable intent; retries are idempotent')
+    verified = client.call(2, identity(401))
+    writes = struct.unpack('>9Q', client.call(1))[1]
+    selected_fd = os.open(target, os.O_RDONLY | os.O_CLOEXEC)
+    assert client.inspect_file(selected, selected_fd) == verified
+    assert os.lseek(selected_fd, 0, os.SEEK_CUR) == 0
+    check(True, 'INSPECT_FILE validates the actual read-only descriptor and returns the full durable record without changing its offset')
+    client.inspect_file((str(cache_root), 'wrong-zone', 'a/00/401'), selected_fd, code=4)
+    client.inspect_file((str(cache_root), 'zone-a', '../escape'), selected_fd, code=4)
+    client.inspect_file((str(cache_root), 'zone-a', 'a/00/other'), selected_fd, code=7)
+    check(True, 'read inspection binds the selected instance to its registered root, zone and exact path')
+    marker = os.getxattr(selected_fd, 'user.ngx_cache_purge.id')
+    replacement_fd = os.open(replacement, os.O_RDONLY | os.O_CLOEXEC)
+    client.inspect_file(selected, replacement_fd, code=1)
+    os.setxattr(replacement_fd, 'user.ngx_cache_purge.id', marker)
+    client.inspect_file(selected, replacement_fd, code=7)
+    assert os.getxattr(replacement_fd, 'user.ngx_cache_purge.id') == marker
+    os.close(replacement_fd)
+    check(True, 'unknown and copied-marker files are rejected without adoption or repair')
+    write_only = os.open(target, os.O_WRONLY | os.O_CLOEXEC)
+    path_only = os.open(target, os.O_PATH | os.O_CLOEXEC)
+    directory_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    for fd in (write_only, path_only, directory_fd):
+        client.inspect_file(selected, fd, code=4)
+        os.close(fd)
+    check(True, 'write-only, O_PATH and directory descriptors cannot pass cache read inspection')
+    linked = target.parent / 'hardlink'
+    os.link(target, linked)
+    client.inspect_file(selected, selected_fd, code=7)
+    linked.unlink()
+    detached = target.parent / 'detached'
+    target.rename(detached)
+    client.inspect_file(selected, selected_fd, code=7)
+    target.write_bytes(detached.read_bytes())
+    os.setxattr(target, 'user.ngx_cache_purge.id', marker)
+    client.inspect_file(selected, selected_fd, code=7)
+    target.unlink(); detached.rename(target)
+    check(True, 'hardlinks, detached descriptors and replaced named instances fail even when marker bytes agree')
+    directory = cache_root / 'a'
+    moved_directory = cache_root / 'moved'
+    directory.rename(moved_directory); directory.symlink_to(moved_directory, target_is_directory=True)
+    client.inspect_file(selected, selected_fd, code=4)
+    directory.unlink(); moved_directory.rename(directory)
+    cache_root.rename(root / 'detached-cache'); cache_root.mkdir()
+    client.inspect_file(selected, selected_fd, code=4)
+    cache_root.rmdir(); (root / 'detached-cache').rename(cache_root)
+    check(True, 'read inspection rejects intermediate symlinks and replaced root directories')
+    original_stat = os.fstat(selected_fd)
+    os.pwrite(temporary, b'changed entity with a different size', 0)
+    client.inspect_file(selected, selected_fd, code=7)
+    os.pwrite(temporary, b'complete cached entity', 0)
+    os.ftruncate(temporary, original_stat.st_size)
+    os.utime(temporary, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    os.setxattr(temporary, 'user.ngx_cache_purge.id', b'malformed')
+    client.inspect_file(selected, selected_fd, code=7)
+    os.setxattr(temporary, 'user.ngx_cache_purge.id', marker)
+    check(True, 'changed physical proof and malformed file markers are rejected without failing the database owner')
+    for _ in range(100):
+        assert client.inspect_file(selected, selected_fd) == verified
+    assert struct.unpack('>9Q', client.call(1))[1] == writes
+    assert target.read_bytes() == b'complete cached entity'
+    assert os.getxattr(selected_fd, 'user.ngx_cache_purge.id') == marker
+    check(True, 'repeated verified reads leave database writes, cache contents and markers unchanged')
     client.call(13, identity(401) + struct.pack('>Q', 2) + string('replacement') + b'\0', code=4)
     target.unlink()
+    client.inspect_file(selected, selected_fd, code=7)
+    os.close(selected_fd)
+    check(True, 'an evicted open descriptor cannot be accepted using its formerly committed marker')
     assert client.finish_file(401, lease) == finished and not target.exists()
     check(True, 'a late finish retry returns its durable result without recreating an evicted file')
     os.close(temporary); os.close(lease)

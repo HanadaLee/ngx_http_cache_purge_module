@@ -136,6 +136,13 @@ ngx_int_t ngx_http_cache_purge_client_finish_file(
     int lease_fd, ngx_msec_t timeout, ngx_http_cache_purge_client_done_pt done,
     void *data, ngx_http_cache_purge_call_t **call);
 
+/* INSPECT_FILE copies the selected cache FD, with the same bounded ownership
+ * as submit_files. Success proves physical publication, not purge freshness. */
+ngx_int_t ngx_http_cache_purge_client_inspect_file(
+    ngx_http_cache_purge_client_t *client, const ngx_str_t *payload,
+    int cache_fd, ngx_msec_t timeout, ngx_http_cache_purge_client_done_pt done,
+    void *data, ngx_http_cache_purge_call_t **call);
+
 /* Cancel consumes the handle and suppresses its callback. Cancellation does
  * not roll back a request already sent. Clear the caller's handle afterwards.
  * */

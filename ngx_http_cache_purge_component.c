@@ -738,6 +738,23 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
     rc = 0;
 
     switch (p->request.opcode) {
+    case NGX_HTTP_CACHE_PURGE_OP_INSPECT_FILE:
+        root = ngx_http_cache_purge_component_string(&d, 32768);
+        zone = ngx_http_cache_purge_component_string(&d, 32768);
+        name = ngx_http_cache_purge_component_string(&d, 32768);
+        if ((rc = ngx_http_cache_purge_component_end(&d)) != 0) {
+            break;
+        }
+        rc = ngx_http_cache_purge_publications_inspect(
+            c->publications, store, root, zone, name, p->input_rights[0],
+            p->uid, &file, error);
+        if (rc == 0) {
+            ngx_http_cache_purge_component_put_integer(e, file.state, 1);
+            ngx_http_cache_purge_component_put_integer(e, file.revision, 8);
+            ngx_http_cache_purge_component_put_file(e, &file);
+        }
+        break;
+
     case NGX_HTTP_CACHE_PURGE_OP_ACQUIRE_PUBLICATION:
         root = ngx_http_cache_purge_component_string(&d, 32768);
         zone = ngx_http_cache_purge_component_string(&d, 32768);
@@ -1476,6 +1493,7 @@ ngx_http_cache_purge_component_read(ngx_http_cache_purge_component_t *c,
         expected =
             p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_PREPARE_FILE ? 2 :
             p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_FINISH_FILE  ? 1 :
+            p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_INSPECT_FILE ? 1 :
                                                                         0;
         if (p->rights_count != expected) {
             return ngx_http_cache_purge_component_error(
