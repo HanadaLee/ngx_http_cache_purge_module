@@ -43,7 +43,7 @@ set_target_properties(ngx_cache_purge_coordinator PROPERTIES POSITION_INDEPENDEN
 target_link_libraries(ngx_cache_purge_coordinator PUBLIC ngx_cache_purge_control)
 target_compile_options(ngx_cache_purge_coordinator PRIVATE -Wall -Wextra -Werror)
 
-add_library(ngx_cache_purge_component STATIC ngx_cache_purge_component.cc)
+add_library(ngx_cache_purge_component STATIC ngx_cache_purge_component.cc ngx_cache_purge_publication.cc)
 set_target_properties(ngx_cache_purge_component PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(ngx_cache_purge_component PUBLIC ngx_cache_purge_coordinator ngx_cache_purge_files)
 target_compile_options(ngx_cache_purge_component PRIVATE -Wall -Wextra -Werror)

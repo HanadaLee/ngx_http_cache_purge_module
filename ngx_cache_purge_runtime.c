@@ -28,6 +28,7 @@ struct ngx_http_cache_purge_runtime_s {
     ngx_uint_t                       started;
     ngx_uint_t                       failed;
     ngx_array_t                      roots;
+    ngx_array_t                      file_roots;
     ngx_event_t                      owner_event;
 };
 
@@ -47,8 +48,9 @@ ngx_http_cache_purge_runtime_create(ngx_conf_t *cf)
     }
     ngx_cache_purge_component_options(&rt->options);
     if (rt->options.abi != NGX_CACHE_PURGE_COMPONENT_ABI
-        || ngx_cache_purge_component_abi_4() != NGX_CACHE_PURGE_COMPONENT_ABI
-        || ngx_array_init(&rt->roots, cf->pool, 2, sizeof(ngx_str_t)) != NGX_OK)
+        || ngx_cache_purge_component_abi_5() != NGX_CACHE_PURGE_COMPONENT_ABI
+        || ngx_array_init(&rt->roots, cf->pool, 2, sizeof(ngx_str_t)) != NGX_OK
+        || ngx_array_init(&rt->file_roots, cf->pool, 8, sizeof(ngx_cache_purge_root_t)) != NGX_OK)
     {
         return NULL;
     }
@@ -256,7 +258,13 @@ ngx_http_cache_purge_runtime_post(ngx_conf_t *cf)
     ngx_http_cache_purge_runtime_t *rt, *old;
     ngx_path_t **paths;
     ngx_str_t *root;
-    ngx_uint_t i;
+    ngx_uint_t i, j;
+    ngx_cache_purge_root_t *registered;
+    ngx_http_file_cache_t **caches;
+    ngx_module_t *module;
+    ngx_command_t *command;
+    ngx_array_t *configured;
+    void *main_conf;
 
     main = ngx_http_conf_get_module_main_conf(cf, ngx_http_cache_purge_module);
     rt = main->runtime;
@@ -294,8 +302,43 @@ ngx_http_cache_purge_runtime_post(ngx_conf_t *cf)
     if (rt->path == NULL) {
         return NGX_OK;
     }
+    /* The native cache_path setter publishes its main-conf array offset.
+     * Reuse that metadata rather than private protocol configuration layouts
+     * or undeclared cache-loader symbols. */
+    for (i = 0; cf->cycle->modules[i]; i++) {
+        module = cf->cycle->modules[i];
+        if (module->type != NGX_HTTP_MODULE || module->commands == NULL) { continue; }
+        for (command = module->commands; command->name.len; command++) {
+            if (command->set != ngx_http_file_cache_set_slot || command->conf != NGX_HTTP_MAIN_CONF_OFFSET) { continue; }
+            main_conf = ((ngx_http_conf_ctx_t *) cf->ctx)->main_conf[module->ctx_index];
+            if (main_conf == NULL) { continue; }
+            configured = (ngx_array_t *) ((u_char *) main_conf + command->offset);
+            if (configured->nelts == 0) { continue; }
+            if (configured->size != sizeof(ngx_http_file_cache_t *)) { return NGX_ERROR; }
+            caches = configured->elts;
+            for (j = 0; j < configured->nelts; j++) {
+                registered = ngx_array_push(&rt->file_roots);
+                if (registered == NULL) { return NGX_ERROR; }
+                ngx_memzero(registered, sizeof(*registered));
+                registered->path.data = caches[j]->path->name.data;
+                registered->path.len = caches[j]->path->name.len;
+                registered->kind = NGX_PURGE_ROOT_CACHE;
+                registered->zone.data = caches[j]->shm_zone->shm.name.data;
+                registered->zone.len = caches[j]->shm_zone->shm.name.len;
+            }
+        }
+    }
     paths = cf->cycle->paths.elts;
     for (i = 0; i < cf->cycle->paths.nelts; i++) {
+        if (paths[i] != rt->path && paths[i]->loader == NULL && paths[i]->manager == NULL)
+        {
+            registered = ngx_array_push(&rt->file_roots);
+            if (registered == NULL) { return NGX_ERROR; }
+            ngx_memzero(registered, sizeof(*registered));
+            registered->path.data = paths[i]->name.data;
+            registered->path.len = paths[i]->name.len;
+            registered->kind = NGX_PURGE_ROOT_TEMP;
+        }
         if (paths[i] == rt->path || paths[i]->loader == NULL) { continue; }
         root = ngx_array_push(&rt->roots);
         if (root == NULL) { return NGX_ERROR; }
@@ -307,6 +350,8 @@ ngx_http_cache_purge_runtime_post(ngx_conf_t *cf)
             return NGX_ERROR;
         }
     }
+    rt->options.roots = rt->file_roots.elts;
+    rt->options.root_count = rt->file_roots.nelts;
     return NGX_OK;
 }
 

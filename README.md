@@ -35,9 +35,12 @@ a lease and return its descriptor through the worker IPC client. Only this
 operation's successful response may carry one descriptor, attached to the first
 frame byte. The client closes its borrowed reference after the callback and on
 failure or cancellation. Consumers that retain a duplicate must bound and close
-it separately. Incoming request descriptors are currently rejected; native file
-transactions are not connected yet. Blocking file operations remain outside the
-HTTP event loop.
+it separately. `PREPARE_FILE` accepts a lease and a complete temporary-file
+descriptor. The component validates configured cache roots/zones, the temporary
+path and inode, then persists an index intent and a matching file marker.
+Retries bind to the same physical temporary file. Native rename/FINISH, readable
+publication, and the production fill consumer remain unfinished. Blocking file
+operations remain outside the HTTP event loop.
 
 A durable operation ledger now stores selectors, idempotency identities,
 checkpoints, retry scheduling, and independent materialization/propagation states.
@@ -118,7 +121,7 @@ On graceful reload, the old worker requests asynchronous executor shutdown so
 long-lived HTTP responses do not keep the database owner indefinitely. Its
 executor finishes the current operation and closes the DB before the replacement
 opens it. The old worker can continue sending its response and joins the stopped
-executor when it exits. The component C ABI is 4; rebuild its archives together
+executor when it exits. The component C ABI is 5; rebuild its archives together
 with the addon. Override `CACHE_PURGE_ROCKSDB_LIBS` to use
 a fixed RocksDB archive and its compression/runtime dependencies. The default
 links the system shared RocksDB library. Static archives linked into a dynamic

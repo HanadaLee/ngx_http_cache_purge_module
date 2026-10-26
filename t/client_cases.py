@@ -42,13 +42,32 @@ def run_client_cases(Run, root, checks):
 
         def handle(self):
             self.request.settimeout(3)
+            rights = []
             try:
                 while True:
-                    magic, version, op, label, size, result = struct.unpack('>4sHHQII', self.take(24))
+                    first, ancillary, flags, _ = self.request.recvmsg(1, socket.CMSG_SPACE(8), socket.MSG_CMSG_CLOEXEC)
+                    if not first:
+                        return
+                    for level, kind, raw in ancillary:
+                        assert level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS
+                        rights.extend(array.array('i', raw))
+                    assert not (flags & socket.MSG_CTRUNC)
+                    magic, version, op, label, size, result = struct.unpack('>4sHHQII', first + self.take(23))
                     assert magic == b'NCP1' and version == 1 and result == 0 and size <= 524288
                     data = self.take(size)
+                    assert len(rights) == (2 if op == 18 else 0)
                     with lock:
                         frames.append(op)
+                    if op == 18:
+                        entity = os.pread(rights[1], 16, 0)
+                        if entity.startswith(b'slow'):
+                            time.sleep(.4)
+                        body = data[:16] + struct.pack('>QB', 1, 1)
+                        self.request.sendall(struct.pack('>4sHHQII', magic, version, op, label, len(body), 0) + body)
+                        for fd in rights:
+                            os.close(fd)
+                        rights.clear()
+                        continue
                     if op == 108:
                         return
                     if op == 109:
@@ -96,6 +115,9 @@ def run_client_cases(Run, root, checks):
                         self.request.sendall(response + data)
             except (EOFError, ConnectionResetError, BrokenPipeError, TimeoutError):
                 pass
+            finally:
+                for fd in rights:
+                    os.close(fd)
 
     directory = Path(tempfile.mkdtemp(prefix='client-peer-', dir=root))
     directory.chmod(0o755)
@@ -164,6 +186,25 @@ def run_client_cases(Run, root, checks):
         assert value[0] == 200 and value[1]['X-IPC-Lease'] == '1' and len(value[2]) == 24
         assert rpc('/rpc/?op=17', text('/cache/fixture/file'))[1]['X-IPC-Result'] == '0'
         checks.append('real worker receives a component-acquired OFD lease and releases its borrowed callback reference')
+
+        query = f'files=1&root={case.path}/cache-a&zone=a&id=501'
+        value = rpc('/rpc-files/?' + query, b'complete native temporary body')
+        assert value[0] == 200 and value[1]['X-IPC-Result'] == '0', value
+        assert value[2] == (501).to_bytes(16, 'big') + struct.pack('>QB', 1, 1)
+        temporary_path = Path(value[1]['X-IPC-Temp-Path'])
+        assert temporary_path.read_bytes() == b'complete native temporary body'
+        marker = os.getxattr(temporary_path, 'user.ngx_cache_purge.id')
+        assert marker[:8] == b'NCF1\0\0\0\1' and marker[8:24] == (501).to_bytes(16, 'big')
+        assert rpc('/rpc/?op=2', (501).to_bytes(16, 'big'))[2][0] == 1
+        checks.append('real worker sends lease and native request-body temp descriptors; component registers a durable PREPARED file')
+        for number, directory, zone in ((502, 'cache-fcgi', 'f'), (503, 'cache-uwsgi', 'u'), (504, 'cache-scgi', 's')):
+            value = rpc(f'/rpc-files/?files=1&root={case.path}/{directory}&zone={zone}&id={number}', b'registered root')
+            assert value[0] == 200 and value[1]['X-IPC-Result'] == '0', value
+        checks.append('cache_path directive metadata registers proxy, FastCGI, uWSGI and SCGI root/zone pairs without private layouts')
+        value = rpc('/rpc-files-fake/?' + query, b'outbound rights')
+        assert value[0] == 200 and value[2][:16] == (501).to_bytes(16, 'big')
+        assert rpc('/rpc-files-fake/?' + query + '&timeout=50', b'slow outbound')[0] == 504
+        checks.append('outbound descriptor copies survive the acquire callback and are released on response or timeout')
 
         def rights_gone():
             for fd in Path(f'/proc/{owner}/fd').iterdir():

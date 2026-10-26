@@ -217,9 +217,16 @@ class Run:
         rpc_locations = '' if rpc_socket is None else f'''
 client_body_buffer_size 1m;
 location /rpc/ {{ cache_purge_test_rpc runtime; }}
+location /rpc-files/ {{ client_body_in_file_only on; cache_purge_test_rpc runtime; }}
+location /rpc-files-fake/ {{ client_body_in_file_only on; cache_purge_test_rpc {rpc_socket}; }}
 location /rpc-fake/ {{ cache_purge_test_rpc {rpc_socket}; }}
 location /rpc-wrong/ {{ cache_purge_test_rpc {rpc_socket}; cache_purge_test_rpc_wrong_uid on; }}
 location /rpc-missing/ {{ cache_purge_test_rpc {self.path}/missing.sock; }}
+'''
+        extra_paths = '' if rpc_socket is None else f'''
+fastcgi_cache_path {self.path}/cache-fcgi keys_zone=f:1m;
+uwsgi_cache_path {self.path}/cache-uwsgi keys_zone=u:1m;
+scgi_cache_path {self.path}/cache-scgi keys_zone=s:1m;
 '''
         self.config = loads + user + f'''
 daemon off; worker_processes {workers}; pid {self.path}/pid;
@@ -230,6 +237,7 @@ cache_purge_store {self.path}/index cache=8m write_buffer=2m;
 cache_purge_state_zone control 4m;
 proxy_cache_path {self.path}/cache-a keys_zone=a:1m;
 proxy_cache_path {self.path}/cache-b keys_zone=b:1m;
+{extra_paths}
 server {{ listen 127.0.0.1:{self.port};
 {rpc_locations}
 location /hold/ {{ proxy_pass http://127.0.0.1:{origin.server_port}; proxy_buffering off; }}

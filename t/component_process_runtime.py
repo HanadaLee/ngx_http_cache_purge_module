@@ -39,14 +39,19 @@ def wait_for(function, timeout=10):
 
 
 class Component:
-    def __init__(self, path, connections=8, timeout=3000, budget=1100000, payload=512 * 1024, shared=None):
+    def __init__(self, path, connections=8, timeout=3000, budget=1100000, payload=512 * 1024, shared=None, roots=None):
         self.path = path
         path.mkdir(exist_ok=True)
         self.stderr = (root / f'stderr-{len(processes)}.log').open('w')
         command = [str(args.binary), str(path), str(connections), str(timeout), str(budget), str(payload)]
         if shared:
             command.append(str(shared))
-        self.process = subprocess.Popen(command,
+        env = os.environ.copy()
+        env.pop('CACHE_PURGE_TEST_CACHE_ROOT', None)
+        env.pop('CACHE_PURGE_TEST_TEMP_ROOT', None)
+        if roots:
+            env['CACHE_PURGE_TEST_CACHE_ROOT'], env['CACHE_PURGE_TEST_TEMP_ROOT'] = map(str, roots)
+        self.process = subprocess.Popen(command, env=env,
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=self.stderr, text=True, bufsize=1)
         processes.append(self)
@@ -95,10 +100,10 @@ def identity(value):
     return value.to_bytes(16, 'big')
 
 
-def record(n, root='/cache/a', uri='/dir/a', misc='', metadata='proof-v1'):
+def record(n, root='/cache/a', uri='/dir/a', misc='', metadata='proof-v1', zone=None, path=None):
     fields = ['team\x1fhttps\x1fa.test\x1f' + uri + '\x1f' + misc,
               'https://a.test' + uri, 'business.test', 'team', root,
-              'zone-a' if root == '/cache/a' else 'zone-b', f'a/00/{n}', 'bytes=0-99', 'lang']
+              zone or ('zone-a' if root == '/cache/a' else 'zone-b'), path or f'a/00/{n}', 'bytes=0-99', 'lang']
     return (identity(n) + b''.join(map(string, fields)) + string(metadata)
             + b'\x02' + string('photo') + string('common') + b'\0\0'
             + string('') * 6 + identity(0))
@@ -172,6 +177,12 @@ class Client:
             for fd in rights:
                 os.close(fd)
 
+    def prepare_file(self, data, fds, code=0):
+        packet = self.packet(18, data)
+        assert self.socket.sendmsg([packet[:1]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', fds))]) == 1
+        self.socket.sendall(packet[1:])
+        return self.reply(18, code)
+
     def page(self, kind, value, scope='', bookmark=b'', limit=32):
         data = self.call(8, query(kind, value, scope, bookmark, limit))
         count, done, size = struct.unpack('>BBI', data[:6])
@@ -182,6 +193,70 @@ class Client:
 
 
 try:
+    cache_root, temp_root = root / 'cache', root / 'temp'
+    cache_root.mkdir(); temp_root.mkdir()
+    publisher = Component(root / 'publication', roots=(cache_root, temp_root))
+    publisher.opened()
+    client = Client(publisher.path)
+    temp = temp_root / 'body'
+    temp.write_bytes(b'complete cached entity')
+    target = cache_root / 'a/00/401'
+    lease = client.lease(str(target))
+    temporary = os.open(temp, os.O_RDWR | os.O_CLOEXEC)
+    payload = record(401, root=str(cache_root), zone='zone-a') + string(str(temp))
+    prepared = client.prepare_file(payload, [lease, temporary])
+    assert prepared == identity(401) + struct.pack('>QB', 1, 1)
+    marker = os.getxattr(temporary, 'user.ngx_cache_purge.id')
+    assert marker == b'NCF1\0\0\0\1' + identity(401) + hashlib.sha256(str(target).encode()).digest()[:16]
+    assert temp.read_bytes() == b'complete cached entity'
+    assert client.prepare_file(payload, [lease, temporary]) == prepared
+    check(True, 'PREPARE_FILE persists the index intent and matching xattr without changing entity bytes; retries are stable')
+    replacement = temp_root / 'other'
+    replacement.write_bytes(b'complete cached entity')
+    replacement_fd = os.open(replacement, os.O_RDWR | os.O_CLOEXEC)
+    client.prepare_file(payload, [lease, replacement_fd], code=4)
+    client.prepare_file(record(401, root=str(cache_root), zone='zone-a') + string(str(replacement)),
+                        [lease, replacement_fd], code=7)
+    assert not os.listxattr(replacement_fd)
+    check(True, 'a path/FD mismatch or reuse of an intent for another physical temp file cannot stamp that file')
+    client.prepare_file(record(402, root=str(cache_root), zone='wrong-zone') + string(str(replacement)),
+                        [lease, replacement_fd], code=4)
+    client.prepare_file(record(402, root=str(cache_root), zone='zone-a', path='../escape') + string(str(replacement)),
+                        [lease, replacement_fd], code=4)
+    outside = root / 'outside'
+    outside.write_bytes(b'untouched')
+    outside_fd = os.open(outside, os.O_RDWR | os.O_CLOEXEC)
+    client.prepare_file(record(402, root=str(cache_root), zone='zone-a') + string(str(outside)),
+                        [lease, outside_fd], code=4)
+    alias = temp_root / 'symlink'
+    alias.symlink_to(replacement)
+    client.prepare_file(record(402, root=str(cache_root), zone='zone-a') + string(str(alias)),
+                        [lease, replacement_fd], code=4)
+    assert not os.listxattr(replacement_fd) and not os.listxattr(outside_fd)
+    check(True, 'unregistered zones, traversal, external temp paths and symlinks are rejected before mutation')
+    # A competing OFD description cannot substitute for the protected lease.
+    wrong_lease = os.open(publisher.path / 'file.leases', os.O_RDWR | os.O_CLOEXEC)
+    client.prepare_file(payload, [wrong_lease, temporary], code=6)
+    check(True, 'PREPARE_FILE requires exclusive access to its canonical cache address')
+    cache_root.rename(root / 'old-cache')
+    cache_root.mkdir()
+    client.prepare_file(record(402, root=str(cache_root), zone='zone-a') + string(str(replacement)),
+                        [lease, replacement_fd], code=4)
+    cache_root.rmdir()
+    (root / 'old-cache').rename(cache_root)
+    check(not os.listxattr(replacement_fd), 'replacing a configured root cannot silently redirect prepared file identity')
+    for fd in (lease, temporary, replacement_fd, outside_fd, wrong_lease):
+        os.close(fd)
+    client.close()
+    publisher.process.kill(); publisher.process.wait(timeout=5)
+    publisher = Component(publisher.path, roots=(cache_root, temp_root))
+    publisher.opened(); client = Client(publisher.path)
+    assert client.call(2, identity(401))[0] == 1
+    lease = client.lease(str(target)); temporary = os.open(temp, os.O_RDWR | os.O_CLOEXEC)
+    assert client.prepare_file(payload, [lease, temporary]) == prepared
+    os.close(temporary); os.close(lease); client.close(); publisher.stop()
+    check(True, 'owner crash preserves PREPARE_FILE intent and permits an identical file retry without index rebuild')
+
     lease_component = Component(root / 'leases')
     lease_component.opened()
     lease_client = Client(lease_component.path)
@@ -377,6 +452,6 @@ finally:
         component.stderr.close()
 
 result = {'checks': checks, 'count': len(checks), 'root': str(root),
-          'scope': 'component/index/ledger IPC and PREPARING control publication; native cache hooks and physical jobs are not wired'}
+    'scope': 'component/index/ledger IPC and durable PREPARE_FILE; native rename/FINISH, immediate invalidation and physical jobs are not wired'}
 args.output.write_text(json.dumps(result, indent=2) + '\n')
 print(json.dumps(result), flush=True)

@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <thread>
+#include <cstring>
 
 static int visit(void *data, const ngx_cache_purge_control_match_t *match) {
     auto *result = static_cast<uint64_t *>(data); ++result[0]; result[1] |= match->flags; return 0;
@@ -20,6 +21,16 @@ int main(int argc, char **argv) {
     options.io_timeout_ms = std::strtoul(argv[3], nullptr, 10);
     options.buffer_bytes = std::strtoul(argv[4], nullptr, 10);
     options.max_payload_bytes = std::strtoul(argv[5], nullptr, 10);
+    ngx_cache_purge_root_t roots[2]{};
+    const char *cache = std::getenv("CACHE_PURGE_TEST_CACHE_ROOT");
+    const char *temporary = std::getenv("CACHE_PURGE_TEST_TEMP_ROOT");
+    if (cache && temporary) {
+        roots[0] = {{reinterpret_cast<const unsigned char *>(cache), std::strlen(cache)},
+                    {reinterpret_cast<const unsigned char *>("zone-a"), 6}, NGX_PURGE_ROOT_CACHE};
+        roots[1] = {{reinterpret_cast<const unsigned char *>(temporary), std::strlen(temporary)},
+                    {nullptr, 0}, NGX_PURGE_ROOT_TEMP};
+        options.roots = roots; options.root_count = 2;
+    }
     ngx_cache_purge_component_t *component = nullptr;
     ngx_cache_purge_store_error_t error;
     void *shared = nullptr; size_t shared_size = 0;

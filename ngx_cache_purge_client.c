@@ -15,6 +15,8 @@ struct ngx_cache_purge_call_s {
     size_t length, sent;
     uint64_t id;
     uint16_t opcode;
+    int fds[2];
+    size_t fd_count;
     unsigned completing:1;
 };
 
@@ -130,20 +132,23 @@ ngx_cache_purge_client_create(ngx_pool_t *pool, ngx_log_t *log,
     return client;
 }
 
-ngx_int_t
-ngx_cache_purge_client_submit(ngx_cache_purge_client_t *client, uint16_t opcode,
+static ngx_int_t
+ngx_cache_purge_client_submit_internal(ngx_cache_purge_client_t *client, uint16_t opcode,
     const ngx_str_t *payload, ngx_msec_t timeout,
-    ngx_cache_purge_client_done_pt done, void *data, ngx_cache_purge_call_t **out)
+    ngx_cache_purge_client_done_pt done, void *data, ngx_cache_purge_call_t **out,
+    const int *fds, size_t fd_count)
 {
     ngx_cache_purge_call_t *call;
-    size_t length;
+    size_t length, i;
 
     if (out != NULL) {
         *out = NULL;
     }
     if (client == NULL || client->stopped || out == NULL || done == NULL
         || opcode == 0 || payload == NULL || (payload->len && payload->data == NULL)
-        || timeout == 0 || timeout > 300000)
+        || timeout == 0 || timeout > 300000
+        || fd_count != (opcode == NGX_PURGE_OP_PREPARE_FILE ? 2U : 0U)
+        || (fd_count && fds == NULL))
     {
         return NGX_ERROR;
     }
@@ -167,6 +172,15 @@ ngx_cache_purge_client_submit(ngx_cache_purge_client_t *client, uint16_t opcode,
         ngx_free(call);
         return NGX_ERROR;
     }
+    for (i = 0; i < fd_count; i++) {
+        call->fds[i] = fcntl(fds[i], F_DUPFD_CLOEXEC, 0);
+        if (call->fds[i] < 0) {
+            while (i) { close(call->fds[--i]); }
+            ngx_free(call->packet); ngx_free(call);
+            return NGX_ERROR;
+        }
+    }
+    call->fd_count = fd_count;
     call->client = client;
     call->opcode = opcode;
     call->id = ++client->next_id;
@@ -194,6 +208,23 @@ ngx_cache_purge_client_submit(ngx_cache_purge_client_t *client, uint16_t opcode,
     *out = call;
     ngx_post_event(&client->pump, &ngx_posted_events);
     return NGX_OK;
+}
+
+ngx_int_t
+ngx_cache_purge_client_submit(ngx_cache_purge_client_t *client, uint16_t opcode,
+    const ngx_str_t *payload, ngx_msec_t timeout,
+    ngx_cache_purge_client_done_pt done, void *data, ngx_cache_purge_call_t **out)
+{
+    return ngx_cache_purge_client_submit_internal(client, opcode, payload, timeout, done, data, out, NULL, 0);
+}
+
+ngx_int_t
+ngx_cache_purge_client_submit_files(ngx_cache_purge_client_t *client,
+    const ngx_str_t *payload, const int fds[2], ngx_msec_t timeout,
+    ngx_cache_purge_client_done_pt done, void *data, ngx_cache_purge_call_t **out)
+{
+    return ngx_cache_purge_client_submit_internal(client, NGX_PURGE_OP_PREPARE_FILE, payload, timeout,
+                                                 done, data, out, fds, 2);
 }
 
 static ngx_int_t
@@ -289,7 +320,16 @@ ngx_cache_purge_client_write(ngx_event_t *ev)
     }
     while (budget && call->sent < call->length) {
         amount = ngx_min(budget, call->length - call->sent);
-        n = c->send(c, call->packet + call->sent, amount);
+        if (call->fd_count) {
+            n = ngx_cache_purge_transport_send(c->fd, call->packet + call->sent, 1, call->fds, call->fd_count);
+            if (n < 0 && errno == EINTR) { continue; }
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { c->write->ready = 0; n = NGX_AGAIN; }
+            if (n > 0) {
+                while (call->fd_count) { close(call->fds[--call->fd_count]); }
+            }
+        } else {
+            n = c->send(c, call->packet + call->sent, amount);
+        }
         if (n == NGX_AGAIN) {
             if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
                 ngx_cache_purge_client_finish(call, NGX_PURGE_CLIENT_IO, 1);
@@ -471,6 +511,7 @@ ngx_cache_purge_client_finish(ngx_cache_purge_call_t *call,
         ngx_del_timer(&call->deadline);
     }
     ngx_queue_remove(&call->queue);
+    while (call->fd_count) { close(call->fds[--call->fd_count]); }
     client->stats.pending--;
     client->stats.request_bytes -= call->length;
     ngx_free(call->packet);

@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define NGX_CACHE_PURGE_COMPONENT_ABI 4
+#define NGX_CACHE_PURGE_COMPONENT_ABI 5
 #define NGX_CACHE_PURGE_PROTOCOL_VERSION 1
 #define NGX_CACHE_PURGE_FRAME_SIZE 24
 
@@ -40,8 +40,16 @@ typedef enum {
     NGX_PURGE_OP_ACCEPT_OPERATION,
     NGX_PURGE_OP_GET_OPERATION,
     NGX_PURGE_OP_GET_CONTROL_STATUS,
-    NGX_PURGE_OP_ACQUIRE_FILE_LEASE /* string canonical address -> digest[16], offset u64 + one FD */
+    NGX_PURGE_OP_ACQUIRE_FILE_LEASE, /* string canonical address -> digest[16], offset u64 + one FD */
+    NGX_PURGE_OP_PREPARE_FILE /* file, previous ID, temp path; two FDs: lease, temp */
 } ngx_cache_purge_opcode_t;
+
+#define NGX_PURGE_ROOT_CACHE 1
+#define NGX_PURGE_ROOT_TEMP  2
+typedef struct {
+    ngx_cache_purge_bytes_t path, zone;
+    uint32_t kind;
+} ngx_cache_purge_root_t;
 
 typedef struct {
     uint32_t abi;
@@ -57,6 +65,8 @@ typedef struct {
     uint64_t live_selector_bytes;
     void    *control_memory;     /* shared mapping owned by nginx, valid until stop */
     size_t   control_bytes;
+    const ngx_cache_purge_root_t *roots; /* Copied by start; opened only on executor. */
+    uint32_t root_count;
 } ngx_cache_purge_component_options_t;
 
 typedef struct {
@@ -72,7 +82,7 @@ typedef struct {
 } ngx_cache_purge_component_status_t;
 
 void ngx_cache_purge_component_options(ngx_cache_purge_component_options_t *options);
-uint32_t ngx_cache_purge_component_abi_4(void); /* Link-time header/archive compatibility marker. */
+uint32_t ngx_cache_purge_component_abi_5(void); /* Link-time header/archive compatibility marker. */
 
 /* Only start after fork in the selected nginx worker, never while parsing
  * configuration or in master. Copies its inputs and starts one executor thread.

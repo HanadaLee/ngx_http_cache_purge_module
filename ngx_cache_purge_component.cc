@@ -4,6 +4,7 @@
 #include "ngx_cache_purge_coordinator.hpp"
 #include "ngx_cache_purge_files.h"
 #include "ngx_cache_purge_transport.h"
+#include "ngx_cache_purge_publication.hpp"
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
@@ -58,6 +59,9 @@ struct Descriptor {
 struct Peer {
     Descriptor fd;
     Descriptor output_lease;
+    Descriptor input_rights[2];
+    size_t rights_count = 0;
+    uid_t uid = 0;
     std::array<char, NGX_CACHE_PURGE_FRAME_SIZE> header{};
     size_t header_used = 0, input_used = 0, output_used = 0;
     std::string input, output;
@@ -84,6 +88,8 @@ struct ngx_cache_purge_component_s {
     std::atomic<uint64_t> control_publication{0};
     ngx_cache_purge_store_error_t terminal_error{};
     std::vector<std::unique_ptr<Peer>> peers;
+    std::vector<RootSpec> roots;
+    std::unique_ptr<Publications> publications;
     size_t next_peer = 0;
 
     bool owner() const { return pid == getpid() && creator == std::this_thread::get_id(); }
@@ -169,6 +175,7 @@ struct ngx_cache_purge_component_s {
                 || (credentials.uid != geteuid() && credentials.uid != options.client_uid)) { ++rejected; continue; }
             nonblocking(client.value);
             auto peer = std::make_unique<Peer>(); peer->fd.value = client.value; client.value = -1;
+            peer->uid = credentials.uid;
             peer->deadline = Clock::now() + std::chrono::milliseconds(options.io_timeout_ms);
             *slot = std::move(peer); ++connections;
         }
@@ -182,13 +189,18 @@ struct ngx_cache_purge_component_s {
             else { destination = p.input.data() + p.input_used; remaining = p.input.size() - p.input_used; }
             if (!remaining) return true;
             int rights[NGX_CACHE_PURGE_TRANSPORT_FDS]; size_t count;
+            bool first = !p.parsed && p.header_used == 0;
             ssize_t n = ngx_cache_purge_transport_recv(p.fd.value, destination,
-                              std::min(budget, remaining), 0, rights, &count);
+                              first ? 1 : std::min(budget, remaining), first, rights, &count);
             if (n < 0) {
                 if (errno == EINTR) continue;
                 return errno == EAGAIN || errno == EWOULDBLOCK;
             }
             if (!n) return false;
+            if (count) {
+                for (size_t i = 0; i < count; i++) p.input_rights[i].value = rights[i];
+                p.rights_count = count;
+            }
             budget -= static_cast<size_t>(n);
             if (p.parsed) { p.input_used += n; continue; }
             p.header_used += n;
@@ -196,6 +208,8 @@ struct ngx_cache_purge_component_s {
                 p.request = wire::frame({p.header.data(), p.header.size()});
                 if (p.request.result || p.request.size > options.max_payload_bytes)
                     throw IndexError(NGX_PURGE_STORE_LIMIT, "invalid component request size/result");
+                if (p.rights_count != (p.request.opcode == NGX_PURGE_OP_PREPARE_FILE ? 2U : 0U))
+                    throw IndexError(NGX_PURGE_STORE_INVALID, "unexpected component request descriptors");
                 resize(p.input, p.request.size); p.parsed = true;
             }
         }
@@ -220,6 +234,16 @@ struct ngx_cache_purge_component_s {
     std::string dispatch(Index &index, Operations &operations, Coordinator *coordinator, ngx_cache_purge_store_t *store, Peer &p) {
         wire::Decoder d{p.input}; wire::Encoder e;
         switch (p.request.opcode) {
+        case NGX_PURGE_OP_PREPARE_FILE: {
+            Fill fill{wire::file(d), d.id()}; auto temporary = d.string(); d.end();
+            auto lock_path = path + "/file.leases";
+            ngx_cache_purge_store_error_t error;
+            if (lease_anchor.value < 0)
+                checked(ngx_cache_purge_file_locks_open(lock_path.c_str(), geteuid(), 1, &lease_anchor.value, &error), error);
+            auto match = publications->prepare(index, std::move(fill), temporary, lease_anchor.value,
+                                               p.input_rights[0].value, p.input_rights[1].value, p.uid);
+            wire::match(e, match); break;
+        }
         case NGX_PURGE_OP_ACQUIRE_FILE_LEASE: {
             auto address = d.string(65536); d.end();
             unsigned char digest[16]; uint64_t offset;
@@ -327,12 +351,15 @@ struct ngx_cache_purge_component_s {
             wire::Encoder e; e.string(error.what()); response = std::move(e.data); code = error.code;
         }
         release(p.input);
+        for (auto &right : p.input_rights) right.reset();
+        p.rights_count = 0;
         if (response.size() > options.max_payload_bytes) throw IndexError(NGX_PURGE_STORE_LIMIT, "IPC response size limit");
         auto packet = wire::frame(p.request.opcode, p.request.id, response, code);
         resize(p.output, packet.size()); p.output.swap(packet);
         p.deadline = Clock::now() + std::chrono::milliseconds(options.io_timeout_ms);
     }
     void serve(ngx_cache_purge_store_t *store) {
+        publications = std::make_unique<Publications>(roots, path);
         Index index(store); Operations operations(store, {options.max_live_operations, options.live_selector_bytes});
         std::unique_ptr<Coordinator> coordinator;
         if (options.control_memory) coordinator = std::make_unique<Coordinator>(operations, options.control_memory, options.control_bytes);
@@ -414,6 +441,7 @@ struct ngx_cache_purge_component_s {
         for (size_t i = 0; i < peers.size(); ++i) drop(i);
         remove_socket(); // Still own the DB lock when removing the rendezvous path.
         lease_anchor.reset();
+        publications.reset();
         if (store) {
             ngx_cache_purge_store_error_t error;
             int closed = ngx_cache_purge_store_close(&store, &error);
@@ -432,7 +460,7 @@ extern "C" void ngx_cache_purge_component_options(ngx_cache_purge_component_opti
     o->client_uid = UINT32_MAX;
     o->propagation_ms = 300000; o->max_live_operations = 4096; o->live_selector_bytes = 4 * 1024 * 1024;
 }
-extern "C" uint32_t ngx_cache_purge_component_abi_4(void) { return NGX_CACHE_PURGE_COMPONENT_ABI; }
+extern "C" uint32_t ngx_cache_purge_component_abi_5(void) { return NGX_CACHE_PURGE_COMPONENT_ABI; }
 extern "C" int ngx_cache_purge_component_start(const char *path,
     const ngx_cache_purge_component_options_t *options,
     ngx_cache_purge_component_t **output, ngx_cache_purge_store_error_t *error) {
@@ -446,13 +474,30 @@ extern "C" int ngx_cache_purge_component_start(const char *path,
             || !options->owner_retry_ms || options->owner_retry_ms > 1000
             || !options->max_live_operations || options->max_live_operations > 65536
             || options->live_selector_bytes < 1024 || options->live_selector_bytes > 64 * 1024 * 1024
-            || (options->control_memory == nullptr) != (options->control_bytes == 0))
+            || (options->control_memory == nullptr) != (options->control_bytes == 0)
+            || options->root_count > 256 || (options->root_count && !options->roots))
             return failure(error, NGX_PURGE_STORE_INVALID, "invalid component options");
         auto component = std::make_unique<ngx_cache_purge_component_s>();
         component->path = path; component->socket_path = component->path + "/component.sock";
         if (component->path.empty() || component->path[0] != '/' || component->socket_path.size() >= sizeof(sockaddr_un::sun_path))
             return failure(error, NGX_PURGE_STORE_INVALID, "component requires a short absolute Unix socket path");
         component->options = *options;
+        size_t root_bytes = 0;
+        for (size_t i = 0; i < options->root_count; i++) {
+            const auto &root = options->roots[i];
+            if (!root.path.data || root.path.len < 2 || root.path.len > 4096 || root.zone.len > 128
+                || (root.zone.len && !root.zone.data) || root.path.data[0] != '/'
+                || std::memchr(root.path.data, 0, root.path.len)
+                || (root.zone.len && std::memchr(root.zone.data, 0, root.zone.len))
+                || (root.kind != NGX_PURGE_ROOT_CACHE && root.kind != NGX_PURGE_ROOT_TEMP)
+                || (root.kind == NGX_PURGE_ROOT_CACHE && !root.zone.len))
+                return failure(error, NGX_PURGE_STORE_INVALID, "invalid publication root");
+            root_bytes += root.path.len + root.zone.len;
+            if (root_bytes > 65536) return failure(error, NGX_PURGE_STORE_LIMIT, "publication roots exceed budget");
+            component->roots.push_back({std::string(reinterpret_cast<const char *>(root.path.data), root.path.len),
+                root.zone.len ? std::string(reinterpret_cast<const char *>(root.zone.data), root.zone.len) : "", root.kind});
+        }
+        component->options.roots = nullptr; // No caller-owned pointers cross the executor boundary.
         if (component->options.client_uid == UINT32_MAX)
             component->options.client_uid = static_cast<uint32_t>(geteuid());
         if (component->options.client_uid != geteuid() && geteuid() != 0)

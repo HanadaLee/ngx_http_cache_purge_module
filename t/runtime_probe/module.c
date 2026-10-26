@@ -18,6 +18,11 @@ typedef struct { unsigned flags; } probe_result_t;
 typedef struct {
     ngx_http_request_t *request;
     ngx_cache_purge_call_t *call;
+    ngx_cache_purge_client_t *client;
+    ngx_str_t prepare, temporary;
+    ngx_msec_t timeout;
+    int temporary_fd;
+    unsigned prepare_sent:1;
 } probe_rpc_t;
 
 static ngx_int_t rpc_handler(ngx_http_request_t *r);
@@ -117,6 +122,94 @@ rpc_client(ngx_http_request_t *r)
     return *slot;
 }
 
+static u_char *
+rpc_number(u_char *p, uint64_t value, ngx_uint_t width)
+{
+    ngx_uint_t i;
+    for (i = width; i; i--) { *p++ = (u_char) (value >> ((i - 1) * 8)); }
+    return p;
+}
+
+static u_char *
+rpc_string(u_char *p, ngx_str_t value)
+{
+    p = rpc_number(p, value.len, 4);
+    return value.len ? ngx_cpymem(p, value.data, value.len) : p;
+}
+
+static void
+rpc_prepare_done(ngx_cache_purge_call_t *call, void *data, const ngx_cache_purge_reply_t *reply)
+{
+    probe_rpc_t *ctx = data;
+    ngx_http_request_t *r = ctx->request;
+    ngx_table_elt_t *header;
+    ngx_int_t rc;
+    int fds[2];
+    ctx->call = NULL;
+    if (!ctx->prepare_sent && reply->transport == NGX_PURGE_CLIENT_OK && reply->result == 0) {
+        fds[0] = reply->lease_fd; fds[1] = ctx->temporary_fd;
+        ctx->prepare_sent = 1;
+        rc = ngx_cache_purge_client_submit_files(ctx->client, &ctx->prepare, fds, ctx->timeout,
+                                                rpc_prepare_done, ctx, &ctx->call);
+        if (rc != NGX_OK) { ngx_http_finalize_request(r, 503); }
+        return;
+    }
+    header = ngx_list_push(&r->headers_out.headers);
+    if (header == NULL) { ngx_http_finalize_request(r, NGX_ERROR); return; }
+    header->hash = 1; ngx_str_set(&header->key, "X-IPC-Temp-Path"); header->value = ctx->temporary;
+    rpc_done(call, data, reply);
+}
+
+/* Test provider: use nginx's own request-body temporary FD, not synchronous
+ * file creation in the request handler. This is not a cache-fill consumer. */
+static void
+rpc_prepare_body(ngx_http_request_t *r, ngx_cache_purge_client_t *client, ngx_msec_t timeout)
+{
+    ngx_str_t root, zone = ngx_string("a"), value, target, address;
+    ngx_str_t fields[] = { ngx_string("publication-probe"), ngx_string("https://probe.test/publication"),
+        ngx_string("probe.test"), ngx_string("team"), ngx_null_string, ngx_null_string, ngx_null_string,
+        ngx_null_string, ngx_null_string };
+    ngx_str_t empty = ngx_null_string, metadata = ngx_string("fixture");
+    ngx_http_cleanup_t *cleanup;
+    probe_rpc_t *ctx;
+    ngx_int_t id, rc;
+    ngx_uint_t i;
+    u_char *p;
+    if (!r->request_body || !r->request_body->temp_file
+        || ngx_http_arg(r, (u_char *) "root", 4, &root) != NGX_OK
+        || ngx_http_arg(r, (u_char *) "id", 2, &value) != NGX_OK
+        || (id = ngx_atoi(value.data, value.len)) <= 0)
+    { ngx_http_finalize_request(r, 400); return; }
+    (void) ngx_http_arg(r, (u_char *) "zone", 4, &zone);
+    target.data = ngx_pnalloc(r->pool, 64);
+    ctx = ngx_pcalloc(r->pool, sizeof(*ctx)); cleanup = ngx_http_cleanup_add(r, 0);
+    if (!target.data || !ctx || !cleanup) { ngx_http_finalize_request(r, 500); return; }
+    target.len = ngx_sprintf(target.data, "prepared-%i", id) - target.data;
+    ctx->request = r; ctx->client = client; ctx->timeout = timeout;
+    ctx->temporary = r->request_body->temp_file->file.name;
+    ctx->temporary_fd = r->request_body->temp_file->file.fd;
+    cleanup->handler = rpc_cleanup; cleanup->data = ctx;
+    ctx->prepare.data = ngx_pnalloc(r->pool, 1024 + root.len + zone.len + ctx->temporary.len);
+    address.data = ngx_pnalloc(r->pool, 4 + root.len + 1 + target.len);
+    if (!ctx->prepare.data || !address.data) { ngx_http_finalize_request(r, 500); return; }
+    p = ctx->prepare.data;
+    p = rpc_number(p, 0, 8); p = rpc_number(p, id, 8);
+    fields[4] = root; fields[5] = zone; fields[6] = target;
+    for (i = 0; i < 9; i++) { p = rpc_string(p, fields[i]); }
+    p = rpc_string(p, metadata); *p++ = 0; *p++ = 0; *p++ = 0;
+    for (i = 0; i < 6; i++) { p = rpc_string(p, empty); }
+    p = rpc_number(p, 0, 8); p = rpc_number(p, 0, 8);
+    p = rpc_string(p, ctx->temporary); ctx->prepare.len = p - ctx->prepare.data;
+    p = rpc_number(address.data, root.len + 1 + target.len, 4);
+    p = ngx_cpymem(p, root.data, root.len); *p++ = '/';
+    p = ngx_cpymem(p, target.data, target.len); address.len = p - address.data;
+    rc = ngx_cache_purge_client_submit(client, NGX_PURGE_OP_ACQUIRE_FILE_LEASE, &address, timeout,
+                                     rpc_prepare_done, ctx, &ctx->call);
+    if (rc != NGX_OK) { ngx_http_finalize_request(r, 503); return; }
+    r->read_event_handler = ngx_http_test_reading;
+    if (ngx_handle_read_event(r->connection->read, 0) != NGX_OK) { ngx_http_finalize_request(r, NGX_ERROR); }
+}
+
 static void
 rpc_body(ngx_http_request_t *r)
 {
@@ -134,6 +227,9 @@ rpc_body(ngx_http_request_t *r)
     if (ngx_http_arg(r, (u_char *) "timeout", 7, &value) == NGX_OK) { timeout = ngx_atoi(value.data, value.len); }
     if (op < 1 || op > 65535 || timeout < 1 || timeout > 10000) {
         ngx_http_finalize_request(r, 400); return;
+    }
+    if (ngx_http_arg(r, (u_char *) "files", 5, &value) == NGX_OK) {
+        rpc_prepare_body(r, client, timeout); return;
     }
     for (cl = r->request_body ? r->request_body->bufs : NULL; cl; cl = cl->next) {
         if (cl->buf->in_file || ngx_buf_size(cl->buf) > 524288 - (off_t) payload.len) {

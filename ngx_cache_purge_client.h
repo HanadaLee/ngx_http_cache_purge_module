@@ -62,6 +62,14 @@ ngx_int_t ngx_cache_purge_client_submit(ngx_cache_purge_client_t *client,
     ngx_cache_purge_client_done_pt done, void *data,
     ngx_cache_purge_call_t **call);
 
+/* PREPARE_FILE accepts two borrowed input FDs (lease, complete temp file).
+ * Successful submit copies them with CLOEXEC; the caller keeps its originals.
+ * Copies are bounded by 2 * max_pending and released on send/cancel/failure.
+ * No other current opcode accepts request descriptors. */
+ngx_int_t ngx_cache_purge_client_submit_files(ngx_cache_purge_client_t *client,
+    const ngx_str_t *payload, const int fds[2], ngx_msec_t timeout,
+    ngx_cache_purge_client_done_pt done, void *data, ngx_cache_purge_call_t **call);
+
 /* Cancel consumes the handle and suppresses its callback. Cancellation does
  * not roll back a request already sent. Clear the caller's handle afterwards. */
 void ngx_cache_purge_client_cancel(ngx_cache_purge_call_t *call);
