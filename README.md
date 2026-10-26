@@ -15,8 +15,9 @@ The module is undergoing a storage and lifecycle redesign. The default build
 implements the legacy PURGE/REFRESH interfaces. An opt-in development build now
 connects RocksDB ownership, durable operations, and shared control publication to
 one executor in ordinary nginx worker 0. Real upstream fills now enter the
-persistent index through standard module interfaces. Read admission, the new
-Invalidate/Delete HTTP API, and multilevel cache propagation are still being implemented.
+persistent index through standard module interfaces. File-response admission now
+checks the selected descriptor and shared FENCE table. Special cache paths, the
+new Invalidate/Delete HTTP API, and multilevel propagation remain unfinished.
 
 The repository now contains a bounded RocksDB storage bridge and a persistent
 URL/key/file index. They support cross-zone lookup, scoped TAG postings, full
@@ -33,16 +34,28 @@ bounded background steps, including after owner restart or a lost reply. It
 first acquires an independent OFD lease, so active writers remain protected.
 Verified renamed files become READY; abandoned preparations are retired without
 deleting unrelated files. Changed identities and inaccessible roots remain
-pending. This recovery does not yet provide native read admission or purge FENCEs.
+pending. Recovery and response admission have independent responsibilities.
 
 `INSPECT_FILE` checks the actual cache descriptor on the executor through bounded
 IPC. It requires a READY marker, a committed current index record with no pending
 intent, and matching root/zone/path and same-filesystem publication identity.
 Unknown, unfinished, changed, replaced and evicted instances are rejected without
 repairing files or writing the database. The worker client duplicates and transfers
-one descriptor; the caller keeps its original. This inspection does not attest
-purge freshness or authorize response delivery. Native read admission and its
-final shared-control guard are still being integrated.
+one descriptor; the caller keeps its original. Inspection alone does not attest
+purge freshness. The native file-response consumer also checks key, URL, host,
+prefix and scoped TAG FENCEs, then commits its decision under a short shared
+control guard. It waits before slice, Range and client-conditional filters run.
+No shared guard spans IPC or asynchronous body streaming. Unknown files and
+matching FENCEs cause an unconditional upstream retry using the original key.
+
+Read checks are bounded to 64 concurrent waits per worker, with a three-second
+overall deadline. A PREPARED marker can wait for publication within that deadline.
+No complete file index is loaded into worker memory. Successful upstream 304
+responses currently cause an unconditional refill until durable validation and
+TAG updates are implemented. Cached redirects, memory-only cached errors and
+complete URL-alias coverage still need admission handling. Operation receipts
+remain PREPARING; these partial consumers do not expose reliable public 202
+acceptance or completed immediate purge semantics yet.
 
 HTTP workers now have an event-driven Unix IPC client with a reusable connection,
 bounded queues and buffers, absolute deadlines, peer UID verification, and explicit
@@ -84,10 +97,11 @@ purge API or automatically execute physical cache operations yet.
 The shared control-table library uses bounded immutable images for exact,
 prefix, host, and scoped TAG matching. Normal lookups do not acquire a mutex or
 query RocksDB. FENCE and proxy-only PROPAGATE duties share records but expire
-independently. Native read/FENCE integration is still pending; tests use
-a separate precontent consumer to verify the shared barrier against real HITs.
+independently. Native file-response admission consumes this table. A separate
+precontent test consumer still covers coordinator lifecycle; special response
+paths and FENCE retirement remain unfinished.
 
-The module-owned fill helper uses an auxiliary header filter and the existing
+The module-owned fill helper uses an initial header filter and the existing
 upstream finalizer to defer publication
 until asynchronous preparation has completed. It retains the request and cache
 node through cancellation and reload, and works on unmodified nginx without a
@@ -95,8 +109,9 @@ custom store hook. FINISH verifies the actual final file because native update
 does not return a rename result. `t/native_fill_runtime.py` covers the native
 lifecycle separately. `t/capture_runtime.py` exercises real native fills through
 the companion key module, worker IPC, durable preparation, rename and READY
-publication. Cached-response admission, 304 commits, eviction coordination and
-background invalidation remain to be connected.
+publication. Selected-descriptor admission is connected for native file responses;
+304 commits, special response paths, eviction coordination and background
+invalidation remain to be connected.
 
 The persistent build provides `cache_purge_key`, `cache_purge_url`,
 `cache_purge_tag`, and `cache_purge_tag_namespace` as independently inherited
@@ -178,6 +193,11 @@ Dynamic persistent builds produce two module files. Load the provider first:
 load_module modules/ngx_http_cache_rocksdb_module.so;
 load_module modules/ngx_http_cache_purge_module.so;
 ```
+
+Register the persistent purge addon after other header-filter addons, or load its
+dynamic module last among them. Its admission filter must run before slice and
+other filters modify response state. Startup and `nginx -t` reject an unsafe
+filter order when `cache_purge_key` is configured.
 
 This requires Linux, HTTP cache support, and `master_process on`. The persistent
 runtime uses standard worker initialization, timers, and exit callbacks. It does

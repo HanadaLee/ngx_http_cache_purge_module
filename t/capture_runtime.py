@@ -91,6 +91,8 @@ class Origin(http.server.BaseHTTPRequestHandler):
             content_range = f'bytes {start}-{end}/{len(body)}'; body = body[start:end + 1]; status = 206
         self.send_response(status)
         self.send_header('Cache-Control', 'max-age=3600')
+        self.send_header('Accept-Ranges', 'bytes')
+        self.send_header('ETag', '"capture-v1"')
         self.send_header('Cache-Tag', policies.get(path, 'news, red, news'))
         if path == '/vary': self.send_header('Vary', 'Accept-Language')
         if content_range: self.send_header('Content-Range', content_range)
@@ -218,9 +220,9 @@ def until(fn, timeout=8):
         if value: return value
         time.sleep(.01)
     raise AssertionError('condition timeout')
-def get(path, headers=None):
+def get(path, headers=None, method='GET'):
     conn = http.client.HTTPConnection('127.0.0.1', port, timeout=25)
-    conn.request('GET', path, headers={'Host': 'cache.test', **(headers or {})})
+    conn.request(method, path, headers={'Host': 'cache.test', **(headers or {})})
     response = conn.getresponse(); result = response.status, response.getheader('X-Status'), response.read()
     conn.close(); return result
 def string(value):
@@ -267,6 +269,14 @@ def record(ident):
     return result
 def pending():
     return rpc(9, string('') + bytes([32]))[0]
+
+def fence(name, kind, value, scope=''):
+    previous = struct.unpack('>IQ', rpc(16))[1]
+    payload = (string(name) + b'\x01' + struct.pack('>Q', int(time.time() * 1000))
+               + bytes([kind]) + string(value) + string(scope) + string('read-test'))
+    receipt = rpc(14, payload)
+    assert receipt[len(payload) + 40] == 1
+    until(lambda: (state := struct.unpack('>IQ', rpc(16)))[0] == 6 and state[1] != previous)
 def ready_file(item):
     path = Path(os.fsdecode(item['root'])) / os.fsdecode(item['path'])
     marker = os.getxattr(path, 'user.ngx_cache_purge.id')
@@ -284,6 +294,47 @@ try:
     assert first['namespace'] == b'tenant' and set(first['tags']) == {b'news', b'red'}
     assert get('/asset')[1] == 'HIT' and calls.count('/asset') == 1
     checks.append('real upstream fill is durably indexed with the native key snapshot, scoped tags and READY marker')
+    assert get('/asset', method='HEAD') == (200, 'HIT', b'')
+    assert get('/asset', {'Range': 'bytes=1-3'}) == (206, 'HIT', b'ass')
+    assert get('/asset', {'If-None-Match': '"capture-v1"'}) == (304, 'HIT', b'')
+    checks.append('deferred descriptor inspection preserves native HEAD, Range and client conditional output filters')
+    assert get('/unmarked')[1] == 'MISS'
+    unmarked = records('/unmarked', 1)[0]
+    os.removexattr(ready_file(unmarked), 'user.ngx_cache_purge.id')
+    assert get('/unmarked') == (200, 'BYPASS', b'/unmarked')
+    until(lambda: records('/unmarked', 1)[0]['id'] != unmarked['id'])
+    assert get('/unmarked')[1] == 'HIT' and calls.count('/unmarked') == 2
+    assert record(unmarked['id'])['state'] == 3
+    checks.append('a native HIT with no publication marker refills and replaces its old index instance before later reuse')
+    assert get('/read-wait')[1] == 'MISS'
+    waiting_file = ready_file(records('/read-wait', 1)[0])
+    waiting_marker = os.getxattr(waiting_file, 'user.ngx_cache_purge.id')
+    os.setxattr(waiting_file, 'user.ngx_cache_purge.id', waiting_marker[:7] + b'\1' + waiting_marker[8:])
+    release = threading.Timer(.15, os.setxattr, (waiting_file, 'user.ngx_cache_purge.id', waiting_marker))
+    before_wait = time.monotonic(); release.start()
+    try:
+        with socket.create_connection(('127.0.0.1', port), timeout=5) as held:
+            held.sendall(b'GET /read-wait HTTP/1.1\r\nHost: cache.test\r\nConnection: close\r\n\r\n')
+            held.settimeout(.05)
+            try:
+                early = held.recv(1)
+                raise AssertionError(('unverified response bytes escaped', early))
+            except socket.timeout: pass
+            held.settimeout(5)
+            response = http.client.HTTPResponse(held); response.begin()
+            assert response.status == 200 and response.getheader('X-Status') == 'HIT'
+            assert response.read() == b'/read-wait'
+        assert time.monotonic() - before_wait >= .1
+    finally: release.join()
+    assert calls.count('/read-wait') == 1
+    checks.append('PREPARED-marker reads wait asynchronously until READY without exposing bytes or fetching a new entity')
+    os.setxattr(waiting_file, 'user.ngx_cache_purge.id', waiting_marker[:7] + b'\1' + waiting_marker[8:])
+    with socket.create_connection(('127.0.0.1', port), timeout=5) as abandoned:
+        abandoned.sendall(b'GET /read-wait HTTP/1.1\r\nHost: cache.test\r\nConnection: close\r\n\r\n')
+        time.sleep(.04)
+    os.setxattr(waiting_file, 'user.ngx_cache_purge.id', waiting_marker)
+    assert get('/read-wait')[1] == 'HIT'
+    checks.append('client abandonment during descriptor inspection drains without losing later HITs')
     assert get('/asset?z=b')[1] == 'MISS'
     both = records('/asset', 2)
     assert {x['zone'] for x in both} == {b'a', b'b'}
@@ -296,12 +347,27 @@ try:
     assert get('/vary', {'Accept-Language': 'de'})[2] == b'/varyde'
     varied = records('/vary', 2)
     assert len({x['path'] for x in varied}) == 2 and all(x['vary'] == b'Accept-Language' for x in varied)
+    assert get('/vary', {'Accept-Language': 'en'})[1] == 'HIT'
+    assert get('/vary', {'Accept-Language': 'de'})[1] == 'HIT'
     checks.append('native Vary secondary files are published under the same base key')
+    german = next(item for item in varied if ready_file(item).read_bytes().endswith(b'/varyde'))
+    os.removexattr(ready_file(german), 'user.ngx_cache_purge.id')
+    assert get('/vary', {'Accept-Language': 'en'})[1] == 'HIT'
+    assert get('/vary', {'Accept-Language': 'de'}) == (200, 'BYPASS', b'/varyde')
+    until(lambda: german['id'] not in {item['id'] for item in records('/vary', 2)})
+    assert get('/vary', {'Accept-Language': 'de'})[1] == 'HIT'
+    checks.append('read admission inspects the selected Vary file and refills only the unmarked variant')
     assert get('/slice')[2] == slice_body
     sliced = records('/slice', 3)
     assert len({x['key'] for x in sliced}) == 1 and len({x['range'] for x in sliced}) == 3
     assert get('/slice')[2] == slice_body and calls.count('/slice') == 3
     checks.append('slice subrequests publish all ranges under one base key')
+    middle = next(item for item in sliced if item['range'] == b'bytes=1024-2047')
+    os.removexattr(ready_file(middle), 'user.ngx_cache_purge.id')
+    assert get('/slice')[2] == slice_body
+    until(lambda: middle['id'] not in {item['id'] for item in records('/slice', 3)})
+    assert get('/slice')[2] == slice_body and calls.count('/slice') == 4
+    checks.append('an unmarked slice refills independently without mixing output or refetching verified slices')
     assert get('/large')[2] == b'/large' * 40000
     ready_file(records('/large', 1)[0])
     checks.append('threaded native temporary writes finish before durable publication')
@@ -332,6 +398,10 @@ try:
         item = records(path, 1)[0]; ready_file(item)
         assert item['zone'] == name.encode() and item['tags'] == [name.encode()]
         assert get(path)[1] == 'HIT'
+        os.removexattr(ready_file(item), 'user.ngx_cache_purge.id')
+        assert get(path) == (200, 'BYPASS', (name + ':body').encode())
+        until(lambda: records(path, 1)[0]['id'] != item['id'])
+        assert get(path)[1] == 'HIT'
         checks.append(name + ': actual native file, key snapshot and scoped TAG are durably indexed')
     if a.capacity:
         count = a.workers * 64 + 8
@@ -360,6 +430,34 @@ try:
     assert {x[0] for x in query('http://cache.test/asset')} == before
     assert get('/asset')[1] == 'HIT'
     checks.append('full nginx restart reuses persisted file relations without rebuilding the index')
+    assert get('/fenced-url')[1] == 'MISS'; records('/fenced-url', 1)
+    assert get('/fenced-url?z=b')[1] == 'MISS'; records('/fenced-url', 2)
+    assert get('/fenced-url')[1] == 'HIT'
+    fence('read-url', 1, 'http://cache.test/fenced-url')
+    assert get('/fenced-url') == (200, 'BYPASS', b'/fenced-url')
+    assert get('/fenced-url?z=b') == (200, 'BYPASS', b'/fenced-url')
+    assert get('/asset')[1] == 'HIT'
+    checks.append('native read admission checks the published URL FENCE across both zones while unrelated cached files remain HITs')
+    assert get('/fenced-prefix/a')[1] == 'MISS'; records('/fenced-prefix/a', 1)
+    fence('read-prefix', 3, 'http://cache.test/fenced-prefix/')
+    assert get('/fenced-prefix/a')[1] == 'BYPASS'
+    checks.append('native read admission applies bytewise prefix FENCEs to cached files')
+    assert get('/fenced-key')[1] == 'MISS'
+    fenced_key = records('/fenced-key', 1)[0]['key']
+    fence('read-key', 0, fenced_key)
+    assert get('/fenced-key')[1] == 'BYPASS'
+    checks.append('native read admission applies exact base-key FENCEs')
+    policies['/fenced-tag'] = 'only-this-tag'
+    assert get('/fenced-tag')[1] == 'MISS'; records('/fenced-tag', 1)
+    fence('read-wrong-tag', 5, 'only-this-tag', 'other-tenant')
+    assert get('/fenced-tag')[1] == 'HIT'
+    fence('read-tag', 5, 'only-this-tag', 'tenant')
+    assert get('/fenced-tag')[1] == 'BYPASS'
+    assert get('/asset')[1] == 'HIT'
+    checks.append('native TAG admission uses persisted entity tags with namespace isolation')
+    fence('read-host', 4, 'cache.test')
+    assert get('/asset')[1] == 'BYPASS'
+    checks.append('native read admission applies host FENCEs; receipts still remain PREPARING pending complete protocol coverage')
 finally:
     capacity_gate.set()
     for process, log in processes: stop(process); log.close()

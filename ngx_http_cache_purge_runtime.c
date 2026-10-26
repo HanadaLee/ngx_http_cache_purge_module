@@ -491,6 +491,9 @@ ngx_http_cache_purge_runtime_module_init(ngx_cycle_t *cycle)
     if (main == NULL || main->runtime->path == NULL) {
         return NGX_OK;
     }
+    if (ngx_http_cache_purge_capture_ready(cycle) != NGX_OK) {
+        return NGX_ERROR;
+    }
     core = (ngx_core_conf_t *) ngx_get_conf(cycle->conf_ctx, ngx_core_module);
     if (!core->master) {
         ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
