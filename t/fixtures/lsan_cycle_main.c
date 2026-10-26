@@ -7,7 +7,7 @@ extern int lsan_cycle_fail, lsan_cycle_leak;
 static __attribute__((noinline)) void
 check_cycle(void)
 {
-    ngx_cycle_t  *cycle, bootstrap;
+    ngx_cycle_t *cycle, bootstrap;
 
     memset(&bootstrap, 0, sizeof(bootstrap));
     bootstrap.pool = calloc(1, 1024);

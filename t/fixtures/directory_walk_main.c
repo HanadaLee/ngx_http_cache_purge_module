@@ -1,5 +1,6 @@
-static void entry_path(char *path, size_t capacity, const char *directory,
-    const char *entry)
+static void
+entry_path(char *path, size_t capacity, const char *directory,
+           const char *entry)
 {
     size_t len = strlen(directory);
     size_t entry_len = strlen(entry);
@@ -10,16 +11,17 @@ static void entry_path(char *path, size_t capacity, const char *directory,
     memcpy(path + len, entry, entry_len + 1);
 }
 
-int main(void)
+int
+main(void)
 {
-    char root[] = "purge-walk-XXXXXX";
-    char path[1024], deep[3][1024], component[96];
-    char outside[] = "purge-outside-XXXXXX", alias[1024], target[1024];
+    char  root[] = "purge-walk-XXXXXX";
+    char  path[1024], deep[3][1024], component[96];
+    char  outside[] = "purge-outside-XXXXXX", alias[1024], target[1024];
     FILE *file;
-    ngx_http_cache_purge_walk_ctx_t ctx;
-    ngx_http_cache_purge_cursor_t cursor;
-    ngx_int_t rc;
-    unsigned i, before, calls, allocations;
+    ngx_http_cache_purge_walk_ctx_t  ctx;
+    ngx_http_cache_purge_cursor_t    cursor;
+    ngx_int_t                        rc;
+    unsigned                        i, before, calls, allocations;
 
     assert(mkdtemp(root) != NULL);
     memset(&ctx, 0, sizeof(ctx));
@@ -51,7 +53,7 @@ int main(void)
     cursor.ctx = &ctx;
     before = reads;
     assert(ngx_http_cache_purge_walk_step(&cursor, 64) == NGX_AGAIN);
-    assert(reads - before == NGX_CACHE_PURGE_WALK_MSEC);
+    assert(reads - before == NGX_HTTP_CACHE_PURGE_WALK_MSEC);
     assert(ngx_http_cache_purge_walk_step(&cursor, 0) == NGX_OK);
     assert(handles == 0);
     ngx_free(cursor.path.data);
@@ -81,8 +83,7 @@ int main(void)
     memset(component, 'x', sizeof(component) - 1);
     component[sizeof(component) - 1] = 0;
     for (i = 0; i < 3; i++) {
-        entry_path(deep[i], sizeof(deep[i]),
-                   i ? deep[i - 1] : root, component);
+        entry_path(deep[i], sizeof(deep[i]), i ? deep[i - 1] : root, component);
         assert(mkdir(deep[i], 0700) == 0);
         entry_path(path, sizeof(path), deep[i], "entry");
         file = fopen(path, "w");
@@ -119,7 +120,8 @@ int main(void)
     assert(mkdtemp(outside) != NULL);
     outside_path = realpath(outside, NULL);
     assert(outside_path != NULL);
-    snprintf(target, sizeof(target), "%s/0123456789abcdef0123456789abcdef", outside);
+    snprintf(target, sizeof(target), "%s/0123456789abcdef0123456789abcdef",
+             outside);
     file = fopen(target, "w");
     assert(file != NULL && fclose(file) == 0);
     snprintf(path, sizeof(path), "%s/linked", root);
@@ -137,7 +139,7 @@ int main(void)
     ctx.cache_root.data = (u_char *) root;
     ctx.cache_root.len = strlen(root);
 
-#if (NGX_CACHE_PURGE_HAVE_AT)
+#if (NGX_HTTP_CACHE_PURGE_HAVE_AT)
     /* Replace the child after classification but before openat. */
     snprintf(swap_path, sizeof(swap_path), "%s/swap", root);
     snprintf(moved_path, sizeof(moved_path), "%s-moved", root);

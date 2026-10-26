@@ -18,12 +18,12 @@ main(void)
     access.elts = &cidr;
     access.nelts = 1;
 
-    assert(ngx_http_cache_purge_access(&access, NULL,
-                     (struct sockaddr *) &peer) == NGX_OK);
+    assert(ngx_http_cache_purge_access(&access, NULL, (struct sockaddr *) &peer)
+           == NGX_OK);
     peer.sin6_addr.s6_addr[15] = 6;
-    assert(ngx_http_cache_purge_access(&access, NULL,
-                     (struct sockaddr *) &peer) == NGX_DECLINED);
-    assert(ngx_http_cache_purge_access(NULL, NULL,
-                     (struct sockaddr *) &peer) == NGX_DECLINED);
+    assert(ngx_http_cache_purge_access(&access, NULL, (struct sockaddr *) &peer)
+           == NGX_DECLINED);
+    assert(ngx_http_cache_purge_access(NULL, NULL, (struct sockaddr *) &peer)
+           == NGX_DECLINED);
     return 0;
 }

@@ -1,4 +1,4 @@
-#include "ngx_cache_purge_index.hpp"
+#include "ngx_http_cache_purge_index.hpp"
 #include <unistd.h>
 #include <algorithm>
 #include <chrono>
@@ -8,7 +8,7 @@
 #include <set>
 #include <thread>
 
-using namespace ngx_cache_purge;
+using namespace ngx_http_cache_purge;
 static unsigned assertions;
 static void check(bool value, const char *message) {
     if (!value) throw std::runtime_error(message);
@@ -70,36 +70,36 @@ static void pages(Index &index, const Selector &selector) {
     }
     check(actual == expected, "paged traversal matches one-snapshot traversal");
 }
-static std::vector<std::string> raw_keys(ngx_cache_purge_store_t *store, ngx_cache_purge_cf_t cf) {
-    ngx_cache_purge_cursor_t *cursor = nullptr; ngx_cache_purge_store_error_t error;
-    ngx_cache_purge_bytes_t empty{nullptr, 0};
-    check(ngx_cache_purge_cursor_open(store, cf, empty, empty, &cursor, &error) == 0, "raw cursor open");
+static std::vector<std::string> raw_keys(ngx_http_cache_rocksdb_t *store, ngx_http_cache_rocksdb_cf_e cf) {
+    ngx_http_cache_rocksdb_cursor_t *cursor = nullptr; ngx_http_cache_rocksdb_error_t error;
+    ngx_http_cache_rocksdb_bytes_t empty{nullptr, 0};
+    check(ngx_http_cache_rocksdb_cursor_open(store, cf, empty, empty, &cursor, &error) == 0, "raw cursor open");
     std::vector<unsigned char> k(65536), v(262144); std::vector<std::string> keys;
     for (;;) {
-        ngx_cache_purge_buffer_t kb{k.data(), k.size(), 0}, vb{v.data(), v.size(), 0};
-        int rc = ngx_cache_purge_cursor_next(cursor, &kb, &vb, &error);
-        if (rc == NGX_PURGE_STORE_DONE) break;
-        check(rc == NGX_PURGE_STORE_OK, "raw cursor next");
+        ngx_http_cache_rocksdb_buffer_t kb{k.data(), k.size(), 0}, vb{v.data(), v.size(), 0};
+        int rc = ngx_http_cache_rocksdb_cursor_next(cursor, &kb, &vb, &error);
+        if (rc == NGX_HTTP_CACHE_ROCKSDB_DONE) break;
+        check(rc == NGX_HTTP_CACHE_ROCKSDB_OK, "raw cursor next");
         keys.emplace_back(reinterpret_cast<char *>(k.data()), kb.length);
     }
-    check(ngx_cache_purge_cursor_close(&cursor, &error) == 0, "raw cursor close");
+    check(ngx_http_cache_rocksdb_cursor_close(&cursor, &error) == 0, "raw cursor close");
     return keys;
 }
 
-static ngx_cache_purge_bytes_t bytes(const std::string &value) {
+static ngx_http_cache_rocksdb_bytes_t bytes(const std::string &value) {
     return {reinterpret_cast<const unsigned char *>(value.data()), value.size()};
 }
-static void raw_write(ngx_cache_purge_store_t *store, ngx_cache_purge_cf_t cf,
+static void raw_write(ngx_http_cache_rocksdb_t *store, ngx_http_cache_rocksdb_cf_e cf,
                       const std::string &key, const std::string &value, bool remove = false) {
-    ngx_cache_purge_mutation_t change{cf, remove ? NGX_PURGE_STORE_DELETE : NGX_PURGE_STORE_PUT, bytes(key), bytes(value)};
-    ngx_cache_purge_store_error_t error;
-    check(ngx_cache_purge_store_write(store, &change, 1, nullptr, 0, &error) == 0, "raw test mutation");
+    ngx_http_cache_rocksdb_mutation_t change{cf, remove ? NGX_HTTP_CACHE_ROCKSDB_DELETE : NGX_HTTP_CACHE_ROCKSDB_PUT, bytes(key), bytes(value)};
+    ngx_http_cache_rocksdb_error_t error;
+    check(ngx_http_cache_rocksdb_write(store, &change, 1, nullptr, 0, &error) == 0, "raw test mutation");
 }
 
 static int process_test(const std::string &mode, const char *path) {
-    ngx_cache_purge_store_options_t options; ngx_cache_purge_store_options(&options);
-    ngx_cache_purge_store_t *store = nullptr; ngx_cache_purge_store_error_t error;
-    check(ngx_cache_purge_store_open(path, &options, &store, &error) == 0, error.message);
+    ngx_http_cache_rocksdb_options_t options; ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr; ngx_http_cache_rocksdb_error_t error;
+    check(ngx_http_cache_rocksdb_open(path, &options, &store, &error) == 0, error.message);
     {
         Index index(store);
         auto a = file(1), b = file(2, "/dir/a", "", "b.example", "/cache/b"), c = file(3, "/dir/a", "fr");
@@ -138,7 +138,7 @@ static int process_test(const std::string &mode, const char *path) {
             _exit(0); // Deliberately bypass index/DB cleanup after acknowledged writes.
         }
     }
-    check(ngx_cache_purge_store_close(&store, &error) == 0, error.message);
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
     std::cout << "PASS recovery " << assertions << " assertions" << std::endl;
     return 0;
 }
@@ -148,10 +148,10 @@ int main(int argc, char **argv) {
         if (argc == 3) return process_test(argv[1], argv[2]);
         char path[] = "/tmp/cache-purge-index-test-XXXXXX";
         check(mkdtemp(path) != nullptr, "test directory");
-        ngx_cache_purge_store_options_t options; ngx_cache_purge_store_options(&options);
+        ngx_http_cache_rocksdb_options_t options; ngx_http_cache_rocksdb_options(&options);
         options.cursor_lifetime_ms = 5000;
-        ngx_cache_purge_store_t *store = nullptr; ngx_cache_purge_store_error_t error;
-        check(ngx_cache_purge_store_open(path, &options, &store, &error) == 0, error.message);
+        ngx_http_cache_rocksdb_t *store = nullptr; ngx_http_cache_rocksdb_error_t error;
+        check(ngx_http_cache_rocksdb_open(path, &options, &store, &error) == 0, error.message);
         {
             Index index(store);
             auto publication = file(200, "/publication");
@@ -167,16 +167,16 @@ int main(int argc, char **argv) {
                       && !pending->next(m), "pending cursor includes committed-but-unpublished files");
             }
             auto pub_replacement = file(201, "/publication"); pub_replacement.path = publication.path;
-            fails(NGX_PURGE_STORE_BUSY, [&] { index.prepare(pub_replacement, publication.id); });
-            fails(NGX_PURGE_STORE_BUSY, [&] { index.retire(publication.id, 2); });
-            fails(NGX_PURGE_STORE_BUSY, [&] { index.update_metadata(publication.id, 2, "new", {}); });
-            fails(NGX_PURGE_STORE_CONFLICT, [&] { index.publish(publication.id, 1); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_BUSY, [&] { index.prepare(pub_replacement, publication.id); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_BUSY, [&] { index.retire(publication.id, 2); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_BUSY, [&] { index.update_metadata(publication.id, 2, "new", {}); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_CONFLICT, [&] { index.publish(publication.id, 1); });
             check(index.current(publication.root, publication.path)->id == publication.id, "current path returns the exact committed instance");
             check(index.publish(publication.id, 2).revision == 2
                   && index.publish(publication.id, 2).revision == 2, "publication cleanup is idempotent");
-            fails(NGX_PURGE_STORE_CONFLICT, [&] { index.discard_publication(publication.id, 2); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_CONFLICT, [&] { index.discard_publication(publication.id, 2); });
             index.prepare(pub_replacement, publication.id);
-            fails(NGX_PURGE_STORE_BUSY, [&] { index.publish(publication.id, 2); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_BUSY, [&] { index.publish(publication.id, 2); });
             index.commit_pending(pub_replacement.id, 1);
             check(index.get(publication.id).state == FileState::retired, "replacement retires old instance while retaining new intent");
             auto discarded = index.discard_publication(pub_replacement.id, 2);
@@ -185,7 +185,7 @@ int main(int argc, char **argv) {
             index.collect_file(publication.id, 3); index.collect_file(pub_replacement.id, 3);
             auto retained = file(202, "/schema-retained");
             install(index, retained);
-            raw_write(store, NGX_PURGE_STORE_DEFAULT, "M:index", "1");
+            raw_write(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, "M:index", "1");
             Index upgraded(store);
             check(!upgraded.current(publication.root, publication.path), "v1 schema upgrades without rebuilding index records");
             check(upgraded.current(retained.root, retained.path)->id == retained.id
@@ -203,20 +203,20 @@ int main(int argc, char **argv) {
             check(index.prepare(a).revision == 1, "idempotent prepare");
             check(selected(index, {SelectorKind::url, a.url, ""}) == std::set<unsigned>{1}, "prepared file enumerated for writer handling");
             auto different = a; different.metadata = "other proof";
-            fails(NGX_PURGE_STORE_CONFLICT, [&] { index.prepare(different); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_CONFLICT, [&] { index.prepare(different); });
             check(index.commit(a.id, 1).revision == 2, "commit increments revision");
-            fails(NGX_PURGE_STORE_CONFLICT, [&] { index.commit(a.id, 1); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_CONFLICT, [&] { index.commit(a.id, 1); });
             for (const auto &record : {b, c, d, e, f}) install(index, record);
             auto corrupt = file(7, "/bad-projection");
             for (bool url : {false, true}) {
-                auto cf = url ? NGX_PURGE_STORE_URL : NGX_PURGE_STORE_DEFAULT;
+                auto cf = url ? NGX_HTTP_CACHE_ROCKSDB_URL : NGX_HTTP_CACHE_ROCKSDB_DEFAULT;
                 auto projection = std::string(1, url ? 'U' : 'K') + (url ? corrupt.url : corrupt.key);
                 const std::string foreign_id(8, '\x7f');
                 raw_write(store, cf, projection, foreign_id);
-                ngx_cache_purge_store_stats_t before, after;
-                check(ngx_cache_purge_store_stats(store, &before, &error) == 0, "corruption initial stats");
-                fails(NGX_PURGE_STORE_CORRUPT, [&] { index.prepare(corrupt); });
-                check(ngx_cache_purge_store_stats(store, &after, &error) == 0 && after.writes == before.writes,
+                ngx_http_cache_rocksdb_stats_t before, after;
+                check(ngx_http_cache_rocksdb_stats(store, &before, &error) == 0, "corruption initial stats");
+                fails(NGX_HTTP_CACHE_ROCKSDB_CORRUPT, [&] { index.prepare(corrupt); });
+                check(ngx_http_cache_rocksdb_stats(store, &after, &error) == 0 && after.writes == before.writes,
                       "inconsistent projection is not overwritten or partially committed");
                 raw_write(store, cf, projection, "", true);
             }
@@ -230,33 +230,33 @@ int main(int argc, char **argv) {
             check(index.get(a.id).tags == std::vector<std::string>({"common", "photo"}), "deduplicated canonical TAGs");
             check(index.get(b.id).range == "bytes=100-199" && index.get(b.id).root == "/cache/b", "physical locator and range preserved");
             auto bad = file(7); bad.path = "../escape";
-            fails(NGX_PURGE_STORE_INVALID, [&] { index.prepare(bad); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_INVALID, [&] { index.prepare(bad); });
             bad = file(7); bad.key += "wrong";
-            fails(NGX_PURGE_STORE_INVALID, [&] { index.prepare(bad); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_INVALID, [&] { index.prepare(bad); });
             bad = file(7); bad.url += "wrong";
-            fails(NGX_PURGE_STORE_INVALID, [&] { index.prepare(bad); });
-            fails(NGX_PURGE_STORE_CONFLICT, [&] { index.collect_file(a.id, 2); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_INVALID, [&] { index.prepare(bad); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_CONFLICT, [&] { index.collect_file(a.id, 2); });
 
             auto replacement = a; replacement.id = id(10); replacement.metadata = "new proof";
-            fails(NGX_PURGE_STORE_CONFLICT, [&] { index.prepare(replacement); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_CONFLICT, [&] { index.prepare(replacement); });
             index.prepare(replacement, a.id);
             auto competing = replacement; competing.id = id(11);
-            fails(NGX_PURGE_STORE_BUSY, [&] { index.prepare(competing, a.id); });
-            fails(NGX_PURGE_STORE_BUSY, [&] { index.retire(a.id, 2); });
-            fails(NGX_PURGE_STORE_BUSY, [&] { index.update_metadata(a.id, 2, "304", a.tags); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_BUSY, [&] { index.prepare(competing, a.id); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_BUSY, [&] { index.retire(a.id, 2); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_BUSY, [&] { index.update_metadata(a.id, 2, "304", a.tags); });
             auto aborted = index.abort_prepare(replacement.id, 1);
             check(aborted.state == FileState::retired, "abort prepared file");
             index.collect_file(replacement.id, aborted.revision);
             install(index, competing, a.id);
             check(index.get(a.id).state == FileState::retired && index.get(a.id).revision == 3, "replace retires old instance");
-            fails(NGX_PURGE_STORE_CONFLICT, [&] { index.collect_file(a.id, 2); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_CONFLICT, [&] { index.collect_file(a.id, 2); });
             index.collect_file(a.id, 3);
             check(index.get(competing.id).state == FileState::committed, "old cleanup preserves new path instance");
             auto changed = index.update_metadata(competing.id, 2, "304 success", {"updated"});
             check(changed.revision == 3, "metadata revision");
             check(selected(index, {SelectorKind::namespace_tag, "updated", "team"}) == std::set<unsigned>{11}, "TAG replacement added");
             check(!selected(index, {SelectorKind::namespace_tag, "photo", "team"}).count(11), "TAG replacement removed old relation");
-            fails(NGX_PURGE_STORE_CONFLICT, [&] { index.update_metadata(competing.id, 2, "stale", {"photo"}); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_CONFLICT, [&] { index.update_metadata(competing.id, 2, "stale", {"photo"}); });
             check(index.get(competing.id).metadata == "304 success", "stale metadata update rejected");
 
             const std::string alias = "https://aliases.test/";
@@ -271,7 +271,7 @@ int main(int argc, char **argv) {
                 pages(index, selector);
             auto wrong = index.query({SelectorKind::url, a.url, ""}); Match m;
             check(wrong->next(m), "bookmark source"); auto token = wrong->bookmark(); wrong.reset();
-            fails(NGX_PURGE_STORE_INVALID, [&] { index.query({SelectorKind::url, e.url, ""}, token); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_INVALID, [&] { index.query({SelectorKind::url, e.url, ""}, token); });
 
             auto expected_snapshot = selected(index, {SelectorKind::url, a.url, ""});
             auto snapshot = index.query({SelectorKind::url, a.url, ""});
@@ -308,15 +308,15 @@ int main(int argc, char **argv) {
 
             std::vector<Fill> fills;
             for (unsigned n = 100; n != 132; ++n) fills.push_back({file(n, "/batch/" + std::to_string(n)), {}});
-            ngx_cache_purge_store_stats_t before, after;
-            check(ngx_cache_purge_store_stats(store, &before, &error) == 0, "batch initial stats");
+            ngx_http_cache_rocksdb_stats_t before, after;
+            check(ngx_http_cache_rocksdb_stats(store, &before, &error) == 0, "batch initial stats");
             auto batched = index.prepare_batch(fills);
-            check(ngx_cache_purge_store_stats(store, &after, &error) == 0 && after.writes == before.writes + 1,
+            check(ngx_http_cache_rocksdb_stats(store, &after, &error) == 0 && after.writes == before.writes + 1,
                   "32 prepares share one durable write");
             std::vector<ExpectedFile> revisions;
             for (const auto &entry : batched) revisions.push_back({entry.id, entry.revision});
             auto invalid_batch = revisions; invalid_batch.back().revision = 999;
-            fails(NGX_PURGE_STORE_CONFLICT, [&] { index.commit_batch(invalid_batch); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_CONFLICT, [&] { index.commit_batch(invalid_batch); });
             check(index.get(revisions.front().id).state == FileState::prepared, "failed commit batch is entirely rolled back");
             auto committed = index.commit_batch(revisions);
             revisions.clear(); for (const auto &entry : committed) revisions.push_back({entry.id, entry.revision});
@@ -328,9 +328,9 @@ int main(int argc, char **argv) {
             auto pending = file(99, "/unfinished"); index.prepare(pending);
             auto queued = file(98, "/retired"); install(index, queued); index.retire(queued.id, 2);
         }
-        check(ngx_cache_purge_store_close(&store, &error) == 0, error.message);
+        check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
         options.cursor_lifetime_ms = 250;
-        check(ngx_cache_purge_store_open(path, &options, &store, &error) == 0, error.message);
+        check(ngx_http_cache_rocksdb_open(path, &options, &store, &error) == 0, error.message);
         {
             Index index(store);
             Selector selector{SelectorKind::url, "https://shared.cache.test/dir/a", ""};
@@ -338,7 +338,7 @@ int main(int argc, char **argv) {
             check(expiring->next(first), "expiration first result");
             auto resume = expiring->bookmark(); std::vector<unsigned> actual{numeric(first.id)};
             std::this_thread::sleep_for(std::chrono::milliseconds(300));
-            fails(NGX_PURGE_STORE_EXPIRED, [&] { expiring->next(first); }); expiring.reset();
+            fails(NGX_HTTP_CACHE_ROCKSDB_EXPIRED, [&] { expiring->next(first); }); expiring.reset();
             auto continued = index.query(selector, resume);
             while (continued->next(first)) actual.push_back(numeric(first.id));
             continued.reset();
@@ -362,13 +362,13 @@ int main(int argc, char **argv) {
             }
             unsigned passes = 0;
             while (index.collect_keys(3)) check(++passes < 100, "bounded GC makes progress");
-            check(raw_keys(store, NGX_PURGE_STORE_URL).empty(), "URL CF reclaimed");
-            check(raw_keys(store, NGX_PURGE_STORE_TAG).empty(), "TAG CF reclaimed");
-            auto keys = raw_keys(store, NGX_PURGE_STORE_DEFAULT);
+            check(raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_URL).empty(), "URL CF reclaimed");
+            check(raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_TAG).empty(), "TAG CF reclaimed");
+            auto keys = raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT);
             check(keys.size() == 3 && std::find(keys.begin(), keys.end(), "M:index") != keys.end()
                   && std::find(keys.begin(), keys.end(), "M:next") != keys.end(), "all file/value/component/alias records reclaimed");
         }
-        check(ngx_cache_purge_store_close(&store, &error) == 0, error.message);
+        check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
         std::cout << "PASS " << assertions << " index assertions; database " << path << std::endl;
         return 0;
     } catch (const std::exception &error) {

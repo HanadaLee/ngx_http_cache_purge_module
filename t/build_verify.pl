@@ -72,7 +72,7 @@ if ($sanitize && $^O eq 'linux') {
 }
 my ($sources) = read_file("$module/config") =~ /CACHE_PURGE_SRCS="([^"]+)"/s;
 die "missing module source list" unless defined $sources;
-for my $unit ($sources =~ /(ngx_cache_purge_\w+)\.c/g) {
+for my $unit ($sources =~ /(ngx_http_cache_purge_\w+)\.c/g) {
     $makefile =~ /(\S*addon\/\S*\Q$unit\E\.o)/ or die "missing object: $unit";
     my $target = $1;
     make_path(dirname($target));

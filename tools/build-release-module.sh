@@ -20,7 +20,7 @@ arch=$(uname -m)
 case "$arch" in x86_64|aarch64) ;; *) echo "Unsupported architecture: $arch" >&2; exit 1;; esac
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-name="ngx_cache_purge-${MODULE_VERSION}-nginx-${NGINX_VERSION}-linux-${arch}"
+name="ngx_http_cache_purge-${MODULE_VERSION}-nginx-${NGINX_VERSION}-linux-${arch}"
 stage="$work/$name"
 mkdir -p "$stage"
 sh t/download.sh "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" "$work/nginx.tar.gz"
@@ -28,7 +28,7 @@ tar --no-same-owner -xzf "$work/nginx.tar.gz" -C "$work"
 cd "$work/nginx-$NGINX_VERSION"
 ./configure --with-compat --with-threads --with-http_ssl_module \
     --add-dynamic-module="$module_dir" \
-    --with-cc-opt="-ffile-prefix-map=$work=/usr/src/build -ffile-prefix-map=$module_dir=/usr/src/ngx_cache_purge"
+    --with-cc-opt="-ffile-prefix-map=$work=/usr/src/build -ffile-prefix-map=$module_dir=/usr/src/ngx_http_cache_purge"
 make -j"$(getconf _NPROCESSORS_ONLN)"
 cp objs/ngx_http_cache_purge_module.so "$stage/"
 # Exercise the delivered .so, rather than a statically linked module.
@@ -75,7 +75,7 @@ python3 - "$stage/BUILD-INFO.txt" "$work" "$module_dir" <<'PYTHON'
 import pathlib, sys
 path = pathlib.Path(sys.argv[1])
 text = path.read_text().replace(sys.argv[2], '/usr/src/build')
-path.write_text(text.replace(sys.argv[3], '/usr/src/ngx_cache_purge'))
+path.write_text(text.replace(sys.argv[3], '/usr/src/ngx_http_cache_purge'))
 PYTHON
 (cd "$stage" && sha256sum ngx_http_cache_purge_module.so > SHA256SUMS)
 chmod 644 "$stage"/*

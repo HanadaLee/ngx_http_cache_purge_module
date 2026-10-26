@@ -1,9 +1,10 @@
-int main(void)
+int
+main(void)
 {
-    test_conf_t conf = { 2, 100, NULL };
-    ngx_cycle_t cycle = 0;
-    ngx_event_t event = { &cycle };
-    ngx_http_cache_purge_work_t *work = &ngx_cache_purge_work;
+    test_conf_t                  conf = { 2, 100, NULL };
+    ngx_cycle_t                  cycle = 0;
+    ngx_event_t                  event = { &cycle };
+    ngx_http_cache_purge_work_t *work = &ngx_http_cache_purge_work;
 
     work->conf = &conf;
     script(NGX_AGAIN, NGX_BUSY);

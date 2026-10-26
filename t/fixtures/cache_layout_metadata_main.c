@@ -1,14 +1,14 @@
 int
 main(void)
 {
-    ngx_http_file_cache_t cache;
-    ngx_http_file_cache_sh_t shared;
-    ngx_slab_pool_t pool;
-    ngx_http_file_cache_node_t node;
-    ngx_rbtree_node_t sentinel;
-    ngx_str_t path = ngx_string("/cache/000102030405060708090a0b0c0d0e0f");
-    u_char key[NGX_HTTP_CACHE_KEY_LEN];
-    ngx_uint_t i;
+    ngx_http_file_cache_t       cache;
+    ngx_http_file_cache_sh_t    shared;
+    ngx_slab_pool_t             pool;
+    ngx_http_file_cache_node_t  node;
+    ngx_rbtree_node_t           sentinel;
+    ngx_str_t  path = ngx_string("/cache/000102030405060708090a0b0c0d0e0f");
+    u_char      key[NGX_HTTP_CACHE_KEY_LEN];
+    ngx_uint_t  i;
 
     memset(&cache, 0, sizeof(cache));
     memset(&shared, 0, sizeof(shared));

@@ -1,5 +1,12 @@
 # ngx_http_cache_purge
 
+This repository builds two HTTP modules in persistent mode:
+`ngx_http_cache_rocksdb_module` provides the bounded RocksDB C API, and
+`ngx_http_cache_purge_module` implements HTTP cache indexing and purge behavior.
+Both modules remain in this repository. The engine bridge is isolated in
+`rocksdb/`; the migration of the remaining C++ purge implementation to C is in
+progress. File markers and OFD leases already use a C implementation.
+
 HTTP cache invalidation for nginx proxy, FastCGI, SCGI, and uWSGI caches.
 
 The module is undergoing a storage and lifecycle redesign. The default build
@@ -137,7 +144,7 @@ ctest --test-dir /tmp/cache-purge-store --output-on-failure
 ```
 
 Its blocking APIs belong on the index component's execution thread.
-They must not run directly in HTTP workers.
+They must not run on an HTTP worker's event loop.
 
 To build the development runtime into nginx, supply the directory containing
 the CMake archives when configuring the addon:
@@ -146,6 +153,13 @@ the CMake archives when configuring the addon:
 CACHE_PURGE_ROCKSDB_LIB_DIR=/tmp/cache-purge-store \
     ./configure --add-module=/path/to/ngx_http_cache_purge
 make
+```
+
+Dynamic persistent builds produce two module files. Load the provider first:
+
+```nginx
+load_module modules/ngx_http_cache_rocksdb_module.so;
+load_module modules/ngx_http_cache_purge_module.so;
 ```
 
 This requires Linux, HTTP cache support, and `master_process on`. The persistent

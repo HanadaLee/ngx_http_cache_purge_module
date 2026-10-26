@@ -1,8 +1,8 @@
-#include "ngx_cache_purge_operations.hpp"
+#include "ngx_http_cache_purge_operations.hpp"
 #include <unistd.h>
 #include <iostream>
 
-using namespace ngx_cache_purge;
+using namespace ngx_http_cache_purge;
 static unsigned assertions;
 static void check(bool value, const char *message) {
     if (!value) throw std::runtime_error(message);
@@ -16,30 +16,30 @@ template<class Function> void fails(int code, Function function) {
 static OperationInput input(std::string id, PurgeMode mode = PurgeMode::invalidate) {
     return {std::move(id), {SelectorKind::namespace_tag, "photo", "team"}, mode, 1000, "config-v1"};
 }
-static ngx_cache_purge_store_t *open(const char *path) {
-    ngx_cache_purge_store_options_t options; ngx_cache_purge_store_options(&options);
-    ngx_cache_purge_store_t *store = nullptr; ngx_cache_purge_store_error_t error;
-    check(ngx_cache_purge_store_open(path, &options, &store, &error) == 0, error.message); return store;
+static ngx_http_cache_rocksdb_t *open(const char *path) {
+    ngx_http_cache_rocksdb_options_t options; ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr; ngx_http_cache_rocksdb_error_t error;
+    check(ngx_http_cache_rocksdb_open(path, &options, &store, &error) == 0, error.message); return store;
 }
-static void close(ngx_cache_purge_store_t *&store) {
-    ngx_cache_purge_store_error_t error;
-    check(ngx_cache_purge_store_close(&store, &error) == 0, error.message);
+static void close(ngx_http_cache_rocksdb_t *&store) {
+    ngx_http_cache_rocksdb_error_t error;
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
 }
 static OperationCheckpoint point(uint64_t id, bool done, uint64_t pending = 0, uint64_t failed = 0) {
     return {id, "opaque-index-bookmark", done, 1200, 1, pending, failed, failed ? "file busy" : ""};
 }
-static uint64_t writes(ngx_cache_purge_store_t *store) {
-    ngx_cache_purge_store_stats_t stats; ngx_cache_purge_store_error_t error;
-    check(ngx_cache_purge_store_stats(store, &stats, &error) == 0, "ledger write stats"); return stats.writes;
+static uint64_t writes(ngx_http_cache_rocksdb_t *store) {
+    ngx_http_cache_rocksdb_stats_t stats; ngx_http_cache_rocksdb_error_t error;
+    check(ngx_http_cache_rocksdb_stats(store, &stats, &error) == 0, "ledger write stats"); return stats.writes;
 }
-static ngx_cache_purge_bytes_t bytes(const std::string &s) {
+static ngx_http_cache_rocksdb_bytes_t bytes(const std::string &s) {
     return {reinterpret_cast<const unsigned char *>(s.data()), s.size()};
 }
-static void raw_write(ngx_cache_purge_store_t *store, const std::string &key, const std::string &value, bool remove = false) {
-    ngx_cache_purge_mutation_t mutation{NGX_PURGE_STORE_DEFAULT, remove ? NGX_PURGE_STORE_DELETE : NGX_PURGE_STORE_PUT,
+static void raw_write(ngx_http_cache_rocksdb_t *store, const std::string &key, const std::string &value, bool remove = false) {
+    ngx_http_cache_rocksdb_mutation_t mutation{NGX_HTTP_CACHE_ROCKSDB_DEFAULT, remove ? NGX_HTTP_CACHE_ROCKSDB_DELETE : NGX_HTTP_CACHE_ROCKSDB_PUT,
                                       bytes(key), bytes(value)};
-    ngx_cache_purge_store_error_t error;
-    check(ngx_cache_purge_store_write(store, &mutation, 1, nullptr, 0, &error) == 0, "raw corruption fixture");
+    ngx_http_cache_rocksdb_error_t error;
+    check(ngx_http_cache_rocksdb_write(store, &mutation, 1, nullptr, 0, &error) == 0, "raw corruption fixture");
 }
 
 int main(int argc, char **argv) {
@@ -68,44 +68,44 @@ int main(int argc, char **argv) {
         auto *store = open(path);
         {
             Index index(store); Operations ops(store, {2, 4096});
-            auto invalid = input("bad id"); fails(NGX_PURGE_STORE_INVALID, [&] { ops.accept(invalid, 1000); });
+            auto invalid = input("bad id"); fails(NGX_HTTP_CACHE_ROCKSDB_INVALID, [&] { ops.accept(invalid, 1000); });
             invalid = input("bad"); invalid.selector.scope.clear();
-            fails(NGX_PURGE_STORE_INVALID, [&] { ops.accept(invalid, 1000); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_INVALID, [&] { ops.accept(invalid, 1000); });
             auto a = ops.accept(input("a"), 1000);
             check(a.revision == 1 && a.sequence == 1 && !a.effective_at_ms && !a.propagate
                   && a.stage == OperationStage::preparing, "durable acceptance is not effective");
             auto before = writes(store);
             check(ops.accept(input("a"), 9999, 0).revision == 1 && writes(store) == before, "same ID is a read-only replay");
             auto changed = input("a"); changed.selector.scope = "other";
-            fails(NGX_PURGE_STORE_CONFLICT, [&] { ops.accept(changed, 1000); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_CONFLICT, [&] { ops.accept(changed, 1000); });
             changed = input("a", PurgeMode::remove);
-            fails(NGX_PURGE_STORE_CONFLICT, [&] { ops.accept(changed, 1000); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_CONFLICT, [&] { ops.accept(changed, 1000); });
             auto b = ops.accept(input("b", PurgeMode::remove), 1001, 100);
             check(b.sequence == 2 && ops.live().items.size() == 2, "overlapping Delete/Invalidate remain separate");
             check(ops.usage().live_records == 2 && ops.usage().last_sequence == 2, "persistent resident usage watermark");
-            fails(NGX_PURGE_STORE_LIMIT, [&] { ops.accept(input("c"), 1002); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_LIMIT, [&] { ops.accept(input("c"), 1002); });
             check(ops.due(2000).items.empty(), "unpublished operations cannot be scheduled");
             auto first = ops.live("", 1), second = ops.live(first.after, 1), end = ops.live(second.after, 1);
             check(first.items[0].input.id == "a" && second.items[0].input.id == "b" && end.done, "paged recovery order");
-            fails(NGX_PURGE_STORE_INVALID, [&] { ops.live("Qbad", 1); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_INVALID, [&] { ops.live("Qbad", 1); });
             a = ops.activate("a", 1, 1100);
             check(a.propagate && a.propagation_until_ms == 301100 && a.stage == OperationStage::active, "activation freezes sending window");
             check(ops.activate("a", a.revision, 9999).propagation_until_ms == 301100, "activation retry does not extend window");
             check(ops.due(1099).items.empty() && ops.due(1100).items.size() == 1, "due time scheduling");
-            fails(NGX_PURGE_STORE_BUSY, [&] { ops.materialize("a", a.revision, a.sequence); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_BUSY, [&] { ops.materialize("a", a.revision, a.sequence); });
             auto p = point(1, true, 1, 1);
             a = ops.checkpoint("a", a.revision, p);
             check(a.stage == OperationStage::draining && a.visits == 1, "EOF enters drain state");
             before = writes(store);
             check(ops.checkpoint("a", 2, p).visits == 1 && writes(store) == before, "checkpoint reply loss does not double count");
             auto other = p; other.failed = 0;
-            fails(NGX_PURGE_STORE_CONFLICT, [&] { ops.checkpoint("a", a.revision, other); });
-            fails(NGX_PURGE_STORE_BUSY, [&] { ops.materialize("a", a.revision, a.sequence); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_CONFLICT, [&] { ops.checkpoint("a", a.revision, other); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_BUSY, [&] { ops.materialize("a", a.revision, a.sequence); });
             check(ops.expire_propagation(301099) == 0 && ops.expire_propagation(301100) == 1, "local propagation expiration");
             a = ops.get("a");
             check(!a.propagate && ops.live().items.size() == 2 && !ops.due(400000).items.empty(), "propagation timeout never clears FENCE or jobs");
             p = point(2, true); a = ops.checkpoint("a", a.revision, p);
-            fails(NGX_PURGE_STORE_BUSY, [&] { ops.materialize("a", a.revision, 0); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_BUSY, [&] { ops.materialize("a", a.revision, 0); });
             a = ops.materialize("a", a.revision, a.sequence);
             check(ops.live().items.size() == 1 && ops.due(400000).items.empty(), "verified drain releases fence and schedule");
             check(ops.accept(input("a"), 900000).stage == OperationStage::materialized, "completed ID remains a receipt");
@@ -122,7 +122,7 @@ int main(int argc, char **argv) {
             (void) d;
             Operations lowered(store, {1, 1024});
             check(lowered.live().items.size() == 2, "lowered capacity retains existing controls");
-            fails(NGX_PURGE_STORE_LIMIT, [&] { lowered.accept(input("e"), 3002); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_LIMIT, [&] { lowered.accept(input("e"), 3002); });
         }
         close(store); store = open(path);
         {
@@ -139,15 +139,15 @@ int main(int argc, char **argv) {
             auto before = writes(store);
             check(ops.expire_propagation(4100, 32) == 32 && writes(store) == before + 1, "32 propagation expirations share one durable batch");
             check(ops.live().items.size() == 1 && ops.live().items[0].input.id == "d", "batch expiry preserves unpublished fence");
-            fails(NGX_PURGE_STORE_NOT_FOUND, [&] { ops.get("missing"); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND, [&] { ops.get("missing"); });
             auto d = ops.get("d"); std::string link = "L";
             for (int shift = 56; shift >= 0; shift -= 8) link += static_cast<char>(d.sequence >> shift);
             raw_write(store, link, "", true);
-            fails(NGX_PURGE_STORE_CORRUPT, [&] { ops.get("d"); });
-            fails(NGX_PURGE_STORE_CORRUPT, [&] { ops.accept(input("d"), 9999); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_CORRUPT, [&] { ops.get("d"); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_CORRUPT, [&] { ops.accept(input("d"), 9999); });
             raw_write(store, link, "d");
             raw_write(store, "M:operations", "future");
-            fails(NGX_PURGE_STORE_SCHEMA, [&] { Operations unsupported(store); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_SCHEMA, [&] { Operations unsupported(store); });
             raw_write(store, "M:operations", "1");
             check(ops.get("d").sequence == d.sequence, "schema rejection preserves existing operation");
             for (unsigned n = 0; n != 10; ++n) {

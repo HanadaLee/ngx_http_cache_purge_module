@@ -39,6 +39,10 @@ for directory in (build, addon, key): directory.mkdir()
 for source, destination in [(repo, addon), (a.key, key)]:
     for path in [source / 'config', *source.glob('*.c'), *source.glob('*.h')]:
         (destination / path.name).write_bytes(path.read_bytes().replace(b'\r\n', b'\n'))
+(addon / 'rocksdb').mkdir()
+for path in (repo / 'rocksdb').iterdir():
+    if path.suffix in ('.c', '.h'):
+        (addon / 'rocksdb' / path.name).write_bytes(path.read_bytes().replace(b'\r\n', b'\n'))
 revision = subprocess.check_output(['git', '-C', str(a.nginx), 'rev-parse', a.nginx_ref], text=True).strip()
 archive = subprocess.check_output(['git', '-c', 'core.autocrlf=false', '-C', str(a.nginx), 'archive', revision])
 subprocess.run(['tar', '-xf', '-', '-C', str(build)], input=archive, check=True)
@@ -151,7 +155,7 @@ for name, server in gateways.items():
       {name}_pass 127.0.0.1:{server.server_address[1]};
     }}''')
 loads = ''.join(f'load_module {build}/objs/{name}.so;\n' for name in
-                ('ngx_http_cache_key_module', 'ngx_http_cache_purge_module')) if a.dynamic else ''
+                ('ngx_http_cache_key_module', 'ngx_http_cache_rocksdb_module', 'ngx_http_cache_purge_module')) if a.dynamic else ''
 extension = any(line.split() == ['#define', 'NGX_RESTY_EXT', '1']
                 for line in (build / 'objs/ngx_auto_config.h').read_text().splitlines())
 slice_config = 'slice on; slice_size 1024;' if extension else 'slice 1024;'
@@ -369,9 +373,9 @@ result = {'root': str(root), 'run': str(run), 'nginx_revision': revision,
           'core_source_patch_sha256': hashlib.sha256(source_patch).hexdigest(),
           'dynamic': a.dynamic, 'sanitizer': a.sanitize, 'expr': bool(a.expr), 'extension': extension,
           'workers': a.workers, 'checks': checks,
-          'sources': {group: {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in directory.iterdir()}
+          'sources': {group: {str(p.relative_to(directory)): hashlib.sha256(p.read_bytes()).hexdigest() for p in directory.rglob('*') if p.is_file()}
                       for group, directory in [('addon', addon), ('key', key)]},
-          'library_sha256': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in a.libraries.glob('libngx_cache_purge_*.a')},
+          'library_sha256': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in a.libraries.glob('libngx_http_cache_*.a')},
           'scope': 'Real key provider and upstream PREPARE/rename/FINISH over bounded worker IPC; no completed purge API or FENCE activation'}
 a.output.write_text(json.dumps(result, indent=2) + '\n')
 print('PASS', len(checks), 'native index capture checks')

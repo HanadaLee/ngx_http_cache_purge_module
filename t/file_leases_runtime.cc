@@ -1,5 +1,5 @@
 /* Kernel-backed leases across threads, descriptor handoff, and process death. */
-#include "ngx_cache_purge_files.h"
+#include "ngx_http_cache_purge_files.h"
 #include <atomic>
 #include <cerrno>
 #include <cstring>
@@ -16,7 +16,7 @@
 #include <unistd.h>
 
 static unsigned assertions;
-static ngx_cache_purge_store_error_t error;
+static ngx_http_cache_rocksdb_error_t error;
 static void check(bool value, const char *message) {
     ++assertions;
     if (!value) throw std::runtime_error(std::string(message) + ": " + error.message);
@@ -42,7 +42,7 @@ struct Child {
     }
 };
 static void release(FD &fd) {
-    check(ngx_cache_purge_file_lease_release(&fd.value, &error) == 0 && fd.value == -1,
+    check(ngx_http_cache_purge_file_lease_release(&fd.value, &error) == 0 && fd.value == -1,
           "release one owned reference");
 }
 static int send_fd(int channel, int fd) {
@@ -90,51 +90,51 @@ int main(int argc, char **argv) {
         check(mkdtemp(temporary), "temporary lease directory");
         std::string root(temporary), path = root + "/locks";
         FD anchor;
-        check(ngx_cache_purge_file_locks_open(path.c_str(), getuid(), 1, &anchor.value, &error) == 0,
+        check(ngx_http_cache_purge_file_locks_open(path.c_str(), getuid(), 1, &anchor.value, &error) == 0,
               "create persistent anchor");
         FD first, second, distinct;
-        check(ngx_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &first.value, &error) == 0,
+        check(ngx_http_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &first.value, &error) == 0,
               "acquire first lease");
-        check(ngx_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &second.value, &error)
-              == NGX_PURGE_STORE_BUSY && second.value == -1, "same-PID acquisition must conflict");
-        check(ngx_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 43, &distinct.value, &error) == 0,
+        check(ngx_http_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &second.value, &error)
+              == NGX_HTTP_CACHE_ROCKSDB_BUSY && second.value == -1, "same-PID acquisition must conflict");
+        check(ngx_http_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 43, &distinct.value, &error) == 0,
               "unrelated path remains available");
         release(distinct);
         FD shared(fcntl(first.value, F_DUPFD_CLOEXEC, 0));
         check(shared.value >= 0, "duplicate an existing lease reference");
         release(first);
-        check(ngx_cache_purge_file_lease_adopt(anchor.value, shared.value, 42, &error) == 0,
+        check(ngx_http_cache_purge_file_lease_adopt(anchor.value, shared.value, 42, &error) == 0,
               "executor in same PID adopts the same description");
         FD unowned;
-        check(ngx_cache_purge_file_locks_open(path.c_str(), getuid(), 0, &unowned.value, &error) == 0,
+        check(ngx_http_cache_purge_file_locks_open(path.c_str(), getuid(), 0, &unowned.value, &error) == 0,
               "independent unowned descriptor");
-        check(ngx_cache_purge_file_lease_adopt(anchor.value, unowned.value, 42, &error) == NGX_PURGE_STORE_BUSY,
+        check(ngx_http_cache_purge_file_lease_adopt(anchor.value, unowned.value, 42, &error) == NGX_HTTP_CACHE_ROCKSDB_BUSY,
               "same inode alone does not grant a held lease");
         release(unowned);
-        check(ngx_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &second.value, &error)
-              == NGX_PURGE_STORE_BUSY, "closing unrelated descriptors cannot drop a held lease");
+        check(ngx_http_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &second.value, &error)
+              == NGX_HTTP_CACHE_ROCKSDB_BUSY, "closing unrelated descriptors cannot drop a held lease");
         release(shared);
-        check(ngx_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &second.value, &error) == 0,
+        check(ngx_http_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &second.value, &error) == 0,
               "last reference releases the lease");
         release(second);
 
         FD other;
         auto other_path = root + "/other";
-        check(ngx_cache_purge_file_locks_open(other_path.c_str(), getuid(), 1, &other.value, &error) == 0,
+        check(ngx_http_cache_purge_file_locks_open(other_path.c_str(), getuid(), 1, &other.value, &error) == 0,
               "second lock file");
-        check(ngx_cache_purge_file_lease_adopt(anchor.value, other.value, 42, &error) == NGX_PURGE_STORE_OWNER,
+        check(ngx_http_cache_purge_file_lease_adopt(anchor.value, other.value, 42, &error) == NGX_HTTP_CACHE_ROCKSDB_OWNER,
               "reject a foreign lock inode");
-        check(ngx_cache_purge_file_lease_acquire(other_path.c_str(), anchor.value, 42, &second.value, &error)
-              == NGX_PURGE_STORE_OWNER && second.value == -1, "acquisition checks the pinned anchor inode");
+        check(ngx_http_cache_purge_file_lease_acquire(other_path.c_str(), anchor.value, 42, &second.value, &error)
+              == NGX_HTTP_CACHE_ROCKSDB_OWNER && second.value == -1, "acquisition checks the pinned anchor inode");
         check(fchmod(other.value, 0644) == 0, "unsafe mode fixture");
-        check(ngx_cache_purge_file_lease_adopt(anchor.value, other.value, 42, &error) == NGX_PURGE_STORE_INVALID,
+        check(ngx_http_cache_purge_file_lease_adopt(anchor.value, other.value, 42, &error) == NGX_HTTP_CACHE_ROCKSDB_INVALID,
               "reject permissive lease file");
         check(fchmod(other.value, 0600) == 0, "restore mode fixture");
         FD readonly(open(path.c_str(), O_RDONLY | O_CLOEXEC));
-        check(ngx_cache_purge_file_lease_adopt(anchor.value, readonly.value, 42, &error) == NGX_PURGE_STORE_INVALID,
+        check(ngx_http_cache_purge_file_lease_adopt(anchor.value, readonly.value, 42, &error) == NGX_HTTP_CACHE_ROCKSDB_INVALID,
               "reject read-only descriptors");
-        check(ngx_cache_purge_file_lease_acquire(path.c_str(), anchor.value, UINT64_MAX, &second.value, &error)
-              == NGX_PURGE_STORE_INVALID && second.value == -1, "reject out-of-range offsets");
+        check(ngx_http_cache_purge_file_lease_acquire(path.c_str(), anchor.value, UINT64_MAX, &second.value, &error)
+              == NGX_HTTP_CACHE_ROCKSDB_INVALID && second.value == -1, "reject out-of-range offsets");
 
         // Fork only before creating any test threads. Queued SCM_RIGHTS
         // references survive the sending worker until received or discarded.
@@ -148,7 +148,7 @@ int main(int argc, char **argv) {
             if (!pid) {
                 close(receiver.value); close(ready_read.value);
                 int fd;
-                if (ngx_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &fd, &error)) _exit(2);
+                if (ngx_http_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &fd, &error)) _exit(2);
                 if (transfer && send_fd(sender.value, fd)) _exit(3);
                 char ready = 'R';
                 if (write(ready_write.value, &ready, 1) != 1) _exit(4);
@@ -158,26 +158,26 @@ int main(int argc, char **argv) {
             release(sender); release(ready_write);
             char ready;
             check(read(ready_read.value, &ready, 1) == 1 && ready == 'R', "holder owns lease before observation");
-            check(ngx_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &first.value, &error)
-                  == NGX_PURGE_STORE_BUSY, "live process holds path exclusively");
+            check(ngx_http_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &first.value, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_BUSY, "live process holds path exclusively");
             child.stop();
             if (transfer) {
-                check(ngx_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &first.value, &error)
-                      == NGX_PURGE_STORE_BUSY, "queued descriptor survives sender SIGKILL");
+                check(ngx_http_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &first.value, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_BUSY, "queued descriptor survives sender SIGKILL");
                 FD received(receive_fd(receiver.value));
                 check((fcntl(received.value, F_GETFD) & FD_CLOEXEC) != 0, "received lease is close-on-exec");
-                check(ngx_cache_purge_file_lease_adopt(anchor.value, received.value, 42, &error) == 0,
+                check(ngx_http_cache_purge_file_lease_adopt(anchor.value, received.value, 42, &error) == 0,
                       "receiver safely adopts the transferred lease");
-                check(ngx_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &first.value, &error)
-                      == NGX_PURGE_STORE_BUSY, "executor retains exclusive access after sender death");
+                check(ngx_http_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &first.value, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_BUSY, "executor retains exclusive access after sender death");
                 release(received);
             }
-            check(ngx_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &first.value, &error) == 0,
+            check(ngx_http_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &first.value, &error) == 0,
                   "recovery acquires only after all descriptions are gone");
             release(first);
         }
 
-        check(ngx_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &first.value, &error) == 0,
+        check(ngx_http_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &first.value, &error) == 0,
               "lease for exec inheritance check");
         auto fd_argument = std::to_string(first.value);
         pid_t pid = fork(); check(pid >= 0, "fork exec verifier");
@@ -193,7 +193,7 @@ int main(int argc, char **argv) {
 
         auto before = descriptor_count();
         for (unsigned i = 0; i < 128; ++i) {
-            check(ngx_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &first.value, &error) == 0,
+            check(ngx_http_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &first.value, &error) == 0,
                   "repeat acquisition");
             int sockets[2];
             check(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0, "discarded handoff socket");
@@ -201,7 +201,7 @@ int main(int argc, char **argv) {
             check(send_fd(sender.value, first.value) == 0, "queue lease reference");
             release(first);
             release(receiver); // Kernel discards the unreceived SCM_RIGHTS reference.
-            check(ngx_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &second.value, &error) == 0,
+            check(ngx_http_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &second.value, &error) == 0,
                   "closed receiver releases queued lease");
             release(second);
         }
@@ -214,14 +214,14 @@ int main(int argc, char **argv) {
             threads.emplace_back([&] {
                 ++ready;
                 while (!start.load()) std::this_thread::yield();
-                int fd = -1; ngx_cache_purge_store_error_t local;
-                int rc = ngx_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &fd, &local);
+                int fd = -1; ngx_http_cache_rocksdb_error_t local;
+                int rc = ngx_http_cache_purge_file_lease_acquire(path.c_str(), anchor.value, 42, &fd, &local);
                 if (!rc) ++winners;
-                else if (rc == NGX_PURGE_STORE_BUSY) ++busy;
+                else if (rc == NGX_HTTP_CACHE_ROCKSDB_BUSY) ++busy;
                 else ++failures;
                 ++completed;
                 while (!finish.load()) std::this_thread::yield();
-                if (fd >= 0 && ngx_cache_purge_file_lease_release(&fd, &local)) ++failures;
+                if (fd >= 0 && ngx_http_cache_purge_file_lease_release(&fd, &local)) ++failures;
             });
         }
         while (ready != 16) std::this_thread::yield();

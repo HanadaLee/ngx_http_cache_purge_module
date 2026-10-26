@@ -22,15 +22,19 @@ force(ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data)
 static ngx_int_t
 pre(ngx_conf_t *cf)
 {
-    ngx_str_t name = ngx_string("cache_revalidate_probe");
-    ngx_http_variable_t *v = ngx_http_add_variable(cf, &name, NGX_HTTP_VAR_NOCACHEABLE);
-    if (!v) { return NGX_ERROR; }
+    ngx_str_t            name = ngx_string("cache_revalidate_probe");
+    ngx_http_variable_t *v =
+        ngx_http_add_variable(cf, &name, NGX_HTTP_VAR_NOCACHEABLE);
+    if (!v) {
+        return NGX_ERROR;
+    }
     v->get_handler = force;
     return NGX_OK;
 }
 
-static ngx_http_module_t context = { pre, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
-ngx_module_t ngx_http_revalidate_probe_module = {
-    NGX_MODULE_V1, &context, NULL, NGX_HTTP_MODULE,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NGX_MODULE_V1_PADDING
+static ngx_http_module_t context = { pre,  NULL, NULL, NULL,
+                                     NULL, NULL, NULL, NULL };
+ngx_module_t             ngx_http_revalidate_probe_module = {
+    NGX_MODULE_V1, &context, NULL, NGX_HTTP_MODULE,      NULL, NULL, NULL, NULL,
+    NULL,          NULL,     NULL, NGX_MODULE_V1_PADDING
 };

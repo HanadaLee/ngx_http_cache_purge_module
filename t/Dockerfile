@@ -84,7 +84,7 @@ ENV NGINX_SOURCE=/opt/nginx \
 
 # Test and documentation edits must not invalidate the configured server build.
 FROM core-source AS source
-COPY config ngx_cache_purge*.c ngx_cache_purge*.h /src/
+COPY config ngx_http_cache_purge*.c ngx_http_cache_purge*.h /src/
 
 # Strict GCC/Clang and sanitizer jobs build their selected configuration at run time.
 FROM source AS verify

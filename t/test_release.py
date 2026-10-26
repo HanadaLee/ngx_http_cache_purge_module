@@ -43,7 +43,7 @@ class ReleasePublication(unittest.TestCase):
             gh = root / 'bin' / 'gh'
             gh.write_text(GH)
             gh.chmod(0o755)
-            assets = [f'ngx_cache_purge-{tag}-nginx-{v}-linux-{a}.{e}'
+            assets = [f'ngx_http_cache_purge-{tag}-nginx-{v}-linux-{a}.{e}'
                       for v in ('1.30.6', '1.31.7')
                       for a in ('x86_64', 'aarch64') for e in ('tar.gz', 'zip')]
             for name in assets[1:] if missing else assets:

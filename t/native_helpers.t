@@ -51,9 +51,9 @@ sub capture {
 
 my ($sources) = read_file("$root/config") =~ /CACHE_PURGE_SRCS="([^"]+)"/s;
 die "missing module source list" unless defined $sources;
-my $source = read_file("$root/ngx_cache_purge.h")
+my $source = read_file("$root/ngx_http_cache_purge.h")
              . join "\n", map { read_file("$root/$_.c") }
-               ($sources =~ /(ngx_cache_purge_\w+)\.c/g);
+               ($sources =~ /(ngx_http_cache_purge_\w+)\.c/g);
 sub function {
     my ($name, $text) = @_;
     $text = $source unless defined $text;
@@ -68,9 +68,9 @@ sub function {
 sub platform_function {
     my ($name) = @_;
     return "#if (NGX_WIN32)\n"
-           . function($name, read_file("$root/ngx_cache_purge_win32.h"))
+           . function($name, read_file("$root/ngx_http_cache_purge_win32.h"))
            . "#else\n"
-           . function($name, read_file("$root/ngx_cache_purge_posix.h"))
+           . function($name, read_file("$root/ngx_http_cache_purge_posix.h"))
            . "#endif\n\n";
 }
 
@@ -173,7 +173,7 @@ subtest 'bounded traversal and allocation-error cleanup' => sub {
                . fixture('directory_walk_main')
                . ($ENV{TEST_NGINX_NO_LEAK_CHECK} ? fixture('no_leak_check') : ''));
     for my $relative (0, 1) {
-        run(@cc, @asan, "-DNGX_CACHE_PURGE_HAVE_AT=$relative",
+        run(@cc, @asan, "-DNGX_HTTP_CACHE_PURGE_HAVE_AT=$relative",
             "$tmp/walk.c", '-o', "$tmp/walk");
         run("$tmp/walk");
     }
@@ -220,8 +220,8 @@ subtest 'pending/running deduplication, admission, metrics and recovery' => sub 
     die 'missing queue types' unless defined $types;
     my $code = "#include <ngx_config.h>\n#include <ngx_core.h>\n"
                . "#include <ngx_http.h>\n#include <assert.h>\n"
-               . "#include \"$root/ngx_cache_purge_invalidation.h\"\n";
-    $code .= "$1\n" while $source =~ /^(#define NGX_CACHE_PURGE_\w+[^\n]*)/mg;
+               . "#include \"$root/ngx_http_cache_purge_invalidation.h\"\n";
+    $code .= "$1\n" while $source =~ /^(#define NGX_HTTP_CACHE_PURGE_\w+[^\n]*)/mg;
     $code .= $types . "\n" . fixture('queue_state_shim');
     my $strings = read_file("$nginx/src/core/ngx_string.c");
     for my $name (qw(insert_value lookup)) {
@@ -258,11 +258,11 @@ subtest 'generation rules and conditional invalidation' => sub {
               qw(src/core src/event src/event/modules src/os/unix objs
                  src/http src/http/modules src/http/v2 src/http/v3);
     unshift @inc, "-I$ENV{NGINX_BUILD_DIR}" if $ENV{NGINX_BUILD_DIR};
-    my $generation = read_file("$root/ngx_cache_purge_invalidation.c");
+    my $generation = read_file("$root/ngx_http_cache_purge_invalidation.c");
     $generation =~ /(typedef struct ngx_http_cache_purge_rule_s.*?)(?=typedef struct ngx_http_cache_purge_snapshot_s)/s
         or die 'missing generation state';
     my $code = "#include <ngx_config.h>\n#include <assert.h>\n#include <stdio.h>\n"
-               . "#include \"$root/ngx_cache_purge_invalidation.h\"\n" . $1
+               . "#include \"$root/ngx_http_cache_purge_invalidation.h\"\n" . $1
                . fixture('generation_shim');
     my $strings = read_file("$nginx/src/core/ngx_string.c");
     $strings =~ /(ngx_int_t\nngx_hextoi\(.*?\n})/s or die 'missing hextoi';
@@ -305,7 +305,7 @@ subtest 'native protocol and cache metadata layout' => sub {
               qw(src/core src/event src/event/modules src/os/unix objs
                  src/http src/http/modules src/http/v2 src/http/v3);
     unshift @inc, "-I$ENV{NGINX_BUILD_DIR}" if $ENV{NGINX_BUILD_DIR};
-    my $layout = qq{#include "$root/ngx_cache_purge_module.c"\n};
+    my $layout = qq{#include "$root/ngx_http_cache_purge_module.c"\n};
     for my $protocol (qw(proxy fastcgi scgi uwsgi)) {
         my $native = read_file("$nginx/src/http/modules/ngx_http_${protocol}_module.c");
         my $header = "$nginx/src/http/modules/ngx_http_${protocol}_module.h";

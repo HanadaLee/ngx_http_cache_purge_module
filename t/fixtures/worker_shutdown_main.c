@@ -1,7 +1,8 @@
-int main(void)
+int
+main(void)
 {
-    ngx_http_cache_purge_work_t *work = &ngx_cache_purge_work;
-    ngx_thread_task_t task = { { 0, 1 } };
+    ngx_http_cache_purge_work_t *work = &ngx_http_cache_purge_work;
+    ngx_thread_task_t            task = { { 0, 1 } };
     work->task = &task;
     work->event.timer_set = 1;
     work->item = work;

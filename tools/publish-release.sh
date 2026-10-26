@@ -9,7 +9,7 @@ fi
 python3 - "$RELEASE_TAG" <<'PY'
 import pathlib, sys
 root = pathlib.Path('dist')
-expected = {f'ngx_cache_purge-{sys.argv[1]}-nginx-{version}-linux-{arch}.{ext}'
+expected = {f'ngx_http_cache_purge-{sys.argv[1]}-nginx-{version}-linux-{arch}.{ext}'
             for version in ('1.30.6', '1.31.7')
             for arch in ('x86_64', 'aarch64') for ext in ('tar.gz', 'zip')}
 actual = {p.name for p in root.iterdir() if p.name != 'SHA256SUMS'}
@@ -26,7 +26,7 @@ else
     prerelease=()
     if [[ "$RELEASE_TAG" == *-* ]]; then prerelease=(--prerelease); fi
     gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes \
-        --title "ngx_cache_purge $RELEASE_TAG" "${prerelease[@]}"
+        --title "ngx_http_cache_purge $RELEASE_TAG" "${prerelease[@]}"
 fi
 # Replacement is permitted only while the release remains a draft.
 gh release upload "$RELEASE_TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS --clobber

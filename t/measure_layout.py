@@ -19,12 +19,12 @@ def main():
     source = Path(os.environ["NGINX_SOURCE"])
     build = source / "objs"
     # Use production declarations so this report follows layout changes.
-    generation = (repo / "ngx_cache_purge_invalidation.c").read_text()
+    generation = (repo / "ngx_http_cache_purge_invalidation.c").read_text()
     generation = generation[generation.index("typedef struct ngx_http_cache_purge_rule_s"):
                             generation.index("static ngx_int_t")]
     refresh = re.search(r"(typedef struct \{\n    u_char\s+hash\[32\];.*?"
                         r"\} ngx_http_cache_refresh_t;)",
-                        (repo / "ngx_cache_purge_refresh.c").read_text(), re.S)
+                        (repo / "ngx_http_cache_purge_refresh.c").read_text(), re.S)
     if refresh is None:
         raise RuntimeError("REFRESH declarations changed; update the layout probe")
     types = ["ngx_pool_t", "ngx_http_request_t", "ngx_http_cache_t",
@@ -36,11 +36,11 @@ def main():
              "ngx_http_cache_purge_cursor_t", "ngx_http_cache_purge_work_t",
              "ngx_http_cache_purge_dir_t", "ngx_http_cache_refresh_entry_t",
              "ngx_http_cache_refresh_scan_t", "ngx_http_cache_refresh_t"]
-    code = '#include "ngx_cache_purge.h"\n#include <stdio.h>\n'
+    code = '#include "ngx_http_cache_purge.h"\n#include <stdio.h>\n'
     code += generation + refresh.group(1) + "\nint main(void) {\n"
     for name in types:
         code += f'printf("{name} %lu\\n", (unsigned long) sizeof({name}));\n'
-    for name in ["NGX_MAX_PROCESSES", "NGX_CACHE_PURGE_REFRESH_BATCH", "NGX_PTR_SIZE"]:
+    for name in ["NGX_MAX_PROCESSES", "NGX_HTTP_CACHE_PURGE_REFRESH_BATCH", "NGX_PTR_SIZE"]:
         code += f'printf("{name} %lu\\n", (unsigned long) {name});\n'
     code += "return 0;\n}\n"
     includes = [repo, build] + [source / p for p in (
@@ -62,7 +62,7 @@ def main():
     report["note"] = "sizeof values exclude allocator overhead, stacks and shared mapping accounting"
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / "layout.json").write_text(json.dumps(report, indent=2) + "\n")
-    stack_files = sorted(build.rglob("*ngx_cache_purge*.su"))
+    stack_files = sorted(build.rglob("*ngx_http_cache_purge*.su"))
     if not stack_files:
         raise RuntimeError("compiler produced no module stack-usage reports")
     with (args.output / "stack-usage.tsv").open("w") as out:

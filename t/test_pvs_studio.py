@@ -32,7 +32,7 @@ if stage == 'configure':
     module = next(a.split('=', 1)[1] for a in args if a.startswith('--add-module='))
     config = (pathlib.Path(module) / 'config').read_text()
     sources = re.search(r'CACHE_PURGE_SRCS="([^"]+)"', config, re.S).group(1)
-    units = re.findall(r'\$ngx_addon_dir/(ngx_cache_purge_\w+)\.c', sources)
+    units = re.findall(r'\$ngx_addon_dir/(ngx_http_cache_purge_\w+)\.c', sources)
     rules = ['objs/addon/fixture/' + unit + '.o: ' + module + '/' + unit + '.c'
              for unit in units]
     if os.environ.get('PVS_TEST_MISSING_TARGET'):
@@ -98,7 +98,7 @@ class AnalysisPipeline(unittest.TestCase):
                 self.assertEqual(args['make'][:4], ['-f', 'objs/Makefile', '-B', '-j2'])
                 config = (ROOT / 'config').read_text()
                 sources = re.search(r'CACHE_PURGE_SRCS="([^"]+)"', config, re.S).group(1)
-                units = re.findall(r'\$ngx_addon_dir/(ngx_cache_purge_\w+)\.c', sources)
+                units = re.findall(r'\$ngx_addon_dir/(ngx_http_cache_purge_\w+)\.c', sources)
                 self.assertEqual(args['make'][4:],
                                  ['objs/addon/fixture/' + unit + '.o' for unit in units])
                 excluded = args['analyze'][args['analyze'].index('-e') + 1]
@@ -200,8 +200,8 @@ class ImageRepository(unittest.TestCase):
 
 class ModuleTargets(unittest.TestCase):
     def test_rejects_empty_or_ambiguous_module_targets(self):
-        manifest = 'CACHE_PURGE_SRCS="$ngx_addon_dir/ngx_cache_purge_module.c"'
-        rule = 'objs/addon/src/ngx_cache_purge_module.o: module.c\n'
+        manifest = 'CACHE_PURGE_SRCS="$ngx_addon_dir/ngx_http_cache_purge_module.c"'
+        rule = 'objs/addon/src/ngx_http_cache_purge_module.o: module.c\n'
         cases = [('', rule), ('CACHE_PURGE_SRCS=""', rule),
                  ('CACHE_PURGE_SRCS="$ngx_addon_dir/unsupported.cc"', rule),
                  (manifest, ''), (manifest, rule + rule)]

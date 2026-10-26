@@ -3,10 +3,10 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
-typedef unsigned char u_char;
-typedef long ngx_int_t;
-typedef int ngx_err_t;
-typedef int ngx_log_t;
+typedef unsigned char  u_char;
+typedef long          ngx_int_t;
+typedef int           ngx_err_t;
+typedef int           ngx_log_t;
 #define ngx_inline inline
 #define NGX_OK 0
 #define NGX_ERROR -1
@@ -18,7 +18,7 @@ typedef int ngx_log_t;
 #define ngx_errno errno
 #define ngx_delete_file_n "unlink()"
 #define ngx_open_file_n "open()"
-static int file_result, logged, logged_level, logged_errno;
+static int  file_result, logged, logged_level, logged_errno;
 static char message[256];
 static int
 ngx_delete_file(u_char *name)

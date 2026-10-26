@@ -19,7 +19,7 @@ my @includes = map { "-I$_" } qw(src/core src/event src/event/modules
 my @commands = map {
     {directory => $nginx, file => "$root/$_.c",
      arguments => ['gcc', '-std=gnu89', @includes, '-c', "$root/$_.c"]}
-} ($sources =~ /(ngx_cache_purge_\w+)\.c/g);
+} ($sources =~ /(ngx_http_cache_purge_\w+)\.c/g);
 open my $db, '>', 'objs/purge-compile-commands.json' or die $!;
 print {$db} encode_json(\@commands);
 close $db or die $!;

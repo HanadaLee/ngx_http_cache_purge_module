@@ -11,7 +11,7 @@ ngx_event_process_init(void)
 }
 
 __attribute__((noinline)) void
-ngx_cache_purge_lsan_probe(void)
+ngx_http_cache_purge_lsan_probe(void)
 {
     allocation = malloc(17);
     allocation = NULL;
@@ -22,7 +22,7 @@ main(int argc, char **argv)
 {
     (void) argv;
     if (argc > 1) {
-        ngx_cache_purge_lsan_probe();
+        ngx_http_cache_purge_lsan_probe();
     } else {
         ngx_event_process_init();
     }

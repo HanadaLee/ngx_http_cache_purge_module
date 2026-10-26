@@ -532,7 +532,7 @@ sub stop_server {
     }
     if ($s->{scan_root_fault}) {
         @severe = grep {
-            !/\[crit\].*ngx_cache_purge: .* "\Q$s->{cache}\E" failed \(\d+: Not a directory\)/
+            !/\[crit\].*ngx_http_cache_purge: .* "\Q$s->{cache}\E" failed \(\d+: Not a directory\)/
         } @severe;
     }
     is_deeply(\@severe, [], 'no unexpected severe diagnostic');
@@ -917,7 +917,7 @@ subtest 'unreadable scan roots return an explicit HTTP problem' => sub {
         is($body->{status}, 500, 'problem status agrees with HTTP');
         unlike($r->{content}, qr/\Q$s->{cache}\E/, 'response does not disclose the cache path');
         like(read_file("$s->{root}/error.log"),
-             qr/ngx_cache_purge: .* "\Q$s->{cache}\E" failed \(\d+: Not a directory\)/,
+             qr/ngx_http_cache_purge: .* "\Q$s->{cache}\E" failed \(\d+: Not a directory\)/,
              'server log identifies the failed filesystem operation');
         is(request($s, '/cache/warm')->{headers}{'x-cache'}, 'HIT', 'failed scan preserves the entry');
         stop_server($s);
@@ -1441,7 +1441,7 @@ subtest 'REFRESH profile validation waits for a real cache candidate' => sub {
     is(scalar @{$r->{results}}, 1, 'profile check has one current cache candidate');
     is($r->{results}[0]{result}, 'skipped_profile', 'client-controlled Host profile is rejected');
     like(read_file("$s->{root}/error.log"),
-         qr/\[error\].*ngx_cache_purge: REFRESH profile "[^"]+" rejected: header "Host" must have a literal value/,
+         qr/\[error\].*ngx_http_cache_purge: REFRESH profile "[^"]+" rejected: header "Host" must have a literal value/,
          'REFRESH diagnostic identifies the profile and rejected header');
     ok(!-e "$s->{root}/head-started", 'rejected Host never reaches the origin');
     is(request($s, $key)->{headers}{'x-cache'}, 'HIT', 'rejected profile preserves the cached entry');
@@ -1514,7 +1514,7 @@ subtest 'REFRESH unsafe profiles cannot send origin probes' => sub {
         is($r->{results}[0]{result}, 'skipped_profile', "$name: unsafe profile rejected");
         ok(!-e "$s->{root}/head-started", "$name: no origin HEAD was sent");
         is(request($s, '/cache/warm')->{headers}{'x-cache'}, 'HIT', "$name: entry remains usable");
-        like(read_file("$s->{root}/error.log"), qr/\[error\].*ngx_cache_purge: REFRESH profile .*\Q$reason\E/,
+        like(read_file("$s->{root}/error.log"), qr/\[error\].*ngx_http_cache_purge: REFRESH profile .*\Q$reason\E/,
              "$name: actionable diagnostic");
         stop_server($s);
     }
@@ -1605,7 +1605,7 @@ subtest 'path protection, concurrent walks and diagnostics' => sub {
            ->{headers}{'x-cache'}, 'MISS', 'Vary entry invalidated');
     }
     my $log = read_file("$s->{root}/error.log");
-    like($log, qr/\[error\].*ngx_cache_purge: access denied for 127\.0\.0\.1/,
+    like($log, qr/\[error\].*ngx_http_cache_purge: access denied for 127\.0\.0\.1/,
          'access diagnostic retains level and client address');
     is(scalar(() = $log =~ /selector of \d+ bytes exceeds the supported limit, not purging/g),
        1, 'one long-prefix diagnostic');

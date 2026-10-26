@@ -15,7 +15,7 @@
 #include <ngx_core.h>
 
 static ngx_cycle_t *volatile test_cycle;
-static ngx_pool_t  *volatile test_bootstrap_pool;
+static ngx_pool_t *volatile test_bootstrap_pool;
 
 ngx_cycle_t *__real_ngx_init_cycle(ngx_cycle_t *old_cycle);
 ngx_cycle_t *__wrap_ngx_init_cycle(ngx_cycle_t *old_cycle);
@@ -23,7 +23,7 @@ ngx_cycle_t *__wrap_ngx_init_cycle(ngx_cycle_t *old_cycle);
 ngx_cycle_t *
 __wrap_ngx_init_cycle(ngx_cycle_t *old_cycle)
 {
-    ngx_cycle_t  *cycle;
+    ngx_cycle_t *cycle;
 
     cycle = __real_ngx_init_cycle(old_cycle);
     if (ngx_test_config) {

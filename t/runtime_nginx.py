@@ -57,6 +57,15 @@ for files, destination in [([source / 'config', *source.glob('*.c'), *source.glo
             assert (destination / path.name).read_bytes() == contents, ('stale addon', path)
         else:
             (destination / path.name).write_bytes(contents)
+(addon / 'rocksdb').mkdir(exist_ok=True)
+for path in (source / 'rocksdb').iterdir():
+    if path.suffix in ('.c', '.h'):
+        contents = path.read_bytes().replace(b'\r\n', b'\n')
+        target = addon / 'rocksdb' / path.name
+        if a.runtime_only:
+            assert target.read_bytes() == contents, ('stale provider', path)
+        else:
+            target.write_bytes(contents)
 git = ['git', '-c', 'safe.directory=' + str(a.nginx), '-C', str(a.nginx)]
 revision = subprocess.check_output(git + ['rev-parse', a.nginx_ref], text=True).strip()
 patches = {}
@@ -85,9 +94,8 @@ print('BUILD', root, flush=True)
 manifest = {'nginx_revision': revision, 'openresty_patches': patches, 'dynamic': a.dynamic,
             'shared_rocksdb': a.shared_rocksdb,
             'sanitizer': a.sanitize,
-            'archives': {name: hashlib.sha256(path.read_bytes()).hexdigest()
-                         for name in ('component', 'coordinator', 'control', 'operations', 'index', 'store', 'files')
-                         for path in [a.libraries / f'libngx_cache_purge_{name}.a']}}
+            'archives': {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                         for path in a.libraries.glob('libngx_http_cache_*.a')}}
 if a.runtime_only:
     assert json.loads((root / 'build.json').read_text()) == manifest, 'stale build manifest'
 else:
@@ -212,7 +220,8 @@ class Run:
             user = f'user {account.pw_name} {grp.getgrgid(account.pw_gid).gr_name};'
         loads = ''
         if a.dynamic:
-            loads = (f'load_module {build}/objs/ngx_http_cache_purge_module.so;\n'
+            loads = (f'load_module {build}/objs/ngx_http_cache_rocksdb_module.so;\n'
+                     f'load_module {build}/objs/ngx_http_cache_purge_module.so;\n'
                      f'load_module {build}/objs/ngx_http_cache_purge_runtime_probe_module.so;\n')
         rpc_locations = '' if rpc_socket is None else f'''
 client_body_buffer_size 1m;
@@ -586,8 +595,8 @@ result = {'root': str(root), 'nginx_revision': revision, 'dynamic': a.dynamic,
           'rocksdb_linkage': 'shared' if a.shared_rocksdb else 'static', 'checks': checks,
           'process_group_memory': memory,
           'empty_component_pss_increment_kib': memory['component_empty']['pss_kib'] - memory['baseline']['pss_kib'],
-          'library_sha256': {name: hashlib.sha256((a.libraries / f'libngx_cache_purge_{name}.a').read_bytes()).hexdigest()
-                             for name in ('component', 'coordinator', 'control', 'operations', 'index', 'store', 'files')},
+          'library_sha256': {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                             for path in a.libraries.glob('libngx_http_cache_*.a')},
           'addon_sha256': {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in addon.iterdir() if path.is_file()},
           'probe_sha256': {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in probe.iterdir() if path.is_file()},
           'runtime_paths': [str(instance.path) for instance in runtime_cases],

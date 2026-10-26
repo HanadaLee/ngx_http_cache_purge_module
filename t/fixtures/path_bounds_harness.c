@@ -2,11 +2,11 @@ static void
 check(char *root, char *input, char *temp, unsigned int expected)
 {
     ngx_http_cache_purge_walk_ctx_t ctx;
-    ngx_str_t path, name;
-    protection_t protection;
-    long page;
-    u_char *memory;
-    size_t len;
+    ngx_str_t                       path, name;
+    protection_t  protection;
+    long          page;
+    u_char       *memory;
+    size_t        len;
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.cache_root.data = (u_char *) root;
@@ -29,8 +29,7 @@ check(char *root, char *input, char *temp, unsigned int expected)
     path.data = memory + page - len;
     path.len = len;
     memcpy(path.data, input, len); /* Deliberately no trailing zero. */
-    assert(ngx_http_cache_purge_is_protected_path(&ctx, &path)
-           == expected);
+    assert(ngx_http_cache_purge_is_protected_path(&ctx, &path) == expected);
     assert(munmap(memory, (size_t) page * 2) == 0);
 }
 
@@ -38,17 +37,20 @@ int
 main(void)
 {
     ngx_http_cache_purge_walk_ctx_t ctx;
-    ngx_str_t path, names[1];
-    protection_t protection;
-    unsigned int state, count;
-    size_t i, len;
-    u_char input[256];
+    ngx_str_t                       path, names[1];
+    protection_t                    protection;
+    unsigned int                    state, count;
+    size_t                          i, len;
+    u_char                          input[256];
 
     check("/var/cache", "/var/cache/proxy_temp/", "/var/cache/proxy_temp", 1);
-    check("/var/cache", "/var/cache/proxy_temp/abc", "/var/cache/proxy_temp", 1);
+    check("/var/cache", "/var/cache/proxy_temp/abc", "/var/cache/proxy_temp",
+          1);
     check("/var/cache", "/var/cache/main/app_proxy_temp_file", NULL, 0);
-    check("/var/cache", "/var/cache/proxy_temp2/file", "/var/cache/proxy_temp", 0);
-    check("/var/cache", "/var/cache/app/proxy_temp/file", "/var/cache/proxy_temp", 0);
+    check("/var/cache", "/var/cache/proxy_temp2/file", "/var/cache/proxy_temp",
+          0);
+    check("/var/cache", "/var/cache/app/proxy_temp/file",
+          "/var/cache/proxy_temp", 0);
     check("/var/cache", "/var/cache/proxy_temp/file", NULL, 0);
     check("/proxy_temp/cache", "/proxy_temp/cache/main/entry", NULL, 0);
     check("/var/cache///", "/var/cache/main/entry", NULL, 0);
@@ -58,13 +60,17 @@ main(void)
 #if (NGX_WIN32)
     check("C:\\Cache", "c:/cache\\PROXY_TEMP\\entry", "C:/Cache/proxy_temp", 1);
     check("C:/", "c:\\proxy_temp\\entry", "C:/proxy_temp", 1);
-    check("//server/share/cache", "\\\\server\\share\\cache\\spool", "//server/share/cache/spool", 1);
+    check("//server/share/cache", "\\\\server\\share\\cache\\spool",
+          "//server/share/cache/spool", 1);
 #else
-    check("/var/cache", "/var/cache/name\\proxy_temp/entry", "/var/cache/proxy_temp", 0);
+    check("/var/cache", "/var/cache/name\\proxy_temp/entry",
+          "/var/cache/proxy_temp", 0);
 #if (NGX_HAVE_CASELESS_FILESYSTEM)
-    check("/var/cache", "/var/cache/PROXY_TEMP/entry", "/var/cache/proxy_temp", 1);
+    check("/var/cache", "/var/cache/PROXY_TEMP/entry", "/var/cache/proxy_temp",
+          1);
 #else
-    check("/var/cache", "/var/cache/PROXY_TEMP/entry", "/var/cache/proxy_temp", 0);
+    check("/var/cache", "/var/cache/PROXY_TEMP/entry", "/var/cache/proxy_temp",
+          0);
 #endif
 #endif
 
