@@ -197,6 +197,13 @@ def run_client_cases(Run, root, checks):
         assert marker[:8] == b'NCF1\0\0\0\1' and marker[8:24] == (501).to_bytes(16, 'big')
         assert rpc('/rpc/?op=2', (501).to_bytes(16, 'big'))[2][0] == 1
         checks.append('real worker sends lease and native request-body temp descriptors; component registers a durable PREPARED file')
+        final_path = case.path / 'cache-a/prepared-501'
+        temporary_path.rename(final_path)
+        value = rpc('/rpc-files/?' + query + '&finish=1', b'finish')
+        assert value[0] == 200 and value[2] == (501).to_bytes(16, 'big') + struct.pack('>QB', 2, 2), value
+        assert os.getxattr(final_path, 'user.ngx_cache_purge.id')[7] == 2
+        assert rpc('/rpc-files/?' + query + '&finish=1', b'retry')[2] == value[2]
+        checks.append('worker FINISH_FILE sends one lease descriptor, publishes READY after rename and tolerates a lost-reply retry')
         for number, directory, zone in ((502, 'cache-fcgi', 'f'), (503, 'cache-uwsgi', 'u'), (504, 'cache-scgi', 's')):
             value = rpc(f'/rpc-files/?files=1&root={case.path}/{directory}&zone={zone}&id={number}', b'registered root')
             assert value[0] == 200 and value[1]['X-IPC-Result'] == '0', value

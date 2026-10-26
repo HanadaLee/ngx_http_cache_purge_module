@@ -1,6 +1,8 @@
 /* Real filesystem identity and index-publication checks; not a native consumer. */
 #include "ngx_cache_purge_files.h"
 #include "ngx_cache_purge_index.hpp"
+#include "ngx_cache_purge_publication.hpp"
+#include "ngx_cache_purge_component.h"
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
@@ -47,6 +49,7 @@ static int publication(const std::string &mode, const std::string &path) {
     ngx_cache_purge_store_t *store = nullptr;
     check(ngx_cache_purge_store_open((path + "/db").c_str(), &options, &store, &error) == 0, "open publication DB");
     Index index(store);
+    Publications publications({{path + "/cache", "cache", NGX_PURGE_ROOT_CACHE}}, path + "/db");
     File file; file.id = id(1); file.key = "base"; file.url = "https://example.test/file";
     file.host = "example.test"; file.tag_namespace = "tenant";
     file.root = path + "/cache"; file.zone = "cache"; file.path = "file";
@@ -60,11 +63,13 @@ static int publication(const std::string &mode, const std::string &path) {
     if (mode != "--recover") {
         Descriptor fd(open((file.root + "/temporary").c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600));
         body(fd.fd);
-        check(ngx_cache_purge_file_marker_prepare(fd.fd, file.id.data(), address, 1, &error) == 0, "durable temporary identity");
-        index.prepare(file);
+        check(publications.prepare(index, {file, {}}, file.root + "/temporary", anchor.fd, lease.fd, fd.fd, getuid()).state
+              == FileState::prepared, "durable intent and temporary identity");
+        if (mode == "--crash-prepared") _exit(0);
         check(rename((file.root + "/temporary").c_str(), target.c_str()) == 0, "rename cached file");
         Descriptor directory(open(file.root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
         check(fsync(directory.fd) == 0, "sync target directory");
+        if (mode == "--crash-rename") _exit(0);
         index.commit_pending(file.id, 1);
         if (mode == "--crash-marker")
             check(ngx_cache_purge_file_marker_publish(fd.fd, file.id.data(), address, 1, &error) == 0, "durable readable marker");
@@ -74,27 +79,28 @@ static int publication(const std::string &mode, const std::string &path) {
     }
     auto pending = index.pending_fills(); Match match;
     if (pending->next(match)) {
-        check(match.id == file.id && match.state == FileState::committed && match.revision == 2
+        check(match.id == file.id && (match.state == FileState::prepared || match.state == FileState::committed)
               && !pending->next(match), "only unfinished publication recovered");
         pending.reset();
-        int fd = open(target.c_str(), O_RDWR | O_NOFOLLOW | O_CLOEXEC);
-        if (fd < 0) {
-            check(errno == ENOENT, "missing file is a content miss");
-            index.discard_publication(file.id, 2);
+        auto finished = publications.finish(index, file.id, 1, anchor.fd, lease.fd, getuid());
+        if (finished.state == FileState::retired) {
             check(!index.current(file.root, file.path), "missing publication cannot be admitted");
         } else {
+            int fd = open(target.c_str(), O_RDWR | O_NOFOLLOW | O_CLOEXEC);
             Descriptor descriptor(fd);
             ngx_cache_purge_file_marker_t marker;
             check(ngx_cache_purge_file_marker_read(fd, &marker, &error) == 0
                   && std::memcmp(marker.id, file.id.data(), 16) == 0
-                  && std::memcmp(marker.address, address, 16) == 0, "recover exact file instance");
-            check(ngx_cache_purge_file_marker_publish(fd, file.id.data(), address, 1, &error) == 0, "finish file publication");
-            index.publish(file.id, 2);
+                  && std::memcmp(marker.address, address, 16) == 0
+                  && marker.state == NGX_CACHE_PURGE_FILE_READY, "recover and publish exact file instance");
+            check(finished.state == FileState::committed && !index.has_fill_intent(file.id), "finish cleared durable intent");
             intact(fd);
         }
     }
     pending.reset();
     check(!index.pending_fills()->next(match), "publication recovery queue is empty");
+    check(publications.finish(index, file.id, 1, anchor.fd, lease.fd, getuid()).state == index.get(file.id).state,
+          "finish retry preserves the durable result");
     check(ngx_cache_purge_store_close(&store, &error) == 0, "close publication DB");
     std::cout << "PASS recovery " << assertions << " assertions" << std::endl;
     return 0;

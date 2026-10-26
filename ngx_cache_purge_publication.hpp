@@ -12,6 +12,11 @@ public:
     ~Publications();
     Match prepare(Index &index, Fill fill, const std::string &temporary,
                   int anchor_fd, int lease_fd, int temporary_fd, uint32_t peer_uid);
+    /* Caller must have finished/abandoned native writing and retain the lease.
+     * Reconcile the actual final instance; do not trust a reported rename code.
+     * A committed result proves identity publication, not purge freshness. */
+    Match finish(Index &index, const FileId &id, uint64_t prepared_revision,
+                 int anchor_fd, int lease_fd, uint32_t peer_uid);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

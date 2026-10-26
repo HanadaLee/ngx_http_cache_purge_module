@@ -87,6 +87,7 @@ public:
     Match publish(const FileId &id, uint64_t expected_revision);
     Match discard_publication(const FileId &id, uint64_t expected_revision);
     std::optional<Match> current(const std::string &root, const std::string &path);
+    bool has_fill_intent(const FileId &id);
     Match abort_prepare(const FileId &id, uint64_t expected_revision);
     Match retire(const FileId &id, uint64_t expected_revision);
     std::vector<Match> retire_batch(const std::vector<ExpectedFile> &files);

@@ -147,7 +147,7 @@ ngx_cache_purge_client_submit_internal(ngx_cache_purge_client_t *client, uint16_
     if (client == NULL || client->stopped || out == NULL || done == NULL
         || opcode == 0 || payload == NULL || (payload->len && payload->data == NULL)
         || timeout == 0 || timeout > 300000
-        || fd_count != (opcode == NGX_PURGE_OP_PREPARE_FILE ? 2U : 0U)
+        || fd_count != (opcode == NGX_PURGE_OP_PREPARE_FILE ? 2U : opcode == NGX_PURGE_OP_FINISH_FILE ? 1U : 0U)
         || (fd_count && fds == NULL))
     {
         return NGX_ERROR;
@@ -225,6 +225,15 @@ ngx_cache_purge_client_submit_files(ngx_cache_purge_client_t *client,
 {
     return ngx_cache_purge_client_submit_internal(client, NGX_PURGE_OP_PREPARE_FILE, payload, timeout,
                                                  done, data, out, fds, 2);
+}
+
+ngx_int_t
+ngx_cache_purge_client_finish_file(ngx_cache_purge_client_t *client,
+    const ngx_str_t *payload, int lease_fd, ngx_msec_t timeout,
+    ngx_cache_purge_client_done_pt done, void *data, ngx_cache_purge_call_t **out)
+{
+    return ngx_cache_purge_client_submit_internal(client, NGX_PURGE_OP_FINISH_FILE, payload, timeout,
+                                                 done, data, out, &lease_fd, 1);
 }
 
 static ngx_int_t

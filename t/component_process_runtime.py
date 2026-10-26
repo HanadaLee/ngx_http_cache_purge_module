@@ -183,6 +183,12 @@ class Client:
         self.socket.sendall(packet[1:])
         return self.reply(18, code)
 
+    def finish_file(self, n, lease, revision=1, code=0):
+        packet = self.packet(19, identity(n) + struct.pack('>Q', revision))
+        assert self.socket.sendmsg([packet[:1]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [lease]))]) == 1
+        self.socket.sendall(packet[1:])
+        return self.reply(19, code)
+
     def page(self, kind, value, scope='', bookmark=b'', limit=32):
         data = self.call(8, query(kind, value, scope, bookmark, limit))
         count, done, size = struct.unpack('>BBI', data[:6])
@@ -210,6 +216,9 @@ try:
     assert marker == b'NCF1\0\0\0\1' + identity(401) + hashlib.sha256(str(target).encode()).digest()[:16]
     assert temp.read_bytes() == b'complete cached entity'
     assert client.prepare_file(payload, [lease, temporary]) == prepared
+    client.call(4, batch([(401, 1)]), code=4)
+    client.call(5, identity(401) + struct.pack('>Q', 1), code=4)
+    check(client.call(2, identity(401))[0] == 1, 'raw index mutations cannot bypass physical publication checks')
     check(True, 'PREPARE_FILE persists the index intent and matching xattr without changing entity bytes; retries are stable')
     replacement = temp_root / 'other'
     replacement.write_bytes(b'complete cached entity')
@@ -254,8 +263,44 @@ try:
     assert client.call(2, identity(401))[0] == 1
     lease = client.lease(str(target)); temporary = os.open(temp, os.O_RDWR | os.O_CLOEXEC)
     assert client.prepare_file(payload, [lease, temporary]) == prepared
-    os.close(temporary); os.close(lease); client.close(); publisher.stop()
     check(True, 'owner crash preserves PREPARE_FILE intent and permits an identical file retry without index rebuild')
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp.rename(target)
+    finished = client.finish_file(401, lease)
+    assert finished == identity(401) + struct.pack('>QB', 2, 2)
+    assert os.getxattr(target, 'user.ngx_cache_purge.id')[7] == 2
+    assert client.finish_file(401, lease) == finished
+    assert client.call(9, string('') + bytes([32]))[0] == 0
+    check(True, 'FINISH_FILE publishes the renamed instance and clears its durable intent; retries are idempotent')
+    client.call(13, identity(401) + struct.pack('>Q', 2) + string('replacement') + b'\0', code=4)
+    target.unlink()
+    assert client.finish_file(401, lease) == finished and not target.exists()
+    check(True, 'a late finish retry returns its durable result without recreating an evicted file')
+    os.close(temporary); os.close(lease)
+
+    for number, scenario in ((402, 'missing'), (403, 'directory'), (404, 'unrelated'), (405, 'changed')):
+        source = temp_root / f'body-{number}'
+        source.write_bytes(b'new complete entity')
+        destination = cache_root / f'a/00/{number}'
+        lease = client.lease(str(destination))
+        temporary = os.open(source, os.O_RDWR | os.O_CLOEXEC)
+        prepared_data = record(number, root=str(cache_root), zone='zone-a') + string(str(source))
+        client.prepare_file(prepared_data, [lease, temporary])
+        if scenario == 'directory': destination.mkdir()
+        elif scenario == 'unrelated': destination.write_bytes(b'leave this file unchanged')
+        elif scenario == 'changed':
+            source.write_bytes(b'content changed after prepare')
+            source.rename(destination)
+            client.finish_file(number, lease, code=7)
+            assert os.getxattr(destination, 'user.ngx_cache_purge.id')[7] == 1
+            destination.unlink()  # Test-owned damaged candidate; FINISH itself never unlinks it.
+        result = client.finish_file(number, lease)
+        assert result[-1] == 3 and client.finish_file(number, lease) == result
+        if scenario == 'unrelated': assert destination.read_bytes() == b'leave this file unchanged'
+        if scenario == 'directory': assert destination.is_dir()
+        os.close(temporary); os.close(lease)
+    check(True, 'missing, failed and changed candidates retire safely without altering unrelated final paths')
+    client.close(); publisher.stop()
 
     lease_component = Component(root / 'leases')
     lease_component.opened()
@@ -452,6 +497,6 @@ finally:
         component.stderr.close()
 
 result = {'checks': checks, 'count': len(checks), 'root': str(root),
-    'scope': 'component/index/ledger IPC and durable PREPARE_FILE; native rename/FINISH, immediate invalidation and physical jobs are not wired'}
+    'scope': 'component/index/ledger IPC and same-filesystem PREPARE/FINISH; native upstream producer, immediate invalidation and physical jobs are not wired'}
 args.output.write_text(json.dumps(result, indent=2) + '\n')
 print(json.dumps(result), flush=True)

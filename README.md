@@ -38,9 +38,13 @@ failure or cancellation. Consumers that retain a duplicate must bound and close
 it separately. `PREPARE_FILE` accepts a lease and a complete temporary-file
 descriptor. The component validates configured cache roots/zones, the temporary
 path and inode, then persists an index intent and a matching file marker.
-Retries bind to the same physical temporary file. Native rename/FINISH, readable
-publication, and the production fill consumer remain unfinished. Blocking file
-operations remain outside the HTTP event loop.
+Retries bind to the same physical temporary file. `FINISH_FILE` accepts the
+original prepared revision and a lease descriptor, verifies the final instance,
+and completes durable index/READY-marker publication after a same-filesystem
+rename. Retries recover interrupted publication without recreating an evicted
+file. Raw index mutations cannot bypass these checks for physical records.
+Cross-filesystem copy verification and the native upstream fill consumer remain
+unfinished. Blocking file operations remain outside the HTTP event loop.
 
 A durable operation ledger now stores selectors, idempotency identities,
 checkpoints, retry scheduling, and independent materialization/propagation states.

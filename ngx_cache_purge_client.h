@@ -69,6 +69,11 @@ ngx_int_t ngx_cache_purge_client_submit(ngx_cache_purge_client_t *client,
 ngx_int_t ngx_cache_purge_client_submit_files(ngx_cache_purge_client_t *client,
     const ngx_str_t *payload, const int fds[2], ngx_msec_t timeout,
     ngx_cache_purge_client_done_pt done, void *data, ngx_cache_purge_call_t **call);
+/* FINISH_FILE copies one lease FD and otherwise follows submit_files ownership.
+ * Invoke only after native writing has ceased; the result may be RETIRED. */
+ngx_int_t ngx_cache_purge_client_finish_file(ngx_cache_purge_client_t *client,
+    const ngx_str_t *payload, int lease_fd, ngx_msec_t timeout,
+    ngx_cache_purge_client_done_pt done, void *data, ngx_cache_purge_call_t **call);
 
 /* Cancel consumes the handle and suppresses its callback. Cancellation does
  * not roll back a request already sent. Clear the caller's handle afterwards. */

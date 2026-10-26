@@ -11,10 +11,10 @@ p.add_argument('--output', type=Path, required=True)
 a = p.parse_args()
 checks = []
 roots = []
-for cut in ('index', 'marker', 'missing'):
+for cut in ('prepared', 'rename', 'index', 'marker', 'missing'):
     root = Path(tempfile.mkdtemp(prefix='cache-purge-file-publication-', dir='/tmp'))
     roots.append(str(root))
-    mode = '--crash-marker' if cut == 'marker' else '--crash-index'
+    mode = '--crash-' + ('index' if cut == 'missing' else cut)
     checks.append(subprocess.check_output([str(a.binary), mode, str(root)], text=True, timeout=30).strip())
     if cut == 'missing':
         (root / 'cache/file').unlink()
@@ -24,5 +24,5 @@ for cut in ('index', 'marker', 'missing'):
         checks.append(subprocess.check_output([str(a.binary), '--recover', str(root)], text=True, timeout=30).strip())
     assert unrelated.read_bytes() == b'untouched'
 a.output.write_text(json.dumps({'checks': checks, 'directories': roots,
-    'scope': 'Real xattrs, rename and durable index publication recovery; not nginx integration or power-loss testing'}, indent=2) + '\n')
+    'scope': 'Real PREPARE/FINISH, xattrs, rename and durable index publication recovery; not nginx integration or power-loss testing'}, indent=2) + '\n')
 print('PASS file/index publication crash cuts and repeated recovery', flush=True)

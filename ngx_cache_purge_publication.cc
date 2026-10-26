@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <string_view>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -52,7 +53,7 @@ std::string canonical(const std::string &path) {
 }
 /* Resolve relative components from the pinned directory without following
  * symlinks. An absent target is allowed during PREPARE; absent temp is not. */
-int beneath(int root, const std::string &path, bool missing) {
+int beneath(int root, const std::string &path, bool missing, bool writable = false) {
     require(relative(path), "unsafe relative file path");
     FD current(fcntl(root, F_DUPFD_CLOEXEC, 0));
     if (current.value < 0) io("duplicate registered directory");
@@ -61,7 +62,7 @@ int beneath(int root, const std::string &path, bool missing) {
         auto slash = path.find('/', at);
         bool last = slash == std::string::npos;
         auto part = path.substr(at, last ? std::string::npos : slash - at);
-        int fd = openat(current.value, part.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK
+        int fd = openat(current.value, part.c_str(), (last && writable ? O_RDWR : O_RDONLY) | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK
                        | (last ? 0 : O_DIRECTORY));
         if (fd < 0) {
             if (errno == ENOENT && missing) return -1;
@@ -91,6 +92,47 @@ struct Root {
                 "registered directory was replaced; restart required");
     }
 };
+struct Proof {
+    uint64_t device, inode, size, seconds;
+    uint32_t nanoseconds;
+    std::string temporary;
+};
+Proof proof(const std::string &metadata) {
+    std::string_view input(metadata); size_t at = 4;
+    require(input.size() >= 4 && input.substr(0, 4) == "NFP1", "file has no publication proof");
+    auto number = [&](unsigned width) {
+        require(width <= input.size() - at, "truncated publication proof");
+        uint64_t value = 0;
+        while (width--) value = (value << 8) | static_cast<unsigned char>(input[at++]);
+        return value;
+    };
+    Proof result{number(8), number(8), number(8), number(8), static_cast<uint32_t>(number(4)), ""};
+    auto length = number(4); require(length <= input.size() - at, "truncated publication temporary path");
+    result.temporary = std::string(input.substr(at, length)); at += length;
+    length = number(4); require(length == input.size() - at, "invalid publication policy payload");
+    require(result.nanoseconds < 1000000000 && !result.temporary.empty() && result.temporary.front() == '/',
+            "invalid publication identity");
+    return result;
+}
+bool same(const Proof &proof, const struct stat &st) {
+    return proof.device == static_cast<uint64_t>(st.st_dev) && proof.inode == static_cast<uint64_t>(st.st_ino)
+        && proof.size == static_cast<uint64_t>(st.st_size) && proof.seconds == static_cast<uint64_t>(st.st_mtim.tv_sec)
+        && proof.nanoseconds == static_cast<uint32_t>(st.st_mtim.tv_nsec);
+}
+void sync_parents(Root &root, std::string relative_name) {
+    // Constant FD space; native hashed cache paths have only a few components.
+    // Sync bottom-up so newly created path entries precede their parents.
+    for (;;) {
+        auto slash = relative_name.rfind('/');
+        if (slash == std::string::npos) {
+            if (fsync(root.fd.value)) io("sync registered cache root");
+            return;
+        }
+        relative_name.resize(slash);
+        FD directory(beneath(root.fd.value, relative_name, true));
+        if (directory.value >= 0 && fsync(directory.value)) io("sync publication directory");
+    }
+}
 }
 struct Publications::Impl {
     std::vector<std::unique_ptr<Root>> roots;
@@ -186,5 +228,70 @@ Match Publications::prepare(Index &index, Fill fill, const std::string &temporar
         || after.st_mtim.tv_sec != received.st_mtim.tv_sec || after.st_mtim.tv_nsec != received.st_mtim.tv_nsec)
         throw IndexError(NGX_PURGE_STORE_CONFLICT, "temporary file changed during durable preparation");
     return match;
+}
+
+Match Publications::finish(Index &index, const FileId &id, uint64_t revision,
+                           int anchor, int lease, uint32_t peer_uid) {
+    require(revision != 0, "missing prepared revision");
+    auto file = index.get(id);
+    auto saved = proof(file.metadata);
+    if (file.revision < revision) throw IndexError(NGX_PURGE_STORE_CONFLICT, "publication revision moved backwards");
+    if (!index.has_fill_intent(id)) return {id, file.revision, file.state};
+    if (file.revision != revision && !(revision != UINT64_MAX && file.revision == revision + 1
+                                      && file.state == FileState::committed))
+        throw IndexError(NGX_PURGE_STORE_CONFLICT, "publication revision changed");
+    Root *target = nullptr, *source = nullptr; size_t longest = 0;
+    for (const auto &root : impl_->roots) {
+        if (root->configured.kind == NGX_PURGE_ROOT_CACHE && root->path == file.root
+            && root->configured.zone == file.zone) target = root.get();
+        if (root->path.size() > longest && contains(root->path, saved.temporary)) {
+            source = root.get(); longest = root->path.size();
+        }
+    }
+    require(target && source, "publication directories are no longer registered");
+    target->verify(); source->verify();
+    std::string address = target->path + '/' + file.path;
+    unsigned char digest[16]; uint64_t offset; ngx_cache_purge_store_error_t error;
+    checked(ngx_cache_purge_file_address({reinterpret_cast<const unsigned char *>(address.data()), address.size()},
+                                        digest, &offset, &error), error);
+    checked(ngx_cache_purge_file_lease_adopt(anchor, lease, offset, &error), error);
+    auto abandon = [&]() {
+        return file.state == FileState::prepared ? index.abort_prepare(id, file.revision)
+                                                : index.discard_publication(id, file.revision);
+    };
+    FD observed(beneath(target->fd.value, file.path, true));
+    if (observed.value < 0) return abandon();
+    struct stat st{};
+    if (fstat(observed.value, &st)) io("inspect publication result");
+    if (!S_ISREG(st.st_mode)) return abandon();
+    if (static_cast<uint64_t>(st.st_dev) != saved.device)
+        throw IndexError(NGX_PURGE_STORE_CONFLICT, "cross-filesystem copy needs verified publication evidence");
+    ngx_cache_purge_file_marker_t marker;
+    int rc = ngx_cache_purge_file_marker_read(observed.value, &marker, &error);
+    if (rc == NGX_PURGE_STORE_NOT_FOUND) return abandon();
+    if (rc == NGX_PURGE_STORE_CORRUPT)
+        throw IndexError(NGX_PURGE_STORE_CONFLICT, "publication marker is malformed");
+    checked(rc, error);
+    if (std::memcmp(marker.id, id.data(), 16) || std::memcmp(marker.address, digest, 16)) return abandon();
+    if (!same(saved, st) || st.st_nlink != 1 || st.st_uid != peer_uid)
+        throw IndexError(NGX_PURGE_STORE_CONFLICT, "publication file differs from its prepared identity");
+    FD fd(beneath(target->fd.value, file.path, false, true));
+    struct stat opened{};
+    if (fstat(fd.value, &opened)) io("inspect writable publication result");
+    if (!same(saved, opened) || opened.st_nlink != 1)
+        throw IndexError(NGX_PURGE_STORE_CONFLICT, "publication file changed while opening");
+    if (fsync(fd.value)) io("sync final cache file");
+    sync_parents(*target, file.path);
+    sync_parents(*source, saved.temporary.substr(source->path.size() + 1));
+    Match result{id, file.revision, file.state};
+    if (file.state == FileState::prepared) result = index.commit_pending(id, file.revision);
+    checked(ngx_cache_purge_file_marker_publish(fd.value, id.data(), digest, 1, &error), error);
+    FD final(beneath(target->fd.value, file.path, true));
+    if (final.value < 0) return index.discard_publication(id, result.revision);
+    struct stat final_stat{};
+    if (fstat(final.value, &final_stat)) io("recheck published file");
+    if (!same(saved, final_stat) || final_stat.st_nlink != 1)
+        return index.discard_publication(id, result.revision);
+    return index.publish(id, result.revision);
 }
 }

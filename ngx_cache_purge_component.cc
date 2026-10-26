@@ -46,6 +46,14 @@ template<class Function> int boundary(ngx_cache_purge_store_error_t *error, Func
 void checked(int rc, const ngx_cache_purge_store_error_t &error) {
     if (rc) throw IndexError(rc, error.message);
 }
+void logical_record(Index &index, const FileId &id, bool missing = false) {
+    try {
+        if (index.get(id).metadata.compare(0, 4, "NFP1") == 0)
+            throw IndexError(NGX_PURGE_STORE_INVALID, "physical file publication requires filesystem operations");
+    } catch (const IndexError &error) {
+        if (!missing || error.code != NGX_PURGE_STORE_NOT_FOUND) throw;
+    }
+}
 void nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL);
     if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 || fcntl(fd, F_SETFD, FD_CLOEXEC) < 0)
@@ -208,7 +216,8 @@ struct ngx_cache_purge_component_s {
                 p.request = wire::frame({p.header.data(), p.header.size()});
                 if (p.request.result || p.request.size > options.max_payload_bytes)
                     throw IndexError(NGX_PURGE_STORE_LIMIT, "invalid component request size/result");
-                if (p.rights_count != (p.request.opcode == NGX_PURGE_OP_PREPARE_FILE ? 2U : 0U))
+                if (p.rights_count != (p.request.opcode == NGX_PURGE_OP_PREPARE_FILE ? 2U
+                                      : p.request.opcode == NGX_PURGE_OP_FINISH_FILE ? 1U : 0U))
                     throw IndexError(NGX_PURGE_STORE_INVALID, "unexpected component request descriptors");
                 resize(p.input, p.request.size); p.parsed = true;
             }
@@ -234,6 +243,15 @@ struct ngx_cache_purge_component_s {
     std::string dispatch(Index &index, Operations &operations, Coordinator *coordinator, ngx_cache_purge_store_t *store, Peer &p) {
         wire::Decoder d{p.input}; wire::Encoder e;
         switch (p.request.opcode) {
+        case NGX_PURGE_OP_FINISH_FILE: {
+            auto id = d.id(); auto revision = d.integer(8); d.end();
+            auto lock_path = path + "/file.leases";
+            ngx_cache_purge_store_error_t error;
+            if (lease_anchor.value < 0)
+                checked(ngx_cache_purge_file_locks_open(lock_path.c_str(), geteuid(), 1, &lease_anchor.value, &error), error);
+            wire::match(e, publications->finish(index, id, revision, lease_anchor.value, p.input_rights[0].value, p.uid));
+            break;
+        }
         case NGX_PURGE_OP_PREPARE_FILE: {
             Fill fill{wire::file(d), d.id()}; auto temporary = d.string(); d.end();
             auto lock_path = path + "/file.leases";
@@ -274,7 +292,12 @@ struct ngx_cache_purge_component_s {
             auto count = d.integer(1);
             if (!count || count > 32) throw IndexError(NGX_PURGE_STORE_LIMIT, "IPC prepare batch count");
             std::vector<Fill> fills; fills.reserve(count);
-            while (count--) { auto f = wire::file(d); fills.push_back({std::move(f), d.id()}); }
+            while (count--) {
+                auto f = wire::file(d);
+                if (f.metadata.compare(0, 4, "NFP1") == 0)
+                    throw IndexError(NGX_PURGE_STORE_INVALID, "reserved physical publication metadata");
+                fills.push_back({std::move(f), d.id()});
+            }
             d.end(); auto result = index.prepare_batch(fills); e.byte(result.size());
             for (auto &m : result) wire::match(e, m);
             break;
@@ -283,13 +306,15 @@ struct ngx_cache_purge_component_s {
         case NGX_PURGE_OP_RETIRE:
         case NGX_PURGE_OP_COLLECT: {
             auto files = wire::expected(d); d.end();
+            for (const auto &file : files) logical_record(index, file.id, p.request.opcode == NGX_PURGE_OP_COLLECT);
             if (p.request.opcode == NGX_PURGE_OP_COLLECT) { index.collect_files(files); break; }
             auto result = p.request.opcode == NGX_PURGE_OP_COMMIT ? index.commit_batch(files) : index.retire_batch(files);
             e.byte(result.size()); for (auto &m : result) wire::match(e, m);
             break;
         }
         case NGX_PURGE_OP_ABORT: {
-            auto id = d.id(); auto revision = d.integer(8); d.end(); wire::match(e, index.abort_prepare(id, revision)); break;
+            auto id = d.id(); auto revision = d.integer(8); d.end(); logical_record(index, id);
+            wire::match(e, index.abort_prepare(id, revision)); break;
         }
         case NGX_PURGE_OP_QUERY:
         case NGX_PURGE_OP_PENDING:
@@ -321,7 +346,10 @@ struct ngx_cache_purge_component_s {
         }
         case NGX_PURGE_OP_UPDATE: {
             auto id = d.id(); auto revision = d.integer(8); auto metadata = d.string(16384); auto tags = wire::tags(d);
-            d.end(); wire::match(e, index.update_metadata(id, revision, metadata, tags)); break;
+            d.end(); logical_record(index, id);
+            if (metadata.compare(0, 4, "NFP1") == 0)
+                throw IndexError(NGX_PURGE_STORE_INVALID, "reserved physical publication metadata");
+            wire::match(e, index.update_metadata(id, revision, metadata, tags)); break;
         }
         case NGX_PURGE_OP_ACCEPT_OPERATION: {
             auto input = wire::operation_input(d); d.end();

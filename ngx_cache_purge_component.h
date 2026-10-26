@@ -41,7 +41,8 @@ typedef enum {
     NGX_PURGE_OP_GET_OPERATION,
     NGX_PURGE_OP_GET_CONTROL_STATUS,
     NGX_PURGE_OP_ACQUIRE_FILE_LEASE, /* string canonical address -> digest[16], offset u64 + one FD */
-    NGX_PURGE_OP_PREPARE_FILE /* file, previous ID, temp path; two FDs: lease, temp */
+    NGX_PURGE_OP_PREPARE_FILE, /* file, previous ID, temp path; two FDs: lease, temp */
+    NGX_PURGE_OP_FINISH_FILE /* file ID, prepared revision; one FD: lease */
 } ngx_cache_purge_opcode_t;
 
 #define NGX_PURGE_ROOT_CACHE 1

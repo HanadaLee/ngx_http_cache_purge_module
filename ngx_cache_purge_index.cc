@@ -620,6 +620,20 @@ std::optional<Match> Index::current(const std::string &root, const std::string &
     return match(record);
 }
 
+bool Index::has_fill_intent(const FileId &id) {
+    Transaction tx(store_);
+    auto record = decode_record(tx.need(common, object(id)));
+    require(record.id == id, NGX_PURGE_STORE_CORRUPT, "file identity mismatch");
+    auto value = tx.get(common, lease(record.root, record.path));
+    bool owned = value && *value == id_bytes(id);
+    require(record.state != FileState::prepared || owned, NGX_PURGE_STORE_CORRUPT, "prepared file has no intent");
+    require(record.state != FileState::retired || !owned, NGX_PURGE_STORE_CORRUPT, "retired file still owns intent");
+    if (record.state == FileState::committed)
+        require(tx.need(common, location(record.root, record.path)) == id_bytes(id),
+                NGX_PURGE_STORE_CORRUPT, "committed path identity mismatch");
+    return owned;
+}
+
 Match Index::abort_prepare(const FileId &id, uint64_t revision) {
     Transaction tx(store_); auto record = load(tx, id, revision);
     require(record.state == FileState::prepared, NGX_PURGE_STORE_CONFLICT, "file is not prepared");

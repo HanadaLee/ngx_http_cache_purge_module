@@ -23,6 +23,7 @@ typedef struct {
     ngx_msec_t timeout;
     int temporary_fd;
     unsigned prepare_sent:1;
+    unsigned finish_requested:1;
 } probe_rpc_t;
 
 static ngx_int_t rpc_handler(ngx_http_request_t *r);
@@ -149,8 +150,13 @@ rpc_prepare_done(ngx_cache_purge_call_t *call, void *data, const ngx_cache_purge
     if (!ctx->prepare_sent && reply->transport == NGX_PURGE_CLIENT_OK && reply->result == 0) {
         fds[0] = reply->lease_fd; fds[1] = ctx->temporary_fd;
         ctx->prepare_sent = 1;
-        rc = ngx_cache_purge_client_submit_files(ctx->client, &ctx->prepare, fds, ctx->timeout,
-                                                rpc_prepare_done, ctx, &ctx->call);
+        if (ctx->finish_requested) {
+            rc = ngx_cache_purge_client_finish_file(ctx->client, &ctx->prepare, fds[0], ctx->timeout,
+                                                    rpc_prepare_done, ctx, &ctx->call);
+        } else {
+            rc = ngx_cache_purge_client_submit_files(ctx->client, &ctx->prepare, fds, ctx->timeout,
+                                                    rpc_prepare_done, ctx, &ctx->call);
+        }
         if (rc != NGX_OK) { ngx_http_finalize_request(r, 503); }
         return;
     }
@@ -186,6 +192,7 @@ rpc_prepare_body(ngx_http_request_t *r, ngx_cache_purge_client_t *client, ngx_ms
     if (!target.data || !ctx || !cleanup) { ngx_http_finalize_request(r, 500); return; }
     target.len = ngx_sprintf(target.data, "prepared-%i", id) - target.data;
     ctx->request = r; ctx->client = client; ctx->timeout = timeout;
+    ctx->finish_requested = ngx_http_arg(r, (u_char *) "finish", 6, &value) == NGX_OK;
     ctx->temporary = r->request_body->temp_file->file.name;
     ctx->temporary_fd = r->request_body->temp_file->file.fd;
     cleanup->handler = rpc_cleanup; cleanup->data = ctx;
@@ -200,6 +207,10 @@ rpc_prepare_body(ngx_http_request_t *r, ngx_cache_purge_client_t *client, ngx_ms
     for (i = 0; i < 6; i++) { p = rpc_string(p, empty); }
     p = rpc_number(p, 0, 8); p = rpc_number(p, 0, 8);
     p = rpc_string(p, ctx->temporary); ctx->prepare.len = p - ctx->prepare.data;
+    if (ctx->finish_requested) {
+        p = rpc_number(ctx->prepare.data, 0, 8); p = rpc_number(p, id, 8);
+        p = rpc_number(p, 1, 8); ctx->prepare.len = p - ctx->prepare.data;
+    }
     p = rpc_number(address.data, root.len + 1 + target.len, 4);
     p = ngx_cpymem(p, root.data, root.len); *p++ = '/';
     p = ngx_cpymem(p, target.data, target.len); address.len = p - address.data;
