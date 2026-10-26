@@ -210,11 +210,16 @@ store_step(ngx_http_request_t *r, ngx_http_cache_t *c, ngx_temp_file_t *tf,
     return NGX_AGAIN;
 }
 
+static ngx_http_output_header_filter_pt next_header;
+
 static ngx_int_t
-store(ngx_http_request_t *r, ngx_temp_file_t *tf)
+store_header(ngx_http_request_t *r)
 {
-    probe_ctx_t *ctx = r->cache->adapter_ctx;
-    return ngx_http_cache_purge_fill_start(r, tf, &ctx->fill, store_step, ctx);
+    probe_ctx_t *ctx = r->cache ? r->cache->adapter_ctx : NULL;
+    if (ctx && ngx_http_cache_purge_fill_arm(r, &ctx->fill, store_step, ctx) == NGX_ERROR) {
+        return NGX_ERROR;
+    }
+    return next_header(r);
 }
 
 static ngx_int_t
@@ -261,13 +266,15 @@ pre(ngx_conf_t *cf)
 static ngx_int_t
 post(ngx_conf_t *cf)
 {
-    static ngx_http_cache_adapter_t adapter = {identity, lookup, send_response, store};
+    static ngx_http_cache_adapter_t adapter = {identity, lookup, send_response};
     ngx_http_core_main_conf_t *core;
     core = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
     if (core->cache_adapter) {
         return NGX_ERROR;
     }
     core->cache_adapter = &adapter;
+    next_header = ngx_http_top_header_filter;
+    ngx_http_top_header_filter = store_header;
     return NGX_OK;
 }
 

@@ -477,8 +477,9 @@ try:
     assert get('/store-rename-failed?prepare=200&finish=15')[0] == 200
     until(lambda: phase_seen('/store-rename-failed', 1))
     cache_file('/store-rename-failed').mkdir()
-    until(lambda: phase_seen('/store-rename-failed', 2, -1))
+    until(lambda: phase_seen('/store-rename-failed', 2, 0))
     until(lambda: phase_seen('/store-rename-failed', 2, complete=True))
+    assert cache_file('/store-rename-failed').is_dir()
     cache_file('/store-rename-failed').rmdir()
     warm('/store-rename-failed')
     checks.append('native rename failure reaches finish and releases the cache node for retry')
