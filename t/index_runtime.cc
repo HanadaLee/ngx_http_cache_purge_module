@@ -122,8 +122,18 @@ static int process_test(const std::string &mode, const char *path) {
             check(selected(index, {SelectorKind::url, "https://alias.test/a", ""}) == std::set<unsigned>({1, 2}), "alias survives without rebuild");
             check(selected(index, {SelectorKind::namespace_tag, "photo", "team"}) == std::set<unsigned>({1, 2}), "TAG scan survives without rebuild");
             index.collect_file(c.id, 3);
+        } else if (mode == "--crash-unpublished") {
+            index.prepare(a); index.commit_pending(a.id, 1);
+        } else if (mode == "--recover-unpublished") {
+            auto pending = index.pending_fills(); Match m;
+            check(pending->next(m) && m.id == a.id && m.state == FileState::committed
+                  && m.revision == 2 && !pending->next(m), "unpublished commit survives abrupt exit in the recovery queue");
+            pending.reset();
+            check(index.current(a.root, a.path)->id == a.id, "unpublished commit retains its current path");
+            check(index.publish(a.id, 2).revision == 2, "recovered publication completes without changing object revision");
+            check(!index.pending_fills()->next(m), "recovered publication removes only its intent");
         } else throw std::runtime_error("unknown process test mode");
-        if (mode != "--recover") {
+        if (mode != "--recover" && mode != "--recover-unpublished") {
             std::cout << "PASS " << mode << " " << assertions << " assertions" << std::endl;
             _exit(0); // Deliberately bypass index/DB cleanup after acknowledged writes.
         }
@@ -144,6 +154,45 @@ int main(int argc, char **argv) {
         check(ngx_cache_purge_store_open(path, &options, &store, &error) == 0, error.message);
         {
             Index index(store);
+            auto publication = file(200, "/publication");
+            check(!index.current(publication.root, publication.path), "new physical path has no committed instance");
+            check(!index.current("/unknown-root", publication.path), "unknown root lookup does not create dictionary entries");
+            index.prepare(publication);
+            check(!index.current(publication.root, publication.path), "prepare alone does not publish the path mapping");
+            auto unpublished = index.commit_pending(publication.id, 1);
+            check(unpublished.state == FileState::committed && unpublished.revision == 2, "DB commit can retain a publication intent");
+            {
+                auto pending = index.pending_fills(); Match m;
+                check(pending->next(m) && m.id == publication.id && m.state == FileState::committed
+                      && !pending->next(m), "pending cursor includes committed-but-unpublished files");
+            }
+            auto pub_replacement = file(201, "/publication"); pub_replacement.path = publication.path;
+            fails(NGX_PURGE_STORE_BUSY, [&] { index.prepare(pub_replacement, publication.id); });
+            fails(NGX_PURGE_STORE_BUSY, [&] { index.retire(publication.id, 2); });
+            fails(NGX_PURGE_STORE_BUSY, [&] { index.update_metadata(publication.id, 2, "new", {}); });
+            fails(NGX_PURGE_STORE_CONFLICT, [&] { index.publish(publication.id, 1); });
+            check(index.current(publication.root, publication.path)->id == publication.id, "current path returns the exact committed instance");
+            check(index.publish(publication.id, 2).revision == 2
+                  && index.publish(publication.id, 2).revision == 2, "publication cleanup is idempotent");
+            fails(NGX_PURGE_STORE_CONFLICT, [&] { index.discard_publication(publication.id, 2); });
+            index.prepare(pub_replacement, publication.id);
+            fails(NGX_PURGE_STORE_BUSY, [&] { index.publish(publication.id, 2); });
+            index.commit_pending(pub_replacement.id, 1);
+            check(index.get(publication.id).state == FileState::retired, "replacement retires old instance while retaining new intent");
+            auto discarded = index.discard_publication(pub_replacement.id, 2);
+            check(discarded.state == FileState::retired && !index.current(pub_replacement.root, pub_replacement.path),
+                  "failed publication can retire its exact instance and clear its path");
+            index.collect_file(publication.id, 3); index.collect_file(pub_replacement.id, 3);
+            auto retained = file(202, "/schema-retained");
+            install(index, retained);
+            raw_write(store, NGX_PURGE_STORE_DEFAULT, "M:index", "1");
+            Index upgraded(store);
+            check(!upgraded.current(publication.root, publication.path), "v1 schema upgrades without rebuilding index records");
+            check(upgraded.current(retained.root, retained.path)->id == retained.id
+                  && upgraded.get(retained.id).metadata == retained.metadata
+                  && selected(upgraded, {SelectorKind::url, retained.url, ""}) == std::set<unsigned>{202},
+                  "schema migration preserves existing files, metadata and URL relationships");
+            upgraded.retire(retained.id, 2); upgraded.collect_file(retained.id, 3);
             auto a = file(1), b = file(2, "/dir/a", "", "b.example", "/cache/b");
             b.range = b.components[5] = "bytes=100-199";
             auto c = file(3, "/dir/a", "fr"), d = file(4, "/dir/a", "", "a.example", "/cache/c");

@@ -446,8 +446,11 @@ Index::Index(ngx_cache_purge_store_t *store) : store_(store) {
     Transaction tx(store_);
     auto schema = tx.get(common, "M:index");
     if (schema) {
-        require(*schema == "1", NGX_PURGE_STORE_SCHEMA, "unsupported file index schema");
+        require(*schema == "1" || *schema == "2", NGX_PURGE_STORE_SCHEMA, "unsupported file index schema");
         require(integer(tx.need(common, "M:next")) != 0, NGX_PURGE_STORE_CORRUPT, "invalid index ID allocator");
+        /* Record encodings are unchanged. Version 2 additionally permits a
+         * committed instance to retain its pending-publication lease. */
+        if (*schema == "1") { tx.put(common, "M:index", "2"); tx.commit(); }
         return;
     }
     for (Cf cf : {common, urls, tags}) {
@@ -457,7 +460,7 @@ Index::Index(ngx_cache_purge_store_t *store) : store_(store) {
             require(cf == common && !key.empty() && key[0] == 0,
                     NGX_PURGE_STORE_SCHEMA, "file index schema missing from non-empty store");
     }
-    tx.put(common, "M:index", "1"); tx.put(common, "M:next", number(1)); tx.commit();
+    tx.put(common, "M:index", "2"); tx.put(common, "M:next", number(1)); tx.commit();
 }
 
 static Match prepare_record(Transaction &tx, Values &pool, const File &file, const FileId &expected_previous) {
@@ -534,7 +537,8 @@ std::vector<Match> Index::prepare_batch(const std::vector<Fill> &fills) {
     tx.commit(); return result;
 }
 
-static Match commit_record(Transaction &tx, const FileId &id, uint64_t revision) {
+static Match commit_record(Transaction &tx, const FileId &id, uint64_t revision,
+                           bool pending_publication = false) {
     auto record = load(tx, id, revision);
     require(record.state == FileState::prepared, NGX_PURGE_STORE_CONFLICT, "file is not prepared");
     require(tx.need(common, lease(record.root, record.path)) == id_bytes(id), NGX_PURGE_STORE_CONFLICT, "fill lease changed");
@@ -550,7 +554,8 @@ static Match commit_record(Transaction &tx, const FileId &id, uint64_t revision)
     }
     record.state = FileState::committed; advance(record);
     tx.put(common, object(id), encode(record)); tx.put(common, location(record.root, record.path), id_bytes(id));
-    tx.del(common, lease(record.root, record.path)); return match(record);
+    if (!pending_publication) tx.del(common, lease(record.root, record.path));
+    return match(record);
 }
 
 Match Index::commit(const FileId &id, uint64_t revision) {
@@ -561,6 +566,58 @@ std::vector<Match> Index::commit_batch(const std::vector<ExpectedFile> &files) {
     Transaction tx(store_); std::vector<Match> result; result.reserve(files.size());
     for (const auto &file : files) result.push_back(commit_record(tx, file.id, file.revision));
     tx.commit(); return result;
+}
+
+Match Index::commit_pending(const FileId &id, uint64_t revision) {
+    Transaction tx(store_); auto result = commit_record(tx, id, revision, true);
+    tx.commit(); return result;
+}
+
+Match Index::publish(const FileId &id, uint64_t revision) {
+    Transaction tx(store_); auto record = load(tx, id, revision);
+    require(record.state == FileState::committed, NGX_PURGE_STORE_CONFLICT, "file is not committed");
+    require(tx.need(common, location(record.root, record.path)) == id_bytes(id),
+            NGX_PURGE_STORE_CONFLICT, "cache path changed before publication");
+    auto intent = tx.get(common, lease(record.root, record.path));
+    if (intent) {
+        require(*intent == id_bytes(id), NGX_PURGE_STORE_BUSY, "another fill owns the path lease");
+        tx.del(common, lease(record.root, record.path));
+    }
+    tx.commit(); return match(record);
+}
+
+Match Index::discard_publication(const FileId &id, uint64_t revision) {
+    Transaction tx(store_); auto record = load(tx, id, revision);
+    require(record.state == FileState::committed, NGX_PURGE_STORE_CONFLICT, "file is not committed");
+    auto intent = tx.get(common, lease(record.root, record.path));
+    require(intent && *intent == id_bytes(id),
+            NGX_PURGE_STORE_CONFLICT, "publication lease changed");
+    require(tx.need(common, location(record.root, record.path)) == id_bytes(id),
+            NGX_PURGE_STORE_CONFLICT, "cache path changed before publication discard");
+    tx.del(common, lease(record.root, record.path));
+    tx.del(common, location(record.root, record.path));
+    record.state = FileState::retired; advance(record);
+    tx.put(common, object(id), encode(record));
+    tx.put(common, "g" + id_bytes(id), number(record.revision));
+    tx.commit(); return match(record);
+}
+
+std::optional<Match> Index::current(const std::string &root, const std::string &path) {
+    require(!root.empty() && root.front() == '/' && root.find('\0') == std::string::npos
+            && relative_path(path), NGX_PURGE_STORE_INVALID, "invalid indexed path");
+    require(root.size() <= max_string && path.size() <= max_string,
+            NGX_PURGE_STORE_LIMIT, "indexed path too long");
+    Transaction tx(store_); Values values(tx);
+    auto root_id = values.find(root);
+    if (!root_id) return {};
+    auto value = tx.get(common, location(root_id, path));
+    if (!value) return {};
+    auto id = file_id(*value);
+    auto record = decode_record(tx.need(common, object(id)));
+    require(record.id == id && record.root == root_id && record.path == path
+            && record.state == FileState::committed,
+            NGX_PURGE_STORE_CORRUPT, "inconsistent current cache path");
+    return match(record);
 }
 
 Match Index::abort_prepare(const FileId &id, uint64_t revision) {
@@ -859,9 +916,16 @@ struct Query::Impl {
             require(body.has_value(), NGX_PURGE_STORE_CORRUPT, "pending fill has no file record");
             auto record = decode_record(*body);
             require(record.id == id, NGX_PURGE_STORE_CORRUPT, "recovery file ID mismatch");
-            if (recovery == 'I')
-                require(record.state == FileState::prepared && key == lease(record.root, record.path),
+            if (recovery == 'I') {
+                require((record.state == FileState::prepared || record.state == FileState::committed)
+                        && key == lease(record.root, record.path),
                         NGX_PURGE_STORE_CORRUPT, "invalid pending-fill relationship");
+                if (record.state == FileState::committed) {
+                    auto current = read(store, common, location(record.root, record.path), outer.handle);
+                    require(current && *current == id_bytes(id), NGX_PURGE_STORE_CORRUPT,
+                            "unpublished file has no matching current path");
+                }
+            }
             else require(record.state == FileState::retired && record.revision == integer(value),
                          NGX_PURGE_STORE_CORRUPT, "invalid retired-file relationship");
             output = match(record);

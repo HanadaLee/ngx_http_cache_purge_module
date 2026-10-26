@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -79,6 +80,13 @@ public:
     std::vector<Match> prepare_batch(const std::vector<Fill> &files);
     Match commit(const FileId &id, uint64_t expected_revision);
     std::vector<Match> commit_batch(const std::vector<ExpectedFile> &files);
+    /* Native file publication keeps its durable lease after the DB commit.
+     * Publish only after the file's readable marker is durable. These APIs
+     * perform no filesystem operations and do not prove writer quiescence. */
+    Match commit_pending(const FileId &id, uint64_t expected_revision);
+    Match publish(const FileId &id, uint64_t expected_revision);
+    Match discard_publication(const FileId &id, uint64_t expected_revision);
+    std::optional<Match> current(const std::string &root, const std::string &path);
     Match abort_prepare(const FileId &id, uint64_t expected_revision);
     Match retire(const FileId &id, uint64_t expected_revision);
     std::vector<Match> retire_batch(const std::vector<ExpectedFile> &files);
@@ -90,6 +98,7 @@ public:
     void collect_files(const std::vector<ExpectedFile> &files);
     size_t collect_keys(size_t edge_budget = 8);
     std::unique_ptr<Query> query(const Selector &selector, const std::string &bookmark = "");
+    /* Includes PREPARED and COMMITTED-but-unpublished instances. */
     std::unique_ptr<Query> pending_fills(const std::string &bookmark = "");
     std::unique_ptr<Query> retired_files(const std::string &bookmark = "");
 private:

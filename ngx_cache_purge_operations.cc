@@ -232,7 +232,7 @@ Operations::Operations(ngx_cache_purge_store_t *store, OperationLimits limits) :
     require(limits.live_records && limits.live_records <= 65536 && limits.live_selector_bytes >= 1024
             && limits.live_selector_bytes <= 64 * 1024 * 1024, NGX_PURGE_STORE_INVALID, "invalid operation capacity");
     Tx tx(store_);
-    require(tx.need("M:index") == "1", NGX_PURGE_STORE_SCHEMA, "operation ledger requires supported file index");
+    require(tx.need("M:index") == "2", NGX_PURGE_STORE_SCHEMA, "operation ledger requires supported file index");
     auto schema = tx.get("M:operations");
     if (!schema) {
         for (const char *prefix : {"D", "L", "Q", "E"}) {

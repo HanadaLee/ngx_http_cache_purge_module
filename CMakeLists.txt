@@ -21,6 +21,13 @@ set_target_properties(ngx_cache_purge_index PROPERTIES POSITION_INDEPENDENT_CODE
 target_link_libraries(ngx_cache_purge_index PUBLIC ngx_cache_purge_store OpenSSL::Crypto)
 target_compile_options(ngx_cache_purge_index PRIVATE -Wall -Wextra -Werror)
 
+add_library(ngx_cache_purge_files STATIC ngx_cache_purge_files.cc)
+target_compile_features(ngx_cache_purge_files PUBLIC cxx_std_17)
+target_include_directories(ngx_cache_purge_files PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+set_target_properties(ngx_cache_purge_files PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(ngx_cache_purge_files PUBLIC OpenSSL::Crypto)
+target_compile_options(ngx_cache_purge_files PRIVATE -Wall -Wextra -Werror)
+
 add_library(ngx_cache_purge_operations STATIC ngx_cache_purge_operations.cc)
 set_target_properties(ngx_cache_purge_operations PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(ngx_cache_purge_operations PUBLIC ngx_cache_purge_index)
@@ -46,6 +53,8 @@ option(CACHE_PURGE_STORE_SANITIZE "Enable address and undefined behavior sanitiz
 if(CACHE_PURGE_STORE_SANITIZE)
   target_compile_options(ngx_cache_purge_store PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
   target_link_options(ngx_cache_purge_store PUBLIC -fsanitize=address,undefined)
+  target_compile_options(ngx_cache_purge_files PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
+  target_link_options(ngx_cache_purge_files PUBLIC -fsanitize=address,undefined)
 endif()
 
 if(CACHE_PURGE_STORE_TESTS)
@@ -63,6 +72,14 @@ if(CACHE_PURGE_STORE_TESTS)
     ${CMAKE_CURRENT_SOURCE_DIR}/t/index_process_runtime.py
     --binary $<TARGET_FILE:cache_purge_index_test>
     --output ${CMAKE_CURRENT_BINARY_DIR}/index-process-results.json)
+  add_executable(cache_purge_files_test t/files_runtime.cc)
+  target_link_libraries(cache_purge_files_test PRIVATE ngx_cache_purge_files ngx_cache_purge_index)
+  target_compile_options(cache_purge_files_test PRIVATE -Wall -Wextra -Werror)
+  add_test(NAME files_runtime COMMAND cache_purge_files_test)
+  add_test(NAME files_process_runtime COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/t/files_process_runtime.py
+    --binary $<TARGET_FILE:cache_purge_files_test>
+    --output ${CMAKE_CURRENT_BINARY_DIR}/files-process-results.json)
   add_executable(cache_purge_component_test t/component_runtime.cc)
   target_link_libraries(cache_purge_component_test PRIVATE ngx_cache_purge_component)
   target_compile_options(cache_purge_component_test PRIVATE -Wall -Wextra -Werror)
@@ -101,7 +118,7 @@ if(CACHE_PURGE_STORE_TESTS)
     ${CMAKE_CURRENT_SOURCE_DIR}/t/coordinator_process_runtime.py
     --binary $<TARGET_FILE:cache_purge_coordinator_test>
     --output ${CMAKE_CURRENT_BINARY_DIR}/coordinator-process-results.json)
-  set_tests_properties(store_runtime index_runtime index_process_runtime component_process_runtime
+  set_tests_properties(store_runtime index_runtime index_process_runtime files_runtime files_process_runtime component_process_runtime
     operations_runtime operations_process_runtime control_runtime control_fault_runtime
     coordinator_runtime coordinator_process_runtime PROPERTIES TIMEOUT 120)
 endif()
