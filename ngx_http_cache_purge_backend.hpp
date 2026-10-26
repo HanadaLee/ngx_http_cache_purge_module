@@ -163,6 +163,7 @@ class Index {
         ngx_http_cache_purge_index_checked(rc, error); return result;
     }
 public:
+    ngx_http_cache_rocksdb_t *native() { return store_; }
     explicit Index(ngx_http_cache_rocksdb_t *store) : store_(store) {
         ngx_http_cache_rocksdb_error_t error;
         int rc = ngx_http_cache_purge_index_init(store, &error); ngx_http_cache_purge_index_checked(rc, error);
@@ -555,21 +556,52 @@ struct PublicationTarget { std::string root, address; FileId previous{}; };
 /* Executor-thread filesystem policy; pinned roots are configuration-sized,
  * never an in-memory copy of the file index. Construction may perform I/O. */
 class Publications {
+    ngx_http_cache_purge_publications_t *native_ = nullptr;
 public:
-    Publications(const std::vector<RootSpec> &roots, const std::string &database);
-    ~Publications();
-    PublicationTarget target(Index &index, const std::string &root,
-                             const std::string &zone, const std::string &path);
-    Match prepare(Index &index, Fill fill, const std::string &temporary,
-                  int anchor_fd, int lease_fd, int temporary_fd, uint32_t peer_uid);
-    /* Caller must have finished/abandoned native writing and retain the lease.
-     * Reconcile the actual final instance; do not trust a reported rename code.
-     * A committed result proves identity publication, not purge freshness. */
-    Match finish(Index &index, const FileId &id, uint64_t prepared_revision,
-                 int anchor_fd, int lease_fd, uint32_t peer_uid);
-private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
+    Publications(const std::vector<RootSpec> &roots, const std::string &database) {
+        std::vector<ngx_http_cache_purge_root_t> raw;
+        raw.reserve(roots.size());
+        for (const auto &root : roots)
+            raw.push_back({ngx_http_cache_purge_native_bytes(root.path),
+                           ngx_http_cache_purge_native_bytes(root.zone), root.kind});
+        ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_publications_open(raw.data(), raw.size(), database.c_str(), &native_, &error);
+        ngx_http_cache_purge_index_checked(rc, error);
+    }
+    ~Publications() { ngx_http_cache_purge_publications_close(&native_, nullptr); }
+    Publications(const Publications &) = delete;
+    Publications &operator=(const Publications &) = delete;
+    PublicationTarget target(Index &index, const std::string &root, const std::string &zone, const std::string &path) {
+        struct Result {
+            ngx_http_cache_purge_publication_target_t value{};
+            ~Result() { ngx_http_cache_purge_publication_target_free(&value); }
+        } output;
+        ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_publications_target(native_, index.native(),
+            ngx_http_cache_purge_native_bytes(root), ngx_http_cache_purge_native_bytes(zone),
+            ngx_http_cache_purge_native_bytes(path), &output.value, &error);
+        ngx_http_cache_purge_index_checked(rc, error);
+        PublicationTarget result{ngx_http_cache_purge_cpp_bytes(output.value.root),
+                                 ngx_http_cache_purge_cpp_bytes(output.value.address), {}};
+        std::memcpy(result.previous.data(), output.value.previous, 16);
+        return result;
+    }
+    Match prepare(Index &index, const Fill &fill, const std::string &temporary,
+                  int anchor_fd, int lease_fd, int temporary_fd, uint32_t peer_uid) {
+        ngx_http_cache_purge_index_fill_t raw{};
+        raw.file = ngx_http_cache_purge_native_file(fill.file);
+        std::memcpy(raw.previous, fill.previous.data(), 16);
+        ngx_http_cache_purge_index_match_t output{}; ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_publications_prepare(native_, index.native(), &raw,
+            ngx_http_cache_purge_native_bytes(temporary), anchor_fd, lease_fd, temporary_fd, peer_uid, &output, &error);
+        ngx_http_cache_purge_index_checked(rc, error); return ngx_http_cache_purge_cpp_match(output);
+    }
+    Match finish(Index &index, const FileId &id, uint64_t revision, int anchor_fd, int lease_fd, uint32_t peer_uid) {
+        ngx_http_cache_purge_index_match_t output{}; ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_publications_finish(native_, index.native(), id.data(), revision,
+            anchor_fd, lease_fd, peer_uid, &output, &error);
+        ngx_http_cache_purge_index_checked(rc, error); return ngx_http_cache_purge_cpp_match(output);
+    }
 };
 }
 

@@ -20,7 +20,7 @@ target_compile_features(ngx_http_cache_purge_files PUBLIC c_std_99)
 target_compile_definitions(ngx_http_cache_purge_files PRIVATE _GNU_SOURCE)
 target_include_directories(ngx_http_cache_purge_files PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 set_target_properties(ngx_http_cache_purge_files PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(ngx_http_cache_purge_files PUBLIC OpenSSL::Crypto)
+target_link_libraries(ngx_http_cache_purge_files PUBLIC ngx_http_cache_purge_index OpenSSL::Crypto)
 target_compile_options(ngx_http_cache_purge_files PRIVATE -Wall -Wextra -Werror -Wdeclaration-after-statement)
 
 add_library(ngx_http_cache_purge_index STATIC ngx_http_cache_purge_index.c)
@@ -37,6 +37,7 @@ target_link_libraries(ngx_http_cache_purge_control PUBLIC ngx_http_cache_purge_i
 target_compile_options(ngx_http_cache_purge_control PRIVATE -Wall -Wextra -Werror -Wdeclaration-after-statement)
 
 add_library(ngx_http_cache_purge_component STATIC ngx_http_cache_purge_component.cc)
+target_compile_features(ngx_http_cache_purge_component PRIVATE cxx_std_17)
 set_target_properties(ngx_http_cache_purge_component PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(ngx_http_cache_purge_component PUBLIC ngx_http_cache_purge_control ngx_http_cache_purge_index ngx_http_cache_purge_files)
 target_compile_options(ngx_http_cache_purge_component PRIVATE -Wall -Wextra -Werror)
@@ -92,7 +93,7 @@ if(CACHE_PURGE_STORE_TESTS)
   add_executable(cache_purge_operations_c_test t/ngx_http_cache_purge_operations_test.c)
   target_compile_definitions(cache_purge_operations_c_test PRIVATE _GNU_SOURCE)
   target_compile_options(cache_purge_operations_c_test PRIVATE -std=gnu89 -Wall -Wextra -Werror -Wdeclaration-after-statement)
-  target_link_libraries(cache_purge_operations_c_test PRIVATE ngx_http_cache_purge_control)
+  target_link_libraries(cache_purge_operations_c_test PRIVATE ngx_http_cache_purge_control ngx_http_cache_purge_files)
   add_test(NAME operations_c_api COMMAND cache_purge_operations_c_test)
   add_test(NAME operations_process_runtime COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/t/operations_process_runtime.py

@@ -666,4 +666,62 @@ ngx_http_cache_purge_index_collect_keys(ngx_http_cache_rocksdb_t *store,
 }
 #endif
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define NGX_HTTP_CACHE_PURGE_INDEX_PREPARED   1
+#define NGX_HTTP_CACHE_PURGE_INDEX_COMMITTED  2
+#define NGX_HTTP_CACHE_PURGE_INDEX_RETIRED    3
+
+typedef struct ngx_http_cache_purge_publications_s
+    ngx_http_cache_purge_publications_t;
+
+typedef struct {
+    ngx_http_cache_rocksdb_bytes_t  root;
+    ngx_http_cache_rocksdb_bytes_t  address;
+    unsigned char                   previous[16];
+    void                           *storage;
+} ngx_http_cache_purge_publication_target_t;
+
+/* Executor-only filesystem/index publication. Open copies configured roots
+ * and pins their canonical directories. Other inputs and descriptors are
+ * borrowed for the call; target owns one allocation, released by target_free.
+ * PREPARE persists intent before the temporary marker. FINISH checks the final
+ * identity before publishing READY; it does not attest purge freshness.
+ */
+int ngx_http_cache_purge_publications_open(
+    const ngx_http_cache_purge_root_t *roots, size_t count,
+    const char *database, ngx_http_cache_purge_publications_t **publications,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_publications_close(
+    ngx_http_cache_purge_publications_t **publications,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_publications_target(
+    ngx_http_cache_purge_publications_t *publications,
+    ngx_http_cache_rocksdb_t *store, ngx_http_cache_rocksdb_bytes_t root,
+    ngx_http_cache_rocksdb_bytes_t zone, ngx_http_cache_rocksdb_bytes_t path,
+    ngx_http_cache_purge_publication_target_t *target,
+    ngx_http_cache_rocksdb_error_t *error);
+void ngx_http_cache_purge_publication_target_free(
+    ngx_http_cache_purge_publication_target_t *target);
+int ngx_http_cache_purge_publications_prepare(
+    ngx_http_cache_purge_publications_t *publications,
+    ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_fill_t *fill,
+    ngx_http_cache_rocksdb_bytes_t temporary, int anchor_fd, int lease_fd,
+    int temporary_fd, uint32_t peer_uid,
+    ngx_http_cache_purge_index_match_t *match,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_publications_finish(
+    ngx_http_cache_purge_publications_t *publications,
+    ngx_http_cache_rocksdb_t *store, const unsigned char id[16],
+    uint64_t prepared_revision, int anchor_fd, int lease_fd, uint32_t peer_uid,
+    ngx_http_cache_purge_index_match_t *match,
+    ngx_http_cache_rocksdb_error_t *error);
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif /* _NGX_HTTP_CACHE_PURGE_INTERNAL_H_INCLUDED_ */

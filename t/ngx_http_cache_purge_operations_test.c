@@ -7,6 +7,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static unsigned                       ngx_http_cache_purge_test_count;
 static ngx_http_cache_rocksdb_error_t ngx_http_cache_purge_test_error;
@@ -351,6 +354,152 @@ ngx_http_cache_purge_test_control(ngx_http_cache_purge_operations_t *ops)
     free(memory);
 }
 
+static void
+ngx_http_cache_purge_test_publication(void)
+{
+    ngx_http_cache_purge_publications_t       *publications;
+    ngx_http_cache_purge_publication_target_t  target;
+    ngx_http_cache_purge_index_fill_t          fill;
+    ngx_http_cache_purge_index_match_t         match;
+    ngx_http_cache_purge_file_marker_t         marker;
+    ngx_http_cache_purge_root_t                root;
+    ngx_http_cache_rocksdb_t                  *store;
+    ngx_http_cache_rocksdb_error_t            *error;
+    unsigned char                              digest[16];
+    uint64_t                                   offset;
+    int                                       anchor, lease, fd, rc;
+    char parent[] = "/tmp/cache-publication-c-XXXXXX";
+    char cache[128], database[128], temporary[128], final[128], locks[128];
+    char configured[128];
+
+    error = &ngx_http_cache_purge_test_error;
+    ngx_http_cache_purge_test_check(mkdtemp(parent) != NULL,
+                                    "C publication directory");
+    snprintf(cache, sizeof(cache), "%s/cache", parent);
+    snprintf(database, sizeof(database), "%s/db", parent);
+    snprintf(temporary, sizeof(temporary), "%s/cache/temp", parent);
+    snprintf(final, sizeof(final), "%s/cache/final", parent);
+    snprintf(locks, sizeof(locks), "%s/locks", parent);
+    snprintf(configured, sizeof(configured), "%s", cache);
+    ngx_http_cache_purge_test_check(mkdir(cache, 0700) == 0,
+                                    "C cache directory");
+    ngx_http_cache_purge_test_check(mkdir(database, 0700) == 0,
+                                    "C index directory");
+    store = ngx_http_cache_purge_test_open(database);
+    ngx_http_cache_purge_test_check(
+        ngx_http_cache_purge_index_init(store, error) == 0,
+        "C publication index");
+    root.path = ngx_http_cache_purge_test_bytes(configured);
+    root.zone = ngx_http_cache_purge_test_bytes("cache");
+    root.kind = NGX_HTTP_CACHE_PURGE_ROOT_CACHE;
+    publications = NULL;
+    rc = ngx_http_cache_purge_publications_open(&root, 1, database,
+                                                &publications, error);
+    ngx_http_cache_purge_test_check(rc == 0, "open C publication roots");
+    configured[0] = 'X';
+    rc = ngx_http_cache_purge_publications_target(
+        publications, store, ngx_http_cache_purge_test_bytes(cache), root.zone,
+        ngx_http_cache_purge_test_bytes("../outside"), &target, error);
+    ngx_http_cache_purge_test_check(rc == NGX_HTTP_CACHE_ROCKSDB_INVALID
+                                        && target.storage == NULL,
+                                    "reject C path traversal");
+    rc = ngx_http_cache_purge_publications_target(
+        publications, store, ngx_http_cache_purge_test_bytes(cache), root.zone,
+        ngx_http_cache_purge_test_bytes("final"), &target, error);
+    ngx_http_cache_purge_test_check(
+        rc == 0 && target.root.len == strlen(cache)
+            && target.address.len == strlen(final)
+            && memcmp(target.address.data, final, target.address.len) == 0,
+        "root config copied; target owns canonical path");
+    ngx_http_cache_purge_publication_target_free(&target);
+    ngx_http_cache_purge_publication_target_free(&target);
+    ngx_http_cache_purge_test_check(target.storage == NULL,
+                                    "repeat C target free");
+
+    ngx_http_cache_purge_test_check(
+        ngx_http_cache_purge_file_locks_open(locks, getuid(), 1, &anchor, error)
+            == 0,
+        "C publication lock anchor");
+    ngx_http_cache_purge_test_check(
+        ngx_http_cache_purge_file_address(
+            ngx_http_cache_purge_test_bytes(final), digest, &offset, error)
+            == 0,
+        "C publication address");
+    ngx_http_cache_purge_test_check(ngx_http_cache_purge_file_lease_acquire(
+                                        locks, anchor, offset, &lease, error)
+                                        == 0,
+                                    "C publication lease");
+    fd = open(temporary, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+    ngx_http_cache_purge_test_check(fd >= 0 && write(fd, "entity", 6) == 6,
+                                    "C temporary entity");
+    memset(&fill, 0, sizeof(fill));
+    fill.file.id[15] = 1;
+    fill.file.state = NGX_HTTP_CACHE_PURGE_INDEX_PREPARED;
+    fill.file.key = ngx_http_cache_purge_test_bytes("key");
+    fill.file.url =
+        ngx_http_cache_purge_test_bytes("https://example.test/file");
+    fill.file.host = ngx_http_cache_purge_test_bytes("example.test");
+    fill.file.tag_namespace = ngx_http_cache_purge_test_bytes("tenant");
+    fill.file.root = ngx_http_cache_purge_test_bytes(cache);
+    fill.file.zone = root.zone;
+    fill.file.path = ngx_http_cache_purge_test_bytes("final");
+    fill.file.metadata.len = 1;
+    memset(&match, 0xff, sizeof(match));
+    rc = ngx_http_cache_purge_publications_prepare(
+        publications, store, &fill, ngx_http_cache_purge_test_bytes(temporary),
+        anchor, lease, fd, getuid(), &match, error);
+    ngx_http_cache_purge_test_check(
+        rc == NGX_HTTP_CACHE_ROCKSDB_INVALID && match.revision == 0
+            && match.id[15] == 0,
+        "C prepare rejects invalid bytes and clears output");
+    fill.file.metadata = ngx_http_cache_purge_test_bytes("policy");
+    rc = ngx_http_cache_purge_publications_prepare(
+        publications, store, &fill, ngx_http_cache_purge_test_bytes(temporary),
+        anchor, lease, fd, getuid(), &match, error);
+    ngx_http_cache_purge_test_check(
+        rc == 0 && match.revision == 1
+            && match.state == NGX_HTTP_CACHE_PURGE_INDEX_PREPARED
+            && fill.file.metadata.len == 6,
+        "C PREPARE keeps borrowed input unchanged");
+    ngx_http_cache_purge_test_check(
+        ngx_http_cache_purge_file_marker_read(fd, &marker, error) == 0
+            && marker.state == NGX_HTTP_CACHE_PURGE_FILE_PREPARED,
+        "C durable intent precedes marker");
+    ngx_http_cache_purge_test_check(rename(temporary, final) == 0,
+                                    "native rename before C FINISH");
+    rc = ngx_http_cache_purge_publications_finish(
+        publications, store, fill.file.id, 1, anchor, lease, getuid(), &match,
+        error);
+    ngx_http_cache_purge_test_check(
+        rc == 0 && match.state == NGX_HTTP_CACHE_PURGE_INDEX_COMMITTED,
+        "C FINISH commits physical identity");
+    ngx_http_cache_purge_test_check(
+        ngx_http_cache_purge_file_marker_read(fd, &marker, error) == 0
+            && marker.state == NGX_HTTP_CACHE_PURGE_FILE_READY,
+        "C FINISH durable readable marker");
+    rc = ngx_http_cache_purge_publications_target(
+        publications, store, fill.file.root, fill.file.zone, fill.file.path,
+        &target, error);
+    ngx_http_cache_purge_test_check(
+        rc == 0 && target.previous[15] == 1,
+        "C target returns current physical instance");
+    ngx_http_cache_purge_test_check(
+        ngx_http_cache_purge_publications_close(&publications, error) == 0
+            && publications == NULL,
+        "close C publication roots");
+    ngx_http_cache_purge_test_check(
+        target.root.len == strlen(cache)
+            && memcmp(target.root.data, cache, strlen(cache)) == 0,
+        "owned target outlives publication context");
+    ngx_http_cache_purge_publication_target_free(&target);
+    close(fd);
+    close(lease);
+    close(anchor);
+    ngx_http_cache_purge_test_check(ngx_http_cache_rocksdb_close(&store, error)
+                                        == 0,
+                                    "close C publication store");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -529,6 +678,7 @@ main(int argc, char **argv)
         "completed C receipt cannot resurrect work");
     ngx_http_cache_purge_operation_free(&op);
     ngx_http_cache_purge_test_control(&ops);
+    ngx_http_cache_purge_test_publication();
     ngx_http_cache_purge_test_check(
         ngx_http_cache_rocksdb_close(&store, &ngx_http_cache_purge_test_error)
             == 0,

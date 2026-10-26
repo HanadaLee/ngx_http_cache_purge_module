@@ -8,8 +8,8 @@ Both modules remain in this repository. The engine bridge is isolated in
 progress. File markers, OFD leases, the durable operation ledger, and the entire
 persistent index use C implementations, including dictionary storage, queries,
 fill preparation, metadata updates, and reclamation. Shared control matching,
-publication, and durable-operation coordination also run in C. The component
-executor is the remaining C++ purge implementation.
+publication, durable-operation coordination, and physical file publication also
+run in C. The component executor is the remaining C++ purge implementation.
 
 HTTP cache invalidation for nginx proxy, FastCGI, SCGI, and uWSGI caches.
 
