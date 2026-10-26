@@ -654,6 +654,20 @@ int ngx_http_cache_purge_index_update(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_rocksdb_bytes_t *tags, size_t count,
     ngx_http_cache_purge_index_match_t *out,
     ngx_http_cache_rocksdb_error_t *error);
+/* Revalidation reuses the existing committed path intent. The first atomic
+ * update changes TAGs/metadata and reserves the path without replacing the
+ * body. Publication replaces its metadata proof and releases that intent. */
+int ngx_http_cache_purge_index_update_pending(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file,
+    ngx_http_cache_rocksdb_bytes_t metadata,
+    const ngx_http_cache_rocksdb_bytes_t *tags, size_t count,
+    ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_publish_update(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file,
+    ngx_http_cache_rocksdb_bytes_t metadata,
+    ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_add_url(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_bytes_t key, ngx_http_cache_rocksdb_bytes_t url,
     ngx_http_cache_rocksdb_error_t *error);
@@ -734,6 +748,46 @@ int ngx_http_cache_purge_publications_inspect(
     ngx_http_cache_rocksdb_t *store, ngx_http_cache_rocksdb_bytes_t root,
     ngx_http_cache_rocksdb_bytes_t zone, ngx_http_cache_rocksdb_bytes_t path,
     int fd, uint32_t peer_uid, ngx_http_cache_purge_index_file_t *file,
+    ngx_http_cache_rocksdb_error_t *error);
+
+typedef struct {
+    ngx_http_cache_purge_index_expected_t  file;
+    unsigned char                          transaction[16];
+    ngx_http_cache_rocksdb_bytes_t         before, after;
+    const ngx_http_cache_rocksdb_bytes_t  *tags;
+    size_t                                 tag_count;
+    int                                    replace_tags;
+} ngx_http_cache_purge_validation_t;
+
+/* Called on the owning executor immediately before the metadata transaction.
+ * The caller must reject a conflicting accepted operation, including controls
+ * not yet published to workers. No SHM guard may span the subsequent I/O. */
+typedef int (*ngx_http_cache_purge_validation_guard_pt)(void *data,
+    const ngx_http_cache_purge_index_file_t *file,
+    ngx_http_cache_rocksdb_error_t *error);
+
+/* Prepare persists the bounded header plan, TAGs and existing path intent in
+ * one transaction. It does not write the file. Finish writes only that prefix,
+ * fsyncs it, and atomically publishes the new proof and releases the intent.
+ * The native consumer supplies its fixed cache header, never entity bytes.
+ * Both calls borrow the descriptors and require the exclusive OFD path lease.
+ */
+int ngx_http_cache_purge_publications_validate_prepare(
+    ngx_http_cache_purge_publications_t *publications,
+    ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_validation_t *validation,
+    int anchor_fd, int lease_fd, int selected_fd, uint32_t peer_uid,
+    ngx_http_cache_purge_validation_guard_pt guard, void *guard_data,
+    ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+/* NULL transaction and revision zero select the persisted plan for recovery.
+ * A missing/replaced final file may return a RETIRED result. */
+int ngx_http_cache_purge_publications_validate_finish(
+    ngx_http_cache_purge_publications_t *publications,
+    ngx_http_cache_rocksdb_t *store, const unsigned char id[16],
+    const unsigned char transaction[16], uint64_t revision,
+    int anchor_fd, int lease_fd, uint32_t peer_uid,
+    ngx_http_cache_purge_index_match_t *out,
     ngx_http_cache_rocksdb_error_t *error);
 
 #ifdef __cplusplus

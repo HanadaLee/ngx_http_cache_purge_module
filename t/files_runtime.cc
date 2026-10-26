@@ -104,9 +104,190 @@ static int publication(const std::string &mode, const std::string &path) {
     return 0;
 }
 
+static int validation_guard(void *data,
+    const ngx_http_cache_purge_index_file_t *file,
+    ngx_http_cache_rocksdb_error_t *)
+{
+    check(file->state == NGX_HTTP_CACHE_PURGE_INDEX_COMMITTED,
+          "guard sees the old committed object");
+    return data ? NGX_HTTP_CACHE_ROCKSDB_CONFLICT : 0;
+}
+
+static int validation(const std::string &mode, const std::string &path) {
+    bool recovering = mode.find("--validate-recover") == 0;
+    std::filesystem::create_directories(path + "/cache");
+    std::filesystem::create_directories(path + "/db");
+    int lock_fd, lease_fd;
+    check(ngx_http_cache_purge_file_locks_open((path + "/db/file.leases").c_str(), getuid(), 1,
+          &lock_fd, &error) == 0, "validation lock anchor");
+    Descriptor anchor(lock_fd);
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    check(ngx_http_cache_rocksdb_open((path + "/db").c_str(), &options, &store, &error) == 0,
+          "validation database");
+    Index index(store);
+    Publications publications({{path + "/cache", "cache", NGX_HTTP_CACHE_PURGE_ROOT_CACHE}}, path + "/db");
+    File file; file.id = id(42); file.key = "key"; file.url = "https://example.test/value";
+    file.host = "example.test"; file.tag_namespace = "tenant"; file.tags = {"red"};
+    file.root = path + "/cache"; file.zone = "cache"; file.path = "file"; file.metadata = "original-metadata";
+    std::string target = file.root + "/file", before = "old-head", after = "new-head", tail(65536, 'B');
+    unsigned char address[16]; uint64_t offset;
+    check(ngx_http_cache_purge_file_address(bytes(target), address, &offset, &error) == 0, "validation address");
+    check(ngx_http_cache_purge_file_lease_acquire((path + "/db/file.leases").c_str(), anchor.fd, offset,
+          &lease_fd, &error) == 0, "validation path lease");
+    Descriptor lease(lease_fd);
+    if (!recovering) {
+        Descriptor temporary(open((file.root + "/temporary").c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600));
+        std::string data = before + tail;
+        check(write(temporary.fd, data.data(), data.size()) == (ssize_t) data.size(), "initial validation entity");
+        publications.prepare(index, {file, {}}, file.root + "/temporary", anchor.fd, lease.fd, temporary.fd, getuid());
+        check(rename((file.root + "/temporary").c_str(), target.c_str()) == 0, "publish validation fixture");
+        publications.finish(index, file.id, 1, anchor.fd, lease.fd, getuid());
+    }
+    std::string blue = "blue", green = "green";
+    ngx_http_cache_rocksdb_bytes_t tags[] = {bytes(green), bytes(blue), bytes(green)};
+    ngx_http_cache_purge_validation_t input{};
+    std::memcpy(input.file.id, file.id.data(), 16); input.file.revision = 2;
+    input.transaction[15] = 1; input.before = bytes(before); input.after = bytes(after);
+    input.tags = tags; input.tag_count = 3; input.replace_tags = 1;
+    ngx_http_cache_purge_index_match_t result{};
+    if (!recovering) {
+        Descriptor selected(open(target.c_str(), O_RDONLY | O_CLOEXEC));
+        if (mode == "--validate-basic") {
+            check(ngx_http_cache_purge_publications_validate_prepare(publications.native(), store, &input,
+                  anchor.fd, lease.fd, selected.fd, getuid(), validation_guard, &input, &result, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "guard veto precedes all mutation");
+            check(index.get(file.id).revision == 2 && !index.has_fill_intent(file.id), "veto has no durable effect");
+            auto wrong = input; wrong.file.revision++;
+            check(ngx_http_cache_purge_publications_validate_prepare(publications.native(), store, &wrong,
+                  anchor.fd, lease.fd, selected.fd, getuid(), validation_guard, nullptr, &result, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "validation CAS rejects stale revision");
+            wrong = input;
+            std::string mismatch = "bad-head";
+            wrong.before = bytes(mismatch);
+            check(ngx_http_cache_purge_publications_validate_prepare(publications.native(), store, &wrong,
+                  anchor.fd, lease.fd, selected.fd, getuid(), validation_guard, nullptr, &result, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "wrong header cannot start validation");
+            Descriptor unrelated(open((file.root + "/other").c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600));
+            check(ngx_http_cache_purge_publications_validate_prepare(publications.native(), store, &input,
+                  anchor.fd, lease.fd, unrelated.fd, getuid(), validation_guard, nullptr, &result, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "selected descriptor must belong to the indexed instance");
+            check(ngx_http_cache_purge_publications_validate_prepare(publications.native(), store, &input,
+                  anchor.fd, anchor.fd, selected.fd, getuid(), validation_guard, nullptr, &result, &error) != 0,
+                  "independent lock anchor cannot impersonate an OFD lease");
+            wrong = input;
+            std::string excessive(4097, 'x');
+            wrong.before = wrong.after = bytes(excessive);
+            check(ngx_http_cache_purge_publications_validate_prepare(publications.native(), store, &wrong,
+                  anchor.fd, lease.fd, selected.fd, getuid(), validation_guard, nullptr, &result, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_INVALID, "prefix bound checked before mutation");
+            check(index.get(file.id).revision == 2 && index.get(file.id).tags == file.tags
+                  && !index.has_fill_intent(file.id), "rejected validation leaves catalogue unchanged");
+        }
+        check(ngx_http_cache_purge_publications_validate_prepare(publications.native(), store, &input,
+              anchor.fd, lease.fd, selected.fd, getuid(), validation_guard, nullptr, &result, &error) == 0,
+              "persist validation plan and TAG update");
+        check(result.state == 2 && result.revision == 3 && index.has_fill_intent(file.id), "validation owns committed path intent");
+        check(index.get(file.id).tags == std::vector<std::string>({"blue", "green"}), "pending TAG replacement is atomic and canonical");
+        ngx_http_cache_purge_index_file_t inspected{};
+        check(ngx_http_cache_purge_publications_inspect(publications.native(), store, bytes(file.root), bytes(file.zone),
+              bytes(file.path), selected.fd, getuid(), &inspected, &error) == NGX_HTTP_CACHE_ROCKSDB_BUSY,
+              "READY marker alone cannot bypass a validation intent");
+        check(ngx_http_cache_purge_publications_validate_prepare(publications.native(), store, &input,
+              anchor.fd, lease.fd, selected.fd, getuid(), validation_guard, nullptr, &result, &error) == 0
+              && result.revision == 3, "prepared validation retry is stable");
+        auto wrong = input; std::string conflicting = "bad-head"; wrong.after = bytes(conflicting);
+        check(ngx_http_cache_purge_publications_validate_prepare(publications.native(), store, &wrong,
+              anchor.fd, lease.fd, selected.fd, getuid(), validation_guard, nullptr, &result, &error)
+              == NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "validation identity cannot change its bound header");
+        if (mode == "--validate-crash-intent") _exit(0);
+        if (mode == "--validate-crash-prefix" || mode == "--validate-crash-torn") {
+            Descriptor writing(open(target.c_str(), O_RDWR | O_CLOEXEC));
+            size_t length = mode == "--validate-crash-prefix" ? after.size() : 2;
+            check(pwrite(writing.fd, after.data(), length, 0) == (ssize_t) length && fsync(writing.fd) == 0,
+                  "simulate durable interrupted prefix write");
+            _exit(0);
+        }
+    }
+    if (mode == "--validate-recover-reject") {
+        check(ngx_http_cache_purge_publications_validate_finish(publications.native(), store, file.id.data(),
+              nullptr, 0, anchor.fd, lease.fd, getuid(), &result, &error) == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+              "changed prefix or object remains pending without file mutation");
+        check(index.get(file.id).revision == 3 && index.has_fill_intent(file.id), "conflict retains recovery intent");
+        check(ngx_http_cache_rocksdb_close(&store, &error) == 0, "close conflicted validation database");
+        std::cout << "PASS rejected validation recovery " << assertions << " assertions" << std::endl;
+        return 0;
+    }
+    check(ngx_http_cache_purge_publications_validate_finish(publications.native(), store, file.id.data(),
+          nullptr, 0, anchor.fd, lease.fd, getuid(), &result, &error) == 0, "finish or recover validation");
+    if (mode == "--validate-crash-done") _exit(0);
+    check(!index.has_fill_intent(file.id), "validation completion releases path reservation");
+    if (result.state == 3) {
+        check(!index.current(file.root, file.path), "lost or replaced file is retired without adoption");
+        auto wrong = input; wrong.transaction[15]++;
+        check(ngx_http_cache_purge_publications_validate_finish(publications.native(), store, file.id.data(),
+              wrong.transaction, 2, anchor.fd, lease.fd, getuid(), &result, &error)
+              == NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "retirement does not authorize a different transaction");
+        check(ngx_http_cache_purge_publications_validate_finish(publications.native(), store, file.id.data(),
+              input.transaction, 2, anchor.fd, lease.fd, getuid(), &result, &error) == 0 && result.state == 3,
+              "matching retired retry preserves its result");
+    } else {
+        check(result.state == 2 && result.revision == 4, "validation advances exactly two revisions");
+        Descriptor selected(open(target.c_str(), O_RDONLY | O_CLOEXEC));
+        std::string contents(8 + tail.size(), '\0');
+        check(pread(selected.fd, contents.data(), contents.size(), 0) == (ssize_t) contents.size()
+              && contents == after + tail, "only the bounded header prefix changed");
+        ngx_http_cache_purge_index_file_t inspected{};
+        check(ngx_http_cache_purge_publications_inspect(publications.native(), store, bytes(file.root), bytes(file.zone),
+              bytes(file.path), selected.fd, getuid(), &inspected, &error) == 0
+              && inspected.revision == 4 && inspected.metadata.len > 64
+              && std::memcmp(inspected.metadata.data, "NFR1", 4) == 0, "updated physical proof passes descriptor inspection");
+        ngx_http_cache_purge_index_file_free(&inspected);
+        ngx_http_cache_rocksdb_stats_t stats{}, retried{};
+        check(ngx_http_cache_rocksdb_stats(store, &stats, &error) == 0, "read validation write count");
+        check(ngx_http_cache_purge_publications_validate_prepare(publications.native(), store, &input,
+              anchor.fd, lease.fd, selected.fd, getuid(), validation_guard, nullptr, &result, &error) == 0
+              && result.revision == 4, "lost success reply retries without another update");
+        check(ngx_http_cache_purge_publications_validate_finish(publications.native(), store, file.id.data(),
+              input.transaction, 2, anchor.fd, lease.fd, getuid(), &result, &error) == 0 && result.revision == 4,
+              "finish retry preserves validation result");
+        check(ngx_http_cache_rocksdb_stats(store, &retried, &error) == 0 && stats.writes == retried.writes,
+              "completed retries perform no database writes");
+        if (mode == "--validate-basic") {
+            auto previous_size = index.get(file.id).metadata.size();
+            auto previous = input;
+            input.file.revision = 4; input.transaction[15] = 2; input.before = bytes(after); input.after = bytes(after);
+            input.replace_tags = 0; input.tags = nullptr; input.tag_count = 0;
+            check(ngx_http_cache_purge_publications_validate_prepare(publications.native(), store, &input,
+                  anchor.fd, lease.fd, selected.fd, getuid(), validation_guard, nullptr, &result, &error) == 0,
+                  "metadata-only validation can retain TAGs");
+            check(ngx_http_cache_purge_publications_validate_finish(publications.native(), store, file.id.data(),
+                  input.transaction, 4, anchor.fd, lease.fd, getuid(), &result, &error) == 0 && result.revision == 6,
+                  "metadata-only validation completes");
+            check(index.get(file.id).tags == std::vector<std::string>({"blue", "green"})
+                  && index.get(file.id).metadata.size() == previous_size, "receipts remain bounded and retain TAGs");
+            check(ngx_http_cache_purge_publications_validate_prepare(publications.native(), store, &previous,
+                  anchor.fd, lease.fd, selected.fd, getuid(), validation_guard, nullptr, &result, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "older validation cannot replay after a newer revision");
+            input.file.revision = 6; input.transaction[15] = 3; input.replace_tags = 1;
+            check(ngx_http_cache_purge_publications_validate_prepare(publications.native(), store, &input,
+                  anchor.fd, lease.fd, selected.fd, getuid(), validation_guard, nullptr, &result, &error) == 0,
+                  "explicit empty TAG update prepares");
+            check(ngx_http_cache_purge_publications_validate_finish(publications.native(), store, file.id.data(),
+                  input.transaction, 6, anchor.fd, lease.fd, getuid(), &result, &error) == 0
+                  && index.get(file.id).tags.empty(), "explicit empty TAG update clears membership");
+        }
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0, "close validation database");
+    std::cout << "PASS validation " << assertions << " assertions" << std::endl;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     try {
-        if (argc == 3) return publication(argv[1], argv[2]);
+        if (argc == 3) return std::string(argv[1]).find("--validate-") == 0
+                                 ? validation(argv[1], argv[2]) : publication(argv[1], argv[2]);
         char root[] = "/tmp/cache-purge-files-XXXXXX";
         check(mkdtemp(root) != nullptr, "temporary directory");
         std::string path(root), target = path + "/final";

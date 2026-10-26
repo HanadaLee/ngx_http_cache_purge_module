@@ -558,6 +558,7 @@ struct PublicationTarget { std::string root, address; FileId previous{}; };
 class Publications {
     ngx_http_cache_purge_publications_t *native_ = nullptr;
 public:
+    ngx_http_cache_purge_publications_t *native() { return native_; }
     Publications(const std::vector<RootSpec> &roots, const std::string &database) {
         std::vector<ngx_http_cache_purge_root_t> raw;
         raw.reserve(roots.size());

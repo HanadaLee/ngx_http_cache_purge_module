@@ -72,6 +72,7 @@ if(CACHE_PURGE_STORE_TESTS)
   add_test(NAME files_process_runtime COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/t/files_process_runtime.py
     --binary $<TARGET_FILE:cache_purge_files_test>
+    --component $<TARGET_FILE:cache_purge_component_test>
     --output ${CMAKE_CURRENT_BINARY_DIR}/files-process-results.json)
   add_executable(cache_purge_component_test t/component_runtime.cc)
   target_link_libraries(cache_purge_component_test PRIVATE ngx_http_cache_purge_component)

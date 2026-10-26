@@ -8,6 +8,8 @@ RocksDB bridge in `rocksdb/`; the entire purge implementation uses C. Its
 executor, shared controls and operation coordination share one source file.
 The persistent index and filesystem publication logic each have their own C
 implementation. Test-only C++ adapters and wire encoders live under `t/`.
+Production code is organized into 12 source/header files across the two modules;
+new behavior is added within these responsibility boundaries.
 
 HTTP cache invalidation for nginx proxy, FastCGI, SCGI, and uWSGI caches.
 
@@ -36,6 +38,14 @@ Verified renamed files become READY; abandoned preparations are retired without
 deleting unrelated files. Changed identities and inaccessible roots remain
 pending. Recovery and response admission have independent responsibilities.
 
+The filesystem backend also supports bounded in-place validation transactions.
+It atomically reserves the existing path intent with TAG and metadata changes,
+writes and fsyncs only a supplied header prefix, then publishes the new physical
+proof. Inspection excludes the pending instance. Retries and automatic recovery
+share the same OFD lease protocol; completed receipts remain bounded across
+repeated validation. This backend API is not yet connected to native upstream
+304 responses or a validation IPC operation.
+
 `INSPECT_FILE` checks the actual cache descriptor on the executor through bounded
 IPC. It requires a READY marker, a committed current index record with no pending
 intent, and matching root/zone/path and same-filesystem publication identity.
@@ -59,8 +69,9 @@ No new nginx core hook or private protocol configuration layout is used.
 Read checks are bounded to 64 concurrent waits per worker, with a three-second
 overall deadline. A PREPARED marker can wait for publication within that deadline.
 No complete file index is loaded into worker memory. Successful upstream 304
-responses currently cause an unconditional refill until durable validation and
-TAG updates are implemented. Complete persistent-alias matching and TAG/alias
+responses currently cause an unconditional refill until the durable validation
+backend and TAG updates are connected to native requests. Complete persistent-alias
+matching and TAG/alias
 provenance for memory-only cached errors remain unfinished. Operation receipts
 remain PREPARING; these partial consumers do not expose reliable public 202
 acceptance or completed immediate purge semantics yet.

@@ -651,7 +651,11 @@ ngx_http_cache_purge_component_logical(ngx_http_cache_rocksdb_t *store,
                    ngx_http_cache_purge_component_error(error, 0, "") :
                    rc;
     }
-    if (file.metadata.len >= 4 && memcmp(file.metadata.data, "NFP1", 4) == 0) {
+    if (file.metadata.len >= 4
+        && (memcmp(file.metadata.data, "NFP1", 4) == 0
+            || memcmp(file.metadata.data, "NFV1", 4) == 0
+            || memcmp(file.metadata.data, "NFR1", 4) == 0))
+    {
         rc = ngx_http_cache_purge_component_error(
             error, NGX_HTTP_CACHE_ROCKSDB_INVALID,
             "physical file publication requires filesystem operations");
@@ -664,7 +668,11 @@ static int
 ngx_http_cache_purge_component_reserved(ngx_http_cache_rocksdb_bytes_t metadata,
     ngx_http_cache_rocksdb_error_t *error)
 {
-    if (metadata.len >= 4 && memcmp(metadata.data, "NFP1", 4) == 0) {
+    if (metadata.len >= 4
+        && (memcmp(metadata.data, "NFP1", 4) == 0
+            || memcmp(metadata.data, "NFV1", 4) == 0
+            || memcmp(metadata.data, "NFR1", 4) == 0))
+    {
         return ngx_http_cache_purge_component_error(
             error, NGX_HTTP_CACHE_ROCKSDB_INVALID,
             "reserved physical publication metadata");
@@ -1600,7 +1608,10 @@ ngx_http_cache_purge_component_recover(ngx_http_cache_purge_component_t *c,
     }
 
     /* Logical preparations are not native filesystem publication intents. */
-    if (file.metadata.len < 4 || memcmp(file.metadata.data, "NFP1", 4) != 0) {
+    if (file.metadata.len < 4
+        || (memcmp(file.metadata.data, "NFP1", 4)
+            && memcmp(file.metadata.data, "NFV1", 4)))
+    {
         rc = 0;
         goto done;
     }
@@ -1624,9 +1635,15 @@ ngx_http_cache_purge_component_recover(ngx_http_cache_purge_component_t *c,
          * keeps its OFD lease until writing/renaming is finished. Acquisition
          * on an independent description proves none of them still owns it.
          */
-        rc = ngx_http_cache_purge_publications_finish(
-            c->publications, store, file.id, file.revision, c->lease_anchor,
-            lease, c->options.client_uid, &match, error);
+        if (memcmp(file.metadata.data, "NFV1", 4) == 0) {
+            rc = ngx_http_cache_purge_publications_validate_finish(
+                c->publications, store, file.id, NULL, 0, c->lease_anchor,
+                lease, c->options.client_uid, &match, error);
+        } else {
+            rc = ngx_http_cache_purge_publications_finish(
+                c->publications, store, file.id, file.revision, c->lease_anchor,
+                lease, c->options.client_uid, &match, error);
+        }
     }
 
 done:

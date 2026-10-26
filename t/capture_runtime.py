@@ -319,6 +319,7 @@ checks = []
 process = start()
 try:
     until(lambda: (run / 'index/component.sock').exists())
+    until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
     assert get('/asset') == (200, 'MISS', b'/asset')
     first = records('/asset', 1)[0]; ready_file(first)
     assert first['key'] == b'tenant\x1fhttp\x1fcache.test\x1f/asset\x1f'
@@ -445,11 +446,13 @@ try:
             values = [future.result() for future in responses]
         assert all(value[0] == 200 for value in values)
         assert all(value[1] == 'MISS' for value in values)
+        until(lambda: pending() == 0)
         def recovered():
             value = get('/after-capacity')
-            assert value[0] == 200 and value[1] in ('MISS', 'HIT')
+            assert value[0] == 200 and value[2] == b'/after-capacity', value
+            assert value[1] in ('MISS', 'HIT', 'BYPASS'), value
             matches = query('http://cache.test/after-capacity')
-            return matches if matches and all(item[2] == 2 for item in matches) else None
+            return matches if matches and all(item[2] == 2 for item in matches) and pending() == 0 else None
         until(recovered, timeout=10)
         ready_file(records('/after-capacity', 1)[0])
         assert get('/after-capacity')[1] == 'HIT'
@@ -458,6 +461,7 @@ try:
     before = {x[0] for x in query('http://cache.test/asset')}
     stop(process); process = start()
     until(lambda: (run / 'index/component.sock').exists())
+    until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
     assert {x[0] for x in query('http://cache.test/asset')} == before
     assert get('/asset')[1] == 'HIT'
     checks.append('full nginx restart reuses persisted file relations without rebuilding the index')
