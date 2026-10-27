@@ -770,6 +770,83 @@ ngx_http_cache_purge_component_put_status(ngx_http_cache_purge_component_t *c,
 }
 
 static int
+ngx_http_cache_purge_component_retire_selected(
+    ngx_http_cache_purge_component_t *c, ngx_http_cache_rocksdb_bytes_t root,
+    ngx_http_cache_rocksdb_bytes_t zone, ngx_http_cache_rocksdb_bytes_t path,
+    ngx_http_cache_rocksdb_bytes_t before, int fd, uint32_t uid,
+    ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_publication_target_t  target;
+    ngx_http_cache_purge_index_file_t          file;
+    ngx_http_cache_purge_index_expected_t      expected;
+    unsigned char                              header[4096], digest[16];
+    uint64_t                                   offset;
+    size_t                                     at;
+    ssize_t                                    n;
+    int                                        lease, rc;
+
+    memset(&target, 0, sizeof(target));
+    memset(&file, 0, sizeof(file));
+    lease = -1;
+    if (before.len == 0 || before.len > sizeof(header)) {
+        return ngx_http_cache_purge_component_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid selected cache header");
+    }
+    rc = ngx_http_cache_purge_publications_target(c->publications,
+        c->operations.store, root, zone, path, &target, error);
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_file_address(target.address, digest,
+                                                 &offset, error);
+    }
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_component_anchor(c, error);
+    }
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_file_lease_acquire(c->lease_path,
+            c->lease_anchor, offset, &lease, error);
+    }
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_publications_inspect(c->publications,
+            c->operations.store, root, zone, path, fd, uid, &file, error);
+    }
+    at = 0;
+    while (rc == 0 && at < before.len) {
+        n = pread(fd, header + at, before.len - at, (off_t) at);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0) {
+            rc = ngx_http_cache_purge_component_error(error,
+                NGX_HTTP_CACHE_PURGE_FILE_ERROR, "read selected cache header");
+        } else if (n == 0) {
+            rc = ngx_http_cache_purge_component_error(error,
+                NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+                "selected cache was truncated");
+        } else {
+            at += (size_t) n;
+        }
+    }
+    if (rc == 0 && memcmp(header, before.data, before.len) != 0) {
+        rc = ngx_http_cache_purge_component_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "selected cache header changed");
+    }
+    if (rc == 0) {
+        memcpy(expected.id, file.id, 16);
+        expected.revision = file.revision;
+        rc = ngx_http_cache_purge_index_apply(c->operations.store,
+            NGX_HTTP_CACHE_PURGE_INDEX_RETIRE, &expected, 1, out, error);
+    }
+    if (rc == 0) {
+        c->collect_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC);
+    }
+    ngx_http_cache_purge_component_close(&lease);
+    ngx_http_cache_purge_index_file_free(&file);
+    ngx_http_cache_purge_publication_target_free(&target);
+    return rc;
+}
+
+static int
 ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
     ngx_http_cache_rocksdb_t *store, ngx_http_cache_purge_component_peer_t *p,
     ngx_http_cache_purge_component_encoder_t *e,
@@ -829,6 +906,21 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
     rc = 0;
 
     switch (p->request.opcode) {
+    case NGX_HTTP_CACHE_PURGE_OP_RETIRE_SELECTED:
+        root = ngx_http_cache_purge_component_string(&d, 32768);
+        zone = ngx_http_cache_purge_component_string(&d, 32768);
+        name = ngx_http_cache_purge_component_string(&d, 32768);
+        metadata = ngx_http_cache_purge_component_string(&d, 4096);
+        if ((rc = ngx_http_cache_purge_component_end(&d)) == 0) {
+            rc = ngx_http_cache_purge_component_retire_selected(c,
+                root, zone, name, metadata, p->input_rights[0], p->uid,
+                &matches[0], error);
+        }
+        if (rc == 0) {
+            ngx_http_cache_purge_component_put_match(e, &matches[0]);
+        }
+        break;
+
     case NGX_HTTP_CACHE_PURGE_OP_REMOVE_FILE:
         ngx_http_cache_purge_component_id(&d, expected[0].id);
         expected[0].revision = ngx_http_cache_purge_component_integer(&d, 8);
@@ -1801,6 +1893,7 @@ ngx_http_cache_purge_component_read(ngx_http_cache_purge_component_t *c,
             p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_REMOVE_FILE  ? 1 :
             p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_INSPECT_FILE ? 1 :
             p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_ADMIT_FILE   ? 1 :
+            p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_RETIRE_SELECTED ? 1 :
                                                                         0;
         if (p->rights_count != expected) {
             return ngx_http_cache_purge_component_error(

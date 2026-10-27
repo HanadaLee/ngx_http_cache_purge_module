@@ -150,6 +150,14 @@ ngx_int_t ngx_http_cache_purge_client_validate_file(
     const int fds[2], ngx_msec_t timeout,
     ngx_http_cache_purge_client_done_pt done, void *data,
     ngx_http_cache_purge_call_t **call);
+
+/* Retire only the selected native header/instance, then let the existing
+ * persistent retired-file collector finish physical deletion and accounting. */
+ngx_int_t ngx_http_cache_purge_client_retire_selected(
+    ngx_http_cache_purge_client_t *client, const ngx_str_t *payload,
+    int cache_fd, ngx_msec_t timeout,
+    ngx_http_cache_purge_client_done_pt done, void *data,
+    ngx_http_cache_purge_call_t **call);
 /* Observe this request's URL/host and verify every persisted alias. The reply
  * carries the publication stamp required by the final shared-memory guard. */
 ngx_int_t ngx_http_cache_purge_client_admit_file(

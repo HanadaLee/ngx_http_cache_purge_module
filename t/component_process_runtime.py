@@ -164,7 +164,7 @@ class Client:
         magic, version, op, request, size, result = struct.unpack('>4sHHQII', self.read(24))
         assert (magic, version, op, request) == (b'NCP1', 1, operation, self.counter)
         data = self.read(size)
-        assert result == code, (result, code, data)
+        assert result in (code if isinstance(code, tuple) else (code,)), (result, code, data)
         return data
 
     def call(self, operation, data=b'', code=0):
@@ -1154,6 +1154,60 @@ try:
     check(True, 'late URL aliases after FENCE retirement queue durable Delete, survive owner death and are collected after the path lease drains')
 
     current_origin = validating.watermark()
+
+    def retire_selected(target, selected, before=b'old-head', code=0):
+        data = b''.join(map(string, (str(validation_cache), 'zone-a', str(target.relative_to(validation_cache)), before)))
+        packet = v.packet(30, data)
+        assert v.socket.sendmsg([packet[:1]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [selected]))]) == 1
+        v.socket.sendall(packet[1:])
+        return v.reply(30, code)
+
+    target, lease, selected = make_validation_file(668, '/retire-selected', metadata=current_origin)
+    original = v.call(2, identity(668))
+    retire_selected(target, selected, code=6)
+    assert v.call(2, identity(668)) == original
+    os.close(lease)
+    retire_selected(target, selected, b'bad-head', code=7)
+    assert v.call(2, identity(668)) == original
+    runtime_before = v.call(28)
+    target.parent.chmod(0o500)
+    try:
+        assert retire_selected(target, selected) == identity(668) + struct.pack('>Q', 3) + b'\x03'
+        assert v.call(2, identity(668))[0] == 3 and target.exists()
+        assert v.call(28) == runtime_before
+        v.close(); validating.stop()
+        validating = Component(validating.path, shared=validation_shared, roots=(validation_cache, validation_temp))
+        validating.opened(); v = Client(validating.path)
+        wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+        assert v.call(2, identity(668))[0] == 3 and target.exists()
+    finally:
+        target.parent.chmod(0o700)
+        os.close(selected)
+    wait_for(lambda: not target.exists())
+    wait_for(lambda: v.page(1, 'https://a.test/retire-selected')[0] == [])
+    check(True, 'RETIRE_SELECTED checks the held lease and exact header, stores only normal retirement, and resumes deletion after owner restart')
+
+    target, lease, selected = make_validation_file(670, '/retire-replaced', metadata=current_origin)
+    source = validation_temp / 'selected-new-671'; source.write_bytes(b'old-head but another entity')
+    fd = os.open(source, os.O_RDWR | os.O_CLOEXEC)
+    payload = record(671, root=str(validation_cache), zone='zone-a', uri='/retire-replaced', path='a/00/670', metadata=current_origin)
+    v.prepare_file(payload[:-16] + identity(670) + string(str(source)), [lease, fd])
+    source.rename(target); v.finish_file(671, lease)
+    os.close(fd); os.close(lease)
+    replacement = v.call(2, identity(671))
+    retire_selected(target, selected, code=(1, 7))
+    assert target.read_bytes() == b'old-head but another entity' and v.call(2, identity(671)) == replacement
+    os.close(selected)
+    check(True, 'a delayed selected-FD retirement cannot retire a replacement even when its header prefix is identical')
+
+    target, lease, selected = make_validation_file(672, '/retire-revalidated', metadata=current_origin)
+    v.validate_file(validation_packet(672, origin=current_origin), lease, selected)
+    os.close(lease)
+    refreshed = v.call(2, identity(672))
+    retire_selected(target, selected, code=7)
+    assert target.read_bytes().startswith(b'new-head') and v.call(2, identity(672)) == refreshed
+    os.close(selected)
+    check(True, 'a delayed selected-FD retirement rejects a successful same-inode header update')
 
     target, lease, selected = make_validation_file(660, '/remove', metadata=current_origin)
     original = v.call(2, identity(660)); contents = target.read_bytes()

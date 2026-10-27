@@ -78,7 +78,10 @@ typedef enum {
     /* state u32, publication u64, ledger[16], usage[4] u64, propagation u32 */
     NGX_HTTP_CACHE_PURGE_OP_GET_RUNTIME_STATUS,
     /* operation ID -> runtime status[64] followed by the durable receipt */
-    NGX_HTTP_CACHE_PURGE_OP_GET_RECEIPT
+    NGX_HTTP_CACHE_PURGE_OP_GET_RECEIPT,
+    /* root/zone/path/native header prefix, one selected FD -> retired match.
+     * No push identity/time is stored. The existing collector deletes it. */
+    NGX_HTTP_CACHE_PURGE_OP_RETIRE_SELECTED
 } ngx_http_cache_purge_opcode_e;
 
 #define NGX_HTTP_CACHE_PURGE_ROOT_CACHE 1

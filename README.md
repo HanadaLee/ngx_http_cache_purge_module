@@ -539,9 +539,16 @@ an unmet Delete rejects that reuse and starts a full fetch. Accepted incoming
 requirements join local outgoing requirements without a local expiry window.
 Identical incoming envelopes are shared across slices of one main request.
 
-Full propagation remains unfinished: received Delete still needs independent
-background file removal, including after a failed replacement. Request-frame
-simplification, historical alias coverage after deletion, uncached proxy routes,
+Selected incoming Delete instances now enter the existing durable retirement
+queue independently of the requesting client or a successful replacement.
+Cleanup verifies the selected file and header, so delayed jobs cannot remove a
+replacement or a successfully revalidated instance. Submission is bounded to
+32 jobs and 256 KiB per worker, with a five-second retry deadline. Once retired,
+normal persistent collection continues across executor restarts.
+
+Full propagation remains unfinished: expired TAG objects whose origin fails
+before metadata inspection still need coverage. Request-frame simplification,
+historical alias coverage after deletion, uncached proxy routes,
 and large-set transport also need integration. Capabilities reports the sender
 transport as
 `filter` or `variables`, while `proxy_propagation_ready` remains false.
