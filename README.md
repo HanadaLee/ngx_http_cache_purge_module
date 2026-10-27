@@ -157,8 +157,13 @@ conditional-validation boundary. That boundary satisfies Invalidate only; Delete
 still requires a new entity. Repeated 304 transactions replace the conditional
 proof without nesting it. Validation receipts carry the publication and any
 remaining Invalidate requirement; stamp zero cannot authorize response reuse.
-Under `NGX_RESTY_EXT`, a forced Invalidate sets the existing PURGE reason to
-prevent stale fallback and clears only that reason after successful validation.
+Under `NGX_RESTY_EXT`, a forced Invalidate sets the existing request `purged`
+flag to prevent stale fallback and clears it after durable validation and
+admission. Origin `must_revalidate` remains an independent boolean. `purged`
+is request state only; invalidation recovery uses the persistent index and
+operation ledger, with no purge bit stored in the native cache file header.
+The shared node bit does not replace persistent operation ordering: an older
+304 cannot satisfy a later Invalidate.
 Without the macro, native configured stale fallback remains available.
 
 File admission supports this behavior for current URL/key/prefix/host selectors,

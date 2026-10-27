@@ -81,6 +81,7 @@ conditional_paths = set()
 conditional_calls = []
 conditional_policies = {}
 validation_waiting, validation_release = threading.Event(), threading.Event()
+invalidate_waiting, invalidate_release = threading.Event(), threading.Event()
 late_waiting, late_release = threading.Event(), threading.Event()
 retry_waiting, retry_release = threading.Event(), threading.Event()
 stream_waiting, stream_release = threading.Event(), threading.Event()
@@ -114,6 +115,9 @@ class Origin(http.server.BaseHTTPRequestHandler):
             if path == '/revalidate-race':
                 validation_waiting.set()
                 assert validation_release.wait(15)
+            if path == '/invalidate/race':
+                invalidate_waiting.set()
+                assert invalidate_release.wait(15)
             self.send_response(304); self.send_header('Cache-Control', conditional_policies.get(path, 'max-age=60'))
             if path in validation_tags: self.send_header('Cache-Tag', validation_tags[path])
             self.end_headers(); return
@@ -656,6 +660,29 @@ try:
     assert records('/invalidate/failure', 1)[0]['revision'] == failed_original['revision']
     origin_failures.remove('/invalidate/failure')
     checks.append('NGX_RESTY_EXT Invalidate suppresses configured failure stale while plain nginx retains the agreed stale downgrade without validating the old entity')
+    conditional_paths.add('/invalidate/failure')
+    assert get('/invalidate/failure') == (200, 'REVALIDATED', b'/invalidate/failure')
+    assert records('/invalidate/failure', 1)[0]['id'] == failed_original['id']
+    assert get('/invalidate/failure') == (200, 'HIT', b'/invalidate/failure')
+    checks.append('a failed Invalidate attempt still requires successful validation before the old entity can HIT again')
+    conditional_paths.add('/invalidate/race')
+    assert get('/invalidate/race') == (200, 'MISS', b'/invalidate/race')
+    race_file = records('/invalidate/race', 1)[0]
+    fence('invalidate-race-first', 1, 'http://cache.test/invalidate/race', mode=1)
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        request = pool.submit(get, '/invalidate/race')
+        assert invalidate_waiting.wait(5)
+        sequence = fence('invalidate-race-second', 1, 'http://cache.test/invalidate/race', mode=1)
+        until(lambda: (count := writers(sequence)) is not None and count > 0)
+        fresh_bodies['/invalidate/race'] = b'after-second-invalidate'
+        invalidate_release.set()
+        assert request.result(timeout=15) == (200, 'BYPASS', b'after-second-invalidate')
+    until(lambda: records('/invalidate/race', 1)[0]['id'] != race_file['id'])
+    assert conditional_calls.count('/invalidate/race') == 1
+    assert calls.count('/invalidate/race') == 3
+    assert get('/invalidate/race') == (200, 'HIT', b'after-second-invalidate')
+    until(lambda: writers(sequence) == 0)
+    checks.append('an older forced 304 cannot clear a second Invalidate; a new full entity is required before HIT')
     conditional_paths.add('/invalidate/policy')
     conditional_policies['/invalidate/policy'] = 'max-age=1, must-revalidate'
     policies['/invalidate/policy'] = 'invalidate-policy'
@@ -667,7 +694,7 @@ try:
     result = get('/invalidate/policy')
     assert result == ((500, 'EXPIRED', b'') if extension else (200, 'STALE', b'/invalidate/policy')), result
     origin_failures.remove('/invalidate/policy')
-    checks.append('a successful 304 persists a newly received origin must-revalidate policy while clearing only the purge reason in the extension build')
+    checks.append('a successful 304 persists a newly received origin must-revalidate policy while clearing only purged in the extension build')
     assert get('/unmarked')[1] == 'MISS'
     unmarked = records('/unmarked', 1)[0]
     os.removexattr(ready_file(unmarked), 'user.ngx_cache_purge.id')
@@ -797,6 +824,13 @@ try:
         checks.append('publication pressure preserves ordinary HITs and response bodies; subsequent fills recover')
     until(lambda: pending() == 0)
     before = {x[0] for x in query('http://cache.test/asset')}
+    conditional_paths.add('/invalidate/restart')
+    assert get('/invalidate/restart') == (200, 'MISS', b'/invalidate/restart')
+    restart_file = records('/invalidate/restart', 1)[0]
+    restart_path = ready_file(restart_file)
+    restart_contents = restart_path.read_bytes()
+    fence('invalidate-before-restart', 1, 'http://cache.test/invalidate/restart', mode=1)
+    assert restart_path.read_bytes() == restart_contents
     stop(process); process = start()
     until(lambda: (run / 'index/component.sock').exists())
     until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
@@ -804,6 +838,11 @@ try:
     assert get('/asset')[1] == 'HIT'
     assert {watermark(record(ident))[0] for ident in before} == {ledger}
     checks.append('full nginx restart reuses persisted file relations without rebuilding the index')
+    assert restart_path.read_bytes() == restart_contents
+    assert get('/invalidate/restart') == (200, 'REVALIDATED', b'/invalidate/restart')
+    assert records('/invalidate/restart', 1)[0]['id'] == restart_file['id']
+    assert get('/invalidate/restart') == (200, 'HIT', b'/invalidate/restart')
+    checks.append('persistent invalidation survives a full restart without writing a purge marker into the native cache file')
     assert get('/alias/three') == (200, 'HIT', b'prefix-fresh-alias')
     assert records('/alias/two', 1)[0]['id'] == alias['id']
     assert calls.count('/alias/three') == 0

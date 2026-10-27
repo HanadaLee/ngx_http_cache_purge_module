@@ -1146,8 +1146,7 @@ ngx_http_cache_purge_read_validation_capture(
     v->after.error_sec = c->error_sec;
     v->after.date = ngx_time();
 #if (NGX_RESTY_EXT)
-    v->after.valid_msec &= ~NGX_HTTP_CACHE_PURGE_REVALIDATE;
-    if (c->must_revalidate & NGX_HTTP_CACHE_REVALIDATE_ORIGIN) {
+    if (c->must_revalidate) {
         v->after.valid_msec |= NGX_HTTP_CACHE_MUST_REVALIDATE;
     }
 #endif
@@ -1451,7 +1450,7 @@ ngx_http_cache_purge_read_complete(ngx_http_cache_purge_capture_t *ctx,
             ctx->cache->error_sec = ctx->validation->after.error_sec;
             ctx->cache->date = ctx->validation->after.date;
 #if (NGX_RESTY_EXT)
-            ctx->cache->must_revalidate &= NGX_HTTP_CACHE_REVALIDATE_ORIGIN;
+            ctx->cache->purged = 0;
 #endif
         }
         ctx->input_bytes = ctx->validation->input_bytes;
@@ -1517,7 +1516,7 @@ ngx_http_cache_purge_read_complete(ngx_http_cache_purge_capture_t *ctx,
         ctx->invalidation_retry = 1;
         ctx->read_state = NGX_HTTP_CACHE_PURGE_READ_READY;
 #if (NGX_RESTY_EXT)
-        ctx->cache->must_revalidate |= NGX_HTTP_CACHE_REVALIDATE_PURGE;
+        ctx->cache->purged = 1;
 #endif
     }
     u->buffer.start = NULL;
