@@ -50,6 +50,19 @@ main()
     check(
         ngx_http_cache_purge_control_reader_open(memory, size, &reader, &error)
         == 0);
+    ngx_http_cache_purge_control_reader_t *closing_reader = nullptr;
+    check(ngx_http_cache_purge_control_reader_open(
+              memory, size, &closing_reader, &error)
+          == 0);
+    check(
+        ngx_http_cache_purge_control_origins(closing_reader, nullptr, 1, &error)
+        == 0);
+    check(ngx_http_cache_purge_control_reader_close(&closing_reader, &error)
+              == NGX_HTTP_CACHE_ROCKSDB_BUSY
+          && closing_reader != nullptr);
+    check(
+        ngx_http_cache_purge_control_origins(closing_reader, nullptr, 0, &error)
+        == 0);
     int ready[2];
     check(pipe(ready) == 0);
     pid_t child = fork();
@@ -60,7 +73,15 @@ main()
         ngx_http_cache_purge_control_reader_open(memory, size, &local, &error);
         _exit(2);
     }
-    killed(child, ready[0]);
+    char held;
+    check(read(ready[0], &held, 1) == 1);
+    /* Idle close must not leak while another process owns the registry mutex. */
+    check(
+        ngx_http_cache_purge_control_reader_close(&closing_reader, &error) == 0
+        && closing_reader == nullptr);
+    check(kill(child, SIGKILL) == 0);
+    int status;
+    check(waitpid(child, &status, 0) == child && WIFSIGNALED(status));
     check(ngx_http_cache_purge_control_reader_open(
               memory, size, &recovery_reader, &error)
           == 0);

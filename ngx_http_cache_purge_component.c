@@ -3960,13 +3960,11 @@ ngx_http_cache_purge_control_reader_close(
         return ngx_http_cache_purge_control_error(
             error, NGX_HTTP_CACHE_ROCKSDB_BUSY, "control reader still active");
     }
-    rc = ngx_http_cache_purge_control_lock(r->shared, error);
-    if (rc != 0) {
-        return rc;
-    }
+    /* Only this thread owns the slot. Clearing its token is the final shared
+     * access; a new reader may reuse it immediately. No registration mutex
+     * is needed, so unrelated shutdowns cannot leave an idle handle BUSY. */
     ngx_http_cache_purge_control_store(
         &ngx_http_cache_purge_control_slots(r->shared)[r->slot].token, 0);
-    pthread_mutex_unlock(&r->shared->mutex);
     free(r);
     *output = NULL;
     return 0;
