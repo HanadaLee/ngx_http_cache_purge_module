@@ -525,12 +525,25 @@ allocator overhead. It fails instead of truncating an oversized requirement set.
 The internal C codec provides bounded binary request frames. It preserves
 complete scoped TAG groups and rejects duplicate or unordered requirements.
 Local windows, nonces, and request/response digests are absent from the format.
-The request codec and sender are implemented; L2 request admission remains to be
-integrated.
+Indexed proxy requests now parse incoming requirements before cache use.
+Duplicate, incomplete, or inconsistent fields return 400; the incoming ignore
+flag discards them without affecting local rules. Admission compares the native
+cache header's second-resolution `date` with the push time rounded down to a
+second. Equal times are covered. No received requirement or extra timestamp is
+written to the index.
 
-Full propagation remains unfinished: L2 ingress/cache decisions, persistent
-historical alias coverage after deletion, uncached proxy routes, and large-set
-transport still need integration. Capabilities reports the sender transport as
+An older object is revalidated for Invalidate or fetched unconditionally for
+Delete. TAG candidates use the selected entity's stored namespace and TAGs.
+An already expired TAG object may receive a native 304 before this inspection;
+an unmet Delete rejects that reuse and starts a full fetch. Accepted incoming
+requirements join local outgoing requirements without a local expiry window.
+Identical incoming envelopes are shared across slices of one main request.
+
+Full propagation remains unfinished: received Delete still needs independent
+background file removal, including after a failed replacement. Request-frame
+simplification, historical alias coverage after deletion, uncached proxy routes,
+and large-set transport also need integration. Capabilities reports the sender
+transport as
 `filter` or `variables`, while `proxy_propagation_ready` remains false.
 The protocol has no module-side authentication, signatures, key management,
 or response verification exchange.

@@ -360,6 +360,13 @@ typedef struct {
 } ngx_http_cache_purge_propagation_build_t;
 
 typedef struct {
+    /* The pool cleanup uses this first member's shared budget accounting. */
+    ngx_http_cache_purge_propagation_t  allocation;
+    ngx_http_cache_purge_fence_t        fence;
+    ngx_str_t                           headers[3];
+} ngx_http_cache_purge_incoming_t;
+
+typedef struct {
     ngx_http_request_t             *request;
     ngx_http_cache_t               *cache;
     ngx_http_cache_purge_fill_t    *fill;
@@ -375,6 +382,8 @@ typedef struct {
     ngx_http_cache_purge_revalidation_t  *validation;
     ngx_http_cache_purge_propagation_t   *propagation;
     ngx_http_cache_purge_propagation_t   *propagation_shared;
+    ngx_http_cache_purge_incoming_t      *incoming, *incoming_shared;
+    uint64_t                              incoming_invalidate, incoming_delete;
 #if (NGX_RESTY_EXT && NGX_HTTP_PROXY_FILTER)
     ngx_list_t                          *propagation_headers;
 #endif
@@ -404,6 +413,8 @@ typedef struct {
     unsigned  read_held : 1;
     unsigned  read_ref : 1;
     unsigned  read_header_only : 1;
+    unsigned  incoming_resolved : 1;
+    unsigned  incoming_error : 1;
     unsigned  origin_valid : 1;
     unsigned  origin_registered : 1;
     unsigned  invalidation_retry : 1;
@@ -464,6 +475,10 @@ static ngx_int_t ngx_http_cache_purge_capture_post(ngx_conf_t *cf);
 static ngx_int_t ngx_http_cache_purge_capture_header(ngx_http_request_t *r);
 static ngx_int_t ngx_http_cache_purge_propagation_variables(ngx_conf_t *cf);
 static ngx_int_t ngx_http_cache_purge_propagation_create(ngx_http_request_t *r);
+static ngx_int_t ngx_http_cache_purge_incoming_parse(
+    ngx_http_cache_purge_capture_t *ctx);
+static ngx_uint_t ngx_http_cache_purge_incoming_mode(
+    ngx_http_cache_purge_capture_t *ctx, time_t date);
 #if (NGX_RESTY_EXT && NGX_HTTP_PROXY_FILTER)
 static ngx_int_t ngx_http_cache_purge_propagation_filter(ngx_http_request_t *r,
     ngx_http_proxy_filter_ctx_t *filter);
@@ -614,7 +629,12 @@ static int
 ngx_http_cache_purge_propagation_compare(const void *left, const void *right)
 {
     const ngx_http_cache_purge_requirement_t  *a = left, *b = right;
+    int                                       order;
 
+    order = ngx_memcmp(a->ledger, b->ledger, 16);
+    if (order != 0) {
+        return order;
+    }
     return (a->sequence > b->sequence) - (a->sequence < b->sequence);
 }
 
@@ -635,7 +655,8 @@ ngx_http_cache_purge_propagation_snapshot(ngx_http_cache_purge_capture_t *ctx)
     ngx_http_request_t                       *r;
     ngx_str_t                                 raw, encoded;
     uint64_t                                  publication;
-    size_t                                    i, size;
+    size_t                                    i, j, size;
+    ngx_http_cache_purge_requirement_t       *item, *existing;
     u_char                                   *p;
     ngx_int_t                                 result;
     int                                       rc;
@@ -670,12 +691,55 @@ ngx_http_cache_purge_propagation_snapshot(ngx_http_cache_purge_capture_t *ctx)
     if (rc != 0) {
         goto done;
     }
+    for (i = 0; i < build.count; i++) {
+        ngx_memcpy(items[i].ledger, watermark.ledger, 16);
+    }
+    if (ctx->incoming) {
+        for (i = 0; i < ctx->incoming->fence.count; i++) {
+            item = &ctx->incoming->fence.requirements[i];
+            for (j = 0; j < build.count; j++) {
+                existing = &items[j];
+                if (ngx_memcmp(item->ledger, existing->ledger, 16) != 0
+                    || item->sequence != existing->sequence)
+                {
+                    continue;
+                }
+                if (item->mode != existing->mode
+                    || item->issued_at_ms != existing->issued_at_ms
+                    || item->selector.kind != existing->selector.kind
+                    || item->id.len != existing->id.len
+                    || ngx_memcmp(item->id.data, existing->id.data,
+                                   item->id.len) != 0
+                    || item->selector.value.len != existing->selector.value.len
+                    || ngx_memcmp(item->selector.value.data,
+                                   existing->selector.value.data,
+                                   item->selector.value.len) != 0
+                    || item->selector.scope.len != existing->selector.scope.len
+                    || (item->selector.scope.len
+                        && ngx_memcmp(item->selector.scope.data,
+                                      existing->selector.scope.data,
+                                      item->selector.scope.len) != 0))
+                {
+                    goto done;
+                }
+                existing->candidate &= item->candidate;
+                break;
+            }
+            if (j == build.count) {
+                if (build.count == NGX_HTTP_CACHE_PURGE_FENCE_COUNT) {
+                    goto done;
+                }
+                items[build.count++] = *item;
+            }
+            if (item->issued_at_ms > build.issued) {
+                build.issued = item->issued_at_ms;
+            }
+            build.modes |= item->mode;
+        }
+    }
     if (build.count == 0) {
         result = NGX_OK;
         goto done;
-    }
-    for (i = 0; i < build.count; i++) {
-        ngx_memcpy(items[i].ledger, watermark.ledger, 16);
     }
     ngx_qsort(items, build.count, sizeof(items[0]),
               ngx_http_cache_purge_propagation_compare);
@@ -816,6 +880,256 @@ ngx_http_cache_purge_propagation_role(ngx_http_cache_purge_loc_conf_t *conf,
     return NGX_DECLINED;
 }
 
+static ngx_int_t
+ngx_http_cache_purge_incoming_parse(ngx_http_cache_purge_capture_t *ctx)
+{
+    ngx_http_cache_purge_loc_conf_t     *conf;
+    ngx_http_cache_purge_capture_t      *main;
+    ngx_http_cache_purge_incoming_t     *incoming;
+    ngx_http_cache_rocksdb_error_t       error;
+    ngx_http_cache_rocksdb_bytes_t       bytes;
+    ngx_http_cache_purge_requirement_t  *items;
+    ngx_pool_cleanup_t                  *cln;
+    ngx_list_part_t                     *part;
+    ngx_table_elt_t                     *headers;
+    ngx_http_request_t                  *r;
+    ngx_str_t                            values[3], raw, check;
+    ngx_uint_t                           i, seen[3] = { 0, 0, 0 }, modes;
+    ngx_int_t                            role;
+    ngx_flag_t                           ignore;
+    uint64_t                             issued, maximum;
+    size_t                               count, size, at;
+    unsigned                             digit;
+    u_char                              *p;
+    int                                  rc;
+
+    r = ctx->request;
+    ignore = ngx_http_cache_purge_ignore_propagation(r);
+    if (ignore == 1) {
+        return NGX_OK;
+    }
+    if (ignore != 0) {
+        return NGX_ERROR;
+    }
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_module);
+    ngx_memzero(values, sizeof(values));
+    for (part = &r->headers_in.headers.part; part; part = part->next) {
+        headers = part->elts;
+        for (i = 0; i < part->nelts; i++) {
+            role = ngx_http_cache_purge_propagation_role(conf, headers[i].key);
+            if (role < 0 || role >= 3) {
+                continue;
+            }
+            if (seen[role]++) {
+                return NGX_ERROR;
+            }
+            values[role] = headers[i].value;
+        }
+    }
+    if (!seen[0] && !seen[1] && !seen[2]) {
+        return NGX_OK;
+    }
+    if (!seen[0] || !seen[1] || !seen[2] || values[0].len == 0
+        || values[0].len > 20 || values[0].data[0] == '0'
+        || values[2].len == 0 || values[2].len % 4
+        || values[2].len + conf->propagation_header[2].len + 4
+           > NGX_HTTP_CACHE_PURGE_PROPAGATION_LINE)
+    {
+        return NGX_ERROR;
+    }
+    main = ngx_http_get_module_ctx(r->main, ngx_http_cache_purge_index_module);
+    if (main && main->incoming_shared) {
+        incoming = main->incoming_shared;
+        for (i = 0; i < 3; i++) {
+            if (incoming->headers[i].len != values[i].len
+                || ngx_memcmp(incoming->headers[i].data, values[i].data,
+                               values[i].len) != 0)
+            {
+                break;
+            }
+        }
+        if (i == 3) {
+            ctx->incoming = incoming;
+            return NGX_OK;
+        }
+    }
+    issued = 0;
+    for (at = 0; at < values[0].len; at++) {
+        digit = (unsigned) values[0].data[at] - '0';
+        if (digit > 9 || issued > (UINT64_MAX - digit) / 10) {
+            return NGX_ERROR;
+        }
+        issued = issued * 10 + digit;
+    }
+    raw.len = ngx_base64_decoded_length(values[2].len);
+    /* Scratch is short-lived; the final parsed bytes are charged separately. */
+    raw.data = ngx_alloc(raw.len + values[2].len, r->connection->log);
+    if (raw.data == NULL) {
+        return NGX_ERROR;
+    }
+    check.data = raw.data + raw.len;
+    rc = NGX_ERROR;
+    if (ngx_decode_base64(&raw, &values[2]) != NGX_OK || raw.len < 6) {
+        goto done;
+    }
+    ngx_encode_base64(&check, &raw);
+    if (check.len != values[2].len
+        || ngx_memcmp(check.data, values[2].data, check.len) != 0)
+    {
+        goto done;
+    }
+    count = ((size_t) raw.data[4] << 8) | raw.data[5];
+    if (count == 0 || count > NGX_HTTP_CACHE_PURGE_FENCE_COUNT) {
+        goto done;
+    }
+    size = sizeof(*incoming) + sizeof(*cln) + count * sizeof(*items) + raw.len;
+    for (i = 0; i < 3; i++) {
+        size += values[i].len;
+    }
+    if (size > NGX_HTTP_CACHE_PURGE_CAPTURE_BYTES
+               - ngx_http_cache_purge_propagation_bytes)
+    {
+        goto done;
+    }
+    cln = ngx_pool_cleanup_add(r->main->pool, size - sizeof(*cln));
+    if (cln == NULL) {
+        goto done;
+    }
+    incoming = cln->data;
+    ngx_memzero(incoming, sizeof(*incoming));
+    incoming->allocation.reserved = size;
+    ngx_http_cache_purge_propagation_bytes += size;
+    cln->handler = ngx_http_cache_purge_propagation_cleanup;
+    items = (ngx_http_cache_purge_requirement_t *) (incoming + 1);
+    p = (u_char *) (items + count);
+    bytes.data = p;
+    bytes.len = raw.len;
+    p = ngx_cpymem(p, raw.data, raw.len);
+    if (ngx_http_cache_purge_fence_decode(bytes, &incoming->fence,
+                                           items, count, &error) != 0)
+    {
+        goto done;
+    }
+    maximum = 0;
+    modes = 0;
+    for (i = 0; i < count; i++) {
+        if (items[i].issued_at_ms > maximum) {
+            maximum = items[i].issued_at_ms;
+        }
+        modes |= items[i].mode;
+    }
+    if (issued != maximum
+        || !ngx_http_cache_purge_capture_equal(values[1],
+            modes == NGX_HTTP_CACHE_PURGE_INVALIDATE ? "invalidate" :
+            modes == NGX_HTTP_CACHE_PURGE_DELETE ? "delete" : "mixed"))
+    {
+        goto done;
+    }
+    for (i = 0; i < 3; i++) {
+        incoming->headers[i].data = p;
+        incoming->headers[i].len = values[i].len;
+        p = ngx_cpymem(p, values[i].data, values[i].len);
+    }
+    ctx->incoming = incoming;
+    if (main) {
+        main->incoming_shared = incoming;
+    }
+    rc = NGX_OK;
+
+done:
+    ngx_free(raw.data);
+    return rc;
+}
+
+static ngx_int_t
+ngx_http_cache_purge_incoming_select(ngx_http_cache_purge_capture_t *ctx,
+    ngx_http_cache_rocksdb_bytes_t namespace,
+    ngx_http_cache_rocksdb_bytes_t host,
+    ngx_http_cache_rocksdb_bytes_t *tags, size_t count, int known)
+{
+    ngx_http_cache_purge_requirement_t  *item;
+    ngx_http_cache_rocksdb_bytes_t       members[64], scope;
+    size_t                               i, j, k, n;
+    uint64_t                            *cutoff;
+    int                                  matched;
+
+    ctx->incoming_invalidate = 0;
+    ctx->incoming_delete = 0;
+    if (ctx->incoming == NULL) {
+        return NGX_OK;
+    }
+    for (i = 0; i < ctx->incoming->fence.count; i++) {
+        item = &ctx->incoming->fence.requirements[i];
+        if (item->selector.kind >= NGX_HTTP_CACHE_PURGE_NAMESPACE_TAG) {
+            if (!known) {
+                /* An expired native file may revalidate before metadata is
+                 * inspected. Decide TAGs at cached-response admission, never
+                 * turn every object in the scope into a confirmed match. */
+                continue;
+            }
+            scope = item->selector.kind == NGX_HTTP_CACHE_PURGE_NAMESPACE_TAG
+                    || item->selector.kind
+                       == NGX_HTTP_CACHE_PURGE_NAMESPACE_TAGS
+                    ? namespace : host;
+            if (scope.len != item->selector.scope.len
+                || ngx_memcmp(scope.data, item->selector.scope.data,
+                               scope.len) != 0)
+            {
+                continue;
+            }
+            if (known) {
+                if (item->selector.kind <= NGX_HTTP_CACHE_PURGE_HOST_TAG) {
+                    members[0] = item->selector.value;
+                    n = 1;
+                } else if (ngx_http_cache_purge_tags_decode(
+                               item->selector.value, members, &n) != 0)
+                {
+                    return NGX_ERROR;
+                }
+                matched = 0;
+                for (j = 0; j < n && !matched; j++) {
+                    for (k = 0; k < count; k++) {
+                        if (members[j].len == tags[k].len
+                            && ngx_memcmp(members[j].data, tags[k].data,
+                                           tags[k].len) == 0)
+                        {
+                            matched = 1;
+                            break;
+                        }
+                    }
+                }
+                if (!matched) {
+                    continue;
+                }
+            }
+        }
+        cutoff = item->mode == NGX_HTTP_CACHE_PURGE_DELETE
+                 ? &ctx->incoming_delete : &ctx->incoming_invalidate;
+        if (item->issued_at_ms > *cutoff) {
+            *cutoff = item->issued_at_ms;
+        }
+    }
+    ctx->incoming_resolved = known;
+    return NGX_OK;
+}
+
+static ngx_uint_t
+ngx_http_cache_purge_incoming_mode(ngx_http_cache_purge_capture_t *ctx,
+    time_t date)
+{
+    if (ctx->incoming_delete
+        && (date < 0 || (uint64_t) date < ctx->incoming_delete / 1000))
+    {
+        return NGX_HTTP_CACHE_PURGE_DELETE;
+    }
+    if (ctx->incoming_invalidate
+        && (date < 0 || (uint64_t) date < ctx->incoming_invalidate / 1000))
+    {
+        return NGX_HTTP_CACHE_PURGE_INVALIDATE;
+    }
+    return 0;
+}
+
 static ngx_flag_t
 ngx_http_cache_purge_propagation_incoming(ngx_http_request_t *r)
 {
@@ -939,14 +1253,40 @@ ngx_http_cache_purge_propagation_create(ngx_http_request_t *r)
     ngx_http_cache_purge_capture_t  *ctx;
     ngx_flag_t                       enabled;
     ngx_int_t                        rc;
+    ngx_uint_t                       mode;
+    ngx_http_cache_rocksdb_bytes_t   namespace, host;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_cache_purge_index_module);
     if (ctx == NULL || ctx->create_request == NULL
-        || ctx->create_request == ngx_http_cache_purge_propagation_create)
+        || ctx->create_request == ngx_http_cache_purge_propagation_create
+        || ctx->incoming_error)
     {
         return NGX_ERROR;
     }
     ctx->propagation = NULL;
+    if (!ctx->incoming_resolved) {
+        namespace.data = ctx->namespace.data;
+        namespace.len = ctx->namespace.len;
+        host.data = ctx->host.data;
+        host.len = ctx->host.len;
+        if (ngx_http_cache_purge_incoming_select(ctx, namespace, host,
+                                                  NULL, 0, 0) != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+    }
+    if (r->upstream->cache_status == NGX_HTTP_CACHE_EXPIRED) {
+        mode = ngx_http_cache_purge_incoming_mode(ctx, ctx->cache->date);
+        if (mode == NGX_HTTP_CACHE_PURGE_DELETE) {
+            /* Native revalidation variables are empty outside EXPIRED. */
+            r->upstream->cache_status = NGX_HTTP_CACHE_BYPASS;
+        }
+#if (NGX_RESTY_EXT)
+        if (mode) {
+            ctx->cache->purged = 1;
+        }
+#endif
+    }
 #if (NGX_RESTY_EXT && NGX_HTTP_PROXY_FILTER)
     ctx->propagation_headers = NULL;
 #endif
@@ -1337,6 +1677,12 @@ ngx_http_cache_purge_capture(ngx_http_request_t *r)
             return NGX_ERROR;
         }
     }
+    if (ctx->create_request
+        && ngx_http_cache_purge_incoming_parse(ctx) != NGX_OK)
+    {
+        ctx->incoming_error = 1;
+        return NGX_ERROR;
+    }
     ctx->failed = 0;
     return NGX_OK;
 }
@@ -1483,7 +1829,10 @@ ngx_http_cache_purge_capture_guard_value(ngx_http_script_engine_t *engine)
     }
     r = engine->request;
     ctx = ngx_http_get_module_ctx(r, ngx_http_cache_purge_index_module);
-    if (ctx && !ctx->origin_valid
+    if (ctx && ctx->incoming_error) {
+        rc = NGX_OK;
+    }
+    if (ctx && !ctx->incoming_error && !ctx->origin_valid
         && ngx_http_cache_purge_capture_origin(ctx) != NGX_OK)
     {
         r->upstream->cacheable = 0;
@@ -1491,7 +1840,8 @@ ngx_http_cache_purge_capture_guard_value(ngx_http_script_engine_t *engine)
     }
     if (rc == NGX_OK) {
         if (ctx && ctx->read_state == NGX_HTTP_CACHE_PURGE_READ_OFF) {
-            if (ngx_http_cache_purge_read_request(ctx) != NGX_OK
+            if ((!ctx->incoming_error
+                 && ngx_http_cache_purge_read_request(ctx) != NGX_OK)
                 || r->main->blocked >= NGX_HTTP_MAX_BLOCKED
                 || r->main->count == 65535)
             {
@@ -2179,6 +2529,8 @@ ngx_http_cache_purge_read_admit(ngx_http_cache_purge_capture_t *ctx,
     ngx_http_cache_purge_read_match_t       match;
     u_char                                 *p, *end;
     int                                     rc;
+    ngx_uint_t                              incoming;
+    time_t                                  date;
 
     if (payload.len < 45 || payload.data[0] != 2) {
         return 0;
@@ -2288,14 +2640,35 @@ ngx_http_cache_purge_read_admit(ngx_http_cache_purge_capture_t *ctx,
     if (rc != 0) {
         return 0;
     }
+    value.data = ctx->host.data;
+    value.len = ctx->host.len;
+    if (ngx_http_cache_purge_incoming_select(ctx, fields[3], value,
+                                              tags, count, 1) != NGX_OK)
+    {
+        return NGX_HTTP_CACHE_PURGE_ADMIT_DENY;
+    }
+    /* A native 304 may precede TAG inspection. It cannot satisfy a Delete
+     * which required replacement of that old entity. No header plan has been
+     * prepared yet; rejecting here restarts an unconditional origin request. */
+    if (ctx->validation && ctx->incoming_delete
+        && (ctx->cache->date < 0
+            || (uint64_t) ctx->cache->date < ctx->incoming_delete / 1000))
+    {
+        return NGX_HTTP_CACHE_PURGE_ADMIT_DENY;
+    }
+    date = ctx->validation ? ctx->validation->after.date : ctx->cache->date;
+    incoming = ngx_http_cache_purge_incoming_mode(ctx, date);
+    if (incoming == NGX_HTTP_CACHE_PURGE_DELETE) {
+        return NGX_HTTP_CACHE_PURGE_ADMIT_DENY;
+    }
 #if !(NGX_RESTY_EXT)
     if (ctx->read_upstream->cache_status == NGX_HTTP_CACHE_STALE
         || ctx->read_upstream->cache_status == NGX_HTTP_CACHE_UPDATING)
     {
-        return 1;
+        return NGX_HTTP_CACHE_PURGE_ADMIT_ALLOW;
     }
 #endif
-    return match.required ? NGX_HTTP_CACHE_PURGE_ADMIT_REVALIDATE :
+    return match.required || incoming ? NGX_HTTP_CACHE_PURGE_ADMIT_REVALIDATE :
                             NGX_HTTP_CACHE_PURGE_ADMIT_ALLOW;
 }
 
@@ -2475,6 +2848,11 @@ ngx_http_cache_purge_read_event(ngx_event_t *event)
         r->main->count--;
         if (r->main->terminated) {
             connection->write->handler(connection->write);
+            return;
+        }
+        if (ctx->incoming_error) {
+            ngx_http_finalize_request(r, NGX_HTTP_BAD_REQUEST);
+            ngx_http_run_posted_requests(connection);
             return;
         }
         ctx->read_resume(r);
