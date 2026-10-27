@@ -99,6 +99,15 @@ static ngx_command_t  ngx_http_cache_purge_module_commands[] = {
       NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1,
       ngx_http_cache_purge_propagation_conf, NGX_HTTP_MAIN_CONF_OFFSET, 0,
       NULL },
+
+    { ngx_string("cache_purge_api"), NGX_HTTP_LOC_CONF | NGX_CONF_NOARGS,
+      ngx_http_cache_purge_api_conf, NGX_HTTP_LOC_CONF_OFFSET, 0, NULL },
+
+    { ngx_string("cache_purge_tag_namespace_header"),
+      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF
+      | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_http_cache_purge_api_header_conf,
+      NGX_HTTP_LOC_CONF_OFFSET, 0, NULL },
 #endif
 
 #if !(NGX_HTTP_CACHE_PURGE_ROCKSDB)
@@ -1783,6 +1792,15 @@ ngx_http_cache_purge_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 #endif
 
     clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+
+#if (NGX_HTTP_CACHE_PURGE_ROCKSDB)
+    if (ngx_http_cache_purge_api_merge(cf, prev, conf) != NGX_CONF_OK) {
+        return NGX_CONF_ERROR;
+    }
+    if (conf->api_prefix.data != NULL) {
+        return NGX_CONF_OK;
+    }
+#endif
 
     ngx_conf_merge_uint_value(conf->response_type, prev->response_type,
                               NGX_HTTP_CACHE_PURGE_RESPONSE_TYPE_JSON);

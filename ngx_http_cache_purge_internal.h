@@ -76,7 +76,9 @@ typedef enum {
     /* Persist acceptance and autonomous activation in one transaction. */
     NGX_HTTP_CACHE_PURGE_OP_SUBMIT_OPERATION,
     /* state u32, publication u64, ledger[16], usage[4] u64, propagation u32 */
-    NGX_HTTP_CACHE_PURGE_OP_GET_RUNTIME_STATUS
+    NGX_HTTP_CACHE_PURGE_OP_GET_RUNTIME_STATUS,
+    /* operation ID -> runtime status[64] followed by the durable receipt */
+    NGX_HTTP_CACHE_PURGE_OP_GET_RECEIPT
 } ngx_http_cache_purge_opcode_e;
 
 #define NGX_HTTP_CACHE_PURGE_ROOT_CACHE 1

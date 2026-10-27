@@ -2,6 +2,7 @@
 #include "ngx_http_cache_purge.h"
 #include "ngx_http_cache_purge_internal.h"
 #include <sys/un.h>
+#include <openssl/sha.h>
 
 
 #define NGX_HTTP_CACHE_PURGE_RUNTIME_READERS  1024
@@ -1677,4 +1678,1479 @@ ngx_http_cache_purge_client_stats(ngx_http_cache_purge_client_t *client,
     ngx_http_cache_purge_client_stats_t *stats)
 {
     *stats = client->stats;
+}
+
+
+#define NGX_HTTP_CACHE_PURGE_API_BODY  262144
+#define NGX_HTTP_CACHE_PURGE_API_REPLY 131072
+#define NGX_HTTP_CACHE_PURGE_API_TIME  5000
+#define NGX_HTTP_CACHE_PURGE_API_JSON  192
+
+typedef struct {
+    ngx_str_t  value;
+    ngx_int_t  child, next;
+    u_char     kind;
+    unsigned   used:1;
+} ngx_http_cache_purge_json_value_t;
+
+typedef struct {
+    u_char                            *at, *end;
+    ngx_uint_t                         count;
+    ngx_uint_t                         failed;
+    ngx_http_cache_purge_json_value_t  values[NGX_HTTP_CACHE_PURGE_API_JSON];
+} ngx_http_cache_purge_json_t;
+
+typedef struct {
+    ngx_http_request_t             *request;
+    ngx_http_cache_purge_client_t  *client;
+    ngx_http_cache_purge_call_t    *call;
+    ngx_event_t                     timer;
+    ngx_msec_t                      deadline;
+    ngx_str_t                       id, payload, record;
+    size_t                          capacity;
+    uint16_t                        opcode;
+    unsigned                        post:1;
+    unsigned                        capabilities:1;
+    unsigned                        submitted:1;
+    unsigned                        finished:1;
+} ngx_http_cache_purge_api_t;
+
+typedef struct {
+    u_char     *at, *end;
+    ngx_uint_t  failed;
+} ngx_http_cache_purge_api_decode_t;
+
+static void ngx_http_cache_purge_api_cleanup(void *data);
+static void ngx_http_cache_purge_api_body(ngx_http_request_t *r);
+static void ngx_http_cache_purge_api_timer(ngx_event_t *event);
+static void ngx_http_cache_purge_api_reply(ngx_http_cache_purge_call_t *call,
+    void *data, const ngx_http_cache_purge_reply_t *reply);
+static ngx_int_t ngx_http_cache_purge_api_call(ngx_http_cache_purge_api_t *ctx,
+    uint16_t  opcode);
+static void ngx_http_cache_purge_api_finish(ngx_http_cache_purge_api_t *ctx,
+    ngx_uint_t  status, const char *error);
+
+char *
+ngx_http_cache_purge_api_conf(ngx_conf_t *cf, ngx_command_t *cmd, void *data)
+{
+    ngx_http_cache_purge_loc_conf_t  *conf = data;
+    ngx_http_core_loc_conf_t         *core;
+
+    core = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+    if (conf->api_prefix.data != NULL || core->handler != NULL) {
+        return "conflicts with an existing content handler";
+    }
+    if (core->name.len == 0 || core->name.len > 1024
+        || core->name.data[0] != '/'
+        || core->name.data[core->name.len - 1] != '/' || core->exact_match
+        || core->noname || core->named
+#if (NGX_PCRE)
+        || core->regex != NULL
+#endif
+        )
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                          "%V requires a plain prefix location ending in /",
+                          &cmd->name);
+        return NGX_CONF_ERROR;
+    }
+    conf->api_prefix = core->name;
+    core->handler = ngx_http_cache_purge_api_handler;
+    return NGX_CONF_OK;
+}
+
+char *
+ngx_http_cache_purge_api_header_conf(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *data)
+{
+    ngx_http_cache_purge_loc_conf_t  *conf = data;
+    ngx_str_t                        *value;
+    ngx_uint_t                        i, n;
+    u_char                            ch;
+    static const char *reserved[] = {
+        "host", "content-length", "transfer-encoding", "connection",
+        "authorization", "proxy-authorization", "content-type", "upgrade",
+        "te", "trailer", "expect"
+    };
+
+    if (conf->tag_namespace_header.data != NULL) {
+        return "is duplicate";
+    }
+    value = cf->args->elts;
+    if (value[1].len == 0 || value[1].len > 128) {
+        return "requires a header name of 1 to 128 bytes";
+    }
+    for (i = 0; i < value[1].len; i++) {
+        ch = value[1].data[i];
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+              || (ch >= '0' && ch <= '9')
+              || (ch != 0 && ngx_strchr("!#$%&'*+-.^_`|~", ch) != NULL)))
+        {
+            return "requires an HTTP token header name";
+        }
+    }
+    for (n = 0; n < sizeof(reserved) / sizeof(reserved[0]); n++) {
+        if (value[1].len == ngx_strlen(reserved[n])
+            && ngx_strncasecmp(value[1].data, (u_char *) reserved[n],
+                               value[1].len) == 0)
+        {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                              "%V cannot use reserved header %V",
+                              &cmd->name, &value[1]);
+            return NGX_CONF_ERROR;
+        }
+    }
+    conf->tag_namespace_header = value[1];
+    return NGX_CONF_OK;
+}
+
+char *
+ngx_http_cache_purge_api_merge(ngx_conf_t *cf,
+    ngx_http_cache_purge_loc_conf_t *prev,
+    ngx_http_cache_purge_loc_conf_t *conf)
+{
+    ngx_http_core_loc_conf_t  *core;
+
+    ngx_conf_merge_str_value(conf->tag_namespace_header,
+                            prev->tag_namespace_header,
+                            "X-Cache-Purge-Namespace");
+    core = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+    if (conf->api_prefix.data == NULL
+        && core->handler == ngx_http_cache_purge_api_handler)
+    {
+        conf->api_prefix = prev->api_prefix;
+    }
+    if (conf->api_prefix.data == NULL) {
+        return NGX_CONF_OK;
+    }
+    if (!ngx_http_cache_purge_runtime_configured(cf)
+        || core->handler != ngx_http_cache_purge_api_handler)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "cache_purge_api requires store/state_zone and its own handler");
+        return NGX_CONF_ERROR;
+    }
+    if (core->client_body_in_file_only) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                          "cache_purge_api requires memory request bodies");
+        return NGX_CONF_ERROR;
+    }
+    if (core->client_max_body_size <= 0
+        || core->client_max_body_size > NGX_HTTP_CACHE_PURGE_API_BODY)
+    {
+        core->client_max_body_size = NGX_HTTP_CACHE_PURGE_API_BODY;
+    }
+    if (core->client_body_buffer_size == NGX_CONF_UNSET_SIZE
+        || core->client_body_buffer_size < NGX_HTTP_CACHE_PURGE_API_BODY)
+    {
+        core->client_body_buffer_size = NGX_HTTP_CACHE_PURGE_API_BODY;
+    }
+    return NGX_CONF_OK;
+}
+
+static ngx_uint_t
+ngx_http_cache_purge_api_equal(ngx_str_t value, const char *text)
+{
+    return value.len == ngx_strlen(text)
+           && ngx_memcmp(value.data, text, value.len) == 0;
+}
+
+static ngx_uint_t
+ngx_http_cache_purge_api_utf8(ngx_str_t value)
+{
+    u_char   *p, *end;
+    uint32_t  ch;
+
+    if (value.len == 0) {
+        return 1;
+    }
+    p = value.data;
+    end = p + value.len;
+    while (p < end) {
+        if (*p < 0x80) {
+            p++;
+            continue;
+        }
+        ch = ngx_utf8_decode(&p, end - p);
+        if (ch > 0x10ffff || (ch >= 0xd800 && ch <= 0xdfff)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void
+ngx_http_cache_purge_json_space(ngx_http_cache_purge_json_t *json)
+{
+    while (json->at < json->end
+           && (*json->at == ' ' || *json->at == '\r'
+               || *json->at == '\n' || *json->at == '\t'))
+    {
+        json->at++;
+    }
+}
+
+static uint32_t
+ngx_http_cache_purge_json_hex(ngx_http_cache_purge_json_t *json)
+{
+    uint32_t    value;
+    ngx_int_t   ch;
+    ngx_uint_t  i;
+
+    if (json->end - json->at < 4) {
+        json->failed = 1;
+        return 0;
+    }
+    value = 0;
+    for (i = 0; i < 4; i++) {
+        ch = ngx_hextoi(json->at++, 1);
+        if (ch == NGX_ERROR) {
+            json->failed = 1;
+            return 0;
+        }
+        value = value * 16 + ch;
+    }
+    return value;
+}
+
+static ngx_int_t
+ngx_http_cache_purge_json_parse(ngx_http_cache_purge_json_t *json,
+    ngx_uint_t depth)
+{
+    ngx_http_cache_purge_json_value_t  *value;
+    ngx_int_t                           index, child, last, key, n;
+    uint32_t                            ch, low;
+    u_char                             *start, *out, end;
+    const char                         *literal;
+
+    ngx_http_cache_purge_json_space(json);
+    if (json->failed || json->at == json->end || depth > 5
+        || json->count == NGX_HTTP_CACHE_PURGE_API_JSON)
+    {
+        json->failed = 1;
+        return -1;
+    }
+    index = json->count++;
+    value = &json->values[index];
+    value->child = value->next = -1;
+    ch = *json->at++;
+    value->kind = (u_char) ch;
+    if (ch == '"') {
+        start = out = json->at;
+        while (json->at < json->end && !json->failed) {
+            ch = *json->at++;
+            if (ch == '"') {
+                value->value.data = start;
+                value->value.len = out - start;
+                json->failed = !ngx_http_cache_purge_api_utf8(value->value);
+                return index;
+            }
+            if (ch < 0x20) {
+                break;
+            }
+            if (ch != '\\') {
+                *out++ = (u_char) ch;
+                continue;
+            }
+            if (json->at == json->end) {
+                break;
+            }
+            ch = *json->at++;
+            switch (ch) {
+            case '"': case '\\': case '/': *out++ = (u_char) ch; break;
+            case 'b': *out++ = '\b'; break;
+            case 'f': *out++ = '\f'; break;
+            case 'n': *out++ = '\n'; break;
+            case 'r': *out++ = '\r'; break;
+            case 't': *out++ = '\t'; break;
+            case 'u':
+                ch = ngx_http_cache_purge_json_hex(json);
+                if (ch >= 0xd800 && ch <= 0xdbff) {
+                    if (json->end - json->at < 6 || json->at[0] != '\\'
+                        || json->at[1] != 'u')
+                    {
+                        json->failed = 1;
+                        break;
+                    }
+                    json->at += 2;
+                    low = ngx_http_cache_purge_json_hex(json);
+                    if (low < 0xdc00 || low > 0xdfff) {
+                        json->failed = 1;
+                        break;
+                    }
+                    ch = 0x10000 + ((ch - 0xd800) << 10) + low - 0xdc00;
+                } else if (ch >= 0xdc00 && ch <= 0xdfff) {
+                    json->failed = 1;
+                    break;
+                }
+                if (ch < 0x80) {
+                    *out++ = (u_char) ch;
+                } else if (ch < 0x800) {
+                    *out++ = (u_char) (0xc0 | (ch >> 6));
+                    *out++ = (u_char) (0x80 | (ch & 63));
+                } else if (ch < 0x10000) {
+                    *out++ = (u_char) (0xe0 | (ch >> 12));
+                    *out++ = (u_char) (0x80 | ((ch >> 6) & 63));
+                    *out++ = (u_char) (0x80 | (ch & 63));
+                } else {
+                    *out++ = (u_char) (0xf0 | (ch >> 18));
+                    *out++ = (u_char) (0x80 | ((ch >> 12) & 63));
+                    *out++ = (u_char) (0x80 | ((ch >> 6) & 63));
+                    *out++ = (u_char) (0x80 | (ch & 63));
+                }
+                break;
+            default: json->failed = 1;
+            }
+        }
+        json->failed = 1;
+        return -1;
+    }
+    if (ch == '{' || ch == '[') {
+        end = ch == '{' ? '}' : ']';
+        last = -1;
+        ngx_http_cache_purge_json_space(json);
+        if (json->at < json->end && *json->at == end) {
+            json->at++;
+            return index;
+        }
+        for ( ;; ) {
+            child = ngx_http_cache_purge_json_parse(json, depth + 1);
+            if (child < 0) {
+                return -1;
+            }
+            if (last < 0) {
+                value->child = child;
+            } else {
+                json->values[last].next = child;
+            }
+            last = child;
+            if (ch == '{') {
+                if (json->values[child].kind != '"') {
+                    break;
+                }
+                for (key = value->child; key != child;
+                     key = json->values[key].next)
+                {
+                    if (json->values[key].value.len
+                        == json->values[child].value.len
+                        && ngx_memcmp(json->values[key].value.data,
+                                      json->values[child].value.data,
+                                      json->values[key].value.len) == 0)
+                    {
+                        json->failed = 1;
+                        return -1;
+                    }
+                }
+                ngx_http_cache_purge_json_space(json);
+                if (json->at == json->end || *json->at++ != ':') {
+                    break;
+                }
+                n = ngx_http_cache_purge_json_parse(json, depth + 1);
+                if (n < 0) {
+                    return -1;
+                }
+                json->values[child].child = n;
+            }
+            ngx_http_cache_purge_json_space(json);
+            if (json->at == json->end) {
+                break;
+            }
+            if (*json->at == end) {
+                json->at++;
+                return index;
+            }
+            if (*json->at++ != ',') {
+                break;
+            }
+        }
+        json->failed = 1;
+        return -1;
+    }
+    literal = ch == 't' ? "rue" : ch == 'f' ? "alse" :
+              ch == 'n' ? "ull" : NULL;
+    if (literal != NULL
+        && (size_t) (json->end - json->at) >= ngx_strlen(literal)
+        && ngx_memcmp(json->at, literal, ngx_strlen(literal)) == 0)
+    {
+        json->at += ngx_strlen(literal);
+        return index;
+    }
+    json->failed = 1;
+    return -1;
+}
+
+static ngx_http_cache_purge_json_value_t *
+ngx_http_cache_purge_json_member(ngx_http_cache_purge_json_t *json,
+    ngx_http_cache_purge_json_value_t *object, const char *name, u_char kind,
+    ngx_uint_t required)
+{
+    ngx_int_t                           i;
+    ngx_http_cache_purge_json_value_t  *key, *value;
+
+    if (object == NULL || object->kind != '{') {
+        json->failed = 1;
+        return NULL;
+    }
+    for (i = object->child; i >= 0; i = key->next) {
+        key = &json->values[i];
+        if (ngx_http_cache_purge_api_equal(key->value, name)) {
+            key->used = 1;
+            value = &json->values[key->child];
+            if (kind != 0 && value->kind != kind) {
+                json->failed = 1;
+                return NULL;
+            }
+            return value;
+        }
+    }
+    json->failed |= required;
+    return NULL;
+}
+
+static ngx_uint_t
+ngx_http_cache_purge_json_known(ngx_http_cache_purge_json_t *json,
+    ngx_http_cache_purge_json_value_t *object)
+{
+    ngx_int_t  i;
+    for (i = object->child; i >= 0; i = json->values[i].next) {
+        if (!json->values[i].used) {
+            return 0;
+        }
+    }
+    return !json->failed;
+}
+
+static ngx_str_t
+ngx_http_cache_purge_api_text(ngx_http_cache_purge_json_t *json,
+    ngx_http_cache_purge_json_value_t *object, const char *name,
+    ngx_uint_t required)
+{
+    ngx_http_cache_purge_json_value_t  *value;
+    ngx_str_t                           empty = ngx_null_string;
+
+    value = ngx_http_cache_purge_json_member(json, object, name, '"', required);
+    return value ? value->value : empty;
+}
+
+static ngx_uint_t
+ngx_http_cache_purge_api_id(ngx_str_t id)
+{
+    size_t  i;
+    u_char  ch;
+    if (id.len == 0 || id.len > 128) {
+        return 0;
+    }
+    if (ngx_http_cache_purge_api_equal(id, ".")
+        || ngx_http_cache_purge_api_equal(id, ".."))
+    {
+        return 0;
+    }
+    for (i = 0; i < id.len; i++) {
+        ch = id.data[i];
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+              || (ch >= '0' && ch <= '9') || ch == '.' || ch == '_'
+              || ch == '-' || ch == ':'))
+        {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static ngx_uint_t
+ngx_http_cache_purge_api_decimal(ngx_str_t value, uint64_t *out)
+{
+    size_t    i;
+    uint64_t  n;
+    unsigned  ch;
+
+    n = 0;
+    if (value.len == 0 || value.len > 20) {
+        return 0;
+    }
+    for (i = 0; i < value.len; i++) {
+        ch = value.data[i] - '0';
+        if (ch > 9 || n > (UINT64_MAX - ch) / 10) {
+            return 0;
+        }
+        n = n * 10 + ch;
+    }
+    *out = n;
+    return 1;
+}
+
+static uint64_t
+ngx_http_cache_purge_api_time(ngx_str_t value)
+{
+    ngx_str_t                part;
+    uint64_t                 fields[7];
+    time_t                   stamp;
+    u_char                   text[64], *p;
+    ngx_uint_t               i;
+    static const ngx_uint_t  at[] = {0, 5, 8, 11, 14, 17, 20};
+    static const char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+
+    if ((value.len != 20 && value.len != 24) || value.data[4] != '-'
+        || value.data[7] != '-' || value.data[10] != 'T'
+        || value.data[13] != ':' || value.data[16] != ':'
+        || value.data[value.len - 1] != 'Z'
+        || (value.len == 24 && value.data[19] != '.'))
+    {
+        return 0;
+    }
+    ngx_memzero(fields, sizeof(fields));
+    for (i = 0; i < (value.len == 24 ? 7U : 6U); i++) {
+        part.data = value.data + at[i];
+        part.len = i == 0 ? 4 : i == 6 ? 3 : 2;
+        if (!ngx_http_cache_purge_api_decimal(part, &fields[i])) {
+            return 0;
+        }
+    }
+    if (fields[0] < 1970 || fields[1] == 0 || fields[1] > 12) {
+        return 0;
+    }
+    p = ngx_sprintf(text, "Sun, %02uL %s %04uL %02uL:%02uL:%02uL GMT",
+                    fields[2], months[fields[1] - 1], fields[0], fields[3],
+                    fields[4], fields[5]);
+    stamp = ngx_parse_http_time(text, p - text);
+    return stamp == (time_t) NGX_ERROR ? 0 :
+           (uint64_t) stamp * 1000 + fields[6];
+}
+
+static u_char *
+ngx_http_cache_purge_api_number(u_char *p, uint64_t value, unsigned width)
+{
+    while (width) {
+        *p++ = (u_char) (value >> (--width * 8));
+    }
+    return p;
+}
+
+static u_char *
+ngx_http_cache_purge_api_string(u_char *p, ngx_str_t value)
+{
+    p = ngx_http_cache_purge_api_number(p, value.len, 4);
+    return value.len ? ngx_cpymem(p, value.data, value.len) : p;
+}
+
+static ngx_int_t
+ngx_http_cache_purge_api_header(ngx_http_request_t *r, ngx_str_t name,
+    ngx_str_t *value)
+{
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *headers;
+    ngx_uint_t        i, found;
+
+    part = &r->headers_in.headers.part;
+    headers = part->elts;
+    found = 0;
+    ngx_str_null(value);
+    for (i = 0; /* void */; i++) {
+        if (i == part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            headers = part->elts;
+            i = 0;
+        }
+        if (headers[i].hash && headers[i].key.len == name.len
+            && ngx_strncasecmp(headers[i].key.data, name.data, name.len) == 0)
+        {
+            if (found++) {
+                return NGX_ERROR;
+            }
+            *value = headers[i].value;
+        }
+    }
+    return found ? NGX_OK : NGX_DECLINED;
+}
+
+static ngx_int_t
+ngx_http_cache_purge_api_prepare(ngx_http_cache_purge_api_t *ctx,
+    ngx_str_t body, const char **error)
+{
+    ngx_http_cache_purge_json_t        *json;
+    ngx_http_cache_purge_json_value_t  *root, *selector, *event, *item, *values;
+    ngx_http_cache_purge_loc_conf_t    *conf;
+    ngx_str_t version, mode, type, field, value, scope, encoding, decoded,
+              encoded;
+    ngx_str_t            issuer, stream, serial, issued, match, tag_scope,
+                         binding;
+    ngx_http_request_t  *r;
+    uint64_t             timestamp, sequence;
+    ngx_uint_t           kind, action;
+    size_t               size, prefix;
+    u_char              *canonical, *p, digest[SHA256_DIGEST_LENGTH];
+
+    *error = "invalid_request";
+    r = ctx->request;
+    json = ngx_pcalloc(r->pool, sizeof(*json));
+    if (json == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    json->at = body.data;
+    json->end = body.data + body.len;
+    if (ngx_http_cache_purge_json_parse(json, 0) != 0 || json->failed) {
+        return NGX_HTTP_BAD_REQUEST;
+    }
+    ngx_http_cache_purge_json_space(json);
+    if (json->at != json->end || json->values[0].kind != '{') {
+        return NGX_HTTP_BAD_REQUEST;
+    }
+    root = &json->values[0];
+    version = ngx_http_cache_purge_api_text(json, root, "version", 1);
+    if (json->failed) {
+        return NGX_HTTP_BAD_REQUEST;
+    }
+    if (!ngx_http_cache_purge_api_equal(version, "ngx-http-cache-purge/v2")) {
+        *error = "unsupported_version";
+        return NGX_HTTP_PRECONDITION_FAILED;
+    }
+    ctx->id = ngx_http_cache_purge_api_text(json, root, "operation_id", 1);
+    mode = ngx_http_cache_purge_api_text(json, root, "mode", 1);
+    selector = ngx_http_cache_purge_json_member(json, root, "selector", '{', 1);
+    event = ngx_http_cache_purge_json_member(json, root, "event", '{', 1);
+    if (json->failed || !ngx_http_cache_purge_api_id(ctx->id)) {
+        return NGX_HTTP_BAD_REQUEST;
+    }
+    action = ngx_http_cache_purge_api_equal(mode, "invalidate") ? 1 :
+             ngx_http_cache_purge_api_equal(mode, "delete") ? 2 : 0;
+    type = ngx_http_cache_purge_api_text(json, selector, "type", 1);
+    encoding = ngx_http_cache_purge_api_text(json, selector, "encoding", 0);
+    ngx_str_null(&scope);
+    ngx_str_null(&value);
+    kind = 0;
+    if (ngx_http_cache_purge_api_equal(type, "tag")) {
+        values = ngx_http_cache_purge_json_member(json, selector,
+                                                 "values", '[', 1);
+        match = ngx_http_cache_purge_api_text(json, selector, "match", 0);
+        tag_scope = ngx_http_cache_purge_api_text(json, selector, "scope", 0);
+        if (json->failed || values->child < 0) {
+            return NGX_HTTP_BAD_REQUEST;
+        }
+        item = &json->values[values->child];
+        if (item->next >= 0) {
+            *error = "multiple_tags_not_supported";
+            return NGX_HTTP_PRECONDITION_FAILED;
+        }
+        if (item->kind != '"'
+            || (match.len && !ngx_http_cache_purge_api_equal(match, "any")))
+        {
+            return NGX_HTTP_BAD_REQUEST;
+        }
+        value = item->value;
+        kind = tag_scope.len == 0
+               || ngx_http_cache_purge_api_equal(tag_scope, "namespace") ? 5 :
+               ngx_http_cache_purge_api_equal(tag_scope, "host") ? 6 : 99;
+        conf = ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_module);
+        if (ngx_http_cache_purge_api_header(r, conf->tag_namespace_header,
+                                           &scope) != NGX_OK
+            || scope.len == 0 || scope.len > 32768
+            || !ngx_http_cache_purge_api_utf8(scope))
+        {
+            *error = "invalid_tag_scope_header";
+            return NGX_HTTP_BAD_REQUEST;
+        }
+    } else {
+        value = ngx_http_cache_purge_api_text(json, selector, "value", 1);
+        if (ngx_http_cache_purge_api_equal(type, "url")) {
+            kind = 1;
+        } else if (ngx_http_cache_purge_api_equal(type, "key")) {
+            kind = 0;
+        } else if (ngx_http_cache_purge_api_equal(type, "prefix")) {
+            field = ngx_http_cache_purge_api_text(json, selector, "field", 1);
+            kind = ngx_http_cache_purge_api_equal(field, "key") ? 2 :
+                   ngx_http_cache_purge_api_equal(field, "url") ? 3 : 99;
+        } else if (ngx_http_cache_purge_api_equal(type, "host")) {
+            kind = 4;
+            item = ngx_http_cache_purge_json_member(json, selector,
+                                                   "include_subdomains", 0, 0);
+            if (item != NULL && item->kind != 'f') {
+                *error = "subdomains_not_supported";
+                return NGX_HTTP_PRECONDITION_FAILED;
+            }
+        } else {
+            kind = 99;
+        }
+    }
+    if (encoding.len && !ngx_http_cache_purge_api_equal(encoding, "utf8")) {
+        if (!ngx_http_cache_purge_api_equal(encoding, "base64")) {
+            return NGX_HTTP_BAD_REQUEST;
+        }
+        if (value.len > ngx_base64_encoded_length(kind >= 5 ? 1024 : 32768)) {
+            return NGX_HTTP_BAD_REQUEST;
+        }
+        decoded.len = ngx_base64_decoded_length(value.len);
+        decoded.data = ngx_pnalloc(r->pool, decoded.len ? decoded.len : 1);
+        if (decoded.data == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        if (ngx_decode_base64(&decoded, &value) != NGX_OK) {
+            return NGX_HTTP_BAD_REQUEST;
+        }
+        encoded.len = ngx_base64_encoded_length(decoded.len);
+        encoded.data = ngx_pnalloc(r->pool, encoded.len ? encoded.len : 1);
+        if (encoded.data == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        ngx_encode_base64(&encoded, &decoded);
+        if (encoded.len != value.len
+            || ngx_memcmp(encoded.data, value.data, value.len) != 0)
+        {
+            return NGX_HTTP_BAD_REQUEST;
+        }
+        value = decoded;
+    }
+    if (action == 0 || kind > 6 || value.len == 0
+        || value.len > (kind >= 5 ? 1024U : 32768U)
+        || !ngx_http_cache_purge_json_known(json, selector))
+    {
+        return NGX_HTTP_BAD_REQUEST;
+    }
+    issuer = ngx_http_cache_purge_api_text(json, event, "issuer", 1);
+    stream = ngx_http_cache_purge_api_text(json, event, "stream_id", 1);
+    serial = ngx_http_cache_purge_api_text(json, event, "sequence", 1);
+    issued = ngx_http_cache_purge_api_text(json, event, "issued_at", 1);
+    timestamp = ngx_http_cache_purge_api_time(issued);
+    if (!ngx_http_cache_purge_json_known(json, root)
+        || !ngx_http_cache_purge_json_known(json, event)
+        || issuer.len == 0 || issuer.len > 96
+        || stream.len == 0 || stream.len > 96
+        || !ngx_http_cache_purge_api_decimal(serial, &sequence) || sequence == 0
+        || timestamp == 0)
+    {
+        return NGX_HTTP_BAD_REQUEST;
+    }
+    prefix = 4 + ctx->id.len + 1 + 8 + 1 + 4 + value.len + 4 + scope.len;
+    size = prefix + 4 + issuer.len + 4 + stream.len + 8;
+    canonical = ngx_pnalloc(r->pool, size);
+    binding.len = 44 + issuer.len + stream.len;
+    binding.data = ngx_pnalloc(r->pool, binding.len);
+    ctx->payload.len = prefix + 4 + binding.len;
+    ctx->payload.data = ngx_pnalloc(r->pool, ctx->payload.len);
+    if (canonical == NULL || binding.data == NULL || ctx->payload.data == NULL)
+    {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    p = ngx_http_cache_purge_api_string(canonical, ctx->id);
+    *p++ = (u_char) action;
+    p = ngx_http_cache_purge_api_number(p, timestamp, 8);
+    *p++ = (u_char) kind;
+    p = ngx_http_cache_purge_api_string(p, value);
+    p = ngx_http_cache_purge_api_string(p, scope);
+    p = ngx_http_cache_purge_api_string(p, issuer);
+    p = ngx_http_cache_purge_api_string(p, stream);
+    ngx_http_cache_purge_api_number(p, sequence, 8);
+    if (SHA256(canonical, size, digest) == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    binding.data[0] = 'H';
+    binding.data[1] = 1;
+    binding.data[2] = (u_char) issuer.len;
+    binding.data[3] = (u_char) stream.len;
+    p = ngx_http_cache_purge_api_number(binding.data + 4, sequence, 8);
+    p = ngx_cpymem(p, digest, sizeof(digest));
+    p = ngx_cpymem(p, issuer.data, issuer.len);
+    ngx_memcpy(p, stream.data, stream.len);
+    p = ngx_cpymem(ctx->payload.data, canonical, prefix);
+    ngx_http_cache_purge_api_string(p, binding);
+    return NGX_OK;
+}
+
+static uint64_t
+ngx_http_cache_purge_api_read(ngx_http_cache_purge_api_decode_t *d,
+    unsigned width)
+{
+    uint64_t  value;
+    if ((size_t) (d->end - d->at) < width) {
+        d->failed = 1;
+        return 0;
+    }
+    value = 0;
+    while (width--) {
+        value = (value << 8) | *d->at++;
+    }
+    return value;
+}
+
+static ngx_str_t
+ngx_http_cache_purge_api_read_string(ngx_http_cache_purge_api_decode_t *d)
+{
+    ngx_str_t  value;
+    value.len = (size_t) ngx_http_cache_purge_api_read(d, 4);
+    value.data = d->at;
+    if (value.len > (size_t) (d->end - d->at)) {
+        value.len = 0;
+        d->failed = 1;
+    }
+    d->at += value.len;
+    return value;
+}
+
+static u_char *
+ngx_http_cache_purge_api_quote(u_char *p, ngx_str_t value)
+{
+    size_t         i;
+    u_char         ch;
+    static u_char  hex[] = "0123456789abcdef";
+
+    *p++ = '"';
+    for (i = 0; i < value.len; i++) {
+        ch = value.data[i];
+        if (ch == '"' || ch == '\\') {
+            *p++ = '\\'; *p++ = ch;
+        } else if (ch < 0x20) {
+            *p++ = '\\'; *p++ = 'u'; *p++ = '0'; *p++ = '0';
+            *p++ = hex[ch >> 4]; *p++ = hex[ch & 15];
+        } else {
+            *p++ = ch;
+        }
+    }
+    *p++ = '"';
+    return p;
+}
+
+static u_char *
+ngx_http_cache_purge_api_date(u_char *p, uint64_t msec)
+{
+    ngx_tm_t  tm;
+    if (msec == 0 || msec > UINT64_C(253402300799999)) {
+        return ngx_cpymem(p, "null", 4);
+    }
+    ngx_gmtime((time_t) (msec / 1000), &tm);
+    return ngx_sprintf(p, "\"%04d-%02d-%02dT%02d:%02d:%02d.%03uLZ\"",
+                      tm.ngx_tm_year, tm.ngx_tm_mon, tm.ngx_tm_mday,
+                      tm.ngx_tm_hour, tm.ngx_tm_min, tm.ngx_tm_sec,
+                      msec % 1000);
+}
+
+static ngx_int_t
+ngx_http_cache_purge_api_send(ngx_http_request_t *r, ngx_uint_t status,
+    ngx_buf_t *buffer)
+{
+    ngx_chain_t       out;
+    ngx_table_elt_t  *header;
+    ngx_int_t         rc;
+
+    r->headers_out.status = status;
+    r->headers_out.content_length_n = buffer->last - buffer->pos;
+    ngx_str_set(&r->headers_out.content_type, "application/json");
+    header = ngx_list_push(&r->headers_out.headers);
+    if (header == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    header->hash = 1;
+    ngx_str_set(&header->key, "Cache-Control");
+    ngx_str_set(&header->value, "no-store");
+    if (r->method == NGX_HTTP_POST && r->request_body == NULL) {
+        r->keepalive = 0;
+        r->lingering_close = 1;
+    }
+    buffer->last_buf = 1;
+    out.buf = buffer;
+    out.next = NULL;
+    rc = ngx_http_send_header(r);
+    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
+        return rc;
+    }
+    return ngx_http_output_filter(r, &out);
+}
+
+static ngx_int_t
+ngx_http_cache_purge_api_render(ngx_http_cache_purge_api_t *ctx,
+    ngx_uint_t status, const char *error)
+{
+    ngx_http_request_t                *r;
+    ngx_http_cache_purge_loc_conf_t   *conf;
+    ngx_http_cache_purge_api_decode_t  d;
+    ngx_buf_t                         *buffer;
+    ngx_str_t                          id, value, scope, binding, message,
+                                       encoded, route;
+    uint64_t                           publication, last, retired, live, bytes,
+                                       policy;
+    uint64_t                           issued, sequence, revision, accepted,
+                                       effective, until;
+    uint64_t                           visits, pending, failed, checkpoint;
+    ngx_uint_t                         state, mode, kind, stage, done,
+                                       propagation, ready;
+    ngx_uint_t                         binary;
+    u_char                             ledger[32], *p, *identity;
+    size_t                             size;
+    static const char *types[] = {"key", "url", "prefix", "prefix",
+                                  "host", "tag", "tag"};
+
+    r = ctx->request;
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_module);
+    if (error != NULL) {
+        buffer = ngx_create_temp_buf(r->pool, 2048);
+        if (buffer == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        p = ngx_sprintf(buffer->last,
+            "{\"version\":\"ngx-http-cache-purge/v2\",\"error\":\"%s\","
+            "\"outcome\":\"%s\",\"operation_id\":", error,
+            !ctx->post || ctx->submitted ? "unknown" : "not_submitted");
+        if (ctx->id.len && ctx->id.len <= 128
+            && ngx_http_cache_purge_api_utf8(ctx->id))
+        {
+            p = ngx_http_cache_purge_api_quote(p, ctx->id);
+        } else {
+            p = ngx_cpymem(p, "null", 4);
+        }
+        buffer->last = ngx_cpymem(p, "}\n", 2);
+        return ngx_http_cache_purge_api_send(r, status, buffer);
+    }
+    if (ctx->record.data == NULL || ctx->record.len < 64) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    d.at = ctx->record.data;
+    d.end = d.at + ctx->record.len;
+    d.failed = 0;
+    state = (ngx_uint_t) ngx_http_cache_purge_api_read(&d, 4);
+    publication = ngx_http_cache_purge_api_read(&d, 8);
+    if (d.end - d.at < 16) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    identity = d.at;
+    ngx_hex_dump(ledger, identity, 16);
+    d.at += 16;
+    last = ngx_http_cache_purge_api_read(&d, 8);
+    retired = ngx_http_cache_purge_api_read(&d, 8);
+    live = ngx_http_cache_purge_api_read(&d, 8);
+    bytes = ngx_http_cache_purge_api_read(&d, 8);
+    policy = ngx_http_cache_purge_api_read(&d, 4);
+    ready = state == NGX_HTTP_CACHE_PURGE_COORD_READY;
+    if (d.failed) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    if (ctx->capabilities) {
+        if (d.at != d.end) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        buffer = ngx_create_temp_buf(r->pool, 8192);
+        if (buffer == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        p = ngx_sprintf(buffer->last,
+            "{\"version\":\"ngx-http-cache-purge/v2\","
+            "\"authentication\":\"nginx-configuration\","
+            "\"index_id\":\"%*s\",\"ready\":%s,\"rules_revision\":\"%uL\","
+            "\"last_sequence\":\"%uL\",\"retired_sequence\":\"%uL\","
+            "\"live_operations\":\"%uL\",\"selector_bytes\":\"%uL\","
+            "\"durable_tasks\":true,\"idempotency\":true,\"status_query\":true,"
+            "\"selectors\":[\"host\",\"url\",\"key\",\"prefix\",\"tag\"],"
+            "\"modes\":[\"invalidate\",\"delete\"],\"binary_selectors\":true,"
+            "\"tag_scopes\":[\"namespace\",\"host\"],\"max_tags\":1,"
+            "\"index_schema\":6,\"ledger_schema\":3,"
+            "\"propagation_timeout_ms\":\"%uL\","
+            "\"propagation_protocols\":[],\"proxy_propagation_ready\":false,"
+            "\"proxy_header_transport\":\"unavailable\","
+            "\"invalidate_stale_policy\":\"%s\","
+            "\"limits\":{\"body_bytes\":262144,\"selector_bytes\":32768,"
+            "\"tag_bytes\":1024,\"namespace_bytes\":32768,"
+            "\"operation_id_bytes\":128,\"acceptance_timeout_ms\":5000},"
+            "\"control_headers\":{\"tag_namespace\":",
+            (size_t) 32, ledger, ready ? "true" : "false", publication,
+            last, retired, live, bytes, policy,
+#if (NGX_RESTY_EXT)
+            "forbid"
+#else
+            "native"
+#endif
+            );
+        p = ngx_http_cache_purge_api_quote(p, conf->tag_namespace_header);
+        buffer->last = ngx_cpymem(p, "}}\n", 3);
+        return ngx_http_cache_purge_api_send(r, status, buffer);
+    }
+    id = ngx_http_cache_purge_api_read_string(&d);
+    mode = (ngx_uint_t) ngx_http_cache_purge_api_read(&d, 1);
+    issued = ngx_http_cache_purge_api_read(&d, 8);
+    kind = (ngx_uint_t) ngx_http_cache_purge_api_read(&d, 1);
+    value = ngx_http_cache_purge_api_read_string(&d);
+    scope = ngx_http_cache_purge_api_read_string(&d);
+    binding = ngx_http_cache_purge_api_read_string(&d);
+    sequence = ngx_http_cache_purge_api_read(&d, 8);
+    revision = ngx_http_cache_purge_api_read(&d, 8);
+    accepted = ngx_http_cache_purge_api_read(&d, 8);
+    effective = ngx_http_cache_purge_api_read(&d, 8);
+    until = ngx_http_cache_purge_api_read(&d, 8);
+    stage = (ngx_uint_t) ngx_http_cache_purge_api_read(&d, 1);
+    (void) ngx_http_cache_purge_api_read(&d, 4);
+    propagation = (ngx_uint_t) ngx_http_cache_purge_api_read(&d, 1);
+    (void) ngx_http_cache_purge_api_read_string(&d);
+    done = (ngx_uint_t) ngx_http_cache_purge_api_read(&d, 1);
+    (void) ngx_http_cache_purge_api_read(&d, 8);
+    visits = ngx_http_cache_purge_api_read(&d, 8);
+    pending = ngx_http_cache_purge_api_read(&d, 8);
+    failed = ngx_http_cache_purge_api_read(&d, 8);
+    checkpoint = ngx_http_cache_purge_api_read(&d, 8);
+    message = ngx_http_cache_purge_api_read_string(&d);
+    if (d.failed || d.at != d.end || kind > 6 || mode < 1 || mode > 2
+        || stage < 1 || stage > 4 || id.len != ctx->id.len
+        || ngx_memcmp(id.data, ctx->id.data, id.len) || sequence > last
+        || !ngx_http_cache_purge_api_utf8(scope)
+        || !ngx_http_cache_purge_api_utf8(message))
+    {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    if (ctx->post && (stage == 1 || !ready)) {
+        return NGX_AGAIN;
+    }
+    size = 8192 + 6 * (id.len + value.len + scope.len + message.len
+                      + conf->api_prefix.len);
+    buffer = ngx_create_temp_buf(r->pool, size);
+    if (buffer == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    p = ngx_sprintf(buffer->last,
+        "{\"version\":\"ngx-http-cache-purge/v2\",\"operation_id\":");
+    p = ngx_http_cache_purge_api_quote(p, id);
+    p = ngx_sprintf(p, ",\"index_id\":\"%*s\",\"mode\":\"%s\","
+        "\"state\":\"%s\",\"durable\":true,\"effective\":%s,\"ready\":%s,"
+        "\"rules_revision\":\"%uL\",\"sequence\":\"%uL\","
+        "\"revision\":\"%uL\",\"accepted_at\":",
+        (size_t) 32, ledger, mode == 1 ? "invalidate" : "delete",
+        stage == 1 ? "preparing" : stage == 4 ? "materialized" : "effective",
+        effective ? "true" : "false", ready ? "true" : "false",
+        publication, sequence, revision);
+    p = ngx_http_cache_purge_api_date(p, accepted);
+    p = ngx_cpymem(p, ",\"effective_at\":", sizeof(",\"effective_at\":") - 1);
+    p = ngx_http_cache_purge_api_date(p, effective);
+    p = ngx_cpymem(p, ",\"propagation_until\":",
+                  sizeof(",\"propagation_until\":") - 1);
+    p = ngx_http_cache_purge_api_date(p, until);
+    p = ngx_sprintf(p, ",\"propagation_retained\":%s,\"issued_at\":",
+                    propagation ? "true" : "false");
+    p = ngx_http_cache_purge_api_date(p, issued);
+    p = ngx_sprintf(p, ",\"selector\":{\"type\":\"%s\"", types[kind]);
+    if (kind == 2 || kind == 3) {
+        p = ngx_sprintf(p, ",\"field\":\"%s\"", kind == 2 ? "key" : "url");
+    }
+    binary = !ngx_http_cache_purge_api_utf8(value);
+    if (binary) {
+        encoded.len = ngx_base64_encoded_length(value.len);
+        encoded.data = ngx_pnalloc(r->pool, encoded.len);
+        if (encoded.data == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        ngx_encode_base64(&encoded, &value);
+        value = encoded;
+        p = ngx_cpymem(p, ",\"encoding\":\"base64\"",
+                      sizeof(",\"encoding\":\"base64\"") - 1);
+    }
+    if (kind >= 5) {
+        p = ngx_sprintf(p, ",\"scope\":\"%s\",\"match\":\"any\",\"values\":[",
+                        kind == 5 ? "namespace" : "host");
+        p = ngx_http_cache_purge_api_quote(p, value);
+        p = ngx_cpymem(p, "]}", 2);
+        p = ngx_sprintf(p, ",\"%s\":",
+                        kind == 5 ? "tag_namespace" : "tag_host");
+        p = ngx_http_cache_purge_api_quote(p, scope);
+    } else {
+        p = ngx_cpymem(p, ",\"value\":", sizeof(",\"value\":") - 1);
+        p = ngx_http_cache_purge_api_quote(p, value);
+        *p++ = '}';
+    }
+    p = ngx_cpymem(p, ",\"request_digest\":",
+                  sizeof(",\"request_digest\":") - 1);
+    if (binding.len >= 44 && binding.data[0] == 'H' && binding.data[1] == 1
+        && binding.len == (size_t) (44 + binding.data[2] + binding.data[3]))
+    {
+        *p++ = '"';
+        p = ngx_hex_dump(p, binding.data + 12, 32);
+        *p++ = '"';
+    } else {
+        p = ngx_cpymem(p, "null", 4);
+    }
+    p = ngx_sprintf(p, ",\"cleanup\":{\"state\":\"%s\",\"scan_done\":%s,"
+        "\"visits\":\"%uL\",\"pending\":\"%uL\",\"failed\":\"%uL\","
+        "\"checkpoint\":\"%uL\",\"last_error\":",
+        stage == 4 ? "done" : failed ? "retrying" : stage == 3 ? "draining" :
+        checkpoint ? "running" : "queued", done ? "true" : "false",
+        visits, pending, failed, checkpoint);
+    p = ngx_http_cache_purge_api_quote(p, message);
+    p = ngx_cpymem(p, "},\"status_url\":", sizeof("},\"status_url\":") - 1);
+    route.len = conf->api_prefix.len + sizeof("operations/") - 1 + id.len;
+    route.data = ngx_pnalloc(r->pool, route.len);
+    if (route.data == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    identity = ngx_cpymem(route.data, conf->api_prefix.data,
+                         conf->api_prefix.len);
+    identity = ngx_cpymem(identity, "operations/", sizeof("operations/") - 1);
+    ngx_memcpy(identity, id.data, id.len);
+    p = ngx_http_cache_purge_api_quote(p, route);
+    buffer->last = ngx_cpymem(p, "}\n", 2);
+    return ngx_http_cache_purge_api_send(r, status, buffer);
+}
+
+static void
+ngx_http_cache_purge_api_cleanup(void *data)
+{
+    ngx_http_cache_purge_api_t  *ctx = data;
+    ctx->finished = 1;
+    if (ctx->timer.timer_set) {
+        ngx_del_timer(&ctx->timer);
+    }
+    if (ctx->call != NULL) {
+        ngx_http_cache_purge_client_cancel(ctx->call);
+        ctx->call = NULL;
+    }
+}
+
+static void
+ngx_http_cache_purge_api_finish(ngx_http_cache_purge_api_t *ctx,
+    ngx_uint_t status, const char *error)
+{
+    ngx_int_t            rc;
+    ngx_http_request_t  *r;
+
+    if (ctx->finished) {
+        return;
+    }
+    r = ctx->request;
+    rc = ngx_http_cache_purge_api_render(ctx, status, error);
+    if (rc == NGX_AGAIN && ctx->post && !r->header_sent) {
+        if ((ngx_msec_int_t) (ctx->deadline - ngx_current_msec) > 10) {
+            ctx->opcode = NGX_HTTP_CACHE_PURGE_OP_GET_RECEIPT;
+            ngx_add_timer(&ctx->timer, 10);
+            return;
+        }
+        rc = ngx_http_cache_purge_api_render(ctx,
+            NGX_HTTP_SERVICE_UNAVAILABLE, "acceptance_pending");
+    }
+    if (rc == NGX_HTTP_INTERNAL_SERVER_ERROR && !r->header_sent) {
+        rc = ngx_http_cache_purge_api_render(ctx,
+            NGX_HTTP_SERVICE_UNAVAILABLE, "invalid_backend_response");
+    }
+    ctx->finished = 1;
+    ngx_http_finalize_request(r, rc);
+}
+
+static ngx_int_t
+ngx_http_cache_purge_api_call(ngx_http_cache_purge_api_t *ctx, uint16_t opcode)
+{
+    ngx_str_t       payload;
+    u_char          id[132];
+    ngx_msec_int_t  left;
+    ngx_int_t       rc;
+
+    left = (ngx_msec_int_t) (ctx->deadline - ngx_current_msec);
+    if (left <= 0 || ctx->finished) {
+        return NGX_ERROR;
+    }
+    ngx_str_null(&payload);
+    if (opcode == NGX_HTTP_CACHE_PURGE_OP_SUBMIT_OPERATION) {
+        payload = ctx->payload;
+    } else if (opcode == NGX_HTTP_CACHE_PURGE_OP_GET_RECEIPT) {
+        if (ctx->id.len > 128) {
+            return NGX_ERROR;
+        }
+        payload.data = id;
+        payload.len = 4 + ctx->id.len;
+        ngx_http_cache_purge_api_string(id, ctx->id);
+    }
+    ctx->opcode = opcode;
+    rc = ngx_http_cache_purge_client_submit(ctx->client, opcode, &payload,
+                (ngx_msec_t) left, ngx_http_cache_purge_api_reply,
+                ctx, &ctx->call);
+    if (rc == NGX_OK && opcode == NGX_HTTP_CACHE_PURGE_OP_SUBMIT_OPERATION) {
+        ctx->submitted = 1;
+    }
+    return rc;
+}
+
+static void
+ngx_http_cache_purge_api_timer(ngx_event_t *event)
+{
+    ngx_http_cache_purge_api_t  *ctx = event->data;
+    if (ngx_http_cache_purge_api_call(ctx, ctx->opcode) != NGX_OK) {
+        ngx_http_cache_purge_api_finish(ctx, NGX_HTTP_SERVICE_UNAVAILABLE,
+                                       "acceptance_pending");
+    }
+}
+
+static void
+ngx_http_cache_purge_api_reply(ngx_http_cache_purge_call_t *call, void *data,
+    const ngx_http_cache_purge_reply_t *reply)
+{
+    ngx_http_cache_purge_api_t  *ctx = data;
+    ngx_uint_t                   status;
+    size_t                       size;
+    u_char                      *buffer;
+    const char                  *error;
+
+    ctx->call = NULL;
+    if (ctx->finished) {
+        return;
+    }
+    if (reply->transport != NGX_HTTP_CACHE_PURGE_CLIENT_OK) {
+        ngx_http_cache_purge_api_finish(ctx, NGX_HTTP_SERVICE_UNAVAILABLE,
+                                       "backend_unavailable");
+        return;
+    }
+    if (reply->result == NGX_HTTP_CACHE_ROCKSDB_BUSY
+        && ctx->post
+        && (ngx_msec_int_t) (ctx->deadline - ngx_current_msec) > 10)
+    {
+        ngx_add_timer(&ctx->timer, 10);
+        return;
+    }
+    if (reply->result != 0) {
+        status = NGX_HTTP_SERVICE_UNAVAILABLE;
+        error = "backend_unavailable";
+        if (reply->result == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) {
+            status = NGX_HTTP_NOT_FOUND;
+            error = "operation_not_found";
+        } else if (reply->result == NGX_HTTP_CACHE_ROCKSDB_CONFLICT) {
+            status = NGX_HTTP_CONFLICT;
+            error = "identity_conflict";
+        } else if (reply->result == NGX_HTTP_CACHE_ROCKSDB_INVALID) {
+            status = NGX_HTTP_BAD_REQUEST;
+            error = "invalid_request";
+        } else if (reply->result == NGX_HTTP_CACHE_ROCKSDB_LIMIT) {
+            error = "capacity_exhausted";
+        }
+        ngx_http_cache_purge_api_finish(ctx, status, error);
+        return;
+    }
+    if (ctx->opcode == NGX_HTTP_CACHE_PURGE_OP_SUBMIT_OPERATION) {
+        if (ngx_http_cache_purge_api_call(ctx,
+                NGX_HTTP_CACHE_PURGE_OP_GET_RECEIPT) != NGX_OK)
+        {
+            ngx_http_cache_purge_api_finish(ctx, NGX_HTTP_SERVICE_UNAVAILABLE,
+                                           "acceptance_pending");
+        }
+        return;
+    }
+    if (reply->payload.len > NGX_HTTP_CACHE_PURGE_API_REPLY) {
+        ngx_http_cache_purge_api_finish(ctx, NGX_HTTP_SERVICE_UNAVAILABLE,
+                                       "invalid_backend_response");
+        return;
+    }
+    if (ctx->capacity < reply->payload.len) {
+        size = 2048;
+        while (size < reply->payload.len) {
+            size *= 2;
+        }
+        buffer = ngx_pnalloc(ctx->request->pool, size);
+        if (buffer == NULL) {
+            ngx_http_cache_purge_api_finish(ctx, NGX_HTTP_INTERNAL_SERVER_ERROR,
+                                           "allocation_failed");
+            return;
+        }
+        ctx->capacity = size;
+        ctx->record.data = buffer;
+    }
+    ctx->record.len = reply->payload.len;
+    if (ctx->record.len) {
+        ngx_memcpy(ctx->record.data, reply->payload.data, reply->payload.len);
+    }
+    ngx_http_cache_purge_api_finish(ctx,
+        ctx->post ? NGX_HTTP_ACCEPTED : NGX_HTTP_OK, NULL);
+}
+
+static void
+ngx_http_cache_purge_api_body(ngx_http_request_t *r)
+{
+    ngx_http_cleanup_t          *cleanup;
+    ngx_http_cache_purge_api_t  *ctx;
+    ngx_chain_t                 *cl;
+    ngx_str_t                    body;
+    size_t                       size;
+    u_char                      *p;
+    ngx_int_t                    rc;
+    const char                  *error;
+
+    ctx = NULL;
+    for (cleanup = r->cleanup; cleanup != NULL; cleanup = cleanup->next) {
+        if (cleanup->handler == ngx_http_cache_purge_api_cleanup) {
+            ctx = cleanup->data;
+            break;
+        }
+    }
+    if (ctx == NULL || ctx->finished) {
+        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+    size = 0;
+    if (r->request_body == NULL || r->request_body->temp_file != NULL) {
+        ngx_http_cache_purge_api_finish(ctx, NGX_HTTP_REQUEST_ENTITY_TOO_LARGE,
+                                       "body_requires_memory_buffer");
+        return;
+    }
+    for (cl = r->request_body->bufs; cl != NULL; cl = cl->next) {
+        if (ngx_buf_special(cl->buf)) {
+            continue;
+        }
+        if (!ngx_buf_in_memory(cl->buf) || cl->buf->in_file
+            || (size_t) (cl->buf->last - cl->buf->pos)
+               > NGX_HTTP_CACHE_PURGE_API_BODY - size)
+        {
+            ngx_http_cache_purge_api_finish(ctx,
+                                           NGX_HTTP_REQUEST_ENTITY_TOO_LARGE,
+                                           "body_too_large");
+            return;
+        }
+        size += cl->buf->last - cl->buf->pos;
+    }
+    if (size == 0) {
+        ngx_http_cache_purge_api_finish(ctx, NGX_HTTP_BAD_REQUEST,
+                                       "empty_request");
+        return;
+    }
+    body.data = ngx_pnalloc(r->pool, size);
+    body.len = size;
+    if (body.data == NULL) {
+        ngx_http_cache_purge_api_finish(ctx, NGX_HTTP_INTERNAL_SERVER_ERROR,
+                                       "allocation_failed");
+        return;
+    }
+    p = body.data;
+    for (cl = r->request_body->bufs; cl != NULL; cl = cl->next) {
+        if (!ngx_buf_special(cl->buf)) {
+            p = ngx_cpymem(p, cl->buf->pos, cl->buf->last - cl->buf->pos);
+        }
+    }
+    rc = ngx_http_cache_purge_api_prepare(ctx, body, &error);
+    if (rc != NGX_OK) {
+        ngx_http_cache_purge_api_finish(ctx, (ngx_uint_t) rc, error);
+        return;
+    }
+    ctx->deadline = ngx_current_msec + NGX_HTTP_CACHE_PURGE_API_TIME;
+    r->read_event_handler = ngx_http_test_reading;
+    if (ngx_http_cache_purge_api_call(ctx,
+            NGX_HTTP_CACHE_PURGE_OP_SUBMIT_OPERATION) != NGX_OK)
+    {
+        ngx_http_cache_purge_api_finish(ctx, NGX_HTTP_SERVICE_UNAVAILABLE,
+                                       "backend_unavailable");
+    }
+}
+
+ngx_int_t
+ngx_http_cache_purge_api_handler(ngx_http_request_t *r)
+{
+    ngx_http_cache_purge_loc_conf_t  *conf;
+    ngx_http_cache_purge_api_t       *ctx;
+    ngx_http_cleanup_t               *cleanup;
+    ngx_str_t                         route, content_type, content_name =
+        ngx_string("Content-Type");
+    ngx_table_elt_t                  *allow;
+    ngx_int_t                         rc;
+    ngx_uint_t                        status;
+    const char                       *error, *methods;
+
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_module);
+    ctx = ngx_pcalloc(r->pool, sizeof(*ctx));
+    if (ctx == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    ctx->request = r;
+    ctx->deadline = ngx_current_msec + NGX_HTTP_CACHE_PURGE_API_TIME;
+    ctx->timer.data = ctx;
+    ctx->timer.handler = ngx_http_cache_purge_api_timer;
+    ctx->timer.log = r->connection->log;
+    cleanup = ngx_http_cleanup_add(r, 0);
+    if (cleanup == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    cleanup->handler = ngx_http_cache_purge_api_cleanup;
+    cleanup->data = ctx;
+    if (r != r->main) {
+        return ngx_http_cache_purge_api_render(ctx, NGX_HTTP_BAD_REQUEST,
+                                             "subrequest_not_supported");
+    }
+    if (r->args.len != 0 || r->uri.len < conf->api_prefix.len
+        || ngx_memcmp(r->uri.data, conf->api_prefix.data, conf->api_prefix.len))
+    {
+        return ngx_http_cache_purge_api_render(ctx, NGX_HTTP_BAD_REQUEST,
+                                             "invalid_route");
+    }
+    route.data = r->uri.data + conf->api_prefix.len;
+    route.len = r->uri.len - conf->api_prefix.len;
+    error = NULL;
+    status = NGX_HTTP_NOT_FOUND;
+    methods = "GET, HEAD";
+    if (ngx_http_cache_purge_api_equal(route, "capabilities")) {
+        ctx->capabilities = 1;
+        ctx->opcode = NGX_HTTP_CACHE_PURGE_OP_GET_RUNTIME_STATUS;
+        if (!(r->method & (NGX_HTTP_GET|NGX_HTTP_HEAD))) {
+            error = "method_not_allowed"; status = NGX_HTTP_NOT_ALLOWED;
+        }
+    } else if (ngx_http_cache_purge_api_equal(route, "operations")) {
+        methods = "POST";
+        ctx->post = 1;
+        if (r->method != NGX_HTTP_POST) {
+            error = "method_not_allowed"; status = NGX_HTTP_NOT_ALLOWED;
+        }
+    } else if (route.len > sizeof("operations/") - 1
+               && ngx_strncmp(route.data, "operations/",
+                              sizeof("operations/") - 1) == 0)
+    {
+        ctx->id.data = route.data + sizeof("operations/") - 1;
+        ctx->id.len = route.len - (sizeof("operations/") - 1);
+        ctx->opcode = NGX_HTTP_CACHE_PURGE_OP_GET_RECEIPT;
+        if (!ngx_http_cache_purge_api_id(ctx->id)) {
+            error = "invalid_operation_id"; status = NGX_HTTP_BAD_REQUEST;
+        } else if (!(r->method & (NGX_HTTP_GET|NGX_HTTP_HEAD))) {
+            error = "method_not_allowed"; status = NGX_HTTP_NOT_ALLOWED;
+        }
+    } else {
+        error = "route_not_found";
+    }
+    if (error != NULL) {
+        if (status == NGX_HTTP_NOT_ALLOWED) {
+            allow = ngx_list_push(&r->headers_out.headers);
+            if (allow == NULL) {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+            allow->hash = 1;
+            ngx_str_set(&allow->key, "Allow");
+            allow->value.data = (u_char *) methods;
+            allow->value.len = ngx_strlen(methods);
+        }
+        return ngx_http_cache_purge_api_render(ctx, status, error);
+    }
+    if (ngx_http_cache_purge_runtime_client(r, &ctx->client) != 0) {
+        return ngx_http_cache_purge_api_render(ctx,
+                                             NGX_HTTP_SERVICE_UNAVAILABLE,
+                                             "backend_unavailable");
+    }
+    if (ctx->post) {
+        if (r->headers_in.content_length_n > NGX_HTTP_CACHE_PURGE_API_BODY) {
+            return ngx_http_cache_purge_api_render(ctx,
+                          NGX_HTTP_REQUEST_ENTITY_TOO_LARGE, "body_too_large");
+        }
+        if (ngx_http_cache_purge_api_header(r, content_name, &content_type)
+            != NGX_OK || content_type.len < sizeof("application/json") - 1
+            || ngx_strncasecmp(content_type.data,
+                               (u_char *) "application/json",
+                               sizeof("application/json") - 1) != 0
+            || (content_type.len != sizeof("application/json") - 1
+                && content_type.data[sizeof("application/json") - 1] != ';'))
+        {
+            return ngx_http_cache_purge_api_render(ctx,
+                                NGX_HTTP_UNSUPPORTED_MEDIA_TYPE,
+                                "application_json_required");
+        }
+        r->request_body_in_single_buf = 1;
+        rc = ngx_http_read_client_request_body(r,
+                                             ngx_http_cache_purge_api_body);
+        return rc >= NGX_HTTP_SPECIAL_RESPONSE ? rc : NGX_DONE;
+    }
+    if (r->headers_in.content_length_n > 0 || r->headers_in.chunked) {
+        r->keepalive = 0;
+        return ngx_http_cache_purge_api_render(ctx, NGX_HTTP_BAD_REQUEST,
+                                             "unexpected_body");
+    }
+    if (ngx_http_cache_purge_api_call(ctx, ctx->opcode) != NGX_OK) {
+        return ngx_http_cache_purge_api_render(ctx,
+                                             NGX_HTTP_SERVICE_UNAVAILABLE,
+                                             "backend_unavailable");
+    }
+    r->read_event_handler = ngx_http_test_reading;
+    r->main->count++;
+    return NGX_DONE;
 }

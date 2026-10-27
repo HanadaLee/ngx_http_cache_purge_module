@@ -728,6 +728,10 @@ typedef struct {
     ngx_str_t                          thread_pool_name;
     ngx_http_cache_purge_namespace_t  *namespace;
     ngx_http_complex_value_t           logical_key;
+#if (NGX_HTTP_CACHE_PURGE_ROCKSDB)
+    ngx_str_t                          api_prefix;
+    ngx_str_t                          tag_namespace_header;
+#endif
 #if (NGX_HTTP_PROXY)
     ngx_flag_t  refresh;
     ngx_str_t   refresh_location;
@@ -745,6 +749,17 @@ typedef struct {
     ngx_http_complex_value_t   proxy_separate_key; /* purge key template*/
 #endif
 } ngx_http_cache_purge_loc_conf_t;
+
+#if (NGX_HTTP_CACHE_PURGE_ROCKSDB)
+char *ngx_http_cache_purge_api_conf(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+char *ngx_http_cache_purge_api_header_conf(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+char *ngx_http_cache_purge_api_merge(ngx_conf_t *cf,
+    ngx_http_cache_purge_loc_conf_t *prev,
+    ngx_http_cache_purge_loc_conf_t *conf);
+ngx_int_t ngx_http_cache_purge_api_handler(ngx_http_request_t *r);
+#endif
 
 typedef struct {
     u_char     *key_partial;

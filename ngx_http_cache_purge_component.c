@@ -736,6 +736,40 @@ ngx_http_cache_purge_component_anchor(ngx_http_cache_purge_component_t *c,
 }
 
 static int
+ngx_http_cache_purge_component_put_status(ngx_http_cache_purge_component_t *c,
+    ngx_http_cache_purge_component_encoder_t *e,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_operation_usage_t  usage;
+    uint64_t                                publication;
+    uint32_t                                state;
+    int                                     rc;
+
+    state = 0;
+    publication = 0;
+    rc = c->coordinator ? ngx_http_cache_purge_coordinator_status(
+                      c->coordinator, &state, &publication, error) : 0;
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_operations_usage(&c->operations, &usage,
+                                                     error);
+    }
+    if (rc == 0) {
+        ngx_http_cache_purge_component_put_integer(e, state, 4);
+        ngx_http_cache_purge_component_put_integer(e, publication, 8);
+        ngx_http_cache_purge_component_put_raw(e, c->operations.ledger, 16);
+        ngx_http_cache_purge_component_put_integer(e, usage.last_sequence, 8);
+        ngx_http_cache_purge_component_put_integer(e,
+                                                  usage.retired_sequence, 8);
+        ngx_http_cache_purge_component_put_integer(e, usage.live_records, 8);
+        ngx_http_cache_purge_component_put_integer(e,
+                                                 usage.live_selector_bytes, 8);
+        ngx_http_cache_purge_component_put_integer(e,
+                                                 c->options.propagation_ms, 4);
+    }
+    return rc;
+}
+
+static int
 ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
     ngx_http_cache_rocksdb_t *store, ngx_http_cache_purge_component_peer_t *p,
     ngx_http_cache_purge_component_encoder_t *e,
@@ -753,7 +787,6 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
     ngx_http_cache_purge_watermark_t           watermark;
     ngx_http_cache_purge_operation_input_t     input;
     ngx_http_cache_purge_operation_t           operation;
-    ngx_http_cache_purge_operation_usage_t     usage;
     ngx_http_cache_purge_selector_t            selector;
     ngx_http_cache_purge_query_t              *query;
     ngx_http_cache_rocksdb_stats_t             stats;
@@ -1366,10 +1399,16 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
         break;
 
     case NGX_HTTP_CACHE_PURGE_OP_GET_OPERATION:
+    case NGX_HTTP_CACHE_PURGE_OP_GET_RECEIPT:
         id = ngx_http_cache_purge_component_string(&d, 128);
         if ((rc = ngx_http_cache_purge_component_end(&d)) == 0) {
             rc = ngx_http_cache_purge_operations_get(&c->operations, id,
                                                      &operation, error);
+        }
+        if (rc == 0
+            && p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_GET_RECEIPT)
+        {
+            rc = ngx_http_cache_purge_component_put_status(c, e, error);
         }
         if (rc == 0) {
             ngx_http_cache_purge_component_put_operation(e, &operation);
@@ -1390,7 +1429,6 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
         break;
 
     case NGX_HTTP_CACHE_PURGE_OP_GET_CONTROL_STATUS:
-    case NGX_HTTP_CACHE_PURGE_OP_GET_RUNTIME_STATUS:
         if ((rc = ngx_http_cache_purge_component_end(&d)) != 0) {
             break;
         }
@@ -1404,25 +1442,12 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
             ngx_http_cache_purge_component_put_integer(e, state, 4);
             ngx_http_cache_purge_component_put_integer(e, publication, 8);
         }
-        if (rc == 0
-            && p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_GET_RUNTIME_STATUS)
-        {
-            rc = ngx_http_cache_purge_operations_usage(&c->operations,
-                                                         &usage, error);
-            if (rc == 0) {
-                ngx_http_cache_purge_component_put_raw(e,
-                                                     c->operations.ledger, 16);
-                ngx_http_cache_purge_component_put_integer(e,
-                                                     usage.last_sequence, 8);
-                ngx_http_cache_purge_component_put_integer(e,
-                                                  usage.retired_sequence, 8);
-                ngx_http_cache_purge_component_put_integer(e,
-                                                      usage.live_records, 8);
-                ngx_http_cache_purge_component_put_integer(e,
-                                               usage.live_selector_bytes, 8);
-                ngx_http_cache_purge_component_put_integer(e,
-                                               c->options.propagation_ms, 4);
-            }
+        break;
+
+    case NGX_HTTP_CACHE_PURGE_OP_GET_RUNTIME_STATUS:
+        rc = ngx_http_cache_purge_component_end(&d);
+        if (rc == 0) {
+            rc = ngx_http_cache_purge_component_put_status(c, e, error);
         }
         break;
 
@@ -2617,16 +2642,18 @@ ngx_http_cache_purge_component_work(ngx_http_cache_purge_component_t *c,
     }
     if (ngx_http_cache_purge_component_load32(&c->cleanup_state) == 2) {
         if (c->cleanup_operation.len == 0) {
-            return ngx_http_cache_purge_component_collect_ack(c, error);
+            rc = ngx_http_cache_purge_component_collect_ack(c, error);
+        } else {
+            rc = ngx_http_cache_purge_operations_get(&c->operations,
+                c->cleanup_operation, &cleanup, error);
+            if (rc == 0) {
+                rc = ngx_http_cache_purge_component_process_file(c, &cleanup,
+                                                                   now, error);
+            }
+            ngx_http_cache_purge_operation_free(&cleanup);
         }
-        rc = ngx_http_cache_purge_operations_get(&c->operations,
-            c->cleanup_operation, &cleanup, error);
         if (rc == 0) {
-            rc = ngx_http_cache_purge_component_process_file(c, &cleanup,
-                                                               now, error);
-        }
-        ngx_http_cache_purge_operation_free(&cleanup);
-        if (rc == 0) {
+            /* Collection acknowledgements must not keep postponing tasks. */
             c->work_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC);
         }
         return rc;
@@ -2734,6 +2761,13 @@ ngx_http_cache_purge_component_controls(ngx_http_cache_purge_component_t *c,
     rc = ngx_http_cache_purge_coordinator_status(c->coordinator, &state,
                                                  &publication, error);
     if (rc == 0) {
+        if (state == NGX_HTTP_CACHE_PURGE_COORD_READY
+            && ngx_http_cache_purge_component_load32(&c->control_state)
+               != NGX_HTTP_CACHE_PURGE_COORD_READY)
+        {
+            /* Resume work held for publication without the idle backoff. */
+            c->work_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC);
+        }
         ngx_http_cache_purge_component_store32(&c->control_state, state);
         ngx_http_cache_purge_component_store64(&c->control_publication,
                                                publication);

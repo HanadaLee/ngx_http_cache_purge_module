@@ -18,8 +18,9 @@ implements the legacy PURGE/REFRESH interfaces. An opt-in development build now
 connects RocksDB ownership, durable operations, and shared control publication to
 one executor in ordinary nginx worker 0. Real upstream fills now enter the
 persistent index through standard module interfaces. File-response admission now
-checks the selected descriptor and shared FENCE table. Special cache paths, the
-new Invalidate/Delete HTTP API, and multilevel propagation remain unfinished.
+checks the selected descriptor and shared FENCE table. The development HTTP API
+supports durable Invalidate/Delete submission and status queries. Multi-TAG
+operations, SCM integration, and multilevel propagation remain unfinished.
 
 The repository now contains a bounded RocksDB storage bridge and a persistent
 URL/key/file index. They support cross-zone lookup, scoped TAG postings, full
@@ -95,8 +96,8 @@ the owner dies. No caller activation request is required. Retries preserve the
 original acceptance, first effective time and propagation deadline; completed
 operations are never requeued. A bounded runtime snapshot reports current READY
 state, publication, persistent ledger identity, operation usage and propagation
-policy. An HTTP caller must still wait for activation and READY before returning
-202; the public HTTP handler is not implemented yet.
+policy. The HTTP handler waits for activation and READY before returning 202.
+Receipt reads combine the runtime state and operation in one executor call.
 
 The filesystem backend also supports bounded in-place validation transactions.
 It reserves the existing path and persists an NFV2 plan while retaining the old
@@ -135,8 +136,7 @@ including old TAGs and watermark regression, before committing a replacement.
 Conflicting late candidates are retired without being stamped READY. This local
 watermark neither changes the cache key nor proves upstream CDN freshness.
 Current selectors use the file's proof for Invalidate and Delete; already-covered
-entities can HIT while their rules remain resident. Rule retirement is unfinished.
-An origin request
+entities can HIT while their rules remain resident. An origin request
 started before a push may finish its response, but its old result must not become
 a reusable cache entry. Requests started after the push must avoid old entries.
 
@@ -251,10 +251,9 @@ including checks against persistent requirements after resident-rule retirement.
 Completed upgrades do not replay on restart. This internal storage schema change
 does not change nginx-ext ABI, which remains 1.
 
-Automatic Delete retirement and full writer/migration coverage remain unfinished.
-Memory-only errors do not receive a separate TAG/alias index. Initial receipts
-remain PREPARING; these partial consumers do not expose reliable public 202
-acceptance or completed immediate purge semantics yet.
+Memory-only errors do not receive a separate TAG/alias index. Initial internal
+receipts remain PREPARING until activation; the HTTP API waits for activation
+and READY before acknowledging reliable acceptance.
 
 HTTP workers now have an event-driven Unix IPC client with a reusable connection,
 bounded queues and buffers, absolute deadlines, peer UID verification, and explicit
@@ -289,16 +288,14 @@ runs on the executor; nginx's existing rename/copy path is unchanged.
 A durable operation ledger now stores selectors, idempotency identities,
 checkpoints, retry scheduling, and independent materialization/propagation states.
 Acceptance remains `preparing` until native cache integration can attest effective
-invalidation, even after its conservative shared barrier is published. The internal
-IPC can accept and inspect those records; it does not expose a completed HTTP
-purge API or automatically execute physical cache operations yet.
+invalidation. Reliable submissions activate autonomously after publication;
+physical cache processing continues in the background.
 
 The shared control-table library uses bounded immutable images for exact,
 prefix, host, and scoped TAG matching. Normal lookups do not acquire a mutex or
 query RocksDB. FENCE and proxy-only PROPAGATE duties share records but expire
 independently. Native file-response admission consumes this table. A separate
-precontent test consumer still covers coordinator lifecycle; special response
-paths and FENCE retirement remain unfinished.
+precontent test consumer also covers coordinator lifecycle.
 
 The module-owned fill helper uses an initial header filter and the existing
 upstream finalizer to defer publication
@@ -308,9 +305,8 @@ custom store hook. FINISH verifies the actual final file because native update
 does not return a rename result. `t/native_fill_runtime.py` covers the native
 lifecycle separately. `t/capture_runtime.py` exercises real native fills through
 the companion key module, worker IPC, durable preparation, rename and READY
-publication. Selected-descriptor admission is connected for native file responses;
-304 commits are connected; complete special-response coverage, eviction
-coordination and background invalidation remain unfinished.
+publication. It also covers selected-descriptor admission, 304 commits,
+background invalidation, native-node cleanup and HTTP management requests.
 
 The persistent build provides `cache_purge_key`, `cache_purge_url`,
 `cache_purge_tag`, and `cache_purge_tag_namespace` as independently inherited
@@ -432,8 +428,71 @@ directories and be a private directory owned by the configured worker UID.
 New storage is created for that UID; existing agent-owned storage must be migrated
 while stopped. Existing directories are not recursively chowned. Store and
 state-zone identity changes require a full restart.
-These directives initialize the component and its resources. They do not yet
-install a complete purge handler or replace native cache read/write behavior.
+These directives initialize the component and its resources. Add an explicit
+management location to expose the development HTTP API.
+
+## Persistent management API
+
+```nginx
+location /__scm/cache/v2/ {
+    allow 127.0.0.1;
+    allow ::1;
+    deny all;
+
+    cache_purge_api;
+    cache_purge_tag_namespace_header X-Cache-Purge-Namespace;
+}
+```
+
+The module does not authenticate management requests or check client addresses.
+Restrict access using nginx listeners, `allow`/`deny`, or other configured access
+controls. Event metadata is caller-supplied identity, and request digests support
+idempotency; neither is an authentication proof. There is no management event
+signature field. L1/L2 validation has a separate contract.
+
+`cache_purge_api` requires a plain prefix location ending in `/`, an initialized
+store and state zone, and no other content handler. It exposes:
+
+- `GET`/`HEAD capabilities`: current readiness, limits, and control header names.
+- `POST operations`: durably accept and activate an operation, then return 202.
+- `GET`/`HEAD operations/{operation_id}`: read its receipt and cleanup progress.
+
+Example request body:
+
+```json
+{
+  "version": "ngx-http-cache-purge/v2",
+  "operation_id": "push-1042",
+  "mode": "invalidate",
+  "selector": {"type": "url", "value": "https://example.test/video.mp4"},
+  "event": {
+    "issuer": "scm",
+    "stream_id": "cache-purge",
+    "sequence": "1042",
+    "issued_at": "2026-10-27T10:00:00Z"
+  }
+}
+```
+
+Selectors include exact `key`, `url`, `host`, `prefix` with `field: key|url`,
+and scoped `tag`. Matching uses the index across zones. Binary selector values
+use `encoding: base64`. TAG accepts `values: ["tag"]` with `scope: namespace|host`;
+the scope value comes from the configured namespace header. Its default name is
+`X-Cache-Purge-Namespace`, and the directive inherits at http/server/location
+scope. Header renaming does not change the operation's semantic identity.
+
+The current API supports one TAG per operation and exact hosts; capabilities
+advertise that limit. Multi-TAG operations and subdomain expansion remain pending.
+Bodies are bounded at 256 KiB. Duplicate or unknown JSON fields, duplicate scope
+headers, and malformed UTF-8/base64 are rejected. The module reserves an in-memory
+body buffer and rejects file-only request buffering for API locations.
+
+202 confirms durable acceptance and active invalidation, without waiting for
+file processing. Disconnecting does not undo an accepted operation. Reuse the
+same operation ID and semantic input after an uncertain response; changed input
+returns 409. The acceptance deadline is five seconds, and a timeout does not
+prove that no submission occurred. Query the status endpoint or retry that ID.
+Capabilities currently report proxy propagation as unavailable.
 
 ## Usage
 

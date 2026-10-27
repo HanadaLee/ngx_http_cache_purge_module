@@ -235,6 +235,13 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
   cache_purge_tag_namespace $cache_key_namespace;
   add_header X-Status $upstream_cache_status always;
   {' '.join(gateway_locations)}
+  location /__purge/v2/ {{ cache_purge_api; proxy_cache off;
+      allow 127.0.0.1; deny all; }}
+  location /__custom/v2/ {{ cache_purge_api; proxy_cache off;
+      allow 127.0.0.1; deny all;
+      cache_purge_tag_namespace_header X-Test-Purge-Scope; }}
+  location /__denied/v2/ {{ cache_purge_api; proxy_cache off; deny all; }}
+  location /__open/v2/ {{ cache_purge_api; proxy_cache off; }}
   location / {{ cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
                 proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /large {{ cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
@@ -358,6 +365,22 @@ def get(path, headers=None, method='GET', details=False):
     conn.request(method, path, headers={'Host': 'cache.test', **(headers or {})})
     response = conn.getresponse(); result = response.status, (dict(response.getheaders()) if details else response.getheader('X-Status')), response.read()
     conn.close(); return result
+
+def api(path, payload=None, method=None, headers=None, raw=None):
+    conn = http.client.HTTPConnection('127.0.0.1', port, timeout=15)
+    body = raw if raw is not None else (json.dumps(payload, ensure_ascii=False).encode() if payload is not None else None)
+    supplied = {'Host': 'cache.test', **(headers or {})}
+    if body is not None: supplied.setdefault('Content-Type', 'application/json')
+    conn.request(method or ('POST' if body is not None else 'GET'), path, body, supplied)
+    response = conn.getresponse(); data = response.read()
+    result = response.status, dict(response.getheaders()), json.loads(data) if data else None
+    conn.close()
+    return result
+
+def api_input(name, selector, mode='delete'):
+    return {'version': 'ngx-http-cache-purge/v2', 'operation_id': name, 'mode': mode,
+            'selector': selector, 'event': {'issuer': 'scm', 'stream_id': 'test-stream',
+            'sequence': '1042', 'issued_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}}
 def string(value):
     if isinstance(value, str): value = value.encode()
     return struct.pack('>I', len(value)) + value
@@ -1267,6 +1290,186 @@ try:
     until(lambda: (run / 'error.log').read_text().count(marker) > rejected)
     assert get('/negative-cache') == (200, 'BYPASS', b'/negative-cache')
     checks.append('disabling indexing by reload is rejected and the existing workers continue enforcing resident Delete FENCEs')
+    (run / 'nginx.conf').write_text(config)
+    status, headers, caps = api('/__purge/v2/capabilities')
+    assert status == 200 and headers['Cache-Control'] == 'no-store' and caps['ready'], (status, caps)
+    assert caps['authentication'] == 'nginx-configuration' and 'signed_events' not in caps
+    assert caps['control_headers']['tag_namespace'] == 'X-Cache-Purge-Namespace'
+    assert caps['index_id'] == ledger.hex() and caps['max_tags'] == 1
+    assert caps['invalidate_stale_policy'] == ('forbid' if extension else 'native')
+    assert not caps['proxy_propagation_ready'] and caps['propagation_protocols'] == []
+    assert api('/__purge/v2/capabilities', method='HEAD')[0::2] == (200, None)
+    custom = api('/__custom/v2/capabilities')[2]
+    assert custom['control_headers']['tag_namespace'] == 'X-Test-Purge-Scope'
+    assert get('/__denied/v2/capabilities', details=True)[0] == 403
+    addresses = [ip for ip in subprocess.check_output(['hostname', '-I'], text=True).split()
+                 if '.' in ip and not ip.startswith('127.')]
+    if addresses:
+        conn = http.client.HTTPConnection('127.0.0.1', port, timeout=10,
+                                          source_address=(addresses[0], 0))
+        conn.request('GET', '/__open/v2/capabilities', headers={'Host': 'cache.test'})
+        assert conn.sock.getsockname()[0] == addresses[0]
+        response = conn.getresponse()
+        assert response.status == 200 and json.loads(response.read())['authentication'] == 'nginx-configuration'
+        conn.request('GET', '/__purge/v2/capabilities',
+                     headers={'Host': 'cache.test', 'X-Forwarded-For': '127.0.0.1'})
+        response = conn.getresponse(); response.read()
+        assert response.status == 403
+        conn.close()
+    assert api('/__purge/v2/operations/missing-api-operation')[0] == 404
+    denied = api('/__purge/v2/capabilities', method='POST', payload={})
+    assert denied[0] == 405 and denied[1]['Allow'] == 'GET, HEAD'
+    checks.append('HTTP capabilities and status use real readiness, instance identity, macro policy and effective header names without advertising unavailable L2/signatures')
+
+    uri = '/invalidate/api-expired'
+    assert get(uri)[0] == 200 and get(uri + '?z=b')[0] == 200
+    files = records(uri, 2)
+    paths = [ready_file(item) for item in files]
+    original_contents = [path.read_bytes() for path in paths]
+    conditional_paths.add(uri)
+    request_body = api_input('api-invalidate', {'type': 'url', 'value': 'http://cache.test' + uri}, 'invalidate')
+    status, headers, receipt = api('/__purge/v2/operations', request_body)
+    assert status == 202 and receipt['effective'] and receipt['ready'] and receipt['durable'], (status, receipt)
+    assert len(receipt['request_digest']) == 64 and receipt['index_id'] == ledger.hex()
+    assert [path.read_bytes() for path in paths] == original_contents
+    assert get(uri) == (200, 'REVALIDATED', uri.encode())
+    assert get(uri + '?z=b') == (200, 'REVALIDATED', uri.encode())
+    readback = api(receipt['status_url'])[2]
+    replay = api('/__purge/v2/operations', raw=json.dumps(request_body, sort_keys=True, indent=2).encode())[2]
+    for name in ('accepted_at', 'effective_at', 'propagation_until', 'sequence', 'request_digest'):
+        assert receipt[name] == readback[name] == replay[name], name
+    conflict = dict(request_body, mode='delete')
+    assert api('/__purge/v2/operations', conflict)[0] == 409
+    checks.append('HTTP 202 waits for durable effectiveness, Invalidate covers both zones, and canonical retries preserve the first receipt while changed input conflicts')
+
+    fresh_bodies[uri] = b'api-new-entity'
+    deleted = api_input('api-delete-prefix', {'type': 'prefix', 'field': 'url', 'value': 'http://cache.test/invalidate/api-'})
+    assert api('/__purge/v2/operations', deleted)[0] == 202
+    for suffix in ('', '?z=b'):
+        reply = get(uri + suffix)
+        assert reply[0] == 200 and reply[1] in ('MISS', 'BYPASS') and reply[2] == b'api-new-entity', reply
+    until(lambda: api('/__purge/v2/operations/api-delete-prefix')[2]['cleanup']['state'] == 'done')
+    assert {item['id'] for item in records(uri, 2)}.isdisjoint({item['id'] for item in files})
+    checks.append('HTTP URL-prefix Delete rejects old hits immediately and finishes physical cleanup independently of response delivery')
+
+    uri = '/api-key'
+    assert get(uri)[0] == 200
+    key_file = records(uri, 1)[0]; ready_file(key_file)
+    operation = api_input('api-key', {'type': 'key', 'value': key_file['key'].decode()})
+    assert api('/__purge/v2/operations', operation)[0] == 202
+    import base64
+    raw_key = b'\xff\x00binary-prefix'
+    operation = api_input('api-binary', {'type': 'prefix', 'field': 'key',
+                          'encoding': 'base64', 'value': base64.b64encode(raw_key).decode()})
+    binary_receipt = api('/__purge/v2/operations', operation)
+    assert binary_receipt[0] == 202 and binary_receipt[2]['selector']['encoding'] == 'base64'
+    assert base64.b64decode(binary_receipt[2]['selector']['value']) == raw_key
+    assert api('/__purge/v2/operations', api_input('api-host',
+               {'type': 'host', 'value': 'unpopulated-api.test', 'include_subdomains': False}))[0] == 202
+    unicode_input = api_input('api-unicode', {'type': 'key', 'value': 'absent/\U0001f680'})
+    unicode_reply = api('/__purge/v2/operations', raw=json.dumps(unicode_input, ensure_ascii=True).encode())
+    assert unicode_reply[0] == 202 and unicode_reply[2]['selector']['value'] == 'absent/\U0001f680'
+    checks.append('HTTP exact key, binary key prefix, empty host matches and Unicode surrogate pairs preserve selector bytes')
+
+    uri = '/api-tag'
+    policies[uri] = 'api-red'
+    assert get(uri)[0] == 200
+    tag_before = records(uri, 1)[0]; ready_file(tag_before)
+    operation = api_input('api-tag', {'type': 'tag', 'values': ['api-red'], 'match': 'any'})
+    assert api('/__custom/v2/operations', operation, headers={'X-Cache-Purge-Namespace': 'tenant'})[0] == 400
+    assert api('/__custom/v2/operations/api-tag')[0] == 404
+    reply = api('/__custom/v2/operations', operation, headers={'X-Test-Purge-Scope': 'tenant'})
+    assert reply[0] == 202 and reply[2]['tag_namespace'] == 'tenant'
+    assert api('/__purge/v2/operations', operation, headers={'X-Cache-Purge-Namespace': 'tenant'})[0] == 202
+    assert get(uri)[0] == 200
+    until(lambda: records(uri, 1)[0]['id'] != tag_before['id'])
+    ready_file(records(uri, 1)[0])
+    operation = api_input('api-host-tag', {'type': 'tag', 'values': ['api-red'], 'scope': 'host'})
+    reply = api('/__purge/v2/operations', operation, headers={'X-Cache-Purge-Namespace': 'cache.test'})
+    assert reply[0] == 202 and reply[2]['tag_host'] == 'cache.test'
+    checks.append('HTTP namespace/host TAG scope uses the configured control header, and header renaming does not change semantic idempotency')
+
+    malformed = api_input('api-invalid', {'type': 'url', 'value': 'absent'})
+    raw = json.dumps(malformed).encode()
+    cases = [raw[:-1] + b',"mode":"delete"}', raw + b' trailing',
+             raw.replace(b'absent', b'\xff'), raw.replace(b'absent', b'\\ud800'),
+             raw[:-1] + b',"unexpected":true}', b'[]', b'{}']
+    for body in cases:
+        result = api('/__purge/v2/operations', raw=body)
+        assert result[0] == 400, (body, result)
+    assert api('/__purge/v2/operations', malformed, headers={'Content-Type': 'text/plain'})[0] == 415
+    bad_base64 = api_input('api-invalid', {'type': 'key', 'encoding': 'base64', 'value': 'YQ==garbage'})
+    assert api('/__purge/v2/operations', bad_base64)[0] == 400
+    signed = dict(malformed, event={**malformed['event'], 'signature': 'not-verified'})
+    assert api('/__purge/v2/operations', signed)[0] == 400
+    assert api('/__purge/v2/operations', api_input('api-multiple-tags',
+               {'type': 'tag', 'values': ['one', 'two']}),
+               headers={'X-Cache-Purge-Namespace': 'tenant'})[0] == 412
+    assert api('/__purge/v2/operations/api-invalid')[0] == 404
+    checks.append('HTTP parser rejects duplicate keys, trailing input, malformed UTF-8/surrogates, unknown fields, unsupported signatures and unsupported TAG groups without acceptance')
+
+    chunked = api_input('api-chunked', {'type': 'url', 'value': 'http://absent.test/chunked'})
+    raw = json.dumps(chunked).encode()
+    conn = http.client.HTTPConnection('127.0.0.1', port, timeout=15)
+    conn.request('POST', '/__purge/v2/operations', [raw[:17], raw[17:]],
+                 {'Host': 'cache.test', 'Content-Type': 'application/json'}, encode_chunked=True)
+    response = conn.getresponse()
+    assert response.status == 202, response.read()
+    assert json.loads(response.read())['operation_id'] == 'api-chunked'
+    conn.close()
+    duplicate = api_input('api-duplicate-header', {'type': 'tag', 'values': ['one']})
+    raw = json.dumps(duplicate).encode()
+    conn = http.client.HTTPConnection('127.0.0.1', port, timeout=15)
+    conn.putrequest('POST', '/__purge/v2/operations', skip_host=True)
+    for name, value in [('Host', 'cache.test'), ('Content-Type', 'application/json'),
+                        ('Content-Length', str(len(raw))), ('X-Cache-Purge-Namespace', 'one'),
+                        ('X-Cache-Purge-Namespace', 'two')]:
+        conn.putheader(name, value)
+    conn.endheaders(raw)
+    response = conn.getresponse()
+    assert response.status == 400, response.read()
+    response.read(); conn.close()
+    assert api('/__purge/v2/operations/api-duplicate-header')[0] == 404
+    conn = http.client.HTTPConnection('127.0.0.1', port, timeout=15)
+    conn.request('POST', '/__purge/v2/operations', b' ' * (262144 + 1),
+                 {'Host': 'cache.test', 'Content-Type': 'application/json'})
+    response = conn.getresponse()
+    assert response.status == 413
+    response.read(); conn.close()
+    checks.append('HTTP handles chunked JSON and rejects duplicate namespace headers and oversized bodies')
+
+    held_uri = '/invalidate/api-held'
+    assert get(held_uri)[0] == 200
+    held_file = records(held_uri, 1)[0]
+    held_path = ready_file(held_file)
+    _, lease = rpc(17, string(str(held_path)), receive_fd=True)
+    try:
+        operation = api_input('api-disconnected', {'type': 'url', 'value': 'http://cache.test' + held_uri})
+        conn = http.client.HTTPConnection('127.0.0.1', port, timeout=15)
+        conn.request('POST', '/__purge/v2/operations', json.dumps(operation),
+                     {'Host': 'cache.test', 'Content-Type': 'application/json'})
+        response = conn.getresponse()
+        assert response.status == 202
+        response.close()
+        conn.close()
+        assert held_path.exists()
+        accepted = api('/__purge/v2/operations/api-disconnected')[2]
+        assert accepted['effective'] and accepted['cleanup']['state'] != 'done'
+        stop(process); process = start()
+        until(lambda: (run / 'index/component.sock').exists())
+        until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
+        restored = api('/__purge/v2/operations/api-disconnected')[2]
+        assert restored['effective_at'] == accepted['effective_at'] and held_path.exists()
+    finally:
+        os.close(lease)
+    try:
+        until(lambda: api('/__purge/v2/operations/api-disconnected')[2]['cleanup']['state'] == 'done')
+    except AssertionError:
+        print('cleanup diagnostic', api('/__purge/v2/operations/api-disconnected')[2],
+              'writers', writers(int(restored['sequence'])), 'file_exists', held_path.exists(), flush=True)
+        raise
+    assert not held_path.exists()
+    checks.append('HTTP acceptance does not wait for a held file lease; disconnection and nginx restart preserve autonomous cleanup and the original effective time')
 finally:
     capacity_gate.set()
     validation_release.set()
@@ -1287,6 +1490,6 @@ result = {'root': str(root), 'run': str(run), 'nginx_revision': revision,
           'sources': {group: {str(p.relative_to(directory)): hashlib.sha256(p.read_bytes()).hexdigest() for p in directory.rglob('*') if p.is_file()}
                       for group, directory in [('addon', addon), ('key', key)]},
           'library_sha256': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in a.libraries.glob('libngx_http_cache_*.a')},
-          'scope': 'Real key provider and upstream PREPARE/rename/FINISH over bounded worker IPC; no completed purge API or FENCE activation'}
+          'scope': 'Real cache capture, admission, durable Invalidate/Delete HTTP API, nginx-configured access control and restart-safe background cleanup; L2 propagation remains incomplete'}
 a.output.write_text(json.dumps(result, indent=2) + '\n')
 print('PASS', len(checks), 'native index capture checks')
