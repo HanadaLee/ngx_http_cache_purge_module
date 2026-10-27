@@ -2,6 +2,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <iostream>
+#include <atomic>
+#include <thread>
 
 using namespace ngx_http_cache_purge;
 static unsigned assertions;
@@ -44,6 +46,8 @@ int main(int argc, char **argv) {
         ngx_http_cache_rocksdb_t *store = nullptr;
         check(ngx_http_cache_rocksdb_open(path, &options, &store, &error) == 0, error.message);
         size_t size = ngx_http_cache_purge_control_size(65536, 8);
+        check(ngx_http_cache_purge_control_size(65536, 9) - size == 64,
+              "writer tracking retains the 64-byte reader slot footprint");
         void *shared = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
         check(shared != MAP_FAILED && ngx_http_cache_purge_control_init(shared, size, 65536, 8, &error) == 0, "coordinator shared region");
         ngx_http_cache_purge_control_reader_t *reader = nullptr;
@@ -78,6 +82,8 @@ int main(int argc, char **argv) {
                       && watermark.sequence == 0 && boundary == version
                       && std::memcmp(watermark.ledger, operations.native()->ledger, 16) == 0,
                       "empty serving table exposes its durable ledger and zero sequence");
+                check(ngx_http_cache_purge_control_origins(reader, nullptr, 1, &error) == 0,
+                      "announce unknown origins before taking their snapshot");
                 check(ngx_http_cache_purge_control_guard_begin(reader, version, &error) == 0, "pin earlier synchronous admission");
                 auto first = coordinator.accept(input("first"), 1000, 300000);
                 check(first.stage == OperationStage::preparing && operations.get("first").revision == 1, "acceptance is durable preparing");
@@ -90,6 +96,59 @@ int main(int argc, char **argv) {
                 ready(coordinator);
                 check(lookup(reader, found, version) == 0 && found[0] == 1 && found[1] == 5, "published preparing barrier matches");
                 check(!operations.get("first").effective_at_ms, "SHM publication alone cannot claim native hook effectiveness");
+                check(coordinator.writers(1) == 1, "unknown origin blocks the old-writer boundary");
+                check(ngx_http_cache_purge_control_reader_close(&reader, &error) == NGX_HTTP_CACHE_ROCKSDB_BUSY
+                      && reader != nullptr, "active origins cannot unregister their reader");
+                std::memcpy(watermark.ledger, operations.native()->ledger, 16); watermark.sequence = 0;
+                check(ngx_http_cache_purge_control_origins(reader, &watermark, 1, &error) == 0
+                      && coordinator.writers(1) == 1, "known pre-operation origins remain visible");
+                watermark.sequence = 1;
+                check(ngx_http_cache_purge_control_origins(reader, &watermark, 1, &error) == 0
+                      && coordinator.writers(1) == 0, "post-operation origins do not block an older cutoff");
+                watermark.ledger[0] ^= 1;
+                check(ngx_http_cache_purge_control_origins(reader, &watermark, 1, &error) == 0
+                      && coordinator.writers(1) == 1, "foreign-ledger origins are conservative blockers");
+                check(ngx_http_cache_purge_control_origins(reader, nullptr, 0, &error) == 0
+                      && coordinator.writers(1) == 0, "completed origins release the boundary");
+                fails(NGX_HTTP_CACHE_ROCKSDB_INVALID, [&] { coordinator.writers(2); });
+
+                std::atomic<bool> registered{false}, racing{false}, stop{false};
+                std::atomic<int> worker_error{0};
+                std::thread updater([&] {
+                    ngx_http_cache_purge_control_reader_t *local = nullptr;
+                    ngx_http_cache_rocksdb_error_t failure;
+                    ngx_http_cache_purge_watermark_t old{}, foreign{};
+                    std::memcpy(old.ledger, operations.native()->ledger, 16);
+                    foreign = old; foreign.ledger[0] ^= 1; foreign.sequence = 1;
+                    int rc = ngx_http_cache_purge_control_reader_open(shared, size, &local, &failure);
+                    if (!rc) rc = ngx_http_cache_purge_control_origins(local, &old, 1, &failure);
+                    worker_error = rc; registered = true;
+                    while (!racing && !stop) std::this_thread::yield();
+                    while (!rc && !stop) {
+                        rc = ngx_http_cache_purge_control_origins(local, &foreign, 1, &failure);
+                        if (!rc) rc = ngx_http_cache_purge_control_origins(local, &old, 1, &failure);
+                        std::this_thread::yield();
+                    }
+                    if (local) {
+                        int cleared = ngx_http_cache_purge_control_origins(local, nullptr, 0, &failure);
+                        if (!rc) rc = cleared;
+                        int closed;
+                        do { closed = ngx_http_cache_purge_control_reader_close(&local, &failure); }
+                        while (closed == NGX_HTTP_CACHE_ROCKSDB_BUSY);
+                        if (!rc) rc = closed;
+                    }
+                    worker_error = rc;
+                });
+                while (!registered) std::this_thread::yield();
+                bool consistent = worker_error == 0;
+                racing = true;
+                for (unsigned i = 0; consistent && i < 1000; i++) {
+                    try { consistent = coordinator.writers(1) == 1; }
+                    catch (const IndexError &e) { consistent = e.code == NGX_HTTP_CACHE_ROCKSDB_BUSY; }
+                }
+                stop = true; updater.join();
+                check(consistent && worker_error == 0 && coordinator.writers(1) == 0,
+                      "concurrent ledger/sequence updates never report a false quiet boundary");
 
                 // Ledger transitions here simulate a future native coordinator;
                 // they are not claims about real files or response admission.

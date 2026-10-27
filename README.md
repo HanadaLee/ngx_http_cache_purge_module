@@ -69,8 +69,18 @@ including old TAGs and watermark regression, before committing a replacement.
 Conflicting late candidates are retired without being stamped READY. This local
 watermark neither changes the cache key nor proves upstream CDN freshness.
 Known selectors still conservatively bypass before native lookup to cover
-memory-only cached errors; rule retirement and in-flight origin-response
-admission remain unfinished.
+memory-only cached errors; rule retirement and the treatment of in-flight origin
+responses remain unfinished.
+
+Each worker announces its oldest active origin boundary in its existing 64-byte
+shared reader slot. A request-local queue keeps registration and removal O(1),
+including across an unconditional retry. Registration ends after publication,
+cached-response admission, or confirmation that the response cannot be cached.
+Reload preserves old-worker registrations; only proven-dead processes are
+reclaimed. The executor can query pre-operation writer registrations through
+bounded IPC. A zero count alone does not permit FENCE removal: queued IPC,
+unfinished durable transactions and physical processing still need closure.
+This changes the internal shared-control ABI to 3; nginx-ext ABI remains 2.
 
 Known request selectors are also checked before native cache lookup. This covers
 memory-only cached upstream errors before `error_page` runs. Cached

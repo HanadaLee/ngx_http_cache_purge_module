@@ -90,6 +90,12 @@ class Component:
         assert kind == 'WATERMARK' and code == '0', (kind, code)
         return b'NFW1' + bytes.fromhex(ledger) + struct.pack('>Q', int(sequence))
 
+    def origin(self, release=False):
+        self.process.stdin.write('e\n' if release else 'b\n'); self.process.stdin.flush()
+        kind, code, sequence = self.line().split()
+        assert kind == 'ORIGIN' and code == '0', (kind, code)
+        return int(sequence)
+
     def stop(self, expected=0):
         self.process.stdin.write('q\n')
         self.process.stdin.flush()
@@ -630,6 +636,8 @@ try:
     c = Client(controlled.path)
     wait_for(lambda: struct.unpack('>IQ', c.call(16))[0] == 6)
     check(controlled.match()[:3] == [0, 0, 0], 'coordinator publishes empty recovered table')
+    participant = Component(controlled.path, shared=shared)
+    assert participant.origin() == 0
     controlled.guard()
     accepted = c.call(14, operation_input('guarded-operation'))
     check(accepted[len(operation_input('guarded-operation')) + 40] == 1, 'coordinated admission still reports PREPARING')
@@ -639,6 +647,17 @@ try:
     controlled.guard(release=True)
     wait_for(lambda: struct.unpack('>IQ', c.call(16))[0] == 6)
     check(controlled.match()[:3] == [0, 1, 5], 'durable operation appears as FENCE plus PREPARING')
+    assert int.from_bytes(c.call(23, struct.pack('>Q', 1)), 'big') == 1
+    participant.origin(release=True)
+    assert int.from_bytes(c.call(23, struct.pack('>Q', 1)), 'big') == 0
+    assert participant.origin() == 1
+    assert int.from_bytes(c.call(23, struct.pack('>Q', 1)), 'big') == 0
+    c.call(14, operation_input('second-writer-cutoff'))
+    wait_for(lambda: struct.unpack('>IQ', c.call(16))[0] == 6)
+    assert int.from_bytes(c.call(23, struct.pack('>Q', 2)), 'big') == 1
+    participant.process.kill(); participant.process.wait(timeout=5)
+    assert int.from_bytes(c.call(23, struct.pack('>Q', 2)), 'big') == 0
+    check(True, 'writer status tracks another process across cutoffs and reclaims it only after verified death')
     check(c.call(15, string('guarded-operation')) == accepted, 'publication alone does not claim native effectiveness')
     c.close()
     controlled.process.kill()
@@ -647,7 +666,7 @@ try:
     restored.opened()
     c = Client(restored.path)
     wait_for(lambda: struct.unpack('>IQ', c.call(16))[0] == 6)
-    check(restored.match()[:3] == [0, 1, 5], 'manager crash reloads durable controls into shared memory')
+    check(restored.match()[:3] == [0, 2, 5], 'manager crash reloads durable controls into shared memory')
     check(c.call(14, operation_input('guarded-operation')) == accepted, 'recovered control keeps original durable identity')
     c.close()
     restored.stop()

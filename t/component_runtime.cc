@@ -36,7 +36,7 @@ int main(int argc, char **argv) {
     ngx_http_cache_rocksdb_error_t error;
     void *shared = nullptr; size_t shared_size = 0;
     ngx_http_cache_purge_control_reader_t *reader = nullptr;
-    bool guarded = false; uint64_t version = 0;
+    bool guarded = false, origin = false; uint64_t version = 0;
     if (argc == 7) {
         shared_size = ngx_http_cache_purge_control_size(1024 * 1024, 32);
         int fd = open(argv[6], O_RDWR | O_CREAT | O_EXCL, 0600); bool created = fd >= 0;
@@ -62,7 +62,8 @@ int main(int argc, char **argv) {
     char command;
     while (std::cin >> command) {
         if (command == 'q') break;
-        if (command == 'm' || command == 'g' || command == 'r' || command == 'w') {
+        if (command == 'm' || command == 'g' || command == 'r' || command == 'w'
+            || command == 'b' || command == 'e') {
             if (!reader) {
                 rc = ngx_http_cache_purge_control_reader_open(shared, shared_size, &reader, &error);
                 if (rc) { std::cout << "MATCH " << rc << " 0 0 0" << std::endl; continue; }
@@ -71,6 +72,21 @@ int main(int argc, char **argv) {
                 rc = ngx_http_cache_purge_control_guard_begin(reader, version, &error);
                 if (!rc) guarded = true;
                 std::cout << "GUARD " << rc << std::endl; continue;
+            }
+            if (command == 'b' || command == 'e') {
+                ngx_http_cache_purge_watermark_t watermark{};
+                uint64_t publication = 0;
+                if (command == 'e') {
+                    rc = ngx_http_cache_purge_control_origins(reader, nullptr, 0, &error);
+                    if (!rc) origin = false;
+                } else {
+                    rc = ngx_http_cache_purge_control_origins(reader, nullptr, 1, &error);
+                    if (!rc) origin = true;
+                    if (!rc) rc = ngx_http_cache_purge_control_watermark(reader, &watermark, &publication, &error);
+                    if (!rc) rc = ngx_http_cache_purge_control_origins(reader, &watermark, 1, &error);
+                }
+                std::cout << "ORIGIN " << rc << ' ' << watermark.sequence << std::endl;
+                continue;
             }
             if (command == 'w') {
                 ngx_http_cache_purge_watermark_t watermark{};
@@ -104,6 +120,7 @@ int main(int argc, char **argv) {
                   << ' ' << status.peak_buffered_bytes << std::endl;
     }
     if (guarded) ngx_http_cache_purge_control_guard_end(reader, &error);
+    if (origin) ngx_http_cache_purge_control_origins(reader, nullptr, 0, &error);
     if (reader) {
         do { rc = ngx_http_cache_purge_control_reader_close(&reader, &error); if (rc == NGX_HTTP_CACHE_ROCKSDB_BUSY) std::this_thread::yield(); } while (rc == NGX_HTTP_CACHE_ROCKSDB_BUSY);
         if (rc) return rc;

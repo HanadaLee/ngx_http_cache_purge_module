@@ -77,6 +77,8 @@ calls, policies = [], {}
 validation_tags = {'/revalidate-replace': 'new-tag', '/revalidate-clear': ''}
 validation_waiting, validation_release = threading.Event(), threading.Event()
 late_waiting, late_release = threading.Event(), threading.Event()
+retry_waiting, retry_release = threading.Event(), threading.Event()
+stream_waiting, stream_release = threading.Event(), threading.Event()
 fresh_bodies = {}
 redirects = {'/redirect-cache': '/redirect-old', '/redirect-tag': '/redirect-old',
              '/redirect-unknown': '/redirect-old', '/redirect-named': '@redirect_named',
@@ -95,6 +97,12 @@ class Origin(http.server.BaseHTTPRequestHandler):
             return
         if path in origin_failures:
             self.send_response(500); self.send_header('Content-Length', '0'); self.end_headers(); return
+        if path == '/no-store-stream':
+            self.send_response(200); self.send_header('Cache-Control', 'no-store')
+            self.send_header('Content-Length', '4096'); self.end_headers()
+            self.wfile.write(b'x'); self.wfile.flush(); stream_waiting.set()
+            assert stream_release.wait(15)
+            self.wfile.write(b'x' * 4095); return
         if path.startswith('/revalidate-') and self.headers.get('If-None-Match') == '"capture-v1"':
             if path == '/revalidate-race':
                 validation_waiting.set()
@@ -107,6 +115,9 @@ class Origin(http.server.BaseHTTPRequestHandler):
         if path == '/capacity': capacity_gate.wait(20)
         body = path.encode() if not path.startswith('/slice') else slice_body
         body = fresh_bodies.get(path, body)
+        if path == '/revalidate-race' and calls.count(path) >= 3:
+            retry_waiting.set()
+            assert retry_release.wait(15)
         if path == '/late-fill' and calls.count(path) == 1:
             body = b'old-late-entity'
             late_waiting.set()
@@ -329,6 +340,18 @@ def fence(name, kind, value, scope=''):
     receipt = rpc(14, payload)
     assert receipt[len(payload) + 40] == 1
     until(lambda: (state := struct.unpack('>IQ', rpc(16)))[0] == 6 and state[1] != previous)
+    return int.from_bytes(receipt[len(payload):len(payload) + 8], 'big')
+
+def writers(sequence):
+    try:
+        value = rpc(23, struct.pack('>Q', sequence))
+    except AssertionError as error:
+        # Concurrent registration updates return BUSY, never a partial count.
+        if error.args and isinstance(error.args[0], tuple) and error.args[0][0] == 6:
+            return None
+        raise
+    assert len(value) == 4
+    return int.from_bytes(value, 'big')
 def ready_file(item):
     path = Path(os.fsdecode(item['root'])) / os.fsdecode(item['path'])
     marker = os.getxattr(path, 'user.ngx_cache_purge.id')
@@ -527,21 +550,37 @@ try:
     with concurrent.futures.ThreadPoolExecutor(1) as pool:
         request = pool.submit(get, '/revalidate-race')
         assert validation_waiting.wait(5)
-        fence('invalidate-during-304', 5, 'race-old', 'tenant')
+        race_sequence = fence('invalidate-during-304', 5, 'race-old', 'tenant')
+        until(lambda: (count := writers(race_sequence)) is not None and count > 0)
         policies['/revalidate-race'] = 'race-new'
         validation_tags['/revalidate-race'] = 'race-new'
         fresh_bodies['/revalidate-race'] = b'fresh-entity'
         validation_release.set()
+        assert retry_waiting.wait(5)
+        until(lambda: (count := writers(race_sequence)) is not None and count > 0)
+        retry_release.set()
         assert request.result(timeout=15) == (200, 'BYPASS', b'fresh-entity')
     until(lambda: records('/revalidate-race', 1)[0]['id'] != race_original['id'])
     assert get('/revalidate-race') == (200, 'HIT', b'fresh-entity')
     assert calls.count('/revalidate-race') == 3
+    until(lambda: writers(race_sequence) == 0)
     checks.append('a TAG FENCE accepted while origin 304 is pending forces a fresh entity even when the 304 replaces that TAG')
     policies['/late-fill'] = 'late-tag'
     with concurrent.futures.ThreadPoolExecutor(1) as pool:
         request = pool.submit(get, '/late-fill')
         assert late_waiting.wait(5)
-        fence('late-fill-rule', 5, 'late-tag', 'tenant')
+        late_sequence = fence('late-fill-rule', 5, 'late-tag', 'tenant')
+        until(lambda: (count := writers(late_sequence)) is not None and count > 0)
+        publication = struct.unpack('>IQ', rpc(16))[1]
+        process.send_signal(signal.SIGHUP)
+        def handed_off():
+            try:
+                state, current = struct.unpack('>IQ', rpc(16))
+                return state == 6 and current != publication
+            except (OSError, EOFError):
+                return False
+        until(handed_off)
+        until(lambda: (count := writers(late_sequence)) is not None and count > 0)
         fresh_bodies['/late-fill'] = b'new-late-entity'
         late_release.set()
         assert request.result(timeout=15) == (200, 'MISS', b'old-late-entity')
@@ -553,11 +592,23 @@ try:
     late = until(lambda: (item if (item := record(marker[8:24]))['state'] == 3 else None))
     assert os.getxattr(target, 'user.ngx_cache_purge.id')[7] == 1
     assert query('http://cache.test/late-fill') == []
+    until(lambda: writers(late_sequence) == 0)
     assert get('/late-fill') == (200, 'BYPASS', b'new-late-entity')
     fresh = records('/late-fill', 1)[0]; ready_file(fresh)
     assert watermark(fresh)[0] == ledger and watermark(fresh)[1] > watermark(late)[1]
     assert get('/late-fill') == (200, 'HIT', b'new-late-entity') and calls.count('/late-fill') == 2
     checks.append('a pre-push late origin fill is retired, while a post-push entity carries durable coverage and reuses HIT under the same TAG FENCE')
+    checks.append('worker reload and executor handoff retain the old worker origin registration until its file transaction finishes')
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        request = pool.submit(get, '/no-store-stream')
+        assert stream_waiting.wait(5)
+        cutoff = fence('noncacheable-stream-cutoff', 1, 'http://cache.test/never-cached')
+        until(lambda: writers(cutoff) == 0)
+        assert not request.done()
+        stream_release.set()
+        assert request.result(timeout=10) == (200, 'MISS', b'x' * 4096)
+    assert query('http://cache.test/no-store-stream') == []
+    checks.append('origin registrations persist through stale-to-fresh retry and release after publication or a confirmed noncacheable response')
     assert get('/fenced-url')[1] == 'MISS'; records('/fenced-url', 1)
     assert get('/fenced-url?z=b')[1] == 'MISS'; records('/fenced-url', 2)
     assert get('/fenced-url')[1] == 'HIT'
@@ -661,6 +712,8 @@ finally:
     capacity_gate.set()
     validation_release.set()
     late_release.set()
+    retry_release.set()
+    stream_release.set()
     for process, log in processes: stop(process); log.close()
     origin.shutdown(); origin.server_close()
     for server in gateways.values(): server.shutdown(); server.server_close()

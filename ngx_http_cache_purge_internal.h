@@ -61,7 +61,9 @@ typedef enum {
     NGX_HTTP_CACHE_PURGE_OP_INSPECT_FILE,
     /* ID, revision, transaction, before/after, TAG mode/count/values;
      * two FDs: lease, selected file -> verified GET-format record */
-    NGX_HTTP_CACHE_PURGE_OP_VALIDATE_FILE
+    NGX_HTTP_CACHE_PURGE_OP_VALIDATE_FILE,
+    /* operation sequence u64 -> number of older active worker registrations */
+    NGX_HTTP_CACHE_PURGE_OP_GET_WRITERS
 } ngx_http_cache_purge_opcode_e;
 
 #define NGX_HTTP_CACHE_PURGE_ROOT_CACHE 1
@@ -162,7 +164,7 @@ int ngx_http_cache_purge_component_stop(
 extern "C" {
 #endif
 
-#define NGX_HTTP_CACHE_PURGE_CONTROL_ABI 2
+#define NGX_HTTP_CACHE_PURGE_CONTROL_ABI 3
 #define NGX_HTTP_CACHE_PURGE_CONTROL_FENCE 1
 #define NGX_HTTP_CACHE_PURGE_CONTROL_PROPAGATE 2
 #define NGX_HTTP_CACHE_PURGE_CONTROL_PREPARING 4
@@ -221,6 +223,13 @@ int ngx_http_cache_purge_control_match(
 int ngx_http_cache_purge_control_watermark(
     ngx_http_cache_purge_control_reader_t *reader,
     ngx_http_cache_purge_watermark_t *watermark, uint64_t *publication,
+    ngx_http_cache_rocksdb_error_t *error);
+/* Announce active/unknown before taking an origin snapshot, then publish the
+ * oldest active snapshot. active=0 clears it only after those requests cannot
+ * issue more writes. One reader coalesces all requests on its owning thread. */
+int ngx_http_cache_purge_control_origins(
+    ngx_http_cache_purge_control_reader_t *reader,
+    const ngx_http_cache_purge_watermark_t *oldest, int active,
     ngx_http_cache_rocksdb_error_t *error);
 /* Pin the exact matched publication across a short synchronous admission step.
  * A new effective publication cannot reopen its gate until this guard leaves.
@@ -555,6 +564,12 @@ int ngx_http_cache_purge_coordinator_close(
 int ngx_http_cache_purge_coordinator_status(
     ngx_http_cache_purge_coordinator_t *coordinator, uint32_t *state,
     uint64_t *publication, ngx_http_cache_rocksdb_error_t *error);
+/* Counts worker registrations with pre-operation or unknown origins. Zero is
+ * not permission to retire a rule: durable intents, queued IPC and physical
+ * materialization require their own checks and a durable retirement floor. */
+int ngx_http_cache_purge_coordinator_writers(
+    ngx_http_cache_purge_coordinator_t *coordinator, uint64_t sequence,
+    uint32_t *writers, ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_coordinator_step(
     ngx_http_cache_purge_coordinator_t *coordinator,
     ngx_http_cache_rocksdb_error_t *error);

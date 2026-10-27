@@ -756,6 +756,18 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
     rc = 0;
 
     switch (p->request.opcode) {
+    case NGX_HTTP_CACHE_PURGE_OP_GET_WRITERS:
+        now = ngx_http_cache_purge_component_integer(&d, 8);
+        if ((rc = ngx_http_cache_purge_component_end(&d)) != 0) {
+            break;
+        }
+        rc = ngx_http_cache_purge_coordinator_writers(c->coordinator, now,
+                                                        &state, error);
+        if (rc == 0) {
+            ngx_http_cache_purge_component_put_integer(e, state, 4);
+        }
+        break;
+
     case NGX_HTTP_CACHE_PURGE_OP_VALIDATE_FILE:
         memset(&validation, 0, sizeof(validation));
         ngx_http_cache_purge_component_id(&d, validation.file.id);
@@ -2394,6 +2406,9 @@ typedef struct {
     uint64_t  pin;
     int64_t   pid;
     uint64_t  birth;
+    uint64_t  origins;
+    uint64_t  ledger[2];
+    uint64_t  revision;
 } __attribute__((aligned(64))) ngx_http_cache_purge_control_slot_t;
 
 typedef struct {
@@ -2764,6 +2779,10 @@ ngx_http_cache_purge_control_reclaim(ngx_http_cache_purge_control_shared_t *s)
             && ngx_http_cache_purge_control_gone(slot->pid, slot->birth))
         {
             ngx_http_cache_purge_control_store(&slot->pin, 0);
+            ngx_http_cache_purge_control_store(&slot->origins, 0);
+            ngx_http_cache_purge_control_store(&slot->ledger[0], 0);
+            ngx_http_cache_purge_control_store(&slot->ledger[1], 0);
+            ngx_http_cache_purge_control_store(&slot->revision, 0);
             ngx_http_cache_purge_control_store(&slot->token, 0);
         }
     }
@@ -3547,6 +3566,10 @@ ngx_http_cache_purge_control_reader_open(void *memory, size_t bytes,
         slot->pid = r->pid;
         slot->birth = stamp;
         ngx_http_cache_purge_control_store(&slot->pin, 0);
+        ngx_http_cache_purge_control_store(&slot->origins, 0);
+        ngx_http_cache_purge_control_store(&slot->ledger[0], 0);
+        ngx_http_cache_purge_control_store(&slot->ledger[1], 0);
+        ngx_http_cache_purge_control_store(&slot->revision, 0);
         ngx_http_cache_purge_control_store(&slot->token, r->token);
         *output = r;
     }
@@ -3575,9 +3598,12 @@ ngx_http_cache_purge_control_reader_close(
     if (rc != 0) {
         return rc;
     }
-    if (r->pinned) {
+    if (r->pinned
+        || ngx_http_cache_purge_control_load(
+            &ngx_http_cache_purge_control_slots(r->shared)[r->slot].origins))
+    {
         return ngx_http_cache_purge_control_error(
-            error, NGX_HTTP_CACHE_ROCKSDB_BUSY, "control reader still pinned");
+            error, NGX_HTTP_CACHE_ROCKSDB_BUSY, "control reader still active");
     }
     rc = ngx_http_cache_purge_control_lock(r->shared, error);
     if (rc != 0) {
@@ -4341,6 +4367,49 @@ ngx_http_cache_purge_control_watermark(
     return rc;
 }
 
+int
+ngx_http_cache_purge_control_origins(ngx_http_cache_purge_control_reader_t *r,
+    const ngx_http_cache_purge_watermark_t *oldest, int active,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_control_slot_t  *slot;
+    uint64_t                             revision, floor, ledger[2];
+    int                                  rc;
+    static const unsigned char zero[16] = { 0 };
+
+    ngx_http_cache_purge_control_clear(error);
+    if ((active != 0 && active != 1) || (!active && oldest != NULL)
+        || (oldest != NULL
+            && (oldest->sequence == UINT64_MAX
+                || memcmp(oldest->ledger, zero, sizeof(zero)) == 0)))
+    {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid origin registration");
+    }
+    rc = ngx_http_cache_purge_control_reader_owner(r, error);
+    if (rc != 0) {
+        return rc;
+    }
+    slot = &ngx_http_cache_purge_control_slots(r->shared)[r->slot];
+    revision = ngx_http_cache_purge_control_load(&slot->revision);
+    if (revision & 1 || revision > UINT64_MAX - 2) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "origin revision exhausted");
+    }
+    memset(ledger, 0, sizeof(ledger));
+    floor = active ? 1 : 0;
+    if (oldest != NULL) {
+        memcpy(ledger, oldest->ledger, sizeof(ledger));
+        floor = oldest->sequence + 1;
+    }
+    ngx_http_cache_purge_control_store(&slot->revision, revision + 1);
+    ngx_http_cache_purge_control_store(&slot->origins, floor);
+    ngx_http_cache_purge_control_store(&slot->ledger[0], ledger[0]);
+    ngx_http_cache_purge_control_store(&slot->ledger[1], ledger[1]);
+    ngx_http_cache_purge_control_store(&slot->revision, revision + 2);
+    return 0;
+}
+
 static void
 ngx_http_cache_purge_control_stamp(ngx_http_cache_purge_control_image_t *image,
     const unsigned char ledger[16], uint64_t sequence)
@@ -4551,6 +4620,72 @@ ngx_http_cache_purge_component_publication_guard(void *data,
     rc = ngx_http_cache_purge_component_record_guard(c, &previous,
                                                       file->metadata, error);
     ngx_http_cache_purge_index_file_free(&previous);
+    return rc;
+}
+
+int
+ngx_http_cache_purge_coordinator_writers(ngx_http_cache_purge_coordinator_t *c,
+    uint64_t sequence, uint32_t *writers,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_control_shared_t  *shared;
+    ngx_http_cache_purge_control_slot_t    *slot;
+    uint64_t                               first, floor, ledger[2];
+    uint32_t                               i, count;
+    int                                    rc;
+
+    ngx_http_cache_purge_control_clear(error);
+    if (writers == NULL || sequence == 0) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid writer status request");
+    }
+    *writers = 0;
+    rc = ngx_http_cache_purge_control_coordinator_owner(c, error);
+    if (rc != 0) {
+        return rc;
+    }
+    if (c->state != NGX_HTTP_CACHE_PURGE_COORD_READY) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_BUSY, "writer status awaits publication");
+    }
+    if (sequence > c->expected.last_sequence) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "writer cutoff is in future");
+    }
+    shared = c->writer->shared;
+    rc = ngx_http_cache_purge_control_lock(shared, error);
+    if (rc != 0) {
+        return rc;
+    }
+    ngx_http_cache_purge_control_reclaim(shared);
+    count = 0;
+    for (i = 0; i < shared->readers; i++) {
+        slot = &ngx_http_cache_purge_control_slots(shared)[i];
+        if (!ngx_http_cache_purge_control_load(&slot->token)) {
+            continue;
+        }
+        first = ngx_http_cache_purge_control_load(&slot->revision);
+        floor = ngx_http_cache_purge_control_load(&slot->origins);
+        ledger[0] = ngx_http_cache_purge_control_load(&slot->ledger[0]);
+        ledger[1] = ngx_http_cache_purge_control_load(&slot->ledger[1]);
+        if (first & 1
+            || first != ngx_http_cache_purge_control_load(&slot->revision))
+        {
+            rc = ngx_http_cache_purge_control_error(error,
+                NGX_HTTP_CACHE_ROCKSDB_BUSY, "origin registration changed");
+            break;
+        }
+        if (floor && (floor <= sequence
+                      || floor - 1 > c->expected.last_sequence
+                      || memcmp(ledger, c->operations.ledger, 16)))
+        {
+            count++;
+        }
+    }
+    pthread_mutex_unlock(&shared->mutex);
+    if (rc == 0) {
+        *writers = count;
+    }
     return rc;
 }
 

@@ -533,6 +533,11 @@ public:
         int rc = ngx_http_cache_purge_coordinator_refresh(native_, &error);
         checked(rc, error);
     }
+    uint32_t writers(uint64_t sequence) {
+        uint32_t count = 0; ngx_http_cache_rocksdb_error_t error;
+        int rc = ngx_http_cache_purge_coordinator_writers(native_, sequence, &count, &error);
+        checked(rc, error); return count;
+    }
     Coordination state() const {
         uint32_t state; uint64_t publication; ngx_http_cache_rocksdb_error_t error;
         int rc = ngx_http_cache_purge_coordinator_status(native_, &state, &publication, &error);

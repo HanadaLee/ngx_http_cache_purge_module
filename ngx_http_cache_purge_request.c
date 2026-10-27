@@ -353,10 +353,13 @@ typedef struct {
     ngx_uint_t                      tag_count, rpc;
     ngx_uint_t                      read_state;
     size_t                          reserved, input_bytes;
-    ngx_msec_t                        deadline;
-    ngx_http_cache_purge_watermark_t  origin;
-    uint64_t                          origin_publication;
-    int                               lease;
+    ngx_msec_t                              deadline;
+    ngx_http_cache_purge_watermark_t        origin;
+    uint64_t                                origin_publication;
+    ngx_queue_t                             origin_queue;
+    ngx_http_cache_purge_control_reader_t  *origin_reader;
+    uint64_t                                writer_sequence;
+    int                                     lease;
     u_char                          id[16], previous[16];
     uint64_t  revision;
     unsigned  admitted : 1;
@@ -368,6 +371,7 @@ typedef struct {
     unsigned  read_ref : 1;
     unsigned  read_header_only : 1;
     unsigned  origin_valid : 1;
+    unsigned  origin_registered : 1;
 } ngx_http_cache_purge_capture_t;
 
 typedef struct {
@@ -386,6 +390,11 @@ static ngx_http_output_header_filter_pt
 static size_t     ngx_http_cache_purge_retained_bytes;
 static ngx_uint_t ngx_http_cache_purge_retained_count;
 static ngx_uint_t ngx_http_cache_purge_read_count;
+static ngx_queue_t ngx_http_cache_purge_origins;
+static ngx_uint_t ngx_http_cache_purge_origins_initialized;
+static u_char ngx_http_cache_purge_origin_ledger[16];
+static void ngx_http_cache_purge_capture_origin_release(
+    ngx_http_cache_purge_capture_t *ctx);
 static void ngx_http_cache_purge_read_event(ngx_event_t *event);
 static ngx_int_t ngx_http_cache_purge_read_header(
     ngx_http_cache_purge_capture_t *ctx);
@@ -575,6 +584,7 @@ ngx_http_cache_purge_capture_cleanup(void *data)
         ngx_delete_posted_event(&ctx->read_event);
     }
     ngx_http_cache_purge_capture_release_publication(ctx);
+    ngx_http_cache_purge_capture_origin_release(ctx);
 }
 
 static ngx_int_t
@@ -756,20 +766,110 @@ ngx_http_cache_purge_capture_guard_length(ngx_http_script_engine_t *engine)
 }
 
 static ngx_int_t
+ngx_http_cache_purge_capture_origin_publish(
+    ngx_http_cache_purge_control_reader_t *reader,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_capture_t   *first;
+    ngx_http_cache_purge_watermark_t  oldest;
+
+    if (ngx_queue_empty(&ngx_http_cache_purge_origins)) {
+        return ngx_http_cache_purge_control_origins(reader, NULL, 0, error);
+    }
+    first = ngx_queue_data(ngx_queue_head(&ngx_http_cache_purge_origins),
+                          ngx_http_cache_purge_capture_t, origin_queue);
+    ngx_memcpy(oldest.ledger, ngx_http_cache_purge_origin_ledger, 16);
+    oldest.sequence = first->writer_sequence;
+    return ngx_http_cache_purge_control_origins(reader, &oldest, 1, error);
+}
+
+static void
+ngx_http_cache_purge_capture_origin_release(ngx_http_cache_purge_capture_t *ctx)
+{
+    ngx_http_cache_rocksdb_error_t  error;
+
+    if (!ctx->origin_registered) {
+        return;
+    }
+    ngx_queue_remove(&ctx->origin_queue);
+    ctx->origin_registered = 0;
+    if (ngx_http_cache_purge_capture_origin_publish(ctx->origin_reader, &error)
+        != 0)
+    {
+        ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
+                      "cache origin registration release: %s", error.message);
+    }
+}
+
+static ngx_int_t
 ngx_http_cache_purge_capture_origin(ngx_http_cache_purge_capture_t *ctx)
 {
     ngx_http_cache_purge_control_reader_t  *reader;
     ngx_http_cache_rocksdb_error_t          error;
+    ngx_http_cache_purge_capture_t         *last;
+    ngx_int_t                               announced;
 
     ctx->origin_valid = 0;
-    if (ngx_http_cache_purge_runtime_reader(ctx->request, &reader, &error) != 0
-        || ngx_http_cache_purge_control_watermark(reader, &ctx->origin,
-            &ctx->origin_publication, &error) != 0)
+    announced = 0;
+    if (ngx_http_cache_purge_runtime_reader(ctx->request, &reader, &error) != 0)
     {
         return NGX_ERROR;
     }
+    if (!ngx_http_cache_purge_origins_initialized) {
+        ngx_queue_init(&ngx_http_cache_purge_origins);
+        ngx_http_cache_purge_origins_initialized = 1;
+    }
+    if (!ngx_queue_empty(&ngx_http_cache_purge_origins)) {
+        last = ngx_queue_data(ngx_queue_last(&ngx_http_cache_purge_origins),
+                             ngx_http_cache_purge_capture_t, origin_queue);
+        if (last->origin_reader != reader) {
+            return NGX_ERROR;
+        }
+    }
+    if (!ctx->origin_registered) {
+        if (ngx_http_cache_purge_control_origins(reader, NULL, 1, &error)
+            != 0)
+        {
+            return NGX_ERROR;
+        }
+        announced = 1;
+    }
+    if (ngx_http_cache_purge_control_watermark(reader, &ctx->origin,
+            &ctx->origin_publication, &error) != 0)
+    {
+        goto failed;
+    }
+    if (!ngx_queue_empty(&ngx_http_cache_purge_origins)) {
+        last = ngx_queue_data(ngx_queue_last(&ngx_http_cache_purge_origins),
+                             ngx_http_cache_purge_capture_t, origin_queue);
+        if (ngx_memcmp(ctx->origin.ledger, ngx_http_cache_purge_origin_ledger,
+                       16) != 0
+            || ctx->origin.sequence < last->writer_sequence)
+        {
+            goto failed;
+        }
+    } else {
+        ngx_memcpy(ngx_http_cache_purge_origin_ledger, ctx->origin.ledger, 16);
+    }
+    if (!ctx->origin_registered) {
+        ctx->origin_reader = reader;
+        ctx->writer_sequence = ctx->origin.sequence;
+        ngx_queue_insert_tail(&ngx_http_cache_purge_origins,
+                              &ctx->origin_queue);
+        ctx->origin_registered = 1;
+        if (ngx_http_cache_purge_capture_origin_publish(reader, &error) != 0) {
+            ngx_http_cache_purge_capture_origin_release(ctx);
+            return NGX_ERROR;
+        }
+    }
     ctx->origin_valid = 1;
     return NGX_OK;
+
+failed:
+    if (announced) {
+        (void) ngx_http_cache_purge_capture_origin_publish(reader, &error);
+    }
+    return NGX_ERROR;
 }
 
 static void
@@ -899,6 +999,7 @@ ngx_http_cache_purge_capture_header(ngx_http_request_t *r)
         ngx_http_get_module_ctx(r, ngx_http_cache_purge_index_module);
     ngx_http_cache_purge_capture_conf_t  *conf;
     ngx_str_t                             value;
+    ngx_int_t                             rc;
     if (ctx && !ctx->failed && ctx->cache == r->cache && r->cached
         && ctx->read_state == NGX_HTTP_CACHE_PURGE_READ_READY)
     {
@@ -907,20 +1008,26 @@ ngx_http_cache_purge_capture_header(ngx_http_request_t *r)
     if (ctx && !ctx->failed && ctx->cache == r->cache && !r->cached) {
         conf =
             ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_index_module);
-        if ((conf->field[NGX_HTTP_CACHE_PURGE_FIELD_TAG]
-             && (ngx_http_complex_value(
-                     r, conf->field[NGX_HTTP_CACHE_PURGE_FIELD_TAG], &value)
-                     != NGX_OK
-                 || ngx_http_cache_purge_capture_tags(ctx, value) != NGX_OK))
-            || ngx_http_cache_purge_fill_arm(
-                   r, &ctx->fill, ngx_http_cache_purge_capture_step, ctx)
-                   == NGX_ERROR)
+        rc = NGX_ERROR;
+        if (conf->field[NGX_HTTP_CACHE_PURGE_FIELD_TAG] == NULL
+            || (ngx_http_complex_value(r,
+                    conf->field[NGX_HTTP_CACHE_PURGE_FIELD_TAG], &value)
+                == NGX_OK
+                && ngx_http_cache_purge_capture_tags(ctx, value) == NGX_OK))
+        {
+            rc = ngx_http_cache_purge_fill_arm(r, &ctx->fill,
+                ngx_http_cache_purge_capture_step, ctx);
+        }
+        if (rc == NGX_ERROR)
         {
             ctx->failed = 1;
             r->upstream->cacheable = 0;
             ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
                           "cache index response metadata unavailable; skipping "
                           "cache fill");
+        }
+        if (rc != NGX_OK) {
+            ngx_http_cache_purge_capture_origin_release(ctx);
         }
     }
     return ngx_http_cache_purge_capture_next_header(r);
@@ -1263,6 +1370,9 @@ ngx_http_cache_purge_read_complete(ngx_http_cache_purge_capture_t *ctx,
         ctx->validation = NULL;
         ctx->tag_count = 0;
         ngx_http_cache_purge_capture_release_publication(ctx);
+    }
+    if (allowed || r->main->terminated) {
+        ngx_http_cache_purge_capture_origin_release(ctx);
     }
     if (ctx->read_state == NGX_HTTP_CACHE_PURGE_READ_WAITING) {
         ngx_http_cache_purge_read_count--;
@@ -1908,6 +2018,7 @@ ngx_http_cache_purge_capture_step(ngx_http_request_t *r,
     if (phase == NGX_HTTP_CACHE_PURGE_FILL_FINISH) {
         if (!ctx->need_finish || ctx->lease < 0) {
             ngx_http_cache_purge_capture_release_publication(ctx);
+            ngx_http_cache_purge_capture_origin_release(ctx);
             return NGX_OK;
         }
         timeout = ngx_http_cache_purge_capture_remaining(ctx);
@@ -1916,6 +2027,7 @@ ngx_http_cache_purge_capture_step(ngx_http_request_t *r,
                    != NGX_OK)
         {
             ngx_http_cache_purge_capture_release_publication(ctx);
+            ngx_http_cache_purge_capture_origin_release(ctx);
             return NGX_ERROR;
         }
         p = ngx_cpymem(payload.data, ctx->id, 16);
@@ -1928,6 +2040,7 @@ ngx_http_cache_purge_capture_step(ngx_http_request_t *r,
             return NGX_AGAIN;
         }
         ngx_http_cache_purge_capture_release_publication(ctx);
+        ngx_http_cache_purge_capture_origin_release(ctx);
         return NGX_ERROR;
     }
     /* Publication limits apply after a complete body exists, never to HITs
@@ -2060,6 +2173,7 @@ ngx_http_cache_purge_capture_reply(ngx_http_cache_purge_call_t *call,
     }
     if (stage == NGX_HTTP_CACHE_PURGE_RPC_FINISH) {
         ngx_http_cache_purge_capture_release_publication(ctx);
+        ngx_http_cache_purge_capture_origin_release(ctx);
     }
     ngx_http_cache_purge_fill_complete(ctx->fill, rc);
 }
