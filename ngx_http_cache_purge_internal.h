@@ -61,12 +61,15 @@ typedef enum {
     NGX_HTTP_CACHE_PURGE_OP_INSPECT_FILE,
     /* ID, revision, transaction, before/after, TAG mode/count/values,
      * request origin ledger[16]/sequence u64;
-     * two FDs: lease, selected file -> verified GET-format record */
+     * two FDs: lease, selected file -> GET-format record and admission stamp */
     NGX_HTTP_CACHE_PURGE_OP_VALIDATE_FILE,
     /* operation sequence u64 -> number of older active worker registrations */
     NGX_HTTP_CACHE_PURGE_OP_GET_WRITERS,
   /* ID/revision, one path lease FD -> removal outcome u32 and retired match */
-    NGX_HTTP_CACHE_PURGE_OP_REMOVE_FILE
+    NGX_HTTP_CACHE_PURGE_OP_REMOVE_FILE,
+    /* root/zone/path/key/URL, one selected FD -> GET record + publication u64.
+     * Registers the observed URL and checks all persisted aliases. */
+    NGX_HTTP_CACHE_PURGE_OP_ADMIT_FILE
 } ngx_http_cache_purge_opcode_e;
 
 #define NGX_HTTP_CACHE_PURGE_ROOT_CACHE 1

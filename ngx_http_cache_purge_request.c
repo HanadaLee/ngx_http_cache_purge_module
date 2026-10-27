@@ -1532,17 +1532,22 @@ ngx_http_cache_purge_read_admit(ngx_http_cache_purge_capture_t *ctx,
     ngx_http_cache_rocksdb_error_t          error;
     ngx_http_cache_rocksdb_bytes_t           fields[10], tags[64], value;
     ngx_http_cache_purge_watermark_t        current, stored;
-    uint64_t                                publication, first;
+    uint64_t                                publication, first, stamp;
     ngx_uint_t                              i, count;
     ngx_http_cache_purge_read_match_t       match;
     u_char                                 *p, *end;
     int                                     rc;
 
-    if (payload.len < 29 || payload.data[0] != 2) {
+    if (payload.len < 37 || payload.data[0] != 2) {
+        return 0;
+    }
+    stamp = ngx_http_cache_purge_capture_read_number(
+        payload.data + payload.len - 8, 8);
+    if (stamp == 0) {
         return 0;
     }
     p = payload.data + 25;
-    end = payload.data + payload.len;
+    end = payload.data + payload.len - 8;
     for (i = 0; i < 10; i++) {
         if (ngx_http_cache_purge_read_field(&p, end, &fields[i]) != NGX_OK) {
             return 0;
@@ -1581,7 +1586,7 @@ ngx_http_cache_purge_read_admit(ngx_http_cache_purge_capture_t *ctx,
     ngx_memzero(&match, sizeof(match));
     rc = ngx_http_cache_purge_control_watermark(reader, &current,
                                                  &first, &error);
-    if (rc != 0) {
+    if (rc != 0 || first != stamp) {
         return 0;
     }
     rc = ngx_http_cache_purge_publication_watermark(fields[9], &stored, &error);
@@ -1859,7 +1864,8 @@ ngx_http_cache_purge_read_event(ngx_event_t *event)
     ctx->root = root;
     ctx->zone = zone;
     ctx->path = path;
-    payload.len = 12 + root.len + zone.len + path.len;
+    payload.len = 20 + root.len + zone.len + path.len
+                  + ctx->key.len + ctx->url.len;
     if (payload.len > NGX_HTTP_CACHE_PURGE_CAPTURE_RECORD) {
         ngx_http_cache_purge_read_complete(ctx, 0);
         return;
@@ -1871,8 +1877,10 @@ ngx_http_cache_purge_read_event(ngx_event_t *event)
     }
     p = ngx_http_cache_purge_capture_string(payload.data, root);
     p = ngx_http_cache_purge_capture_string(p, zone);
-    ngx_http_cache_purge_capture_string(p, path);
-    rc = ngx_http_cache_purge_client_inspect_file(
+    p = ngx_http_cache_purge_capture_string(p, path);
+    p = ngx_http_cache_purge_capture_string(p, ctx->key);
+    ngx_http_cache_purge_capture_string(p, ctx->url);
+    rc = ngx_http_cache_purge_client_admit_file(
         ctx->client, &payload, c->file.fd, timeout,
         ngx_http_cache_purge_read_reply, ctx, &ctx->call);
     ngx_free(payload.data);

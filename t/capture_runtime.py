@@ -234,6 +234,10 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
   location /raw {{ proxy_cache_key "$uri|$arg_m"; cache_purge_key $uri;
                   cache_purge_tag_namespace rawtenant;
                   proxy_pass http://127.0.0.1:{origin.server_port}; }}
+  location /alias/ {{ cache_key_uri /alias/shared;
+                     cache_purge_key $cache_key_base;
+                     cache_purge_url "$scheme://$host$uri";
+                     proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /revalidate- {{ cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
                           proxy_cache_revalidate on; proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /revalidate-expression {{ cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
@@ -431,6 +435,30 @@ try:
     assert get('/remove-native') == (200, 'HIT', b'new-after-removal')
     assert get('/remove-native?z=b') == (200, 'HIT', b'new-after-removal')
     checks.append('physical removal of two indexed native zone instances refills fresh entities and old-instance retries preserve their replacements')
+    assert get('/alias/one') == (200, 'MISS', b'/alias/one')
+    alias = records('/alias/one', 1)[0]; ready_file(alias)
+    assert get('/alias/two') == (200, 'HIT', b'/alias/one')
+    assert get('/alias/three') == (200, 'HIT', b'/alias/one')
+    assert records('/alias/two', 1)[0]['id'] == alias['id'] == records('/alias/three', 1)[0]['id']
+    assert calls.count('/alias/two') == calls.count('/alias/three') == 0
+    checks.append('native HITs register distinct observed URL aliases for one key without issuing extra origin requests')
+    fence('read-discovered-alias', 1, 'http://cache.test/alias/two')
+    fresh_bodies['/alias/one'] = b'fresh-alias-entity'
+    assert get('/alias/one') == (200, 'BYPASS', b'fresh-alias-entity')
+    old_alias = alias['id']
+    alias = until(lambda: (item if (item := records('/alias/one', 1)[0])['id'] != old_alias else None))
+    ready_file(alias)
+    assert records('/alias/two', 1)[0]['id'] == alias['id']
+    assert get('/alias/three') == (200, 'HIT', b'fresh-alias-entity')
+    checks.append('a URL FENCE on a persisted third-party alias invalidates another request URL while a post-push entity can HIT under that FENCE')
+    fence('read-discovered-alias-prefix', 3, 'http://cache.test/alias/tw')
+    fresh_bodies['/alias/one'] = b'prefix-fresh-alias'
+    assert get('/alias/one') == (200, 'BYPASS', b'prefix-fresh-alias')
+    old_alias = alias['id']
+    alias = until(lambda: (item if (item := records('/alias/one', 1)[0])['id'] != old_alias else None))
+    ready_file(alias)
+    assert get('/alias/three') == (200, 'HIT', b'prefix-fresh-alias')
+    checks.append('bytewise URL prefix FENCEs cover persisted aliases even when neither the current nor the original stored URL matches')
     assert get('/unmarked')[1] == 'MISS'
     unmarked = records('/unmarked', 1)[0]
     os.removexattr(ready_file(unmarked), 'user.ngx_cache_purge.id')
@@ -567,6 +595,10 @@ try:
     assert get('/asset')[1] == 'HIT'
     assert {watermark(record(ident))[0] for ident in before} == {ledger}
     checks.append('full nginx restart reuses persisted file relations without rebuilding the index')
+    assert get('/alias/three') == (200, 'HIT', b'prefix-fresh-alias')
+    assert records('/alias/two', 1)[0]['id'] == alias['id']
+    assert calls.count('/alias/three') == 0
+    checks.append('HIT-discovered aliases and their satisfied FENCE coverage survive a full nginx restart without index rebuilding')
     validation_files = {}
     policies['/revalidate-race'] = 'race-old'
     assert get('/revalidate-race') == (200, 'MISS', b'/revalidate-race')

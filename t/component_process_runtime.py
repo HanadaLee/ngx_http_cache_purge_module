@@ -228,7 +228,24 @@ class Client:
         assert self.socket.sendmsg([packet[:1]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
                                                   array.array('i', [lease, selected]))]) == 1
         self.socket.sendall(packet[1:])
-        return self.reply(22, code)
+        reply = self.reply(22, code)
+        if code == 0:
+            assert len(reply) >= 33
+            self.admission_stamp = int.from_bytes(reply[-8:], 'big')
+            return reply[:-8]
+        return reply
+
+    def admit_file(self, target, key, url, fd, code=0):
+        packet = self.packet(25, b''.join(map(string, (*target, key, url))))
+        assert self.socket.sendmsg([packet[:1]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [fd]))]) == 1
+        self.socket.sendall(packet[1:])
+        reply = self.reply(25, code)
+        if code == 0:
+            assert len(reply) >= 33
+            self.admission_stamp = int.from_bytes(reply[-8:], 'big')
+            assert self.admission_stamp != 0
+            return reply[:-8]
+        return reply
 
     def page(self, kind, value, scope='', bookmark=b'', limit=32):
         data = self.call(8, query(kind, value, scope, bookmark, limit))
@@ -711,6 +728,39 @@ try:
                 + string(value) + string(scope) + string('validation-test'))
         v.call(14, data)
 
+    target, lease, selected = make_validation_file(605, '/read-alias', metadata=validation_origin)
+    address = (str(validation_cache), 'zone-a', 'a/00/605')
+    key = 'team\x1fhttps\x1fa.test\x1f/read-alias\x1f'
+    original = v.call(2, identity(605))
+    writes = struct.unpack('>9Q', v.call(1))[1]
+    v.admit_file(address, 'another-key', 'https://a.test/forbidden-alias', selected, code=7)
+    assert struct.unpack('>9Q', v.call(1))[1] == writes and v.page(1, 'https://a.test/forbidden-alias')[0] == []
+    assert v.admit_file(address, key, 'https://a.test/discovered-alias', selected) == original
+    stamp = v.admission_stamp
+    assert stamp == struct.unpack('>IQ', v.call(16))[1]
+    assert v.page(1, 'https://a.test/discovered-alias')[0] == [605]
+    writes = struct.unpack('>9Q', v.call(1))[1]
+    assert v.admit_file(address, key, 'https://a.test/discovered-alias', selected) == original
+    assert struct.unpack('>9Q', v.call(1))[1] == writes
+    check(True, 'ADMIT_FILE binds the native key, durably registers a new URL alias and returns a publication stamp without rewriting repeated observations')
+    validation_operation('discovered-alias-rule', 1, 'https://a.test/discovered-alias')
+    wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+    assert stamp != struct.unpack('>IQ', v.call(16))[1]
+    v.admit_file(address, key, 'https://a.test/read-alias', selected, code=7)
+    assert v.inspect_file(address, selected) == original
+    check(True, 'a FENCE on another persisted alias rejects read admission while physical inspection remains diagnostic only')
+    os.close(selected)
+    source = validation_temp / 'fresh-alias-606'; source.write_bytes(b'fresh alias entity')
+    fd = os.open(source, os.O_RDWR | os.O_CLOEXEC)
+    payload = record(606, root=str(validation_cache), zone='zone-a', uri='/read-alias',
+                     path='a/00/605', metadata=validating.watermark())
+    v.prepare_file(payload[:-16] + identity(605) + string(str(source)), [lease, fd])
+    source.rename(target); v.finish_file(606, lease); os.close(fd)
+    selected = os.open(target, os.O_RDONLY | os.O_CLOEXEC)
+    assert v.admit_file(address, key, 'https://a.test/discovered-alias', selected) == v.call(2, identity(606))
+    os.close(lease); os.close(selected)
+    check(True, 'a newer full entity satisfies the persisted alias FENCE and retains its key URL associations')
+
     target, lease, selected = make_validation_file(601, '/validate')
     packet = validation_packet(601, tags=['new-tag'])
     outcome = v.validate_file(packet, lease, selected)
@@ -728,6 +778,7 @@ try:
     validation_operation('unrelated-validation-rule', 1, 'https://a.test/unrelated')
     wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
     packet = validation_packet(601, revision=4, token=2, before=b'new-head')
+    committed_before_alias = packet
     assert v.validate_file(packet, lease, selected)[:9] == b'\x02' + struct.pack('>Q', 6)
     check(True, 'an unrelated accepted rule permits validation through the bounded URL visitor')
 
@@ -745,6 +796,9 @@ try:
     wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
     v.validate_file(packet, lease, selected, code=7)
     assert v.call(2, identity(601)) == previous and v.page(5, 'new-tag', 'team')[0] == [601]
+    assert v.validate_file(committed_before_alias, lease, selected) == previous
+    assert v.admission_stamp == 0
+    check(True, 'a completed validation receipt can replay under a new alias FENCE but its zero stamp cannot authorize response reuse')
     check(True, 'accepted but unpublished controls stop validation; a persisted alias FENCE blocks TAG removal after publication')
     os.close(lease); os.close(selected)
 
@@ -776,6 +830,8 @@ try:
         v.call(12, string(key) + string(f'https://a.test/many/{i}'))
     previous = v.call(2, identity(620))
     v.validate_file(validation_packet(620), lease, selected, code=5)
+    v.admit_file((str(validation_cache), 'zone-a', 'a/00/620'), key,
+                 'https://a.test/alias-limit', selected, code=5)
     assert v.call(2, identity(620)) == previous and target.read_bytes().startswith(b'old-head')
     os.close(lease); os.close(selected)
     check(True, 'excess URL aliases fail validation without partial TAG or header mutation')

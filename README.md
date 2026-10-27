@@ -77,8 +77,9 @@ including old TAGs and watermark regression, before committing a replacement.
 Conflicting late candidates are retired without being stamped READY. This local
 watermark neither changes the cache key nor proves upstream CDN freshness.
 Known selectors still conservatively bypass before native lookup to cover
-memory-only cached errors; rule retirement and the treatment of in-flight origin
-responses remain unfinished.
+memory-only cached errors; rule retirement remains unfinished. An origin request
+started before a push may finish its response, but its old result must not become
+a reusable cache entry. Requests started after the push must avoid old entries.
 
 Each worker announces its oldest active origin boundary in its existing 64-byte
 shared reader slot. A request-local queue keeps registration and removal O(1),
@@ -89,6 +90,14 @@ reclaimed. The executor can query pre-operation writer registrations through
 bounded IPC. A zero count alone does not permit FENCE removal: queued IPC,
 unfinished durable transactions and physical processing still need closure.
 This changes the internal shared-control ABI to 3; nginx-ext ABI remains 2.
+
+Native file responses use `ADMIT_FILE` to verify the selected descriptor, bind
+the captured key, and persist the observed URL association. Repeated observations
+do not write the database. The executor checks persisted URL aliases against
+FENCEs within count/byte budgets and returns a publication stamp with the record.
+The worker requires the same publication at final admission, closing the gap
+between the database check and response reuse. No alias collection is sent to or
+retained by the worker. Physical `INSPECT_FILE` remains a diagnostic operation.
 
 The operation ledger also persists a monotonic write floor with each materialized
 operation. PREPARE, uncommitted FINISH/recovery and new 304 validation writes
@@ -114,10 +123,11 @@ persist the validation transaction, and pass final FENCE admission before
 reusing the entity. An absent direct upstream TAG header retains the old set;
 a present empty header clears it. General expressions replace the set. New,
 unsatisfied FENCEs and unverified transactions still force an unconditional refill;
-ordinary 304 retains the entity's existing local watermark. Forced Invalidate
-revalidation, complete persistent-alias discovery and
-read matching, and TAG/alias provenance for memory-only cached errors, remain
-unfinished. Operation receipts
+ordinary 304 retains the entity's existing local watermark. Validation receipts
+also carry an admission stamp; a durable receipt without current read clearance
+has stamp zero and cannot authorize response reuse. Forced Invalidate
+revalidation, unobserved alias handling and TAG/alias provenance for memory-only
+cached errors remain unfinished. Operation receipts
 remain PREPARING; these partial consumers do not expose reliable public 202
 acceptance or completed immediate purge semantics yet.
 
@@ -205,7 +215,8 @@ requests. Request inputs and each publication payload are separately bounded
 to 128 KiB; these limits exclude allocator overhead and native nginx buffers.
 The persistent build replaces the legacy generation form of `cache_purge_key`
 with its single-expression index meaning and does not register generation
-namespace directives or variables. URL aliases first seen on HITs are still pending.
+namespace directives or variables. Observed URL aliases are persisted during
+file-response admission and survive restarts without index rebuilding.
 
 ## Current features
 

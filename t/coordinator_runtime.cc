@@ -85,6 +85,7 @@ int main(int argc, char **argv) {
                 check(ngx_http_cache_purge_control_origins(reader, nullptr, 1, &error) == 0,
                       "announce unknown origins before taking their snapshot");
                 check(ngx_http_cache_purge_control_guard_begin(reader, version, &error) == 0, "pin earlier synchronous admission");
+                auto earlier_admission = version;
                 auto first = coordinator.accept(input("first"), 1000, 300000);
                 check(first.stage == OperationStage::preparing && operations.get("first").revision == 1, "acceptance is durable preparing");
                 check(coordinator.accept(input("first"), 5000, 1).propagation_ms == 300000, "replay remains available while publication is pending");
@@ -95,6 +96,8 @@ int main(int argc, char **argv) {
                       == NGX_HTTP_CACHE_ROCKSDB_BUSY, "no watermark while acceptance publication is pending");
                 ready(coordinator);
                 check(lookup(reader, found, version) == 0 && found[0] == 1 && found[1] == 5, "published preparing barrier matches");
+                check(ngx_http_cache_purge_control_guard_begin(reader, earlier_admission, &error) == NGX_HTTP_CACHE_ROCKSDB_BUSY,
+                      "a delayed admission stamp cannot pin a newer control publication");
                 check(!operations.get("first").effective_at_ms, "SHM publication alone cannot claim native hook effectiveness");
                 check(coordinator.writers(1) == 1, "unknown origin blocks the old-writer boundary");
                 check(ngx_http_cache_purge_control_reader_close(&reader, &error) == NGX_HTTP_CACHE_ROCKSDB_BUSY
