@@ -750,7 +750,9 @@ background_delete(const std::string &mode, const std::string &path)
             create(8, "cache", "first", "https://example.test/work/first", 2,
                 id(1));
         } else {
-            check(mode == "--background-seed", "background fixture mode");
+            check(mode == "--background-seed"
+                      || mode == "--background-seed-invalidate",
+                "background fixture mode");
             create(
                 1, "cache", "first", "https://example.test/work/first", 0, {});
             create(2, "cache-b", "second", "https://example.test/work/second",
@@ -764,20 +766,26 @@ background_delete(const std::string &mode, const std::string &path)
                                         "https://example.test/other";
                 ngx_http_cache_purge_operation_input_t input{};
                 input.id = bytes(name);
-                input.mode = NGX_HTTP_CACHE_PURGE_DELETE;
+                input.mode = mode == "--background-seed-invalidate" ?
+                                 NGX_HTTP_CACHE_PURGE_INVALIDATE :
+                                 NGX_HTTP_CACHE_PURGE_DELETE;
                 input.issued_at_ms = 1;
                 input.selector.kind = name == "background" ?
                                           NGX_HTTP_CACHE_PURGE_URL_PREFIX :
                                           NGX_HTTP_CACHE_PURGE_URL;
                 input.selector.value = bytes(value);
                 ngx_http_cache_purge_operation_t accepted{}, active{};
+                uint64_t now =
+                    mode == "--background-seed-invalidate" ?
+                        static_cast<uint64_t>(std::time(nullptr)) * 1000 :
+                        1;
                 check(ngx_http_cache_purge_operations_accept(
-                          &operations, &input, 1, 300000, &accepted, &error)
+                          &operations, &input, now, 300000, &accepted, &error)
                           == 0,
                     "seed durable operation");
                 /* Offline setup does not claim native HTTP acceptance. */
                 check(ngx_http_cache_purge_operations_activate(&operations,
-                          input.id, accepted.revision, 1, &active, &error)
+                          input.id, accepted.revision, now, &active, &error)
                           == 0,
                     "seed active background task");
                 ngx_http_cache_purge_operation_free(&accepted);

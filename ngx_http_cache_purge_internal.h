@@ -67,9 +67,9 @@ typedef enum {
     NGX_HTTP_CACHE_PURGE_OP_GET_WRITERS,
   /* ID/revision, one path lease FD -> removal outcome u32 and retired match */
     NGX_HTTP_CACHE_PURGE_OP_REMOVE_FILE,
-    /* root/zone/path/key/URL, one FD -> GET record, publication u64,
+    /* root/zone/path/key/URL/host, one FD -> GET record, publication u64,
      * required Invalidate sequence u64 (zero permits ordinary reuse).
-     * Registers the observed URL and checks all persisted aliases. */
+     * Registers the observed URL/host and checks all persisted aliases. */
     NGX_HTTP_CACHE_PURGE_OP_ADMIT_FILE
 } ngx_http_cache_purge_opcode_e;
 

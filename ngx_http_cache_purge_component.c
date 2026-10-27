@@ -1983,7 +1983,10 @@ ngx_http_cache_purge_component_process_file(ngx_http_cache_purge_component_t *c,
         } else if (rc == NGX_HTTP_CACHE_ROCKSDB_DONE) {
             rc = ngx_http_cache_purge_component_checkpoint(c, op, NULL,
                 cursor, 1, 0, 0, now + 1000,
-                "native cache cleanup and retirement remain pending", error);
+                op->input.mode == NGX_HTTP_CACHE_PURGE_INVALIDATE
+                    ? "Invalidate awaits origin and file transaction drain"
+                    : "native cache cleanup and retirement remain pending",
+                error);
         } else if (rc == NGX_HTTP_CACHE_ROCKSDB_BUSY
                    || rc == NGX_HTTP_CACHE_ROCKSDB_EXPIRED)
         {
@@ -2086,6 +2089,67 @@ done:
 }
 
 static int
+ngx_http_cache_purge_component_retire_invalidate(
+    ngx_http_cache_purge_component_t *c,
+    const ngx_http_cache_purge_operation_t *op,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_query_t           *query;
+    ngx_http_cache_purge_index_match_t      match;
+    ngx_http_cache_purge_operation_t        updated;
+    ngx_http_cache_rocksdb_bytes_t          empty;
+    uint32_t                                writers;
+    int                                     rc;
+
+    if (op->stage != NGX_HTTP_CACHE_PURGE_DRAINING || !op->scan_done
+        || op->pending || op->failed)
+    {
+        return ngx_http_cache_purge_component_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_BUSY, "Invalidate has unfinished files");
+    }
+    rc = ngx_http_cache_purge_coordinator_writers(c->coordinator,
+        op->sequence, &writers, error);
+    if (rc != 0) {
+        return rc;
+    }
+    if (writers != 0) {
+        return ngx_http_cache_purge_component_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_BUSY, "Invalidate awaits old origins");
+    }
+
+    /* Require an empty intent catalog in this executor step. Even a newer
+     * intent postpones retirement; no unbounded provenance scan is needed.
+     * Queued old writes cannot interleave with the durable floor below. */
+    empty.data = NULL;
+    empty.len = 0;
+    query = NULL;
+    rc = ngx_http_cache_purge_query_open(c->operations.store, NULL,
+        NGX_HTTP_CACHE_PURGE_QUERY_PENDING, empty, &query, error);
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_query_step(query, 32, &match, error);
+    }
+    ngx_http_cache_purge_query_close(&query, NULL);
+    if (rc == 0) {
+        return ngx_http_cache_purge_component_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_BUSY, "Invalidate awaits file transactions");
+    }
+    if (rc != NGX_HTTP_CACHE_ROCKSDB_DONE) {
+        return rc;
+    }
+
+    /* File and selector requirements outlive this FENCE. Advance the global
+     * write floor with its durable removal, then publish the replacement
+     * image through the existing reader gate. PROPAGATE keeps its deadline. */
+    rc = ngx_http_cache_purge_operations_materialize(&c->operations,
+        op->input.id, op->revision, op->sequence, &updated, error);
+    ngx_http_cache_purge_operation_free(&updated);
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_coordinator_refresh(c->coordinator, error);
+    }
+    return rc;
+}
+
+static int
 ngx_http_cache_purge_component_work(ngx_http_cache_purge_component_t *c,
     ngx_http_cache_rocksdb_error_t *error)
 {
@@ -2121,6 +2185,17 @@ ngx_http_cache_purge_component_work(ngx_http_cache_purge_component_t *c,
         op = &page.items[0];
         if (!op->scan_done) {
             rc = ngx_http_cache_purge_component_process_file(c, op, now, error);
+        } else if (op->input.mode == NGX_HTTP_CACHE_PURGE_INVALIDATE) {
+            rc = ngx_http_cache_purge_component_retire_invalidate(c, op,
+                                                                   error);
+            if (rc == NGX_HTTP_CACHE_ROCKSDB_BUSY
+                || rc == NGX_HTTP_CACHE_ROCKSDB_EXPIRED)
+            {
+                rc = 0;
+                if (page.done) {
+                    c->work_at += 1000;
+                }
+            }
         } else if (page.done) {
             c->work_at += 1000;
         }

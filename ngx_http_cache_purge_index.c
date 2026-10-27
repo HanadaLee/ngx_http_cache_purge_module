@@ -1863,6 +1863,8 @@ ngx_http_cache_purge_operations_materialize(
     }
     after = before;
     after.op.stage = NGX_HTTP_CACHE_PURGE_MATERIALIZED;
+    after.op.last_error = ngx_http_cache_purge_op_empty;
+    after.op.next_run_ms = 0;
     if (before.op.sequence > retired) {
         ngx_http_cache_purge_op_set_counter(&tx, "M:op-retired",
                                               before.op.sequence);

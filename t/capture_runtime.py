@@ -551,7 +551,7 @@ try:
     process = start()
     until(lambda: (run / 'index/component.sock').exists())
     until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
-    def materialization_done(name='background-invalidate', expected_visits=3):
+    def materialization_done(name='background-invalidate', expected_visits=3, expected_stage=4):
         d = Decode(rpc(15, string(name)))
         d.string(); d.number(1); d.number(8); d.number(1)
         d.string(); d.string(); d.string()
@@ -560,15 +560,10 @@ try:
         done = d.number(1); d.number(8); visits = d.number(8)
         pending, failed = d.number(8), d.number(8)
         d.number(8); d.string(); d.end()
-        return stage == 3 and done and visits == expected_visits and not pending and not failed
+        return stage == expected_stage and done and visits == expected_visits and not pending and not failed
     until(materialization_done)
     assert all(Path(path).read_bytes() == contents for path, contents in materialized_contents.items())
     stop(process)
-    # All workers have stopped and this fixture's three immutable instances
-    # carry the required policy. This is not automatic production retirement.
-    subprocess.run([str(a.libraries / 'cache_purge_files_test'),
-                    '--retire-invalidate-fixture', str(run / 'index'), 'background-invalidate'],
-                   check=True, timeout=15, stdout=subprocess.DEVNULL)
     process = start()
     until(lambda: (run / 'index/component.sock').exists())
     until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
@@ -585,7 +580,7 @@ try:
     conditional_paths.add(materialized_failure)
     assert get(materialized_failure) == (200, 'REVALIDATED', materialized_failure.encode())
     assert get(materialized_failure) == (200, 'HIT', materialized_failure.encode())
-    checks.append('background Invalidate persists three requirements across two zones without changing files; after controlled rule retirement and restart, fresh native headers still require validation')
+    checks.append('background Invalidate automatically retires its FENCE after persisting three requirements across two zones; after restart, unchanged fresh native headers still require validation')
     checks.append('persistent per-file Invalidate keeps strict failure handling and plain stale downgrade after all resident rules are removed')
     host_cases = []
     late_host_cases = []
@@ -656,8 +651,8 @@ try:
     process = start()
     until(lambda: (run / 'index/component.sock').exists())
     until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
-    for name, *_ in late_alias_cases + late_host_cases:
-        until(lambda name=name: materialization_done(name, 0))
+    for name, mode, *_ in late_alias_cases + late_host_cases:
+        until(lambda name=name, mode=mode: materialization_done(name, 0, 4 if mode == 1 else 3))
     stop(process)
     for name, *_ in late_alias_cases + late_host_cases:
         subprocess.run([str(a.libraries / 'cache_purge_files_test'), '--retire-empty-fixture',

@@ -92,6 +92,16 @@ main(int argc, char **argv)
         }
         options.control_memory = shared;
         options.control_bytes = shared_size;
+        if (std::getenv("CACHE_PURGE_TEST_HOLD_ORIGIN")) {
+            if (ngx_http_cache_purge_control_reader_open(
+                    shared, shared_size, &reader, &error)
+                || ngx_http_cache_purge_control_origins(
+                    reader, nullptr, 1, &error))
+            {
+                return 4;
+            }
+            origin = true;
+        }
     }
     int rc = ngx_http_cache_purge_component_start(
         argv[1], &options, &component, &error);
@@ -187,9 +197,13 @@ main(int argc, char **argv)
                 std::cout << "RELEASE " << rc << std::endl;
                 continue;
             }
-            const unsigned char url[] = "https://a.test/dir/a";
+            const char *url = std::getenv("CACHE_PURGE_TEST_MATCH_URL");
+            if (!url) {
+                url = "https://a.test/dir/a";
+            }
             ngx_http_cache_purge_control_context_t context{};
-            context.url = { url, sizeof(url) - 1 };
+            context.url = { reinterpret_cast<const unsigned char *>(url),
+                std::strlen(url) };
             context.now_ms = 5000;
             context.proxy = 1;
             uint64_t found[2]{};
