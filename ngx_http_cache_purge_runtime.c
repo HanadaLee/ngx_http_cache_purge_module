@@ -335,7 +335,7 @@ ngx_http_cache_purge_runtime_post(ngx_conf_t *cf)
 
     main = ngx_http_conf_get_module_main_conf(cf, ngx_http_cache_purge_module);
     rt = main->runtime;
-    ngx_conf_init_msec_value(rt->propagation, 300000);
+    ngx_conf_init_msec_value(rt->propagation, 120000);
     if (rt->propagation > UINT32_MAX) {
         ngx_conf_log_error(
             NGX_LOG_EMERG, cf, 0,

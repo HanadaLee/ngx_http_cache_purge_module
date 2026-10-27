@@ -3181,7 +3181,7 @@ ngx_http_cache_purge_component_options(
     o->io_timeout_ms = 30000;
     o->owner_retry_ms = 50;
     o->client_uid = UINT32_MAX;
-    o->propagation_ms = 300000;
+    o->propagation_ms = 120000;
     o->max_live_operations = 4096;
     o->live_selector_bytes = 4 * 1024 * 1024;
 }

@@ -417,7 +417,7 @@ print(struct.unpack('>Q',read(struct.unpack('>I',h[16:20])[0])[:8])[0])
     payload = text('native-resource-op') + b'\x01' + struct.pack('>Q', 1000) + b'\x02' + text('/cache/') + text('') + text('probe')
     receipt = ipc(case.path, 14, payload)
     assert receipt[len(payload) + 40] == 1
-    assert struct.unpack('>I', receipt[len(payload) + 41:len(payload) + 45])[0] == 300000
+    assert struct.unpack('>I', receipt[len(payload) + 41:len(payload) + 45])[0] == 120000
     case.ready()
     memory['component_with_control'] = process_memory(case.process.pid)
     for path in ('/cache/a', '/cache/b'):

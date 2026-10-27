@@ -431,7 +431,7 @@ The implemented resource directives are:
 http {
     cache_purge_store /var/lib/nginx/cache-index cache=16m write_buffer=4m;
     cache_purge_state_zone purge_control 16m;
-    cache_purge_propagation_timeout 300s;
+    cache_purge_propagation_timeout 120s;
 }
 ```
 

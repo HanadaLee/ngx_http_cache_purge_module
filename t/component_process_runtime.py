@@ -728,7 +728,7 @@ try:
     wait_for(lambda: struct.unpack('>IQ', sc.call(16))[0] == 6)
     snapshot = struct.unpack('>IQ16sQQQQI', sc.call(28))
     assert snapshot[0] == 6 and snapshot[2] != bytes(16) and snapshot[3:7] == (0, 0, 0, 0)
-    assert snapshot[7] == 300000
+    assert snapshot[7] == 120000
     submitting.match(); submitting.guard()
     submitted_input = operation_input('autonomous-submit')
     accepted = sc.call(27, submitted_input)
@@ -750,7 +750,7 @@ try:
     assert completed[len(submitted_input) + 16:len(submitted_input) + 24] == accepted[len(submitted_input) + 16:len(submitted_input) + 24]
     effective = int.from_bytes(completed[len(submitted_input) + 24:len(submitted_input) + 32], 'big')
     deadline = int.from_bytes(completed[len(submitted_input) + 32:len(submitted_input) + 40], 'big')
-    assert effective > 0 and deadline - effective == 300000
+    assert effective > 0 and deadline - effective == 120000
     before = struct.unpack('>9Q', sc.call(1))[1]
     assert sc.call(27, submitted_input) == completed
     assert struct.unpack('>9Q', sc.call(1))[1] == before
