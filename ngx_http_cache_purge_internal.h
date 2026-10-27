@@ -705,6 +705,21 @@ int
 ngx_http_cache_purge_index_has_intent(ngx_http_cache_rocksdb_t *store,
     const unsigned char id[16], int *owned,
     ngx_http_cache_rocksdb_error_t *error);
+/* A sparse, persistent requirement for an immutable file instance. Setting it
+ * requires a committed file without a pending path intent. Replays retain the
+ * maximum sequence in the same ledger; no file revision or proof is changed.
+ * The executor supplies an accepted Invalidate boundary. The getter returns a
+ * zero watermark when absent, including for prepared/retired instances. */
+int ngx_http_cache_purge_index_require_validation(
+    ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file,
+    const ngx_http_cache_purge_watermark_t *required,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_validation_requirement(
+    ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file,
+    ngx_http_cache_purge_watermark_t *required,
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_update(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_expected_t *file,
     ngx_http_cache_rocksdb_bytes_t metadata,

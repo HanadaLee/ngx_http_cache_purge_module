@@ -180,6 +180,122 @@ raw_write(ngx_http_cache_rocksdb_t *store, ngx_http_cache_rocksdb_cf_e cf,
 }
 
 static void
+ngx_http_cache_purge_test_validation_policy(const std::string &path)
+{
+    check(mkdir(path.c_str(), 0700) == 0, "validation policy directory");
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    ngx_http_cache_rocksdb_error_t error{};
+    check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
+              == 0,
+        "validation policy database");
+    auto original = file(301), replacement = file(302);
+    replacement.path = original.path;
+    ngx_http_cache_purge_index_expected_t expected{};
+    std::memcpy(expected.id, original.id.data(), 16);
+    expected.revision = 2;
+    ngx_http_cache_purge_watermark_t policy{}, found{};
+    std::memcpy(policy.ledger, id(99).data(), 16);
+    policy.sequence = 7;
+    const std::string row =
+        "v"
+        + std::string(reinterpret_cast<const char *>(original.id.data()), 16);
+    {
+        Index index(store);
+        install(index, original);
+        check(ngx_http_cache_purge_index_validation_requirement(
+                  store, &expected, &found, &error)
+                      == 0
+                  && found.sequence == 0,
+            "ordinary objects have no persistent validation requirement");
+        check(ngx_http_cache_purge_index_require_validation(
+                  store, &expected, &policy, &error)
+                  == 0,
+            "persist exact-instance invalidation");
+        policy.sequence = 3;
+        check(ngx_http_cache_purge_index_require_validation(
+                  store, &expected, &policy, &error)
+                      == 0
+                  && ngx_http_cache_purge_index_validation_requirement(
+                         store, &expected, &found, &error)
+                         == 0
+                  && found.sequence == 7,
+            "late replay cannot lower a newer invalidation");
+        policy.sequence = 9;
+        check(ngx_http_cache_purge_index_require_validation(
+                  store, &expected, &policy, &error)
+                  == 0,
+            "later invalidation advances the requirement");
+        check(index.get(original.id).revision == 2
+                  && index.get(original.id).metadata == original.metadata,
+            "policy leaves native publication revision and proof unchanged");
+        policy.ledger[0] = 1;
+        check(ngx_http_cache_purge_index_require_validation(
+                  store, &expected, &policy, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "unrelated ledger cannot overwrite a requirement");
+        policy.ledger[0] = 0;
+        expected.revision = 1;
+        check(ngx_http_cache_purge_index_require_validation(
+                  store, &expected, &policy, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "changed file revision rejects materialization");
+        expected.revision = 2;
+        index.prepare(replacement, original.id);
+        check(ngx_http_cache_purge_index_require_validation(
+                  store, &expected, &policy, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_BUSY,
+            "pending replacement excludes policy mutation");
+        index.abort_prepare(replacement.id, 1);
+        index.collect_file(replacement.id, 2);
+        expected.revision = index
+                                .update_metadata(original.id, 2,
+                                    "validated-proof", { "new-tag" })
+                                .revision;
+        check(ngx_http_cache_purge_index_validation_requirement(
+                  store, &expected, &found, &error)
+                      == 0
+                  && found.sequence == 9,
+            "metadata and TAG changes do not discard unmet invalidation");
+        raw_write(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, "M:index", "2");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
+        "close policy database");
+    check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
+              == 0,
+        "reopen policy database");
+    {
+        Index index(store);
+        check(ngx_http_cache_purge_index_validation_requirement(
+                  store, &expected, &found, &error)
+                      == 0
+                  && found.sequence == 9
+                  && std::memcmp(found.ledger, policy.ledger, 16) == 0,
+            "schema v2 upgrades and persistent policy survives reopen");
+        raw_write(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, row, "bad");
+        check(ngx_http_cache_purge_index_validation_requirement(
+                  store, &expected, &found, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_CORRUPT
+                  && found.sequence == 0,
+            "malformed policy fails closed");
+        raw_write(
+            store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, row, std::string(24, '\0'));
+        check(ngx_http_cache_purge_index_validation_requirement(
+                  store, &expected, &found, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+            "zero ledger and sequence are rejected");
+        auto retired = index.retire(original.id, expected.revision);
+        index.collect_file(original.id, retired.revision);
+        auto keys = raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT);
+        check(std::find(keys.begin(), keys.end(), row) == keys.end(),
+            "file collection also removes its sparse policy row");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
+        "close recovered policy database");
+}
+
+static void
 bounded_scan(const std::string &path)
 {
     check(mkdir(path.c_str(), 0700) == 0, "bounded query directory");
@@ -305,9 +421,29 @@ process_test(const std::string &mode, const char *path)
             index.commit_batch(files);
             index.add_url(a.key, "https://alias.test/a");
             index.retire(c.id, 2);
+            ngx_http_cache_purge_index_expected_t expected{};
+            std::memcpy(expected.id, a.id.data(), 16);
+            expected.revision = 2;
+            ngx_http_cache_purge_watermark_t required{};
+            std::memcpy(required.ledger, id(99).data(), 16);
+            required.sequence = 7;
+            check(ngx_http_cache_purge_index_require_validation(
+                      store, &expected, &required, &error)
+                      == 0,
+                "persist invalidation before abrupt process exit");
         } else if (mode == "--recover") {
             check(index.get(a.id).state == FileState::committed,
                 "committed state survives abrupt exit");
+            ngx_http_cache_purge_index_expected_t expected{};
+            std::memcpy(expected.id, a.id.data(), 16);
+            expected.revision = 2;
+            ngx_http_cache_purge_watermark_t required{};
+            check(ngx_http_cache_purge_index_validation_requirement(
+                      store, &expected, &required, &error)
+                          == 0
+                      && required.sequence == 7
+                      && std::memcmp(required.ledger, id(99).data(), 16) == 0,
+                "sparse invalidation policy survives abrupt process exit");
             auto pending = index.pending_fills();
             Match m;
             check(!pending->next(m), "committed intents removed atomically");
@@ -789,6 +925,8 @@ main(int argc, char **argv)
         }
         check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
         bounded_scan(std::string(path) + "-bounded");
+        ngx_http_cache_purge_test_validation_policy(
+            std::string(path) + "-validation");
         std::cout << "PASS " << assertions << " index assertions; database "
                   << path << std::endl;
         return 0;

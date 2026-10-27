@@ -532,6 +532,57 @@ try:
     assert get('/remove-native') == (200, 'HIT', b'new-after-removal')
     assert get('/remove-native?z=b') == (200, 'HIT', b'new-after-removal')
     checks.append('physical removal of two indexed native zone instances refills fresh entities and old-instance retries preserve their replacements')
+    materialized_uri = '/invalidate/materialized/304'
+    materialized_failure = '/invalidate/materialized/failure'
+    conditional_paths.add(materialized_uri)
+    materialized_targets = [materialized_uri, materialized_uri + '?z=b', materialized_failure]
+    for target in materialized_targets: assert get(target)[1] == 'MISS'
+    materialized = records(materialized_uri, 2) + records(materialized_failure, 1)
+    materialized_contents = {str(ready_file(item)): ready_file(item).read_bytes() for item in materialized}
+    fence('background-invalidate', 3, 'http://cache.test/invalidate/materialized/', mode=1)
+    stop(process)
+    subprocess.run([str(a.libraries / 'cache_purge_files_test'),
+                    '--activate-background', str(run / 'index'), 'background-invalidate'],
+                   check=True, timeout=15, stdout=subprocess.DEVNULL)
+    process = start()
+    until(lambda: (run / 'index/component.sock').exists())
+    until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
+    def materialization_done():
+        d = Decode(rpc(15, string('background-invalidate')))
+        d.string(); d.number(1); d.number(8); d.number(1)
+        d.string(); d.string(); d.string()
+        for _ in range(5): d.number(8)
+        stage = d.number(1); d.number(4); d.number(1); d.string()
+        done = d.number(1); d.number(8); visits = d.number(8)
+        pending, failed = d.number(8), d.number(8)
+        d.number(8); d.string(); d.end()
+        return stage == 3 and done and visits == 3 and not pending and not failed
+    until(materialization_done)
+    assert all(Path(path).read_bytes() == contents for path, contents in materialized_contents.items())
+    stop(process)
+    # All workers have stopped and this fixture's three immutable instances
+    # carry the required policy. This is not automatic production retirement.
+    subprocess.run([str(a.libraries / 'cache_purge_files_test'),
+                    '--retire-invalidate-fixture', str(run / 'index'), 'background-invalidate'],
+                   check=True, timeout=15, stdout=subprocess.DEVNULL)
+    process = start()
+    until(lambda: (run / 'index/component.sock').exists())
+    until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
+    assert all(Path(path).read_bytes() == contents for path, contents in materialized_contents.items())
+    assert get('/asset')[1] == 'HIT'
+    for target in materialized_targets[:2]:
+        assert get(target) == (200, 'REVALIDATED', materialized_uri.encode())
+        assert get(target) == (200, 'HIT', materialized_uri.encode())
+    assert {item['id'] for item in records(materialized_uri, 2)} == {item['id'] for item in materialized[:2]}
+    origin_failures.add(materialized_failure)
+    result = get(materialized_failure)
+    assert result == ((500, 'EXPIRED', b'') if extension else (200, 'STALE', materialized_failure.encode())), result
+    origin_failures.remove(materialized_failure)
+    conditional_paths.add(materialized_failure)
+    assert get(materialized_failure) == (200, 'REVALIDATED', materialized_failure.encode())
+    assert get(materialized_failure) == (200, 'HIT', materialized_failure.encode())
+    checks.append('background Invalidate persists three requirements across two zones without changing files; after controlled rule retirement and restart, fresh native headers still require validation')
+    checks.append('persistent per-file Invalidate keeps strict failure handling and plain stale downgrade after all resident rules are removed')
     assert get('/background-native')[1] == 'MISS'
     assert get('/background-native?z=b')[1] == 'MISS'
     background_files = records('/background-native', 2)

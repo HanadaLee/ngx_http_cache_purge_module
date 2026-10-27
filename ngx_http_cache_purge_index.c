@@ -1091,7 +1091,7 @@ ngx_http_cache_purge_operations_init(ngx_http_cache_purge_operations_t *ops,
     ngx_http_cache_purge_op_require(
         &tx,
         ngx_http_cache_purge_op_equal(index,
-                                      ngx_http_cache_purge_op_literal("2")),
+                                      ngx_http_cache_purge_op_literal("3")),
         NGX_HTTP_CACHE_ROCKSDB_SCHEMA,
         "operation ledger requires supported file index");
     schema = ngx_http_cache_purge_op_get(
@@ -3964,7 +3964,8 @@ ngx_http_cache_purge_index_init(ngx_http_cache_rocksdb_t *store,
                 q,
                 schema.bytes.len == 1
                     && (schema.bytes.data[0] == '1'
-                        || schema.bytes.data[0] == '2'),
+                        || schema.bytes.data[0] == '2'
+                        || schema.bytes.data[0] == '3'),
                 NGX_HTTP_CACHE_ROCKSDB_SCHEMA, "unsupported file index schema"))
         {
             return ngx_http_cache_purge_index_tx_end(tx, error);
@@ -3975,11 +3976,11 @@ ngx_http_cache_purge_index_init(ngx_http_cache_rocksdb_t *store,
         ngx_http_cache_purge_index_require(
             q, ngx_http_cache_purge_index_integer(q, next) != 0,
             NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid index ID allocator");
-        if (schema.bytes.data[0] == '1') {
+        if (schema.bytes.data[0] != '3') {
             ngx_http_cache_purge_index_tx_set(
                 tx, NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
                 ngx_http_cache_purge_op_literal("M:index"),
-                ngx_http_cache_purge_op_literal("2"), 1);
+                ngx_http_cache_purge_op_literal("3"), 1);
         }
     } else if (q->status == 0) {
         for (cf = NGX_HTTP_CACHE_ROCKSDB_DEFAULT;
@@ -4005,7 +4006,7 @@ ngx_http_cache_purge_index_init(ngx_http_cache_rocksdb_t *store,
         ngx_http_cache_purge_index_tx_set(
             tx, NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
             ngx_http_cache_purge_op_literal("M:index"),
-            ngx_http_cache_purge_op_literal("2"), 1);
+            ngx_http_cache_purge_op_literal("3"), 1);
         q->lookup.len = 0;
         ngx_http_cache_purge_index_number(q, &q->lookup, 1);
         ngx_http_cache_purge_index_tx_set(
@@ -5158,6 +5159,133 @@ ngx_http_cache_purge_index_get_file(ngx_http_cache_rocksdb_t *store,
     return rc;
 }
 
+static int
+ngx_http_cache_purge_index_validation_policy(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file,
+    const ngx_http_cache_purge_watermark_t *input,
+    ngx_http_cache_purge_watermark_t *out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_index_tx_t      *tx;
+    ngx_http_cache_purge_query_t         *q;
+    ngx_http_cache_purge_index_record_t   record;
+    ngx_http_cache_purge_index_value_t    value, intent, current;
+    ngx_http_cache_purge_index_reader_t   reader;
+    ngx_http_cache_purge_watermark_t      required;
+
+    memset(out, 0, sizeof(*out));
+    if (store == NULL || file == NULL
+        || (input != NULL && (input->sequence == 0
+            || ngx_http_cache_purge_index_zero(input->ledger))))
+    {
+        return ngx_http_cache_purge_index_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid file validation policy");
+    }
+    tx = ngx_http_cache_purge_index_tx_begin(store, error);
+    if (tx == NULL) {
+        return NGX_HTTP_CACHE_ROCKSDB_LIMIT;
+    }
+    q = tx->context;
+    if (!ngx_http_cache_purge_index_load(tx, file, &record)) {
+        return ngx_http_cache_purge_index_tx_end(tx, error);
+    }
+    memset(&required, 0, sizeof(required));
+    value = ngx_http_cache_purge_index_tx_get(tx,
+        NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+        ngx_http_cache_purge_index_object_key(q, 'v', file->id));
+    if (value.exists) {
+        if (!ngx_http_cache_purge_index_require(q,
+                value.bytes.len == 24,
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                "invalid file validation policy length"))
+        {
+            return ngx_http_cache_purge_index_tx_end(tx, error);
+        }
+        memcpy(required.ledger, value.bytes.data, 16);
+        reader.query = q;
+        reader.data = value.bytes;
+        reader.at = 16;
+        required.sequence = ngx_http_cache_purge_index_read_number(&reader, 8);
+        ngx_http_cache_purge_index_require(q,
+            required.sequence != 0
+                && !ngx_http_cache_purge_index_zero(required.ledger),
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid file validation boundary");
+    }
+    if (input != NULL && q->status == 0) {
+        intent = ngx_http_cache_purge_index_tx_get(tx,
+            NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+            ngx_http_cache_purge_index_path_key(q, 'I', &record));
+        current = ngx_http_cache_purge_index_tx_get(tx,
+            NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+            ngx_http_cache_purge_index_path_key(q, 'P', &record));
+        if (!ngx_http_cache_purge_index_require(q, record.state == 2,
+                NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+                "validation policy requires a committed file")
+            || !ngx_http_cache_purge_index_require(q, !intent.exists,
+                NGX_HTTP_CACHE_ROCKSDB_BUSY,
+                "validation policy awaits path publication")
+            || !ngx_http_cache_purge_index_require(q,
+                ngx_http_cache_purge_index_path_matches(q, current, file->id),
+                NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+                "validation policy target is no longer current")
+            || !ngx_http_cache_purge_index_require(q,
+                !value.exists
+                    || memcmp(required.ledger, input->ledger, 16) == 0,
+                NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+                "validation policy ledger changed"))
+        {
+            return ngx_http_cache_purge_index_tx_end(tx, error);
+        }
+        if (input->sequence > required.sequence) {
+            required = *input;
+            q->lookup.len = 0;
+            ngx_http_cache_purge_index_append(q, &q->lookup,
+                                              required.ledger, 16);
+            ngx_http_cache_purge_index_number(q, &q->lookup, required.sequence);
+            ngx_http_cache_purge_index_tx_set(tx,
+                NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+                ngx_http_cache_purge_index_object_key(q, 'v', file->id),
+                ngx_http_cache_purge_index_bytes(&q->lookup), 1);
+        }
+        ngx_http_cache_purge_index_tx_commit(tx);
+    }
+    if (q->status == 0) {
+        *out = required;
+    }
+    return ngx_http_cache_purge_index_tx_end(tx, error);
+}
+
+int
+ngx_http_cache_purge_index_require_validation(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file,
+    const ngx_http_cache_purge_watermark_t *required,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_watermark_t  out;
+
+    if (required == NULL) {
+        return ngx_http_cache_purge_index_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "missing validation requirement");
+    }
+    return ngx_http_cache_purge_index_validation_policy(store, file, required,
+                                                        &out, error);
+}
+
+int
+ngx_http_cache_purge_index_validation_requirement(
+    ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file,
+    ngx_http_cache_purge_watermark_t *required,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    if (required == NULL) {
+        return ngx_http_cache_purge_index_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "missing validation output");
+    }
+    return ngx_http_cache_purge_index_validation_policy(store, file, NULL,
+                                                        required, error);
+}
+
 int
 ngx_http_cache_purge_index_current(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_bytes_t root, ngx_http_cache_rocksdb_bytes_t path,
@@ -5652,6 +5780,10 @@ ngx_http_cache_purge_index_collect_one(ngx_http_cache_purge_index_tx_t *tx,
     ngx_http_cache_purge_index_tx_set(
         tx, NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
         ngx_http_cache_purge_index_object_key(q, 'g', file->id),
+        ngx_http_cache_purge_op_empty, 0);
+    ngx_http_cache_purge_index_tx_set(
+        tx, NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+        ngx_http_cache_purge_index_object_key(q, 'v', file->id),
         ngx_http_cache_purge_op_empty, 0);
     for (i = 0; i < 6 && q->status == 0; i++) {
         ngx_http_cache_purge_index_dict_drop(tx, record.refs[refs[i]]);

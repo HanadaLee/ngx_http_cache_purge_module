@@ -106,7 +106,7 @@ Reload preserves old-worker registrations; only proven-dead processes are
 reclaimed. The executor can query pre-operation writer registrations through
 bounded IPC. A zero count alone does not permit FENCE removal: queued IPC,
 unfinished durable transactions and physical processing still need closure.
-This changes the internal shared-control ABI to 3; nginx-ext ABI remains 2.
+This changes the internal shared-control ABI to 3; nginx-ext ABI remains 1.
 
 Native file responses use `ADMIT_FILE` to verify the selected descriptor, bind
 the captured key, and persist the observed URL association. Repeated observations
@@ -167,8 +167,17 @@ The shared node bit does not replace persistent operation ordering: an older
 Without the macro, native configured stale fallback remains available.
 
 File admission supports this behavior for current URL/key/prefix/host selectors,
-TAGs and persisted URL aliases. Background Invalidate materialization, unobserved
-alias handling and full writer/migration coverage remain unfinished. Memory-only
+TAGs and persisted URL aliases. Background Invalidate now writes a sparse
+per-instance validation requirement to RocksDB, without rewriting cache files.
+The existing worker executor resumes the bounded scan from durable checkpoints.
+Admission checks that requirement even when no resident rule remains; successful
+conditional validation satisfies it without replacing the entity. Requirements
+are monotonic within one ledger and are collected with their retired file.
+Index schema 3 upgrades schemas 1/2 in place without rebuilding file relations;
+older readers reject it instead of ignoring these requirements.
+
+Automatic FENCE retirement, unobserved alias handling and full writer/migration
+coverage remain unfinished. Memory-only
 errors do not receive a separate TAG/alias index. Operation receipts
 remain PREPARING; these partial consumers do not expose reliable public 202
 acceptance or completed immediate purge semantics yet.

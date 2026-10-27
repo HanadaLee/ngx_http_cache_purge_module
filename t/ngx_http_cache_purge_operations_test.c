@@ -534,7 +534,7 @@ main(int argc, char **argv)
     ngx_http_cache_purge_test_check(mkdtemp(path) != NULL, "test directory");
     store = ngx_http_cache_purge_test_open(path);
     /* Only the ledger is tested here; the file index has its own suite. */
-    ngx_http_cache_purge_test_write(store, "M:index", (unsigned char *) "2", 1);
+    ngx_http_cache_purge_test_write(store, "M:index", (unsigned char *) "3", 1);
     ngx_http_cache_purge_test_check(
         ngx_http_cache_purge_operations_init(&ops, store, NULL,
                                              &ngx_http_cache_purge_test_error)

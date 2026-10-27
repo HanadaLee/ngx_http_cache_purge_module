@@ -1873,7 +1873,7 @@ ngx_http_cache_purge_component_checkpoint(ngx_http_cache_purge_component_t *c,
 
     if (op->checkpoint_id == UINT64_MAX) {
         return ngx_http_cache_purge_component_error(error,
-            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "Delete checkpoint counter overflow");
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "purge checkpoint counter overflow");
     }
     memset(&e, 0, sizeof(e));
     memset(&point, 0, sizeof(point));
@@ -1907,7 +1907,7 @@ ngx_http_cache_purge_component_checkpoint(ngx_http_cache_purge_component_t *c,
 }
 
 static int
-ngx_http_cache_purge_component_delete(ngx_http_cache_purge_component_t *c,
+ngx_http_cache_purge_component_process_file(ngx_http_cache_purge_component_t *c,
     const ngx_http_cache_purge_operation_t *op, uint64_t now,
     ngx_http_cache_rocksdb_error_t *error)
 {
@@ -1916,7 +1916,7 @@ ngx_http_cache_purge_component_delete(ngx_http_cache_purge_component_t *c,
     ngx_http_cache_purge_index_expected_t     expected;
     ngx_http_cache_purge_index_match_t        match;
     ngx_http_cache_purge_index_file_t         file;
-    ngx_http_cache_purge_watermark_t          origin;
+    ngx_http_cache_purge_watermark_t          origin, validated, required;
     ngx_http_cache_rocksdb_bytes_t            cursor, address;
     ngx_http_cache_rocksdb_error_t            failure;
     unsigned char                             digest[16], *path;
@@ -1937,7 +1937,7 @@ ngx_http_cache_purge_component_delete(ngx_http_cache_purge_component_t *c,
             || memcmp(op->bookmark.data, "NDW1", 4) != 0)
         {
             return ngx_http_cache_purge_component_error(error,
-                NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "unknown Delete checkpoint");
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "unknown purge checkpoint");
         }
         d.data = op->bookmark.data;
         d.len = op->bookmark.len;
@@ -1953,11 +1953,11 @@ ngx_http_cache_purge_component_delete(ngx_http_cache_purge_component_t *c,
             || (!pending && expected.revision != 0))
         {
             return ngx_http_cache_purge_component_error(error,
-                NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid Delete checkpoint");
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid purge checkpoint");
         }
     } else if (op->pending || op->failed || op->checkpoint_id) {
         return ngx_http_cache_purge_component_error(error,
-            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "missing Delete checkpoint");
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "missing purge checkpoint");
     }
 
     if (!pending) {
@@ -1998,25 +1998,39 @@ ngx_http_cache_purge_component_delete(ngx_http_cache_purge_component_t *c,
     }
     if (file.revision < expected.revision) {
         rc = ngx_http_cache_purge_component_error(error,
-            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "Delete file revision regressed");
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "purge file revision regressed");
         goto done;
     }
     expected.revision = file.revision;
     if (file.state == NGX_HTTP_CACHE_PURGE_INDEX_PREPARED) {
         rc = ngx_http_cache_purge_component_error(error,
-            NGX_HTTP_CACHE_ROCKSDB_BUSY, "Delete awaits file publication");
+            NGX_HTTP_CACHE_ROCKSDB_BUSY, "purge awaits file publication");
         goto done;
     }
-    rc = ngx_http_cache_purge_publication_watermark(file.metadata,
-                                                      &origin, error);
+    if (op->input.mode == NGX_HTTP_CACHE_PURGE_INVALIDATE
+        && file.state == NGX_HTTP_CACHE_PURGE_INDEX_RETIRED)
+    {
+        goto done;
+    }
+    rc = ngx_http_cache_purge_publication_watermarks(file.metadata,
+        &origin, &validated, error);
+    if (op->input.mode == NGX_HTTP_CACHE_PURGE_INVALIDATE) {
+        origin = validated;
+    }
     if (rc == 0 && memcmp(origin.ledger, c->operations.ledger, 16) == 0
         && origin.sequence >= op->sequence)
     {
-        /* Conditional coverage never satisfies Delete. Only a full entity
-         * fetched after this operation can survive its background scan. */
+        /* Conditional coverage satisfies Invalidate, never Delete. */
         goto done;
     }
     if (rc != 0 && rc != NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) {
+        goto done;
+    }
+    if (op->input.mode == NGX_HTTP_CACHE_PURGE_INVALIDATE) {
+        memcpy(required.ledger, c->operations.ledger, 16);
+        required.sequence = op->sequence;
+        rc = ngx_http_cache_purge_index_require_validation(
+            c->operations.store, &expected, &required, error);
         goto done;
     }
     address.len = file.root.len + 1 + file.path.len;
@@ -2101,8 +2115,8 @@ ngx_http_cache_purge_component_work(ngx_http_cache_purge_component_t *c,
         memcpy(c->work_after, page.after, page.after_len);
         c->work_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC);
         op = &page.items[0];
-        if (op->input.mode == NGX_HTTP_CACHE_PURGE_DELETE && !op->scan_done) {
-            rc = ngx_http_cache_purge_component_delete(c, op, now, error);
+        if (!op->scan_done) {
+            rc = ngx_http_cache_purge_component_process_file(c, op, now, error);
         } else if (page.done) {
             c->work_at += 1000;
         }
@@ -4869,7 +4883,7 @@ ngx_http_cache_purge_component_record_guard(
 {
     ngx_http_cache_purge_validation_context_t  v;
     ngx_http_cache_purge_index_expected_t      expected;
-    ngx_http_cache_purge_watermark_t           watermark, validated;
+    ngx_http_cache_purge_watermark_t           watermark, validated, required;
     int                                        rc;
 
     if (invalidate != NULL) {
@@ -4884,10 +4898,25 @@ ngx_http_cache_purge_component_record_guard(
             error, NGX_HTTP_CACHE_ROCKSDB_BUSY,
             "validation awaits control publication");
     }
-    if (c->count == 0) {
+    memcpy(expected.id, file->id, 16);
+    expected.revision = file->revision;
+    rc = ngx_http_cache_purge_index_validation_requirement(c->operations.store,
+        &expected, &required, error);
+    if (rc != 0) {
+        return rc;
+    }
+    if (required.sequence != 0
+        && (memcmp(required.ledger, c->operations.ledger, 16) != 0
+            || required.sequence > c->expected.last_sequence))
+    {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "file validation requirement is outside the operation ledger");
+    }
+    if (c->count == 0 && required.sequence == 0) {
         return 0;
     }
-    if (c->validation_reader == NULL) {
+    if (c->count != 0 && c->validation_reader == NULL) {
         rc = ngx_http_cache_purge_control_reader_open(c->shared,
             c->shared_bytes, &c->validation_reader, error);
         if (rc != 0) {
@@ -4922,13 +4951,25 @@ ngx_http_cache_purge_component_record_guard(
     {
         v.validated = validation->sequence;
     }
+    if (required.sequence > v.validated) {
+        if (invalidate == NULL) {
+            return ngx_http_cache_purge_control_error(error,
+                NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+                "file still requires origin validation");
+        }
+        v.required = required.sequence;
+    }
+    if (c->count == 0) {
+        if (invalidate != NULL) {
+            *invalidate = v.required;
+        }
+        return 0;
+    }
     v.context.key = file->key;
     v.context.host = file->host;
     v.context.tag_namespace = file->tag_namespace;
     v.context.tags = file->tags;
     v.context.tag_count = file->tag_count;
-    memcpy(expected.id, file->id, 16);
-    expected.revision = file->revision;
 
     /* Each match unpins its image before the next database read. Acceptance
      * and metadata updates share this executor, so none can interleave here. */

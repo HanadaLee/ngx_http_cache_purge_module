@@ -564,7 +564,8 @@ validation(
 }
 
 static int
-activate_background(const std::string &path, const std::string &name)
+activate_background(
+    const std::string &path, const std::string &name, bool materialize = false)
 {
     ngx_http_cache_rocksdb_options_t options;
     ngx_http_cache_rocksdb_options(&options);
@@ -579,16 +580,78 @@ activate_background(const std::string &path, const std::string &name)
               == 0,
         "offline activation ledger");
     ngx_http_cache_purge_operation_t accepted{}, active{};
+    struct Cleanup {
+        ngx_http_cache_rocksdb_t **store;
+        ngx_http_cache_purge_operation_t *accepted, *active;
+        ~Cleanup()
+        {
+            ngx_http_cache_purge_operation_free(accepted);
+            ngx_http_cache_purge_operation_free(active);
+            if (*store != nullptr) {
+                ngx_http_cache_rocksdb_close(store, nullptr);
+            }
+        }
+    } cleanup{ &store, &accepted, &active };
     check(ngx_http_cache_purge_operations_get(
               &operations, bytes(name), &accepted, &error)
-                  == 0
-              && accepted.input.mode == NGX_HTTP_CACHE_PURGE_DELETE,
-        "offline activation requires an existing Delete");
-    check(ngx_http_cache_purge_operations_activate(&operations, bytes(name),
-              accepted.revision,
-              static_cast<uint64_t>(std::time(nullptr)) * 1000, &active, &error)
               == 0,
-        "offline activation for background integration only");
+        "offline fixture requires an existing operation");
+    if (materialize) {
+        check(accepted.input.mode == NGX_HTTP_CACHE_PURGE_INVALIDATE
+                  && accepted.scan_done && !accepted.pending
+                  && !accepted.failed,
+            "offline retirement requires completed Invalidate enumeration");
+        Index index(store);
+        auto text = [](ngx_http_cache_rocksdb_bytes_t value) {
+            return value.len ?
+                       std::string(reinterpret_cast<const char *>(value.data),
+                           value.len) :
+                       std::string();
+        };
+        Selector selector{ static_cast<SelectorKind>(
+                               accepted.input.selector.kind),
+            text(accepted.input.selector.value),
+            text(accepted.input.selector.scope) };
+        auto query = index.query(selector);
+        Match match;
+        unsigned count = 0;
+        while (query->next(match)) {
+            ngx_http_cache_purge_index_expected_t expected{};
+            std::memcpy(expected.id, match.id.data(), 16);
+            expected.revision = match.revision;
+            ngx_http_cache_purge_watermark_t required{};
+            check(
+                ngx_http_cache_purge_index_validation_requirement(
+                    store, &expected, &required, &error)
+                        == 0
+                    && required.sequence >= accepted.sequence
+                    && std::memcmp(required.ledger, operations.ledger, 16) == 0,
+                "fixture files have durable Invalidate requirements");
+            check(++count <= 16, "bounded offline retirement fixture");
+        }
+        query.reset();
+        check(count != 0, "offline fixture has materialized files");
+        /* All native workers are stopped by the test. This does not implement
+         * production retirement, late membership or native node cleanup. */
+        check(ngx_http_cache_purge_operations_materialize(&operations,
+                  bytes(name), accepted.revision, accepted.sequence, &active,
+                  &error)
+                  == 0,
+            "offline controlled retirement fixture");
+        size_t expired;
+        check(ngx_http_cache_purge_operations_expire(&operations,
+                  accepted.propagation_until_ms + 1, 32, &expired, &error)
+                      == 0
+                  && expired != 0,
+            "offline fixture removes the remaining propagation record");
+    } else {
+        check(ngx_http_cache_purge_operations_activate(&operations, bytes(name),
+                  accepted.revision,
+                  static_cast<uint64_t>(std::time(nullptr)) * 1000, &active,
+                  &error)
+                  == 0,
+            "offline activation for background integration only");
+    }
     ngx_http_cache_purge_operation_free(&accepted);
     ngx_http_cache_purge_operation_free(&active);
     check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
@@ -836,6 +899,10 @@ main(int argc, char **argv)
     try {
         if (argc == 4 && std::string(argv[1]) == "--activate-background") {
             return activate_background(argv[2], argv[3]);
+        }
+        if (argc == 4 && std::string(argv[1]) == "--retire-invalidate-fixture")
+        {
+            return activate_background(argv[2], argv[3], true);
         }
         if (argc == 3 && std::string(argv[1]).find("--background-") == 0) {
             return background_delete(argv[1], argv[2]);
