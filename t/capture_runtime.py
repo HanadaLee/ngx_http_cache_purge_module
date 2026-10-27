@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real upstream cache fills through the key module, worker IPC and RocksDB."""
 import argparse
+import array
 import concurrent.futures
 import hashlib
 import http.client
@@ -299,19 +300,45 @@ class Decode:
     def number(self, n): return int.from_bytes(self.take(n), 'big')
     def string(self): return self.take(self.number(4))
     def end(self): assert self.at == len(self.data)
-def rpc(op, payload=b''):
+def rpc(op, payload=b'', fds=(), receive_fd=False):
     with socket.socket(socket.AF_UNIX) as s:
         s.settimeout(8); s.connect(str(run / 'index/component.sock'))
-        s.sendall(struct.pack('>4sHHQII', b'NCP1', 1, op, 1, len(payload), 0) + payload)
+        packet = struct.pack('>4sHHQII', b'NCP1', 1, op, 1, len(payload), 0) + payload
+        if fds:
+            assert s.sendmsg([packet[:1]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', fds))]) == 1
+            s.sendall(packet[1:])
+        else:
+            s.sendall(packet)
         def read(n):
             value = b''
             while len(value) < n:
                 part = s.recv(n - len(value)); assert part; value += part
             return value
-        magic, version, operation, ident, length, result = struct.unpack('>4sHHQII', read(24))
-        body = read(length)
-        assert (magic, version, operation, ident, result) == (b'NCP1', 1, op, 1, 0), (result, body)
-        return body
+        received = array.array('i')
+        try:
+            first = b''
+            if receive_fd:
+                first, control, flags, _ = s.recvmsg(1, socket.CMSG_SPACE(8), socket.MSG_CMSG_CLOEXEC)
+                for level, kind, data in control:
+                    assert (level, kind) == (socket.SOL_SOCKET, socket.SCM_RIGHTS)
+                    received.frombytes(data)
+                assert len(received) == 1 and not flags & socket.MSG_CTRUNC
+            magic, version, operation, ident, length, result = struct.unpack('>4sHHQII', first + read(24 - len(first)))
+            body = read(length)
+            assert (magic, version, operation, ident, result) == (b'NCP1', 1, op, 1, 0), (result, body)
+            return (body, received.pop()) if receive_fd else body
+        finally:
+            for fd in received: os.close(fd)
+
+def physical_remove(item, outcome=1):
+    path = Path(os.fsdecode(item['root'])) / os.fsdecode(item['path'])
+    _, lease = rpc(17, string(str(path)), receive_fd=True)
+    try:
+        removed = rpc(24, item['id'] + struct.pack('>Q', item['revision']), (lease,))
+        assert len(removed) == 29 and removed[:4] == struct.pack('>I', outcome)
+        assert removed[4:20] == item['id'] and removed[-1] == 3
+    finally:
+        os.close(lease)
 def query(value, kind=1, scope=''):
     d = Decode(rpc(8, bytes([kind]) + string(value) + string(scope) + string('') + bytes([32])))
     count, done = d.number(1), d.number(1); d.string()
@@ -388,6 +415,22 @@ try:
     assert get('/asset', {'Range': 'bytes=1-3'}) == (206, 'HIT', b'ass')
     assert get('/asset', {'If-None-Match': '"capture-v1"'}) == (304, 'HIT', b'')
     checks.append('deferred descriptor inspection preserves native HEAD, Range and client conditional output filters')
+    assert get('/remove-native')[1] == 'MISS'
+    assert get('/remove-native?z=b')[1] == 'MISS'
+    removed_instances = records('/remove-native', 2)
+    removed_paths = [ready_file(item) for item in removed_instances]
+    for item in removed_instances: physical_remove(item)
+    assert all(not path.exists() for path in removed_paths)
+    assert query('http://cache.test/remove-native') == []
+    fresh_bodies['/remove-native'] = b'new-after-removal'
+    assert get('/remove-native') == (200, 'MISS', b'new-after-removal')
+    assert get('/remove-native?z=b') == (200, 'MISS', b'new-after-removal')
+    replacements = records('/remove-native', 2)
+    for item in removed_instances: physical_remove(record(item['id']), outcome=3)
+    assert {item['id'] for item in records('/remove-native', 2)} == {item['id'] for item in replacements}
+    assert get('/remove-native') == (200, 'HIT', b'new-after-removal')
+    assert get('/remove-native?z=b') == (200, 'HIT', b'new-after-removal')
+    checks.append('physical removal of two indexed native zone instances refills fresh entities and old-instance retries preserve their replacements')
     assert get('/unmarked')[1] == 'MISS'
     unmarked = records('/unmarked', 1)[0]
     os.removexattr(ready_file(unmarked), 'user.ngx_cache_purge.id')

@@ -114,6 +114,16 @@ for cut in ('basic', 'intent', 'prefix', 'torn', 'done', 'missing', 'replaced', 
     if cut == 'replaced':
         assert (root / 'cache/file').read_bytes() == b'unrelated replacement'
 
+for cut in ('basic', 'retired', 'unlinked'):
+    root = Path(tempfile.mkdtemp(prefix='cache-purge-removal-', dir='/tmp'))
+    roots.append(str(root))
+    mode = '--remove-basic' if cut == 'basic' else '--remove-crash-' + cut
+    checks.append(subprocess.check_output([str(a.binary), mode, str(root)], text=True, timeout=30).strip())
+    unrelated = root / 'cache/a/00/unrelated'; unrelated.write_bytes(b'untouched')
+    for _ in range(2):
+        checks.append(subprocess.check_output([str(a.binary), '--remove-recover', str(root)], text=True, timeout=30).strip())
+    assert unrelated.read_bytes() == b'untouched'
+
 a.output.write_text(json.dumps({'checks': checks, 'directories': roots,
     'scope': 'Real PREPARE/FINISH, xattrs, rename and durable index publication recovery; not nginx integration or power-loss testing'}, indent=2) + '\n')
 print('PASS file/index publication crash cuts and repeated recovery', flush=True)

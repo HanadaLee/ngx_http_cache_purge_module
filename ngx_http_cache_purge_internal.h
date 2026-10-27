@@ -64,7 +64,9 @@ typedef enum {
      * two FDs: lease, selected file -> verified GET-format record */
     NGX_HTTP_CACHE_PURGE_OP_VALIDATE_FILE,
     /* operation sequence u64 -> number of older active worker registrations */
-    NGX_HTTP_CACHE_PURGE_OP_GET_WRITERS
+    NGX_HTTP_CACHE_PURGE_OP_GET_WRITERS,
+  /* ID/revision, one path lease FD -> removal outcome u32 and retired match */
+    NGX_HTTP_CACHE_PURGE_OP_REMOVE_FILE
 } ngx_http_cache_purge_opcode_e;
 
 #define NGX_HTTP_CACHE_PURGE_ROOT_CACHE 1
@@ -829,6 +831,27 @@ int ngx_http_cache_purge_publications_inspect(
     ngx_http_cache_rocksdb_t *store, ngx_http_cache_rocksdb_bytes_t root,
     ngx_http_cache_rocksdb_bytes_t zone, ngx_http_cache_rocksdb_bytes_t path,
     int fd, uint32_t peer_uid, ngx_http_cache_purge_index_file_t *file,
+    ngx_http_cache_rocksdb_error_t *error);
+
+#define NGX_HTTP_CACHE_PURGE_REMOVED   1
+#define NGX_HTTP_CACHE_PURGE_MISSING   2
+#define NGX_HTTP_CACHE_PURGE_REPLACED  3
+/* Per-file I/O failure keeps the executor available for other requests. */
+#define NGX_HTTP_CACHE_PURGE_FILE_ERROR  64
+
+/* Executor-only physical removal of one exact indexed instance. Requires the
+ * exclusive OFD path lease and all cache writers to use that same lease.
+ * Retires the index before unlink, then syncs the parent directories. A changed
+ * instance is never unlinked. Retired metadata remains for task/node cleanup;
+ * the caller may collect it only after its remaining obligations are complete.
+ * A failure after retirement is recoverable by reading the current revision.
+ */
+int ngx_http_cache_purge_publications_remove(
+    ngx_http_cache_purge_publications_t *publications,
+    ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file,
+    int anchor_fd, int lease_fd, uint32_t peer_uid, uint32_t *outcome,
+    ngx_http_cache_purge_index_match_t *out,
     ngx_http_cache_rocksdb_error_t *error);
 
 typedef struct {

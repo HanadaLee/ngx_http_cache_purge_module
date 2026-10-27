@@ -38,6 +38,14 @@ Verified renamed files become READY; abandoned preparations are retired without
 deleting unrelated files. Changed identities and inaccessible roots remain
 pending. Recovery and response admission have independent responsibilities.
 
+The executor can physically remove one indexed file under its exclusive path
+lease. It durably retires the record before unlinking, checks the instance marker
+and inode, and synchronizes parent directories. Retries distinguish removed,
+missing and replaced files; a replacement is preserved. Per-file I/O failures
+remain retryable without stopping the database owner. Retired records remain for
+subsequent task and native-node cleanup. Background task integration, native cache
+accounting and FENCE retirement are still pending; this is not a public Delete API.
+
 The filesystem backend also supports bounded in-place validation transactions.
 It atomically reserves the existing path intent with TAG and metadata changes,
 writes and fsyncs only a supplied header prefix, then publishes the new physical

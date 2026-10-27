@@ -762,6 +762,24 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
     rc = 0;
 
     switch (p->request.opcode) {
+    case NGX_HTTP_CACHE_PURGE_OP_REMOVE_FILE:
+        ngx_http_cache_purge_component_id(&d, expected[0].id);
+        expected[0].revision = ngx_http_cache_purge_component_integer(&d, 8);
+        if ((rc = ngx_http_cache_purge_component_end(&d)) != 0) {
+            break;
+        }
+        rc = ngx_http_cache_purge_component_anchor(c, error);
+        if (rc == 0) {
+            rc = ngx_http_cache_purge_publications_remove(c->publications,
+                store, &expected[0], c->lease_anchor, p->input_rights[0],
+                p->uid, &state, &matches[0], error);
+        }
+        if (rc == 0) {
+            ngx_http_cache_purge_component_put_integer(e, state, 4);
+            ngx_http_cache_purge_component_put_match(e, &matches[0]);
+        }
+        break;
+
     case NGX_HTTP_CACHE_PURGE_OP_GET_WRITERS:
         now = ngx_http_cache_purge_component_integer(&d, 8);
         if ((rc = ngx_http_cache_purge_component_end(&d)) != 0) {
@@ -1602,6 +1620,7 @@ ngx_http_cache_purge_component_read(ngx_http_cache_purge_component_t *c,
             p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_VALIDATE_FILE ? 2 :
             p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_PREPARE_FILE ? 2 :
             p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_FINISH_FILE  ? 1 :
+            p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_REMOVE_FILE  ? 1 :
             p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_INSPECT_FILE ? 1 :
                                                                         0;
         if (p->rights_count != expected) {

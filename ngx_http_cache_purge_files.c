@@ -2063,6 +2063,254 @@ invalid:
                                        "malformed validation plan");
 }
 
+int
+ngx_http_cache_purge_publications_remove(ngx_http_cache_purge_publications_t *p,
+    ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *expected,
+    int anchor, int lease, uint32_t uid, uint32_t *outcome,
+    ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_publication_root_t   *root;
+    ngx_http_cache_purge_publication_proof_t   proof;
+    ngx_http_cache_purge_validation_plan_t     plan;
+    ngx_http_cache_purge_index_file_t          file;
+    ngx_http_cache_purge_index_match_t         retired;
+    ngx_http_cache_purge_file_marker_t         marker;
+    ngx_http_cache_rocksdb_bytes_t             address, relative, base;
+    struct stat                                st, named;
+    unsigned char                              identity[16];
+    char                                      *leaf;
+    uint64_t                                   offset;
+    size_t                                     slash;
+    uint32_t                                   result;
+    int                                        rc, owned, parent, fd, current;
+    int                                        filesystem;
+
+    ngx_http_cache_purge_result(error, 0, "");
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (outcome != NULL) {
+        *outcome = 0;
+    }
+    if (store == NULL || expected == NULL || out == NULL || outcome == NULL
+        || expected->revision == 0 || ngx_http_cache_purge_zero(expected->id))
+    {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid cache removal request");
+    }
+    rc = ngx_http_cache_purge_publication_owner(p, error);
+    if (rc != 0) {
+        return rc;
+    }
+    rc = ngx_http_cache_purge_index_get_file(store, expected->id, &file, error);
+    if (rc != 0) {
+        return rc;
+    }
+    memset(&address, 0, sizeof(address));
+    parent = -1;
+    fd = -1;
+    current = -1;
+    leaf = NULL;
+    filesystem = 0;
+    result = NGX_HTTP_CACHE_PURGE_MISSING;
+    if (file.revision != expected->revision) {
+        rc = ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "cache removal revision changed");
+        goto done;
+    }
+    rc = ngx_http_cache_purge_index_has_intent(store, file.id, &owned, error);
+    if (rc != 0) {
+        goto done;
+    }
+    if (file.state == NGX_HTTP_CACHE_PURGE_INDEX_PREPARED || owned) {
+        rc = ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_BUSY, "cache publication must finish first");
+        goto done;
+    }
+    base = file.metadata;
+    if (base.len >= 4 && memcmp(base.data, "NFV1", 4) == 0) {
+        rc = ngx_http_cache_purge_validation_plan(base, &plan, error);
+        if (rc != 0) {
+            goto done;
+        }
+        base = plan.base;
+    }
+    rc = ngx_http_cache_purge_publication_proof(base, &proof, error);
+    if (rc != 0) {
+        goto done;
+    }
+    root = ngx_http_cache_purge_publication_find(p, file.root, file.zone, 1);
+    if (root == NULL) {
+        rc = ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "unregistered removal root/zone");
+        goto done;
+    }
+    filesystem = 1;
+    rc = ngx_http_cache_purge_publication_verify(root, error);
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_publication_address(root, file.path,
+                                                       &address, error);
+    }
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_file_address(address, identity, &offset,
+                                                error);
+    }
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_file_lease_adopt(anchor, lease, offset,
+                                                   error);
+    }
+    if (rc != 0) {
+        goto done;
+    }
+    slash = file.path.len;
+    while (slash && file.path.data[slash - 1] != '/') {
+        slash--;
+    }
+    leaf = malloc(file.path.len - slash + 1);
+    if (leaf == NULL) {
+        rc = ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "removal filename allocation failed");
+        goto done;
+    }
+    memcpy(leaf, file.path.data + slash, file.path.len - slash);
+    leaf[file.path.len - slash] = 0;
+    if (slash) {
+        relative.data = file.path.data;
+        relative.len = slash - 1;
+        rc = ngx_http_cache_purge_publication_beneath(root->fd, relative,
+                                                       1, 0, &parent, error);
+    } else {
+        parent = fcntl(root->fd, F_DUPFD_CLOEXEC, 0);
+        if (parent < 0) {
+            rc = ngx_http_cache_purge_io(error, "duplicate removal directory");
+        }
+    }
+    if (rc != 0) {
+        goto done;
+    }
+    if (parent >= 0) {
+        if (fstat(parent, &st) != 0) {
+            rc = ngx_http_cache_purge_io(error, "inspect removal directory");
+            goto done;
+        }
+        if (!S_ISDIR(st.st_mode)) {
+            rc = ngx_http_cache_purge_result(error,
+                NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                "removal parent is not a directory");
+            goto done;
+        }
+        fd = openat(parent, leaf,
+                    O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0 && errno != ENOENT) {
+            rc = ngx_http_cache_purge_io(error, "open removal instance");
+            goto done;
+        }
+    }
+    if (fd >= 0) {
+        if (fstat(fd, &st) != 0) {
+            rc = ngx_http_cache_purge_io(error, "inspect removal instance");
+            goto done;
+        }
+        if (!S_ISREG(st.st_mode) || st.st_uid != uid || st.st_nlink != 1) {
+            rc = ngx_http_cache_purge_result(error,
+                NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                "removal file type/owner/link mismatch");
+            goto done;
+        }
+        result = NGX_HTTP_CACHE_PURGE_REPLACED;
+        rc = ngx_http_cache_purge_file_marker_read(fd, &marker, error);
+        if (rc == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND
+            || rc == NGX_HTTP_CACHE_ROCKSDB_CORRUPT)
+        {
+            rc = ngx_http_cache_purge_result(error, 0, "");
+        } else if (rc != 0) {
+            goto done;
+        } else if (memcmp(marker.id, file.id, 16) == 0
+                   && memcmp(marker.address, identity, 16) == 0
+                   && proof.device == (uint64_t) st.st_dev
+                   && proof.inode == (uint64_t) st.st_ino)
+        {
+            if (file.state == NGX_HTTP_CACHE_PURGE_INDEX_COMMITTED
+                && marker.state != NGX_HTTP_CACHE_PURGE_FILE_READY)
+            {
+                rc = ngx_http_cache_purge_result(error,
+                    NGX_HTTP_CACHE_ROCKSDB_BUSY,
+                    "removal marker is unpublished");
+                goto done;
+            }
+            result = NGX_HTTP_CACHE_PURGE_REMOVED;
+        }
+    }
+    filesystem = 0;
+    rc = ngx_http_cache_purge_publication_apply(store,
+        NGX_HTTP_CACHE_PURGE_INDEX_RETIRE, file.id, file.revision,
+        &retired, error);
+    if (rc != 0) {
+        goto done;
+    }
+    filesystem = 1;
+    if (result == NGX_HTTP_CACHE_PURGE_REMOVED) {
+        /* Managed writers cannot rename while this lease is held. The native
+         * cache manager can only unlink, which is an idempotent missing result.
+         */
+        rc = ngx_http_cache_purge_publication_verify(root, error);
+        if (rc == 0) {
+            rc = ngx_http_cache_purge_publication_beneath(root->fd, file.path,
+                1, 0, &current, error);
+        }
+        if (rc != 0) {
+            goto done;
+        }
+        if (current < 0) {
+            result = NGX_HTTP_CACHE_PURGE_MISSING;
+        } else {
+            if (fstat(current, &named) != 0) {
+                rc = ngx_http_cache_purge_io(error,
+                                               "recheck removal instance");
+                goto done;
+            }
+            if (named.st_dev != st.st_dev || named.st_ino != st.st_ino) {
+                result = NGX_HTTP_CACHE_PURGE_REPLACED;
+            } else if (unlinkat(parent, leaf, 0) != 0) {
+                if (errno != ENOENT) {
+                    rc = ngx_http_cache_purge_io(error,
+                                                   "unlink cache instance");
+                    goto done;
+                }
+                result = NGX_HTTP_CACHE_PURGE_MISSING;
+            }
+        }
+    }
+    rc = ngx_http_cache_purge_publication_sync_parents(root, file.path, error);
+    if (rc == 0) {
+        *out = retired;
+        *outcome = result;
+    }
+
+done:
+    if (filesystem && rc == NGX_HTTP_CACHE_ROCKSDB_IO) {
+        rc = NGX_HTTP_CACHE_PURGE_FILE_ERROR;
+        if (error != NULL) {
+            error->code = rc;
+        }
+    }
+    if (current >= 0) {
+        close(current);
+    }
+    if (fd >= 0) {
+        close(fd);
+    }
+    if (parent >= 0) {
+        close(parent);
+    }
+    free(leaf);
+    free((void *) address.data);
+    ngx_http_cache_purge_index_file_free(&file);
+    return rc;
+}
+
 static int
 ngx_http_cache_purge_validation_compare(const void *left, const void *right)
 {

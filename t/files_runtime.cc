@@ -284,8 +284,69 @@ static int validation(const std::string &mode, const std::string &path) {
     return 0;
 }
 
+static int removal(const std::string &mode, const std::string &path) {
+    std::filesystem::create_directories(path + "/cache/a/00");
+    std::filesystem::create_directories(path + "/db");
+    int lock_fd, lease_fd;
+    check(ngx_http_cache_purge_file_locks_open((path + "/locks").c_str(), getuid(), 1, &lock_fd, &error) == 0,
+          "open removal lock file");
+    Descriptor anchor(lock_fd);
+    ngx_http_cache_rocksdb_options_t options; ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    check(ngx_http_cache_rocksdb_open((path + "/db").c_str(), &options, &store, &error) == 0, "open removal DB");
+    {
+        Index index(store);
+        Publications publications({{path + "/cache", "cache", NGX_HTTP_CACHE_PURGE_ROOT_CACHE}}, path + "/db");
+        File file; file.id = id(43); file.key = "remove-key"; file.url = "https://example.test/remove";
+        file.host = "example.test"; file.tag_namespace = "tenant"; file.tags = {"tag"};
+        file.root = path + "/cache"; file.zone = "cache"; file.path = "a/00/file";
+        auto target = file.root + '/' + file.path;
+        unsigned char address[16]; uint64_t offset;
+        check(ngx_http_cache_purge_file_address(bytes(target), address, &offset, &error) == 0, "removal address");
+        check(ngx_http_cache_purge_file_lease_acquire((path + "/locks").c_str(), anchor.fd, offset, &lease_fd, &error) == 0,
+              "hold removal lease");
+        Descriptor lease(lease_fd);
+        if (mode != "--remove-recover") {
+            Descriptor fd(open((file.root + "/temp").c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600));
+            body(fd.fd);
+            publications.prepare(index, {file, {}}, file.root + "/temp", anchor.fd, lease.fd, fd.fd, getuid());
+            check(rename((file.root + "/temp").c_str(), target.c_str()) == 0, "rename removal fixture");
+            check(publications.finish(index, file.id, 1, anchor.fd, lease.fd, getuid()).state == FileState::committed,
+                  "publish removal fixture");
+            if (mode != "--remove-basic") {
+                check(index.retire(file.id, 2).state == FileState::retired, "persist retirement before unlink");
+                if (mode == "--remove-crash-unlinked") check(unlink(target.c_str()) == 0, "unlink before crash");
+                else check(mode == "--remove-crash-retired", "known removal crash cut");
+                std::cout << "PASS " << mode << std::endl; _exit(0);
+            }
+        }
+        auto saved = index.get(file.id);
+        ngx_http_cache_purge_index_expected_t expected{};
+        std::memcpy(expected.id, file.id.data(), 16); expected.revision = saved.revision;
+        ngx_http_cache_purge_index_match_t removed{}; uint32_t outcome = 0;
+        check(ngx_http_cache_purge_publications_remove(publications.native(), store, &expected,
+              anchor.fd, lease.fd, getuid(), &outcome, &removed, &error) == 0,
+              "remove exact instance after durable retirement");
+        check((outcome == NGX_HTTP_CACHE_PURGE_REMOVED || outcome == NGX_HTTP_CACHE_PURGE_MISSING)
+              && removed.state == NGX_HTTP_CACHE_PURGE_INDEX_RETIRED
+              && removed.revision == 3 && !std::filesystem::exists(target), "removed result and absent file");
+        check(!index.current(file.root, file.path), "removed instance has no current mapping");
+        Match pending;
+        check(index.retired_files()->next(pending) && pending.id == file.id, "retired record remains available for node/task cleanup");
+        expected.revision = removed.revision;
+        check(ngx_http_cache_purge_publications_remove(publications.native(), store, &expected,
+              anchor.fd, lease.fd, getuid(), &outcome, &removed, &error) == 0
+              && outcome == NGX_HTTP_CACHE_PURGE_MISSING && removed.revision == 3,
+              "repeated removal is idempotent and syncs absence");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0, "close removal DB");
+    std::cout << "PASS removal " << assertions << " assertions" << std::endl;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     try {
+        if (argc == 3 && std::string(argv[1]).find("--remove-") == 0) return removal(argv[1], argv[2]);
         if (argc == 3) return std::string(argv[1]).find("--validate-") == 0
                                  ? validation(argv[1], argv[2]) : publication(argv[1], argv[2]);
         char root[] = "/tmp/cache-purge-files-XXXXXX";

@@ -217,6 +217,12 @@ class Client:
         self.socket.sendall(packet[1:])
         return self.reply(21, code)
 
+    def remove_file(self, n, lease, revision=2, code=0):
+        packet = self.packet(24, identity(n) + struct.pack('>Q', revision))
+        assert self.socket.sendmsg([packet[:1]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [lease]))]) == 1
+        self.socket.sendall(packet[1:])
+        return self.reply(24, code)
+
     def validate_file(self, data, lease, selected, code=0):
         packet = self.packet(22, data)
         assert self.socket.sendmsg([packet[:1]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
@@ -935,6 +941,81 @@ try:
     assert v.finish_file(654, lease)[-1] == 2
     os.close(fd); os.close(lease)
     check(True, 'queued old or unknown PREPARE cannot resurrect retired work; a current full entity remains publishable')
+
+    target, lease, selected = make_validation_file(660, '/remove', metadata=current_origin)
+    original = v.call(2, identity(660)); contents = target.read_bytes()
+    v.remove_file(660, lease, revision=1, code=7)
+    assert v.call(2, identity(660)) == original and target.read_bytes() == contents
+    removed = v.remove_file(660, lease)
+    assert removed == struct.pack('>I', 1) + identity(660) + struct.pack('>Q', 3) + b'\x03'
+    assert not target.exists() and os.pread(selected, len(contents), 0) == contents
+    v.inspect_file((str(validation_cache), 'zone-a', 'a/00/660'), selected, code=7)
+    assert v.remove_file(660, lease, revision=3)[:4] == struct.pack('>I', 2)
+    assert v.page(1, 'https://a.test/remove')[0] == [] and v.call(2, identity(660))[0] == 3
+    os.close(lease); os.close(selected)
+    check(True, 'REMOVE_FILE retires before unlink, refuses stale revisions and retains metadata for subsequent node/task cleanup')
+
+    target, lease, selected = make_validation_file(661, '/remove-missing', metadata=current_origin)
+    target.unlink()
+    assert v.remove_file(661, lease)[:4] == struct.pack('>I', 2)
+    assert v.call(2, identity(661))[0] == 3
+    os.close(lease); os.close(selected)
+    check(True, 'an already evicted target is retired and its absent directory entry is synchronized')
+
+    target, lease, selected = make_validation_file(662, '/remove-retry', metadata=current_origin)
+    original = v.call(2, identity(662))
+    target.parent.chmod(0o500)
+    try:
+        v.remove_file(662, lease, code=64)
+        assert target.read_bytes().startswith(b'old-head') and v.call(2, identity(662))[0] == 3
+    finally:
+        target.parent.chmod(0o700)
+    assert v.remove_file(662, lease, revision=3)[:4] == struct.pack('>I', 1)
+    assert not target.exists()
+    os.close(lease); os.close(selected)
+    check(True, 'unlink failure leaves a durable retired record and a later retry completes physical removal')
+
+    target, lease, selected = make_validation_file(663, '/remove-link', metadata=current_origin)
+    saved = target.with_name('saved-663'); target.rename(saved); target.symlink_to(saved)
+    original = v.call(2, identity(663))
+    v.remove_file(663, lease, code=64)
+    assert v.call(2, identity(663)) == original and saved.read_bytes().startswith(b'old-head')
+    target.unlink(); saved.rename(target)
+    hardlink = target.with_name('hard-663'); os.link(target, hardlink)
+    v.remove_file(663, lease, code=4)
+    assert v.call(2, identity(663)) == original
+    hardlink.unlink()
+    wrong = v.lease(str(target.with_name('wrong-lease')))
+    v.remove_file(663, wrong, code=6); os.close(wrong)
+    assert target.read_bytes().startswith(b'old-head') and v.call(2, identity(663)) == original
+    assert v.remove_file(663, lease)[:4] == struct.pack('>I', 1)
+    os.close(lease); os.close(selected)
+    check(True, 'symlinks and multiple hardlinks are refused; another lease cannot bypass the held path lease')
+
+    target, lease, selected = make_validation_file(664, '/remove-replaced', metadata=current_origin)
+    os.close(selected)
+    source = validation_temp / 'new-665'; source.write_bytes(b'new replacement')
+    fd = os.open(source, os.O_RDWR | os.O_CLOEXEC)
+    payload = record(665, root=str(validation_cache), zone='zone-a', uri='/remove-replaced',
+                     path='a/00/664', metadata=current_origin)
+    v.prepare_file(payload[:-16] + identity(664) + string(str(source)), [lease, fd])
+    v.remove_file(664, lease, code=6)
+    source.rename(target); v.finish_file(665, lease); os.close(fd)
+    replacement = v.call(2, identity(665))
+    assert v.remove_file(664, lease, revision=3)[:4] == struct.pack('>I', 3)
+    assert target.read_bytes() == b'new replacement' and v.call(2, identity(665)) == replacement
+    os.close(lease)
+    check(True, 'an unfinished replacement blocks retirement and removing its old instance never unlinks the committed replacement')
+
+    target = validation_cache / 'a/00/651'
+    lease = v.lease(str(target))
+    assert v.remove_file(651, lease, revision=6)[:4] == struct.pack('>I', 1)
+    os.close(lease)
+    target = validation_cache / 'a/00/652'
+    lease = v.lease(str(target))
+    assert v.remove_file(652, lease, revision=2)[:4] == struct.pack('>I', 1)
+    os.close(lease)
+    check(True, 'physical removal accepts completed validation receipts and retired PREPARED-marker candidates')
     v.close(); validating.stop()
 finally:
     for component in processes:
