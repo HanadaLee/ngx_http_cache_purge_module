@@ -655,8 +655,10 @@ ngx_http_cache_purge_capture(ngx_http_request_t *r)
     ngx_int_t                       snapshot_result = NGX_DECLINED;
 #endif
 
-    if (conf->field[NGX_HTTP_CACHE_PURGE_FIELD_KEY] == NULL || r->cache == NULL)
-    {
+    if (conf->field[NGX_HTTP_CACHE_PURGE_FIELD_KEY] == NULL) {
+        return NGX_DECLINED;
+    }
+    if (r->cache == NULL) {
         return NGX_OK;
     }
     ctx = ngx_http_get_module_ctx(r, ngx_http_cache_purge_index_module);
@@ -904,18 +906,23 @@ ngx_http_cache_purge_capture_guard_value(ngx_http_script_engine_t *engine)
     ngx_int_t rc = ngx_http_test_predicates(engine->request, code->predicates);
     ngx_http_cache_purge_capture_t  *ctx;
     ngx_http_request_t              *r;
+    ngx_int_t                        captured;
 
     engine->ip += sizeof(*code) - sizeof(uintptr_t);
     if (rc == NGX_ERROR) {
         engine->status = NGX_HTTP_INTERNAL_SERVER_ERROR;
         return;
     }
-    if (ngx_http_cache_purge_capture(engine->request) != NGX_OK) {
+    captured = ngx_http_cache_purge_capture(engine->request);
+    if (captured != NGX_OK) {
         engine->request->upstream->cacheable = 0;
         rc = NGX_DECLINED;
         ngx_log_error(
             NGX_LOG_WARN, engine->request->connection->log, 0,
-            "cache index snapshot unavailable or over budget; skipping cache");
+            captured == NGX_DECLINED ?
+                "cache index key missing at active upstream; skipping cache" :
+                "cache index snapshot unavailable or over budget; "
+                "skipping cache");
     }
     r = engine->request;
     ctx = ngx_http_get_module_ctx(r, ngx_http_cache_purge_index_module);
@@ -1580,41 +1587,24 @@ static ngx_int_t
 ngx_http_cache_purge_read_request(ngx_http_cache_purge_capture_t *ctx)
 {
     ngx_http_cache_purge_control_reader_t  *reader;
-    ngx_http_cache_purge_control_context_t  context;
     ngx_http_cache_rocksdb_error_t          error;
-    uint64_t                                publication;
-    ngx_http_cache_purge_read_match_t       match;
     int                                     rc;
 
-    if (ngx_http_cache_purge_runtime_reader(ctx->request, &reader, &error)
+    if (!ctx->origin_valid
+        || ngx_http_cache_purge_runtime_reader(ctx->request, &reader, &error)
         != 0)
     {
         return NGX_DECLINED;
     }
-    ngx_memzero(&context, sizeof(context));
-    context.key.data = ctx->key.data;
-    context.key.len = ctx->key.len;
-    context.url.data = ctx->url.data;
-    context.url.len = ctx->url.len;
-    context.host.data = ctx->host.data;
-    context.host.len = ctx->host.len;
-    context.tag_namespace.data = ctx->namespace.data;
-    context.tag_namespace.len = ctx->namespace.len;
-    context.now_ms = (uint64_t) ngx_time() * 1000;
-    ngx_memzero(&match, sizeof(match));
-    rc = ngx_http_cache_purge_control_match(reader, &context, 64, 65536,
-        ngx_http_cache_purge_read_match, &match, &publication, &error);
-    if (rc != 0 || match.fenced || match.required || !ctx->origin_valid
-        || publication != ctx->origin_publication)
-    {
-        return NGX_DECLINED;
-    }
-    rc = ngx_http_cache_purge_control_guard_begin(reader, publication, &error);
+    rc = ngx_http_cache_purge_control_guard_begin(reader,
+                                                   ctx->origin_publication,
+                                                   &error);
     if (rc != 0) {
         return NGX_DECLINED;
     }
-    /* Cover known request selectors before native cached-error/redirect
-     * dispatch. Entity TAGs and persistent aliases require the file gate. */
+    /* All cache writers in this mode suppress memory-only errors. The file
+     * gate can therefore decide every selector against actual entity proof,
+     * preserving conditional revalidation and already-covered HITs. */
     rc = ngx_http_cache_purge_control_guard_end(reader, &error);
     return rc == 0 ? NGX_OK : NGX_DECLINED;
 }
@@ -2384,6 +2374,8 @@ ngx_http_cache_purge_capture_post(ngx_conf_t *cf)
         ngx_http_conf_get_module_main_conf(cf,
                                            ngx_http_cache_purge_index_module);
     ngx_http_cache_purge_capture_conf_t  *conf;
+    ngx_http_cache_purge_capture_main_t  *old;
+    ngx_http_core_loc_conf_t             *core;
     ngx_module_t                         *module;
     ngx_command_t                        *cmd;
     ngx_array_t                         **slot, *array;
@@ -2447,6 +2439,26 @@ ngx_http_cache_purge_capture_post(ngx_conf_t *cf)
             }
         }
     }
+    if (cf->cycle->old_cycle && cf->cycle->old_cycle->conf_ctx
+        && cf->cycle->old_cycle->conf_ctx[ngx_http_module.index])
+    {
+        old = NULL;
+        for (i = 0; cf->cycle->old_cycle->modules[i]; i++) {
+            if (cf->cycle->old_cycle->modules[i]
+                == &ngx_http_cache_purge_index_module)
+            {
+                old = ngx_http_cycle_get_module_main_conf(
+                    cf->cycle->old_cycle, ngx_http_cache_purge_index_module);
+                break;
+            }
+        }
+        if ((old ? old->enabled : 0) != main->enabled) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "enabling/disabling cache_purge_key indexing requires a full "
+                "restart to replace memory-only cache error state");
+            return NGX_ERROR;
+        }
+    }
     for (i = 0; cf->cycle->modules[i]; i++) {
         module = cf->cycle->modules[i];
         if (module->type != NGX_HTTP_MODULE || module->commands == NULL) {
@@ -2472,8 +2484,7 @@ ngx_http_cache_purge_capture_post(ngx_conf_t *cf)
             for (k = 0; k < main->locations.nelts; k++) {
                 conf =
                     locations[k][ngx_http_cache_purge_index_module.ctx_index];
-                if (conf->field[NGX_HTTP_CACHE_PURGE_FIELD_KEY] == NULL
-                    || locations[k][module->ctx_index] == NULL)
+                if (locations[k][module->ctx_index] == NULL)
                 {
                     continue;
                 }
@@ -2487,6 +2498,19 @@ ngx_http_cache_purge_capture_post(ngx_conf_t *cf)
                                                       cache_bypass));
                 if (upstream->cache <= 0) {
                     continue;
+                }
+                if (conf->field[NGX_HTTP_CACHE_PURGE_FIELD_KEY] == NULL) {
+                    core = locations[k][ngx_http_core_module.ctx_index];
+                    if (main->enabled && core->handler != NULL) {
+                        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                            "location \"%V\" has upstream caching without "
+                            "cache_purge_key; inherit or configure an index "
+                            "key, or disable its upstream cache", &core->name);
+                        return NGX_ERROR;
+                    }
+                    if (!main->enabled) {
+                        continue;
+                    }
                 }
                 if (*slot && *slot != NGX_CONF_UNSET_PTR && (*slot)->nelts) {
                     value = (*slot)->elts;

@@ -9,6 +9,7 @@ import http.server
 import io
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import socket
@@ -463,10 +464,42 @@ def watermark(item):
     return value[4:20], int.from_bytes(value[20:], 'big')
 
 checks = []
+rogue = f'''  location = /rogue-cache {{
+    proxy_pass http://127.0.0.1:{origin.server_port};
+  }}
+'''
+mixed = config.replace('  location / {', rogue + '  location / {', 1)
+for label, candidate, valid in (
+        ('mixed', mixed, False),
+        ('disabled', mixed.replace('location = /rogue-cache {', 'location = /rogue-cache { proxy_cache off;'), True),
+        ('inherited', mixed.replace('  proxy_cache $zone;',
+            '  cache_purge_key $cache_key_base; cache_purge_url $cache_key_url; proxy_cache $zone;'), True)):
+    candidate_path = run / (label + '.conf'); candidate_path.write_text(candidate)
+    tested = subprocess.run([str(build / 'objs/nginx'), '-t', '-p', str(run) + '/', '-c', str(candidate_path)],
+                            env=env, capture_output=True, text=True, timeout=15)
+    assert (tested.returncode == 0) == valid, (label, tested.stderr)
+    if not valid: assert 'has upstream caching without cache_purge_key' in tested.stderr
+checks.append('persistent indexing rejects an uncovered cache location and accepts inherited keys or explicitly disabled caching')
+legacy_config = re.sub(r'cache_purge_key\s+[^;]+;', '', config)
+(run / 'nginx.conf').write_text(legacy_config)
 process = start()
 try:
     until(lambda: (run / 'index/component.sock').exists())
     until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
+    assert get('/negative-cache') == (200, 'MISS', b'negative-old')
+    assert get('/negative-cache') == (200, 'HIT', b'negative-old')
+    assert calls.count('/negative-cache') == 1
+    (run / 'nginx.conf').write_text(config)
+    process.send_signal(signal.SIGHUP)
+    until(lambda: 'enabling/disabling cache_purge_key indexing requires a full restart' in (run / 'error.log').read_text())
+    assert get('/negative-cache') == (200, 'HIT', b'negative-old')
+    assert calls.count('/negative-cache') == 1
+    stop(process)
+    calls.clear()
+    process = start()
+    until(lambda: (run / 'index/component.sock').exists())
+    until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
+    checks.append('enabling persistent indexing by reload is rejected while legacy negative nodes exist; a full restart enters the indexed mode')
     assert get('/asset') == (200, 'MISS', b'/asset')
     first = records('/asset', 1)[0]; ready_file(first)
     ledger, sequence = watermark(first)
@@ -522,8 +555,8 @@ try:
     until(background_done)
     assert query('http://cache.test/background-native') == []
     fresh_bodies['/background-native'] = b'new-after-background'
-    assert get('/background-native') == (200, 'BYPASS', b'new-after-background')
-    assert get('/background-native?z=b') == (200, 'BYPASS', b'new-after-background')
+    assert get('/background-native') == (200, 'MISS', b'new-after-background')
+    assert get('/background-native?z=b') == (200, 'MISS', b'new-after-background')
     assert {item['id'] for item in records('/background-native', 2)}.isdisjoint(
         {item['id'] for item in background_files})
     checks.append('persisted active Delete automatically processes both native zones after restart without per-file IPC, then retains its FENCE while node cleanup is pending')
@@ -560,6 +593,28 @@ try:
     assert watermark(alias) == watermark(original_alias)
     assert get('/alias/three') == (200, 'HIT', b'prefix-fresh-alias')
     checks.append('Invalidate on another persisted URL alias supports conditional 304 without replacing the shared entity')
+    for name, kind in (('url', 1), ('key', 0), ('url-prefix/item', 3), ('key-prefix/item', 2)):
+        uri = '/invalidate/' + name
+        conditional_paths.add(uri)
+        assert get(uri) == (200, 'MISS', uri.encode())
+        variants = [uri, uri + '?z=b'] if kind == 1 else [uri]
+        if kind == 1: assert get(variants[1]) == (200, 'MISS', uri.encode())
+        original = records(uri, len(variants))
+        original_ids = {item['id'] for item in original}
+        original_origins = {item['id']: watermark(item) for item in original}
+        if kind == 0: value = original[0]['key']
+        elif kind == 2: value = original[0]['key'].rsplit(b'/', 1)[0] + b'/'
+        elif kind == 3: value = 'http://cache.test' + uri.rsplit('/', 1)[0] + '/'
+        else: value = 'http://cache.test' + uri
+        fence('direct-invalidate-' + name, kind, value, mode=1)
+        for variant in variants:
+            assert get(variant) == (200, 'REVALIDATED', uri.encode()), variant
+        after = records(uri, len(variants))
+        assert {item['id'] for item in after} == original_ids
+        assert all(watermark(item) == original_origins[item['id']] for item in after)
+        for variant in variants:
+            assert get(variant) == (200, 'HIT', uri.encode()), variant
+        checks.append('current ' + name + ' Invalidate reuses 304-validated entities and permits covered HITs while its FENCE remains')
     conditional_paths.add('/invalidate/304')
     policies['/invalidate/304'] = 'invalidate-304'
     assert get('/invalidate/304') == (200, 'MISS', b'/invalidate/304')
@@ -841,19 +896,25 @@ try:
     assert get('/fenced-url')[1] == 'MISS'; records('/fenced-url', 1)
     assert get('/fenced-url?z=b')[1] == 'MISS'; records('/fenced-url', 2)
     assert get('/fenced-url')[1] == 'HIT'
-    fence('read-url', 1, 'http://cache.test/fenced-url')
+    url_cutoff = fence('read-url', 1, 'http://cache.test/fenced-url')
     assert get('/fenced-url') == (200, 'BYPASS', b'/fenced-url')
     assert get('/fenced-url?z=b') == (200, 'BYPASS', b'/fenced-url')
+    until(lambda: all(watermark(item)[1] >= url_cutoff for item in records('/fenced-url', 2)))
+    assert get('/fenced-url')[1] == get('/fenced-url?z=b')[1] == 'HIT'
     assert get('/asset')[1] == 'HIT'
     checks.append('native read admission checks the published URL FENCE across both zones while unrelated cached files remain HITs')
     assert get('/fenced-prefix/a')[1] == 'MISS'; records('/fenced-prefix/a', 1)
-    fence('read-prefix', 3, 'http://cache.test/fenced-prefix/')
+    prefix_cutoff = fence('read-prefix', 3, 'http://cache.test/fenced-prefix/')
     assert get('/fenced-prefix/a')[1] == 'BYPASS'
+    until(lambda: watermark(records('/fenced-prefix/a', 1)[0])[1] >= prefix_cutoff)
+    assert get('/fenced-prefix/a')[1] == 'HIT'
     checks.append('native read admission applies bytewise prefix FENCEs to cached files')
     assert get('/fenced-key')[1] == 'MISS'
     fenced_key = records('/fenced-key', 1)[0]['key']
-    fence('read-key', 0, fenced_key)
+    key_cutoff = fence('read-key', 0, fenced_key)
     assert get('/fenced-key')[1] == 'BYPASS'
+    until(lambda: watermark(records('/fenced-key', 1)[0])[1] >= key_cutoff)
+    assert get('/fenced-key')[1] == 'HIT'
     checks.append('native read admission applies exact base-key FENCEs')
     policies['/fenced-tag'] = 'only-this-tag'
     assert get('/fenced-tag')[1] == 'MISS'; records('/fenced-tag', 1)
@@ -884,7 +945,7 @@ try:
     negative_outage = False
     fence('read-negative', 1, 'http://cache.test/negative-cache')
     negative_result = get('/negative-cache')
-    assert negative_result == (200, 'BYPASS', b'/negative-cache'), negative_result
+    assert negative_result == (200, 'MISS', b'/negative-cache'), negative_result
     assert calls.count('/negative-cache') == 3
     assert get('/negative-timeout') == (200, 'MISS', b'negative-old')
     assert get('/negative-timeout') == (200, 'MISS', b'negative-old')
@@ -960,9 +1021,26 @@ try:
     assert redirect_result == (200, 'BYPASS', b'redirect-new'), redirect_result
     assert calls.count('/redirect-cache') == 2
     checks.append('URL FENCE bypasses a cached X-Accel-Redirect before it selects the old target')
+    uri = '/invalidate/host'
+    conditional_paths.add(uri)
+    assert get(uri) == (200, 'MISS', uri.encode())
+    host_before = records(uri, 1)[0]
+    fence('direct-invalidate-host', 4, 'cache.test', mode=1)
+    assert get(uri) == (200, 'REVALIDATED', uri.encode())
+    host_after = records(uri, 1)[0]
+    assert host_before['id'] == host_after['id'] and watermark(host_before) == watermark(host_after)
+    assert get(uri) == (200, 'HIT', uri.encode())
+    checks.append('current host Invalidate conditionally validates without replacing the entity or repeatedly bypassing its covered file')
     fence('read-host', 4, 'cache.test')
     assert get('/asset')[1] == 'BYPASS'
     checks.append('native read admission applies host FENCEs; receipts still remain PREPARING pending complete protocol coverage')
+    marker = 'enabling/disabling cache_purge_key indexing requires a full restart'
+    rejected = (run / 'error.log').read_text().count(marker)
+    (run / 'nginx.conf').write_text(legacy_config)
+    process.send_signal(signal.SIGHUP)
+    until(lambda: (run / 'error.log').read_text().count(marker) > rejected)
+    assert get('/negative-cache') == (200, 'BYPASS', b'/negative-cache')
+    checks.append('disabling indexing by reload is rejected and the existing workers continue enforcing resident Delete FENCEs')
 finally:
     capacity_gate.set()
     validation_release.set()

@@ -92,8 +92,9 @@ Publication and automatic recovery check both the candidate and its predecessor,
 including old TAGs and watermark regression, before committing a replacement.
 Conflicting late candidates are retired without being stamped READY. This local
 watermark neither changes the cache key nor proves upstream CDN freshness.
-Known selectors still conservatively bypass before native lookup to cover
-memory-only cached errors; rule retirement remains unfinished. An origin request
+Current selectors use the file's proof for Invalidate and Delete; already-covered
+entities can HIT while their rules remain resident. Rule retirement is unfinished.
+An origin request
 started before a push may finish its response, but its old result must not become
 a reusable cache entry. Requests started after the push must avoid old entries.
 
@@ -124,14 +125,20 @@ check. A 304 request carries its own origin boundary separately from the stored
 entity's watermark. The native physical-work coordinator does not yet invoke
 materialization: these write guards do not establish complete FENCE retirement.
 
-Known request selectors are also checked before native cache lookup. This covers
-pre-existing memory-only upstream errors before `error_page` runs. Indexed
-requests no longer create these memory-only entries: transport 502/504 and
+Indexed requests do not create memory-only entries: transport 502/504 and
 intercepted errors are excluded, while ordinary disk-backed error responses keep
 their configured cache policy. Native `error_page` conditions are not evaluated
-again by the module. Existing negative nodes and unindexed writers sharing a zone
-still require migration/coverage validation; the early selector bypass remains.
-Cached
+again by the module. Enabling indexing requires every location with a content
+handler and enabled upstream cache settings to inherit or configure
+`cache_purge_key`; alternatively, disable its upstream cache. Parent contexts
+also receive a runtime guard, so a dynamically selected cache path without an
+index key cannot read or write an unindexed entry.
+
+Changing between indexed and unindexed mode requires a full nginx restart to
+replace legacy in-memory error state. Reload within indexed mode remains
+supported, with the persistent index retained. These checks allow current URL,
+key, prefix and host rules to use file admission instead of forcing every match
+through BYPASS. Cached
 `X-Accel-Redirect` responses wait for descriptor and TAG admission before selecting
 their target. The module composes the existing per-request upstream parsing and
 reinitialization callbacks, then uses native header-copy handlers and URI/named
@@ -154,10 +161,10 @@ Under `NGX_RESTY_EXT`, a forced Invalidate sets the existing PURGE reason to
 prevent stale fallback and clears only that reason after successful validation.
 Without the macro, native configured stale fallback remains available.
 
-File admission supports this behavior for TAGs and persisted URL aliases. Current
-URL/key/prefix/host matches still conservatively bypass before native lookup.
-Complete Invalidate coverage, unobserved alias handling and TAG/alias provenance
-for memory-only cached errors remain unfinished. Operation receipts
+File admission supports this behavior for current URL/key/prefix/host selectors,
+TAGs and persisted URL aliases. Background Invalidate materialization, unobserved
+alias handling and full writer/migration coverage remain unfinished. Memory-only
+errors do not receive a separate TAG/alias index. Operation receipts
 remain PREPARING; these partial consumers do not expose reliable public 202
 acceptance or completed immediate purge semantics yet.
 
