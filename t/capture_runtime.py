@@ -564,6 +564,16 @@ try:
     assert get('/asset', {'Range': 'bytes=1-3'}) == (206, 'HIT', b'ass')
     assert get('/asset', {'If-None-Match': '"capture-v1"'}) == (304, 'HIT', b'')
     checks.append('deferred descriptor inspection preserves native HEAD, Range and client conditional output filters')
+    assert get('/head-fill', method='HEAD') == (200, 'MISS', b'')
+    head_file = records('/head-fill', 1)[0]
+    assert get('/head-fill') == (200, 'HIT', b'/head-fill')
+    fresh_bodies['/head-fill'] = b'head-bypass-replacement'
+    assert get('/head-fill?bypass=1', method='HEAD') == (200, 'BYPASS', b'')
+    until(lambda: records('/head-fill', 1)[0]['id'] != head_file['id'])
+    head_reply = get('/head-fill')
+    assert head_reply == (200, 'HIT', b'head-bypass-replacement'), head_reply
+    assert calls.count('/head-fill') == 2
+    checks.append('cache-entry waits preserve HEAD-to-GET conversion on MISS and BYPASS and publish the replacement entity')
     assert get('/remove-native')[1] == 'MISS'
     assert get('/remove-native?z=b')[1] == 'MISS'
     removed_instances = records('/remove-native', 2)

@@ -396,6 +396,7 @@ typedef struct {
     ngx_temp_file_t                      *temporary;
 
     ngx_str_t                       key, url, host, namespace, root, zone, path;
+    ngx_str_t                       method;
     ngx_str_t                       components[6], tags[64];
     ngx_uint_t                      tag_count, rpc;
     ngx_uint_t                      read_state;
@@ -417,6 +418,7 @@ typedef struct {
     unsigned  read_held : 1;
     unsigned  read_ref : 1;
     unsigned  read_header_only : 1;
+    unsigned  read_bypass : 1;
     unsigned  incoming_error : 1;
     unsigned  incoming_retired : 1;
     unsigned  origin_valid : 1;
@@ -1291,6 +1293,9 @@ ngx_http_cache_purge_propagation_create(ngx_http_request_t *r)
             return NGX_ERROR;
         }
     }
+    /* Cache resumption can reinitialize u->method in nginx-ext. Preserve the
+     * native HEAD-to-GET decision made before the cache-entry wait. */
+    r->upstream->method = ctx->method;
     rc = ctx->create_request(r);
 #if (NGX_RESTY_EXT && NGX_HTTP_PROXY_FILTER)
     if (rc == NGX_OK && ngx_http_cache_purge_propagation_verify(ctx) != NGX_OK)
@@ -1554,6 +1559,7 @@ ngx_http_cache_purge_capture(ngx_http_request_t *r)
     cln->handler = ngx_http_cache_purge_capture_cleanup;
     ngx_http_set_ctx(r, ctx, ngx_http_cache_purge_index_module);
     ctx->read_upstream = r->upstream;
+    ctx->method = r->upstream->method;
     ctx->read_process_header = r->upstream->process_header;
     ctx->read_reinit = r->upstream->reinit_request;
     ctx->error_finalize = r->upstream->finalize_request;
@@ -1824,7 +1830,9 @@ ngx_http_cache_purge_capture_guard_value(ngx_http_script_engine_t *engine)
         r->upstream->cacheable = 0;
         rc = NGX_DECLINED;
     }
-    if (rc == NGX_OK) {
+    if (rc == NGX_OK
+        || (ctx && !ctx->failed && ctx->origin_valid && rc == NGX_DECLINED))
+    {
         if (ctx && ctx->read_state == NGX_HTTP_CACHE_PURGE_READ_OFF) {
             if ((!ctx->incoming_error
                  && ngx_http_cache_purge_read_request(ctx) != NGX_OK)
@@ -1833,6 +1841,8 @@ ngx_http_cache_purge_capture_guard_value(ngx_http_script_engine_t *engine)
             {
                 rc = NGX_DECLINED;
             } else {
+                ctx->read_bypass = rc == NGX_DECLINED;
+                rc = NGX_OK;
                 ctx->read_state = NGX_HTTP_CACHE_PURGE_READ_START;
                 ctx->read_event.data = ctx;
                 ctx->read_event.handler = ngx_http_cache_purge_read_event;
@@ -2820,6 +2830,7 @@ ngx_http_cache_purge_read_event(ngx_event_t *event)
     ngx_http_cache_purge_capture_t  *ctx;
     ngx_http_request_t              *r;
     ngx_http_cache_t                *c;
+    ngx_http_upstream_conf_t        *conf;
     ngx_connection_t                *connection;
     ngx_str_t                       payload, root, zone, path;
     ngx_msec_t  timeout;
@@ -2846,6 +2857,20 @@ ngx_http_cache_purge_read_event(ngx_event_t *event)
             ngx_http_finalize_request(r, NGX_HTTP_BAD_REQUEST);
             ngx_http_run_posted_requests(connection);
             return;
+        }
+        if (ctx->read_bypass) {
+            /* Resume after the gate without entering the native file lookup.
+             * Keep the original key and cacheable response-fill behavior. */
+            conf = ngx_palloc(r->pool, sizeof(*conf));
+            if (conf == NULL) {
+                ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+                ngx_http_run_posted_requests(connection);
+                return;
+            }
+            *conf = *ctx->read_upstream->conf;
+            conf->cache = 0;
+            ctx->read_upstream->conf = conf;
+            ctx->read_upstream->cache_status = NGX_HTTP_CACHE_BYPASS;
         }
         ctx->read_resume(r);
         ngx_http_run_posted_requests(connection);
