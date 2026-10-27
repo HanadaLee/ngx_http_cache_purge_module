@@ -1175,9 +1175,9 @@ try:
     assert get('/fenced-tag')[1] == 'MISS'; records('/fenced-tag', 1)
     fence('read-wrong-tag', 5, 'only-this-tag', 'other-tenant')
     assert get('/fenced-tag')[1] == 'HIT'
-    fence('read-tag', 5, 'only-this-tag', 'tenant')
+    tag_cutoff = fence('read-tag', 5, 'only-this-tag', 'tenant')
     assert get('/fenced-tag')[1] == 'BYPASS'
-    until(lambda: watermark(records('/fenced-tag', 1)[0])[1] > 0)
+    until(lambda: watermark(records('/fenced-tag', 1)[0])[1] >= tag_cutoff)
     assert get('/fenced-tag')[1] == 'HIT' and calls.count('/fenced-tag') == 2
     assert get('/asset')[1] == 'HIT'
     checks.append('native TAG admission uses persisted entity tags with namespace isolation')

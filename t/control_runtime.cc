@@ -189,7 +189,11 @@ propagation_reference(const std::vector<Operation> &ops, const Context &c,
 {
     auto result = reference(ops, c, proxy, now);
     for (auto it = result.begin(); it != result.end();) {
-        if (it->second & NGX_HTTP_CACHE_PURGE_CONTROL_PROPAGATE) {
+        if (proxy
+            && (it->second
+                & (NGX_HTTP_CACHE_PURGE_CONTROL_PROPAGATE
+                    | NGX_HTTP_CACHE_PURGE_CONTROL_PREPARING)))
+        {
             it->second = NGX_HTTP_CACHE_PURGE_CONTROL_PROPAGATE;
             ++it;
         } else {
@@ -207,7 +211,10 @@ propagation_reference(const std::vector<Operation> &ops, const Context &c,
                       || ((s.kind == SelectorKind::host_tag
                               || s.kind == SelectorKind::host_tags)
                           && s.scope == c.host);
-        if (scoped && op.propagate && now < op.propagation_until_ms) {
+        if (scoped
+            && (op.stage == OperationStage::preparing
+                || (op.propagate && now < op.propagation_until_ms)))
+        {
             result[op.sequence] = NGX_HTTP_CACHE_PURGE_CONTROL_PROPAGATE
                                   | NGX_HTTP_CACHE_PURGE_CONTROL_TAG_CANDIDATE;
         }
@@ -344,10 +351,15 @@ propagation_tests()
         check(lookup(reader, c) == reference(ops, c, true, 5000),
             "propagation candidates do not change local admission matching");
         expect(query(false, true, 302000).first, 0, "expired propagation");
-        check(query(false, true, 302000).second.empty()
+        const auto expired = query(false, true, 302000).second;
+        check(expired == propagation_reference(ops, c, false, true, 302000)
                   && !lookup(reader, c, true, 302000).empty(),
-            "window end suppresses outgoing requirements without clearing "
-            "fences");
+            "window end suppresses active propagation without clearing fences");
+        check(!expired.empty(), "published preparing fences still propagate");
+        for (const auto &match : expired) {
+            check(ops[match.first - 1].stage == OperationStage::preparing,
+                "only pending first activations remain after active windows");
+        }
         for (auto limits :
             { std::make_pair(1U, 65536U), std::make_pair(64U, 1U) })
         {

@@ -2803,7 +2803,7 @@ ngx_http_cache_purge_api_render(ngx_http_cache_purge_api_t *ctx,
             "\"index_schema\":6,\"ledger_schema\":4,"
             "\"propagation_timeout_ms\":\"%uL\","
             "\"propagation_protocols\":[],\"proxy_propagation_ready\":false,"
-            "\"proxy_header_transport\":\"unavailable\","
+            "\"proxy_header_transport\":\"%s\","
             "\"invalidate_stale_policy\":\"%s\","
             "\"limits\":{\"body_bytes\":262144,\"selector_bytes\":32768,"
             "\"tag_bytes\":1024,\"tag_set_bytes\":32768,"
@@ -2812,6 +2812,11 @@ ngx_http_cache_purge_api_render(ngx_http_cache_purge_api_t *ctx,
             "\"control_headers\":{\"tag_namespace\":",
             (size_t) 32, ledger, ready ? "true" : "false", publication,
             last, retired, live, bytes, policy,
+#if (NGX_RESTY_EXT && NGX_HTTP_PROXY_FILTER)
+            "filter",
+#else
+            "variables",
+#endif
 #if (NGX_RESTY_EXT)
             "forbid"
 #else

@@ -255,6 +255,8 @@ int ngx_http_cache_purge_control_match(
     size_t max_bytes, ngx_http_cache_purge_control_visit_pt visit, void *data,
     uint64_t *publication, ngx_http_cache_rocksdb_error_t *error);
 /* Local outgoing requirements and their ledger come from one pinned image.
+ * Published PREPARING fences also propagate before their first activation
+ * starts the local window. This does not reopen an expired active window.
  * tags_known=0 requires an empty TAG input and returns scoped TAG candidates,
  * not confirmed TAG matches. They must be resolved by the receiving cache.
  * This lookup emits only PROPAGATE, optionally with TAG_CANDIDATE; it never

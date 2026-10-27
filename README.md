@@ -495,18 +495,45 @@ it returns namespace/host-scoped TAG candidates for the receiving cache to resol
 Known empty TAGs remain distinct from missing metadata. The scope index reuses
 operation records; it does not copy cache-file metadata into shared memory.
 Output-budget exhaustion fails the lookup instead of silently truncating rules.
-This internal lookup is not yet connected to the HTTP propagation path.
+The sender now freezes a local requirement snapshot when the native proxy
+`create_request` callback runs. Early rewrite/log reads do not create it. The
+following variables read the same immutable snapshot:
+
+```nginx
+proxy_set_header X-Cache-Purge-Time  $cache_purge_propagation_time;
+proxy_set_header X-Cache-Purge-Mode  $cache_purge_propagation_mode;
+proxy_set_header X-Cache-Purge-Fence $cache_purge_propagation_fence;
+proxy_set_header X-Cache-Purge-Namespace "";
+```
+
+Without the proxy filter framework, an enabled route must provide this complete
+effective header group, using its configured names. Missing, duplicate, or
+incorrect assignments fail before upstream I/O. Native `proxy_set_header` group
+inheritance applies. With `NGX_RESTY_EXT && NGX_HTTP_PROXY_FILTER`, the module
+updates the actual outgoing list automatically, removes duplicates, and checks
+that another handler did not bypass or replace its fields. Both paths support
+HTTP/1 and HTTP/2. FastCGI, SCGI, and uWSGI do not run the sender.
+
+Native retries reuse their generated headers, including beyond the local
+window. Later new requests omit expired active requirements. Published PREPARING
+fences also propagate, closing the gap before first activation starts the clock.
+Identical snapshots within a main request are shared across slice subrequests.
+The initial inline transport limits a fence header line to 8192 bytes and bounds
+per-worker retained/construction bytes to 2 MiB, plus native request buffers and
+allocator overhead. It fails instead of truncating an oversized requirement set.
 
 The internal C codec provides bounded binary request frames. It preserves
 complete scoped TAG groups and rejects duplicate or unordered requirements.
 Local windows, nonces, and request/response digests are absent from the format.
-HTTP encoding and L2 request admission remain to be integrated; the codec alone
-does not enable propagation.
+The request codec and sender are implemented; L2 request admission remains to be
+integrated.
 
-These configuration and policy evaluation interfaces are implemented; L2 request
-header transfer and local cache decisions remain unfinished, and
-`proxy_propagation_ready` remains false. The protocol has no module-side
-authentication, signatures, key management, or response verification exchange.
+Full propagation remains unfinished: L2 ingress/cache decisions, persistent
+historical alias coverage after deletion, uncached proxy routes, and large-set
+transport still need integration. Capabilities reports the sender transport as
+`filter` or `variables`, while `proxy_propagation_ready` remains false.
+The protocol has no module-side authentication, signatures, key management,
+or response verification exchange.
 
 ```nginx
 location /__scm/cache/v2/ {
@@ -567,10 +594,13 @@ Bodies are bounded at 256 KiB. Duplicate or unknown JSON fields, duplicate scope
 headers, and malformed UTF-8/base64 are rejected. The module reserves an in-memory
 body buffer and rejects file-only request buffering for API locations.
 
-202 confirms durable acceptance and active invalidation, without waiting for
-file processing. Disconnecting does not undo an accepted operation. Reuse the
-same operation ID and semantic input after an uncertain response; changed input
-returns 409. The acceptance deadline is five seconds, and a timeout does not
+Every selector uses the same acceptance and background processing path,
+including exact URL and key operations. 202 confirms durable acceptance and
+active invalidation, without waiting for file processing. There is no separate
+synchronous file-processing API for small operations. Disconnecting does not
+undo an accepted operation. Reuse the same operation ID and semantic input
+after an uncertain response; changed input returns 409. The acceptance deadline
+is five seconds, and a timeout does not
 prove that no submission occurred. Query the status endpoint or retry that ID.
 Capabilities currently report proxy propagation as unavailable.
 

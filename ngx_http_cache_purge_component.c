@@ -5203,6 +5203,13 @@ ngx_http_cache_purge_control_emit(ngx_http_cache_purge_control_matcher_t *m,
         match.flags &= ~NGX_HTTP_CACHE_PURGE_CONTROL_PROPAGATE;
     }
     if (m->propagation) {
+        if (m->context->proxy
+            && (r->flags & NGX_HTTP_CACHE_PURGE_CONTROL_PREPARING))
+        {
+            /* Published FENCEs already constrain new origins. Propagate before
+             * first activation starts the local window. */
+            match.flags |= NGX_HTTP_CACHE_PURGE_CONTROL_PROPAGATE;
+        }
         match.flags &= NGX_HTTP_CACHE_PURGE_CONTROL_PROPAGATE;
     }
     if (!match.flags) {
