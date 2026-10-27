@@ -68,6 +68,11 @@ bytes(const std::string &s)
 {
     return { reinterpret_cast<const unsigned char *>(s.data()), s.size() };
 }
+static ngx_http_cache_rocksdb_bytes_t
+bytes(const char *s)
+{
+    return { reinterpret_cast<const unsigned char *>(s), std::strlen(s) };
+}
 static void
 raw_write(ngx_http_cache_rocksdb_t *store, const std::string &key,
     const std::string &value, bool remove = false)
@@ -79,6 +84,202 @@ raw_write(ngx_http_cache_rocksdb_t *store, const std::string &key,
     check(ngx_http_cache_rocksdb_write(store, &mutation, 1, nullptr, 0, &error)
               == 0,
         "raw corruption fixture");
+}
+
+static void
+ngx_http_cache_purge_test_requirements()
+{
+    char path[] = "/tmp/cache-purge-rules-XXXXXX";
+    check(mkdtemp(path) != nullptr, "selector requirement test directory");
+    auto *store = open(path);
+    struct Rule {
+        Selector selector;
+        PurgeMode mode;
+        uint64_t sequence;
+    };
+    std::vector<Rule> rules;
+    std::vector<std::pair<std::string, std::string>> saved;
+    auto query = [&](Operations &ops, Selector selector, size_t limit = 512) {
+        uint64_t actual[2]{}, expected[2]{};
+        ngx_http_cache_purge_selector_t raw{ static_cast<uint32_t>(
+                                                 selector.kind),
+            bytes(selector.value), bytes(selector.scope) };
+        ngx_http_cache_rocksdb_error_t error{};
+        size_t budget = limit;
+        check(ngx_http_cache_purge_operations_requirements(
+                  ops.native(), &raw, &budget, &actual[0], &actual[1], &error)
+                  == 0,
+            error.message);
+        for (const auto &rule : rules) {
+            bool prefix =
+                (selector.kind == SelectorKind::url
+                    && rule.selector.kind == SelectorKind::url_prefix)
+                || (selector.kind == SelectorKind::key
+                    && rule.selector.kind == SelectorKind::key_prefix);
+            if (rule.selector.scope == selector.scope
+                && ((rule.selector.kind == selector.kind
+                        && rule.selector.value == selector.value)
+                    || (prefix
+                        && selector.value.compare(0, rule.selector.value.size(),
+                               rule.selector.value)
+                               == 0)))
+            {
+                auto slot = rule.mode == PurgeMode::remove;
+                expected[slot] = std::max(expected[slot], rule.sequence);
+            }
+        }
+        check(actual[0] == expected[0] && actual[1] == expected[1],
+            "ordered requirements match a full-history reference");
+        return limit - budget;
+    };
+    auto verify = [&](Operations &ops) {
+        for (const auto &value : { "https://a.test/", "https://a.test/dir/abc",
+                 "https://a.test/dir/aa", "https://a.test/dir/y",
+                 "https://a.test/dir/z", "https://a.test/elsewhere" })
+        {
+            query(ops, { SelectorKind::url, value, "" });
+        }
+        check(
+            query(ops, { SelectorKind::url, "https://a.test/dir/y", "" }) <= 8,
+            "predecessor seeks skip hundreds of unrelated sibling prefixes");
+        query(
+            ops, { SelectorKind::key, std::string("k\0\xff", 3) + "tail", "" });
+        query(ops, { SelectorKind::key, "ordinary-key", "" });
+        query(ops, { SelectorKind::host, "a.test", "" });
+        query(ops, { SelectorKind::namespace_tag, "tag", "one" });
+        query(ops, { SelectorKind::namespace_tag, "tag", "two" });
+        query(ops, { SelectorKind::host_tag, "tag", "a.test" });
+        query(ops, { SelectorKind::host_tag, "tag", "other.test" });
+    };
+    {
+        Index index(store);
+        Operations ops(store);
+        auto add = [&](SelectorKind kind, const std::string &value,
+                       PurgeMode mode, const std::string &scope = "") {
+            auto request = input("rule-" + std::to_string(rules.size()), mode);
+            request.selector = { kind, value, scope };
+            auto operation = ops.accept(request, 1000);
+            rules.push_back({ request.selector, mode, operation.sequence });
+        };
+        add(SelectorKind::url_prefix, "https://a.test/", PurgeMode::invalidate);
+        add(SelectorKind::url_prefix, "https://a.test/dir/", PurgeMode::remove);
+        add(SelectorKind::url, "https://a.test/dir/abc", PurgeMode::invalidate);
+        add(SelectorKind::url_prefix, "https://a.test/dir/ab",
+            PurgeMode::invalidate);
+        for (unsigned i = 0; i < 500; i++) {
+            add(SelectorKind::url_prefix,
+                "https://a.test/dir/x/" + std::to_string(i),
+                PurgeMode::invalidate);
+        }
+        add(SelectorKind::url_prefix, "https://a.test/", PurgeMode::remove);
+        add(SelectorKind::key_prefix, "", PurgeMode::invalidate);
+        add(SelectorKind::key_prefix, std::string("k\0", 2), PurgeMode::remove);
+        add(SelectorKind::host, "a.test", PurgeMode::invalidate);
+        add(SelectorKind::namespace_tag, "tag", PurgeMode::remove, "one");
+        add(SelectorKind::host_tag, "tag", PurgeMode::invalidate, "a.test");
+        auto before = writes(store);
+        verify(ops);
+        check(writes(store) == before, "requirement lookup is read-only");
+        auto retired = ops.get("rule-0");
+        retired = ops.activate("rule-0", retired.revision, 2000);
+        retired = ops.checkpoint("rule-0", retired.revision, point(1, true));
+        ops.materialize("rule-0", retired.revision, retired.sequence);
+        ops.expire_propagation(400000);
+        verify(ops);
+        uint64_t invalidate = 123, remove = 123;
+        size_t budget = 0;
+        ngx_http_cache_rocksdb_error_t error{};
+        ngx_http_cache_purge_selector_t selected{ NGX_HTTP_CACHE_PURGE_URL,
+            bytes("https://a.test/dir/abc"), bytes("") };
+        check(ngx_http_cache_purge_operations_requirements(ops.native(),
+                  &selected, &budget, &invalidate, &remove, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_LIMIT
+                  && invalidate == 0 && remove == 0,
+            "exhausted lookup budget never returns partial authorization");
+        ngx_http_cache_rocksdb_cursor_t *cursor = nullptr;
+        check(ngx_http_cache_rocksdb_cursor_open(store,
+                  NGX_HTTP_CACHE_ROCKSDB_DEFAULT, bytes("T"), bytes(""),
+                  &cursor, &error)
+                  == 0,
+            "inspect sparse requirement rows");
+        unsigned char keys[65536], values[16];
+        ngx_http_cache_rocksdb_buffer_t key{ keys, sizeof(keys), 0 },
+            value{ values, sizeof(values), 0 };
+        while (ngx_http_cache_rocksdb_cursor_next(cursor, &key, &value, &error)
+               == 0)
+        {
+            saved.emplace_back(
+                std::string(reinterpret_cast<char *>(keys), key.length),
+                std::string(reinterpret_cast<char *>(values), value.length));
+        }
+        check(ngx_http_cache_rocksdb_cursor_close(&cursor, &error) == 0,
+            "close requirement inspection");
+        check(saved.size() == rules.size() - 1,
+            "repeated selectors share one row with independent mode "
+            "requirements");
+        auto host =
+            std::find_if(saved.begin(), saved.end(), [](const auto &row) {
+                return row.first.size() >= 6
+                       && row.first[1] == NGX_HTTP_CACHE_PURGE_HOST;
+            });
+        check(host != saved.end(), "host requirement row exists");
+        selected = { NGX_HTTP_CACHE_PURGE_HOST, bytes("a.test"), bytes("") };
+        for (const auto &corrupt :
+            { std::string("bad"), std::string(16, '\0') })
+        {
+            raw_write(store, host->first, corrupt);
+            budget = 512;
+            invalidate = remove = 123;
+            check(ngx_http_cache_purge_operations_requirements(ops.native(),
+                      &selected, &budget, &invalidate, &remove, &error)
+                          == NGX_HTTP_CACHE_ROCKSDB_CORRUPT
+                      && invalidate == 0 && remove == 0,
+                "corrupt selector requirement never produces authorization");
+        }
+        raw_write(store, host->first, host->second);
+        for (const auto &row : saved) {
+            raw_write(store, row.first, "", true);
+        }
+        raw_write(store, "M:operations", "1");
+        raw_write(store, "M:rule-replay", "", true);
+    }
+    close(store);
+    store = open(path);
+    {
+        Operations migrated(store);
+        verify(migrated);
+        auto before = writes(store);
+        Operations again(store);
+        verify(again);
+        check(writes(store) == before,
+            "completed rule migration is not repeated on reopen");
+        auto lost =
+            std::find_if(saved.begin(), saved.end(), [&](const auto &row) {
+                return row.first.size() == 6 + rules[99].selector.value.size()
+                       && row.first.compare(
+                              6, std::string::npos, rules[99].selector.value)
+                              == 0;
+            });
+        check(lost != saved.end(),
+            "choose a row beyond the migration checkpoint");
+        raw_write(store, lost->first, "", true);
+        raw_write(store, "M:rule-replay", std::string(7, '\0') + '\1');
+        raw_write(store, "M:rule-cursor", "Drule-0");
+        Operations resumed(store);
+        query(resumed,
+            { SelectorKind::url, rules[99].selector.value + "/object", "" });
+        verify(resumed);
+        before = writes(store);
+        Operations completed(store);
+        check(writes(store) == before,
+            "resumed migration commits its completion marker");
+        ngx_http_cache_rocksdb_stats_t stats{};
+        ngx_http_cache_rocksdb_error_t error{};
+        check(ngx_http_cache_rocksdb_stats(store, &stats, &error) == 0
+                  && stats.cursor_handles == 0,
+            "requirement lookups retain no database cursors");
+    }
+    close(store);
 }
 
 int
@@ -128,6 +329,19 @@ main(int argc, char **argv)
                       && active.failed == 1
                       && active.bookmark == "opaque-index-bookmark",
                 "active checkpoint survives crash");
+            ngx_http_cache_purge_selector_t selector{
+                NGX_HTTP_CACHE_PURGE_NAMESPACE_TAG, bytes("photo"),
+                bytes("team")
+            };
+            ngx_http_cache_rocksdb_error_t error{};
+            size_t budget = 8;
+            uint64_t invalidate = 0, remove = 0;
+            check(ngx_http_cache_purge_operations_requirements(ops.native(),
+                      &selector, &budget, &invalidate, &remove, &error)
+                          == 0
+                      && invalidate == active.sequence && remove == 0,
+                "accepted selector requirement survives abrupt exit atomically "
+                "with the ledger");
             check(
                 ops.live().items.size() == 2 && ops.due(1200).items.size() == 1,
                 "recovery uses control and due ranges");
@@ -346,7 +560,7 @@ main(int argc, char **argv)
             raw_write(store, "M:operations", "future");
             fails(NGX_HTTP_CACHE_ROCKSDB_SCHEMA,
                 [&] { Operations unsupported(store); });
-            raw_write(store, "M:operations", "1");
+            raw_write(store, "M:operations", "2");
             raw_write(store, "M:op-ledger", "broken");
             fails(NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
                 [&] { Operations corrupted(store); });
@@ -392,6 +606,7 @@ main(int argc, char **argv)
                 "normal reopen preserves the retired floor without writes");
         }
         close(store);
+        ngx_http_cache_purge_test_requirements();
         std::cout << "PASS " << assertions << " operation assertions; database "
                   << path << std::endl;
         return 0;

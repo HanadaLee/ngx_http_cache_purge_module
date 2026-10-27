@@ -564,8 +564,8 @@ validation(
 }
 
 static int
-activate_background(
-    const std::string &path, const std::string &name, bool materialize = false)
+activate_background(const std::string &path, const std::string &name,
+    bool materialize = false, bool empty = false)
 {
     ngx_http_cache_rocksdb_options_t options;
     ngx_http_cache_rocksdb_options(&options);
@@ -597,7 +597,7 @@ activate_background(
               == 0,
         "offline fixture requires an existing operation");
     if (materialize) {
-        check(accepted.input.mode == NGX_HTTP_CACHE_PURGE_INVALIDATE
+        check((accepted.input.mode == NGX_HTTP_CACHE_PURGE_INVALIDATE || empty)
                   && accepted.scan_done && !accepted.pending
                   && !accepted.failed,
             "offline retirement requires completed Invalidate enumeration");
@@ -630,7 +630,8 @@ activate_background(
             check(++count <= 16, "bounded offline retirement fixture");
         }
         query.reset();
-        check(count != 0, "offline fixture has materialized files");
+        check(empty ? count == 0 : count != 0,
+            "offline fixture has the expected indexed membership");
         /* All native workers are stopped by the test. This does not implement
          * production retirement, late membership or native node cleanup. */
         check(ngx_http_cache_purge_operations_materialize(&operations,
@@ -642,8 +643,15 @@ activate_background(
         check(ngx_http_cache_purge_operations_expire(&operations,
                   accepted.propagation_until_ms + 1, 32, &expired, &error)
                       == 0
-                  && expired != 0,
+                  && (!accepted.propagate || expired != 0),
             "offline fixture removes the remaining propagation record");
+        ngx_http_cache_purge_operation_free(&active);
+        check(ngx_http_cache_purge_operations_get(
+                  &operations, bytes(name), &active, &error)
+                      == 0
+                  && active.stage == NGX_HTTP_CACHE_PURGE_MATERIALIZED
+                  && !active.propagate,
+            "offline fixture leaves neither resident role active");
     } else {
         check(ngx_http_cache_purge_operations_activate(&operations, bytes(name),
                   accepted.revision,
@@ -903,6 +911,9 @@ main(int argc, char **argv)
         if (argc == 4 && std::string(argv[1]) == "--retire-invalidate-fixture")
         {
             return activate_background(argv[2], argv[3], true);
+        }
+        if (argc == 4 && std::string(argv[1]) == "--retire-empty-fixture") {
+            return activate_background(argv[2], argv[3], true, true);
         }
         if (argc == 3 && std::string(argv[1]).find("--background-") == 0) {
             return background_delete(argv[1], argv[2]);

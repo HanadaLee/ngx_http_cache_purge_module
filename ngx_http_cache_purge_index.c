@@ -63,6 +63,10 @@ static const ngx_http_cache_rocksdb_bytes_t ngx_http_cache_purge_op_empty = {
     NULL, 0
 };
 
+static int ngx_http_cache_purge_op_rules_migrate(
+    ngx_http_cache_purge_operations_t *ops,
+    ngx_http_cache_rocksdb_error_t *error);
+
 static int
 ngx_http_cache_purge_op_fail(ngx_http_cache_purge_op_tx_t *tx, int code,
     const char *message)
@@ -1045,6 +1049,224 @@ ngx_http_cache_purge_op_cursor_next(ngx_http_cache_purge_op_tx_t *tx,
     return rc == 0;
 }
 
+static ngx_http_cache_rocksdb_bytes_t
+ngx_http_cache_purge_op_rule_key(ngx_http_cache_purge_op_tx_t *tx,
+    const ngx_http_cache_purge_selector_t *selector)
+{
+    ngx_http_cache_purge_op_codec_t  codec;
+    ngx_http_cache_rocksdb_bytes_t   key;
+
+    codec.tx = tx;
+    codec.size = 6 + selector->scope.len + selector->value.len;
+    codec.at = 0;
+    codec.data = ngx_http_cache_purge_op_alloc(tx, codec.size);
+    ngx_http_cache_purge_op_put_number(&codec, 'T', 1);
+    ngx_http_cache_purge_op_put_number(&codec, selector->kind, 1);
+    ngx_http_cache_purge_op_put_bytes(&codec, selector->scope);
+    if (tx->status != 0) {
+        return ngx_http_cache_purge_op_empty;
+    }
+    if (selector->value.len != 0) {
+        memcpy(codec.data + codec.at, selector->value.data,
+               selector->value.len);
+    }
+    key.data = codec.data;
+    key.len = codec.size;
+    return key;
+}
+
+static void
+ngx_http_cache_purge_op_rule_decode(ngx_http_cache_purge_op_tx_t *tx,
+    ngx_http_cache_rocksdb_bytes_t raw, uint64_t requirements[2])
+{
+    ngx_http_cache_purge_op_codec_t  codec;
+
+    if (!ngx_http_cache_purge_op_require(tx, raw.len == 16,
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid selector requirement"))
+    {
+        return;
+    }
+    codec.tx = tx;
+    codec.data = (unsigned char *) raw.data;
+    codec.size = raw.len;
+    codec.at = 0;
+    requirements[0] = ngx_http_cache_purge_op_get_number(&codec, 8);
+    requirements[1] = ngx_http_cache_purge_op_get_number(&codec, 8);
+    ngx_http_cache_purge_op_require(tx, requirements[0] || requirements[1],
+        NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "empty selector requirement");
+}
+
+static void
+ngx_http_cache_purge_op_rule_put(ngx_http_cache_purge_op_tx_t *tx,
+    const ngx_http_cache_purge_operation_t *op)
+{
+    ngx_http_cache_rocksdb_bytes_t   key, raw;
+    ngx_http_cache_purge_op_value_t  previous;
+    ngx_http_cache_purge_op_codec_t  codec;
+    uint64_t                         requirements[2];
+    unsigned                         slot;
+
+    key = ngx_http_cache_purge_op_rule_key(tx, &op->input.selector);
+    previous = ngx_http_cache_purge_op_get(tx, key);
+    memset(requirements, 0, sizeof(requirements));
+    if (previous.exists) {
+        ngx_http_cache_purge_op_rule_decode(tx, previous.bytes, requirements);
+    }
+    slot = op->input.mode == NGX_HTTP_CACHE_PURGE_DELETE;
+    if (tx->status != 0 || requirements[slot] >= op->sequence) {
+        return;
+    }
+    requirements[slot] = op->sequence;
+    codec.tx = tx;
+    codec.size = 16;
+    codec.data = ngx_http_cache_purge_op_alloc(tx, codec.size);
+    codec.at = 0;
+    ngx_http_cache_purge_op_put_number(&codec, requirements[0], 8);
+    ngx_http_cache_purge_op_put_number(&codec, requirements[1], 8);
+    raw.data = codec.data;
+    raw.len = codec.size;
+    ngx_http_cache_purge_op_put(tx, key, raw, 1);
+}
+
+int
+ngx_http_cache_purge_operations_requirements(
+    ngx_http_cache_purge_operations_t *ops,
+    const ngx_http_cache_purge_selector_t *selector, size_t *budget,
+    uint64_t *invalidate, uint64_t *remove,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_op_tx_t            tx;
+    ngx_http_cache_purge_operation_input_t  input;
+    ngx_http_cache_purge_selector_t         prefix_selector;
+    ngx_http_cache_rocksdb_cursor_t        *cursor;
+    ngx_http_cache_rocksdb_bytes_t          key, prefix, raw;
+    ngx_http_cache_rocksdb_buffer_t         found, value;
+    uint64_t                                requirements[2], result[2];
+    unsigned char                           encoded[16];
+    size_t                                  common, length, i;
+    int                                     rc, is_prefix;
+
+    if (invalidate != NULL) {
+        *invalidate = 0;
+    }
+    if (remove != NULL) {
+        *remove = 0;
+    }
+    ngx_http_cache_purge_op_begin(&tx, ops, invalidate);
+    if (!ngx_http_cache_purge_op_require(&tx,
+            selector != NULL && budget != NULL && remove != NULL,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid requirement lookup"))
+    {
+        return ngx_http_cache_purge_op_end(&tx, error);
+    }
+    memset(&input, 0, sizeof(input));
+    input.id = ngx_http_cache_purge_op_literal("lookup");
+    input.mode = NGX_HTTP_CACHE_PURGE_INVALIDATE;
+    input.issued_at_ms = 1;
+    input.selector = *selector;
+    if (!ngx_http_cache_purge_op_validate(&tx, &input, 0)) {
+        return ngx_http_cache_purge_op_end(&tx, error);
+    }
+    memset(result, 0, sizeof(result));
+    key = ngx_http_cache_purge_op_rule_key(&tx, selector);
+    value.data = encoded;
+    value.capacity = sizeof(encoded);
+    value.length = 0;
+    cursor = NULL;
+    is_prefix = selector->kind == NGX_HTTP_CACHE_PURGE_KEY_PREFIX
+                || selector->kind == NGX_HTTP_CACHE_PURGE_URL_PREFIX;
+    if (!is_prefix && ngx_http_cache_purge_op_require(&tx, *budget != 0,
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "selector lookup budget exhausted"))
+    {
+        (*budget)--;
+        rc = ngx_http_cache_rocksdb_get(tx.store,
+            NGX_HTTP_CACHE_ROCKSDB_DEFAULT, key, &value, &tx.error);
+        if (rc == 0) {
+            raw.data = encoded;
+            raw.len = value.length;
+            ngx_http_cache_purge_op_rule_decode(&tx, raw, result);
+        } else if (rc != NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) {
+            ngx_http_cache_purge_op_fail(&tx,
+                rc == NGX_HTTP_CACHE_ROCKSDB_BUFFER
+                    ? NGX_HTTP_CACHE_ROCKSDB_CORRUPT : rc,
+                "cannot read selector requirement");
+        }
+    }
+    if (tx.status == 0
+        && (is_prefix || selector->kind <= NGX_HTTP_CACHE_PURGE_URL))
+    {
+        prefix_selector = *selector;
+        if (!is_prefix) {
+            prefix_selector.kind += 2;
+        }
+        key = ngx_http_cache_purge_op_rule_key(&tx, &prefix_selector);
+        prefix = key;
+        prefix.len = 6;
+        found.data = ngx_http_cache_purge_op_alloc(&tx, 32774);
+        found.capacity = 32774;
+        found.length = 0;
+        if (tx.status == 0) {
+            tx.status = ngx_http_cache_rocksdb_cursor_open(tx.store,
+                NGX_HTTP_CACHE_ROCKSDB_DEFAULT, prefix,
+                ngx_http_cache_purge_op_empty, &cursor, &tx.error);
+        }
+        while (tx.status == 0) {
+            if (!ngx_http_cache_purge_op_require(&tx, *budget != 0,
+                    NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+                    "selector lookup budget exhausted"))
+            {
+                break;
+            }
+            (*budget)--;
+            rc = ngx_http_cache_rocksdb_cursor_seek_le(cursor,
+                key, &found, &value, &tx.error);
+            if (rc == NGX_HTTP_CACHE_ROCKSDB_DONE) {
+                break;
+            }
+            if (rc != 0) {
+                ngx_http_cache_purge_op_fail(&tx,
+                    rc == NGX_HTTP_CACHE_ROCKSDB_BUFFER
+                        ? NGX_HTTP_CACHE_ROCKSDB_CORRUPT : rc,
+                    "cannot seek selector prefix requirement");
+                break;
+            }
+            length = found.length - prefix.len;
+            common = 0;
+            while (common < length && common < key.len - prefix.len
+                   && found.data[prefix.len + common]
+                      == key.data[prefix.len + common])
+            {
+                common++;
+            }
+            if (common == length) {
+                raw.data = value.data;
+                raw.len = value.length;
+                ngx_http_cache_purge_op_rule_decode(&tx, raw, requirements);
+                for (i = 0; i < 2 && tx.status == 0; i++) {
+                    if (requirements[i] > result[i]) {
+                        result[i] = requirements[i];
+                    }
+                }
+                if (length == 0) {
+                    break;
+                }
+                common--;
+            }
+            /* No prefix longer than this common part can precede target:
+             * it would sort after the predecessor we just obtained. */
+            key.len = prefix.len + common;
+        }
+    }
+    if (cursor != NULL) {
+        ngx_http_cache_rocksdb_cursor_close(&cursor, NULL);
+    }
+    if (tx.status == 0) {
+        *invalidate = result[0];
+        *remove = result[1];
+    }
+    return ngx_http_cache_purge_op_end(&tx, error);
+}
+
 int
 ngx_http_cache_purge_operations_init(ngx_http_cache_purge_operations_t *ops,
     ngx_http_cache_rocksdb_t *store,
@@ -1058,9 +1280,11 @@ ngx_http_cache_purge_operations_init(ngx_http_cache_purge_operations_t *ops,
     ngx_http_cache_rocksdb_bytes_t  index, ledger;
     size_t                          i;
     uint64_t                        next, retired;
-    int                             changed;
-    const char                       *prefixes[] = { "D", "L", "Q", "E" };
-    const char *keys[] = { "M:op-next", "M:op-live", "M:op-bytes" };
+    int                             changed, rc;
+    const char                       *prefixes[] = { "D", "L", "Q", "E", "T" };
+    const char *keys[] =
+        { "M:op-next", "M:op-live", "M:op-bytes",
+          "M:rule-replay", "M:rule-cursor" };
     static const unsigned char zero[16] = { 0 };
 
     memset(&candidate, 0, sizeof(candidate));
@@ -1097,7 +1321,7 @@ ngx_http_cache_purge_operations_init(ngx_http_cache_purge_operations_t *ops,
     schema = ngx_http_cache_purge_op_get(
         &tx, ngx_http_cache_purge_op_literal("M:operations"));
     if (!schema.exists && tx.status == 0) {
-        for (i = 0; i < 4 && tx.status == 0; i++) {
+        for (i = 0; i < 5 && tx.status == 0; i++) {
             ngx_http_cache_purge_op_cursor_open(&tx, &cursor, prefixes[i],
                                                 ngx_http_cache_purge_op_empty);
             ngx_http_cache_purge_op_require(
@@ -1105,7 +1329,7 @@ ngx_http_cache_purge_operations_init(ngx_http_cache_purge_operations_t *ops,
                 NGX_HTTP_CACHE_ROCKSDB_SCHEMA, "unversioned operation ledger");
             ngx_http_cache_purge_op_cursor_close(&tx, &cursor);
         }
-        for (i = 0; i < 3 && tx.status == 0; i++) {
+        for (i = 0; i < 5 && tx.status == 0; i++) {
             value = ngx_http_cache_purge_op_get(
                 &tx, ngx_http_cache_purge_op_literal(keys[i]));
             ngx_http_cache_purge_op_require(&tx, !value.exists,
@@ -1114,16 +1338,19 @@ ngx_http_cache_purge_operations_init(ngx_http_cache_purge_operations_t *ops,
         }
         ngx_http_cache_purge_op_put(
             &tx, ngx_http_cache_purge_op_literal("M:operations"),
-            ngx_http_cache_purge_op_literal("1"), 1);
+            ngx_http_cache_purge_op_literal("2"), 1);
         ngx_http_cache_purge_op_set_counter(&tx, "M:op-next", 1);
         ngx_http_cache_purge_op_set_counter(&tx, "M:op-live", 0);
         ngx_http_cache_purge_op_set_counter(&tx, "M:op-bytes", 0);
+        ngx_http_cache_purge_op_set_counter(&tx, "M:rule-replay", 0);
         changed = 1;
     } else if (tx.status == 0) {
         ngx_http_cache_purge_op_require(
             &tx,
             ngx_http_cache_purge_op_equal(schema.bytes,
-                                          ngx_http_cache_purge_op_literal("1")),
+                                          ngx_http_cache_purge_op_literal("1"))
+                || ngx_http_cache_purge_op_equal(schema.bytes,
+                                          ngx_http_cache_purge_op_literal("2")),
             NGX_HTTP_CACHE_ROCKSDB_SCHEMA,
             "unsupported operation ledger schema");
         next = ngx_http_cache_purge_op_counter(&tx, "M:op-next");
@@ -1133,6 +1360,16 @@ ngx_http_cache_purge_operations_init(ngx_http_cache_purge_operations_t *ops,
             "invalid operation sequence allocator");
         (void) ngx_http_cache_purge_op_counter(&tx, "M:op-live");
         (void) ngx_http_cache_purge_op_counter(&tx, "M:op-bytes");
+        if (tx.status == 0 && schema.bytes.data[0] == '1') {
+            ngx_http_cache_purge_op_put(&tx,
+                ngx_http_cache_purge_op_literal("M:operations"),
+                ngx_http_cache_purge_op_literal("2"), 1);
+            ngx_http_cache_purge_op_set_counter(&tx, "M:rule-replay", 0);
+            ngx_http_cache_purge_op_put(&tx,
+                ngx_http_cache_purge_op_literal("M:rule-cursor"),
+                ngx_http_cache_purge_op_literal("D"), 1);
+            changed = 1;
+        }
     }
     value = ngx_http_cache_purge_op_get(&tx,
         ngx_http_cache_purge_op_literal("M:op-ledger"));
@@ -1175,7 +1412,14 @@ ngx_http_cache_purge_operations_init(ngx_http_cache_purge_operations_t *ops,
     if (tx.status == 0) {
         *ops = candidate;
     }
-    return ngx_http_cache_purge_op_end(&tx, error);
+    rc = ngx_http_cache_purge_op_end(&tx, error);
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_op_rules_migrate(ops, error);
+        if (rc != 0) {
+            memset(ops, 0, sizeof(*ops));
+        }
+    }
+    return rc;
 }
 
 int
@@ -1364,6 +1608,14 @@ ngx_http_cache_purge_op_accept(ngx_http_cache_purge_operations_t *ops,
             ngx_http_cache_purge_op_put(
                 &tx, ngx_http_cache_purge_op_key(&tx, 'L', &stored.op),
                 input->id, 1);
+            ngx_http_cache_purge_op_rule_put(&tx, &stored.op);
+            ngx_http_cache_purge_op_require(&tx,
+                ngx_http_cache_purge_op_counter(&tx, "M:rule-replay")
+                    == stored.op.sequence - 1,
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                "selector requirements have not caught up with the ledger");
+            ngx_http_cache_purge_op_set_counter(&tx, "M:rule-replay",
+                                                stored.op.sequence);
             ngx_http_cache_purge_op_commit(&tx);
         }
     }
@@ -1722,6 +1974,103 @@ ngx_http_cache_purge_operations_page(ngx_http_cache_purge_operations_t *ops,
         ngx_http_cache_purge_operation_page_free(out);
     }
     return ngx_http_cache_purge_op_end(&tx, error);
+}
+
+static int
+ngx_http_cache_purge_op_rules_migrate(ngx_http_cache_purge_operations_t *ops,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_op_tx_t           tx;
+    ngx_http_cache_purge_op_value_t        after;
+    ngx_http_cache_purge_op_stored_t       stored;
+    ngx_http_cache_rocksdb_cursor_t       *cursor;
+    ngx_http_cache_rocksdb_buffer_t        key, value;
+    ngx_http_cache_rocksdb_bytes_t         raw;
+    uint64_t                               replay, next;
+    int                                    rc;
+
+    for ( ;; ) {
+        ngx_http_cache_purge_op_begin(&tx, ops, &stored);
+        replay = ngx_http_cache_purge_op_counter(&tx, "M:rule-replay");
+        next = ngx_http_cache_purge_op_counter(&tx, "M:op-next");
+        after = ngx_http_cache_purge_op_get(&tx,
+            ngx_http_cache_purge_op_literal("M:rule-cursor"));
+        if (!ngx_http_cache_purge_op_require(&tx, next != 0 && replay < next,
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                "invalid selector requirement replay boundary")
+            || (!after.exists && replay == next - 1))
+        {
+            return ngx_http_cache_purge_op_end(&tx, error);
+        }
+        if (!ngx_http_cache_purge_op_require(&tx,
+                after.exists && after.bytes.len != 0 && after.bytes.len <= 129
+                    && after.bytes.data[0] == 'D',
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                "invalid selector requirement replay cursor"))
+        {
+            return ngx_http_cache_purge_op_end(&tx, error);
+        }
+        cursor = NULL;
+        key.capacity = 129;
+        key.length = 0;
+        key.data = ngx_http_cache_purge_op_alloc(&tx, key.capacity);
+        value.capacity = NGX_HTTP_CACHE_PURGE_OP_RECORD;
+        value.length = 0;
+        value.data = ngx_http_cache_purge_op_alloc(&tx, value.capacity);
+        rc = tx.status;
+        if (rc == 0) {
+            rc = ngx_http_cache_rocksdb_cursor_open(tx.store,
+                NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+                ngx_http_cache_purge_op_literal("D"), after.bytes,
+                &cursor, &tx.error);
+        }
+        if (rc == 0) {
+            rc = ngx_http_cache_rocksdb_cursor_next(cursor,
+                &key, &value, &tx.error);
+        }
+        if (cursor != NULL) {
+            ngx_http_cache_rocksdb_cursor_close(&cursor, NULL);
+        }
+        if (rc == NGX_HTTP_CACHE_ROCKSDB_DONE) {
+            if (ngx_http_cache_purge_op_require(&tx, replay == next - 1,
+                    NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                    "selector replay has missing operation records"))
+            {
+                ngx_http_cache_purge_op_put(&tx,
+                    ngx_http_cache_purge_op_literal("M:rule-cursor"),
+                    ngx_http_cache_purge_op_empty, 0);
+                ngx_http_cache_purge_op_commit(&tx);
+            }
+            return ngx_http_cache_purge_op_end(&tx, error);
+        }
+        tx.status = rc;
+        raw.data = value.data;
+        raw.len = value.length;
+        if (tx.status == 0
+            && ngx_http_cache_purge_op_decode(&tx, raw, &stored) == 0)
+        {
+            raw.data = key.data;
+            raw.len = key.length;
+            if (ngx_http_cache_purge_op_require(&tx,
+                    replay < next - 1 && stored.op.sequence < next
+                        && ngx_http_cache_purge_op_equal(raw,
+                            ngx_http_cache_purge_op_key(&tx, 'D', &stored.op)),
+                    NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                    "selector replay has inconsistent operation records"))
+            {
+                ngx_http_cache_purge_op_rule_put(&tx, &stored.op);
+                ngx_http_cache_purge_op_set_counter(&tx,
+                    "M:rule-replay", replay + 1);
+                ngx_http_cache_purge_op_put(&tx,
+                    ngx_http_cache_purge_op_literal("M:rule-cursor"), raw, 1);
+                ngx_http_cache_purge_op_commit(&tx);
+            }
+        }
+        rc = ngx_http_cache_purge_op_end(&tx, error);
+        if (rc != 0) {
+            return rc;
+        }
+    }
 }
 
 int

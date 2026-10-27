@@ -386,6 +386,28 @@ main(int argc, char **argv)
         require(get(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, key, second)
                     == replacement,
             "child retains snapshot after parent closes");
+        expect(ngx_http_cache_rocksdb_cursor_seek_le(
+                   second, bytes(key), &empty_key, &empty_value, &error),
+            NGX_HTTP_CACHE_ROCKSDB_BUFFER, "predecessor short buffer");
+        expect(ngx_http_cache_rocksdb_cursor_seek_le(
+                   second, bytes(key), &key_buffer, &value_buffer, &error),
+            NGX_HTTP_CACHE_ROCKSDB_OK,
+            "inclusive predecessor retries selected row");
+        require(
+            std::string(reinterpret_cast<char *>(k.data()), key_buffer.length)
+                    == key
+                && std::string(
+                       reinterpret_cast<char *>(v.data()), value_buffer.length)
+                       == replacement,
+            "predecessor uses the inherited snapshot after a later write");
+        expect(ngx_http_cache_rocksdb_cursor_seek_le(
+                   second, bytes(prefix), &key_buffer, &value_buffer, &error),
+            NGX_HTTP_CACHE_ROCKSDB_DONE,
+            "predecessor cannot cross the prefix lower bound");
+        expect(ngx_http_cache_rocksdb_cursor_seek_le(
+                   second, bytes("B:"), &key_buffer, &value_buffer, &error),
+            NGX_HTTP_CACHE_ROCKSDB_INVALID,
+            "predecessor target must belong to its range");
         expect(ngx_http_cache_rocksdb_cursor_close(&second, &error),
             NGX_HTTP_CACHE_ROCKSDB_OK, "close child");
 

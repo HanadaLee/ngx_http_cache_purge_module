@@ -176,7 +176,16 @@ are monotonic within one ledger and are collected with their retired file.
 Index schema 3 upgrades schemas 1/2 in place without rebuilding file relations;
 older readers reject it instead of ignoring these requirements.
 
-Automatic FENCE retirement, unobserved alias handling and full writer/migration
+Persistent selector requirements also survive resident-rule retirement. The
+operation ledger retains the latest Invalidate and Delete sequence independently
+for each selector. Ordered predecessor seeks find matching bytewise prefixes
+without scanning unrelated operation history. File admission uses these records
+to protect URL aliases first observed after enumeration, across native zones.
+Full entities fetched after the latest accepted operation skip this historical
+lookup. Ledger schema 2 upgrades schema 1 through a bounded, checkpointed replay
+of operation records once; native cache files and their index are not rebuilt.
+
+Automatic FENCE retirement, complete host relationships and full writer/migration
 coverage remain unfinished. Memory-only
 errors do not receive a separate TAG/alias index. Operation receipts
 remain PREPARING; these partial consumers do not expose reliable public 202

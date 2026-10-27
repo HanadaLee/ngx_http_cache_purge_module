@@ -844,6 +844,31 @@ ngx_http_cache_rocksdb_cursor_next(ngx_http_cache_rocksdb_cursor_t *cursor,
 }
 
 extern "C" int
+ngx_http_cache_rocksdb_cursor_seek_le(ngx_http_cache_rocksdb_cursor_t *cursor,
+    ngx_http_cache_rocksdb_bytes_t target, ngx_http_cache_rocksdb_buffer_t *key,
+    ngx_http_cache_rocksdb_buffer_t *value,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
+        int code = ngx_http_cache_rocksdb_check(cursor, error);
+        if (code != NGX_HTTP_CACHE_ROCKSDB_OK) {
+            return code;
+        }
+        if (!ngx_http_cache_rocksdb_bytes_valid(
+                target, cursor->store->options.max_key_bytes)
+            || !ngx_http_cache_rocksdb_slice(target).starts_with(
+                cursor->prefix))
+        {
+            return ngx_http_cache_rocksdb_error(error,
+                NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                "invalid predecessor target outside cursor prefix");
+        }
+        cursor->iterator->SeekForPrev(ngx_http_cache_rocksdb_slice(target));
+        return ngx_http_cache_rocksdb_cursor_next(cursor, key, value, error);
+    });
+}
+
+extern "C" int
 ngx_http_cache_rocksdb_cursor_get(ngx_http_cache_rocksdb_cursor_t *cursor,
     ngx_http_cache_rocksdb_cf_e cf, ngx_http_cache_rocksdb_bytes_t key,
     ngx_http_cache_rocksdb_buffer_t *value,

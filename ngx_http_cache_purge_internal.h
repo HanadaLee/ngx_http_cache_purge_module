@@ -484,6 +484,15 @@ int ngx_http_cache_purge_operations_init(ngx_http_cache_purge_operations_t *ops,
     ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_operation_limits_t *limits,
     ngx_http_cache_rocksdb_error_t *error);
+/* Persistent selector requirements survive resident-rule retirement. Exact
+ * key/URL lookups also inspect bytewise prefixes using predecessor seeks.
+ * budget counts database lookups across a caller's complete file check.
+ * Failure clears both outputs; no cursor survives the call. */
+int ngx_http_cache_purge_operations_requirements(
+    ngx_http_cache_purge_operations_t *ops,
+    const ngx_http_cache_purge_selector_t *selector, size_t *budget,
+    uint64_t *invalidate, uint64_t *remove,
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_operations_preview(
     ngx_http_cache_purge_operations_t *ops,
     const ngx_http_cache_purge_operation_input_t *input, uint64_t now,

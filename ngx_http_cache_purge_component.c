@@ -4827,6 +4827,7 @@ typedef struct {
     ngx_http_cache_purge_coordinator_t     *coordinator;
     ngx_http_cache_purge_control_context_t  context;
     uint64_t                                covered, validated, required;
+    size_t                                  budget;
     int                                     allow_invalidate;
 } ngx_http_cache_purge_validation_context_t;
 
@@ -4853,15 +4854,65 @@ ngx_http_cache_purge_component_validation_match(void *data,
 }
 
 static int
+ngx_http_cache_purge_component_validation_rules(
+    ngx_http_cache_purge_validation_context_t *v, uint32_t kind,
+    ngx_http_cache_rocksdb_bytes_t value, ngx_http_cache_rocksdb_bytes_t scope,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_selector_t       selector;
+    ngx_http_cache_purge_control_match_t  match;
+    uint64_t                               invalidate, remove;
+    int                                    rc;
+
+    selector.kind = kind;
+    selector.value = value;
+    selector.scope = scope;
+    rc = ngx_http_cache_purge_operations_requirements(
+        &v->coordinator->operations, &selector, &v->budget,
+        &invalidate, &remove, error);
+    if (rc != 0) {
+        return rc;
+    }
+    if (invalidate > v->coordinator->expected.last_sequence
+        || remove > v->coordinator->expected.last_sequence)
+    {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+            "selector requirement is outside the operation ledger");
+    }
+    memset(&match, 0, sizeof(match));
+    match.flags = NGX_HTTP_CACHE_PURGE_CONTROL_FENCE;
+    match.mode = NGX_HTTP_CACHE_PURGE_DELETE;
+    match.sequence = remove;
+    rc = ngx_http_cache_purge_component_validation_match(v, &match);
+    if (rc == 0) {
+        match.mode = NGX_HTTP_CACHE_PURGE_INVALIDATE;
+        match.sequence = invalidate;
+        rc = ngx_http_cache_purge_component_validation_match(v, &match);
+    }
+    if (rc != 0) {
+        return ngx_http_cache_purge_control_error(error, rc,
+            "file has an unmet persistent selector requirement");
+    }
+    return 0;
+}
+
+static int
 ngx_http_cache_purge_component_validation_url(void *data,
     ngx_http_cache_rocksdb_bytes_t url, ngx_http_cache_rocksdb_error_t *error)
 {
     ngx_http_cache_purge_validation_context_t  *v;
     uint64_t                                    publication;
     int                                         rc;
+    static const ngx_http_cache_rocksdb_bytes_t empty = { NULL, 0 };
 
     v = data;
     v->context.url = url;
+    rc = ngx_http_cache_purge_component_validation_rules(v,
+        NGX_HTTP_CACHE_PURGE_URL, url, empty, error);
+    if (rc != 0 || v->coordinator->count == 0) {
+        return rc;
+    }
     rc = ngx_http_cache_purge_control_match(
         v->coordinator->validation_reader, &v->context, 64, 65536,
         ngx_http_cache_purge_component_validation_match, v,
@@ -4884,6 +4935,8 @@ ngx_http_cache_purge_component_record_guard(
     ngx_http_cache_purge_validation_context_t  v;
     ngx_http_cache_purge_index_expected_t      expected;
     ngx_http_cache_purge_watermark_t           watermark, validated, required;
+    ngx_http_cache_rocksdb_bytes_t             empty;
+    size_t                                     i;
     int                                        rc;
 
     if (invalidate != NULL) {
@@ -4913,9 +4966,6 @@ ngx_http_cache_purge_component_record_guard(
             NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
             "file validation requirement is outside the operation ledger");
     }
-    if (c->count == 0 && required.sequence == 0) {
-        return 0;
-    }
     if (c->count != 0 && c->validation_reader == NULL) {
         rc = ngx_http_cache_purge_control_reader_open(c->shared,
             c->shared_bytes, &c->validation_reader, error);
@@ -4926,6 +4976,7 @@ ngx_http_cache_purge_component_record_guard(
     memset(&v, 0, sizeof(v));
     v.coordinator = c;
     v.allow_invalidate = invalidate != NULL;
+    v.budget = 512;
     rc = ngx_http_cache_purge_publication_watermarks(metadata, &watermark,
                                                        &validated, error);
     if (rc != 0 && rc != NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) {
@@ -4959,11 +5010,31 @@ ngx_http_cache_purge_component_record_guard(
         }
         v.required = required.sequence;
     }
-    if (c->count == 0) {
-        if (invalidate != NULL) {
-            *invalidate = v.required;
-        }
+    if (v.covered >= c->expected.last_sequence && v.required == 0) {
         return 0;
+    }
+    empty.data = NULL;
+    empty.len = 0;
+    rc = ngx_http_cache_purge_component_validation_rules(&v,
+        NGX_HTTP_CACHE_PURGE_KEY, file->key, empty, error);
+    if (rc == 0 && file->host.len != 0) {
+        rc = ngx_http_cache_purge_component_validation_rules(&v,
+            NGX_HTTP_CACHE_PURGE_HOST, file->host, empty, error);
+    }
+    for (i = 0; rc == 0 && i < file->tag_count; i++) {
+        if (file->tag_namespace.len != 0) {
+            rc = ngx_http_cache_purge_component_validation_rules(&v,
+                NGX_HTTP_CACHE_PURGE_NAMESPACE_TAG, file->tags[i],
+                file->tag_namespace, error);
+        }
+        if (rc == 0 && file->host.len != 0) {
+            rc = ngx_http_cache_purge_component_validation_rules(&v,
+                NGX_HTTP_CACHE_PURGE_HOST_TAG, file->tags[i],
+                file->host, error);
+        }
+    }
+    if (rc != 0) {
+        return rc;
     }
     v.context.key = file->key;
     v.context.host = file->host;

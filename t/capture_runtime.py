@@ -547,8 +547,8 @@ try:
     process = start()
     until(lambda: (run / 'index/component.sock').exists())
     until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
-    def materialization_done():
-        d = Decode(rpc(15, string('background-invalidate')))
+    def materialization_done(name='background-invalidate', expected_visits=3):
+        d = Decode(rpc(15, string(name)))
         d.string(); d.number(1); d.number(8); d.number(1)
         d.string(); d.string(); d.string()
         for _ in range(5): d.number(8)
@@ -556,7 +556,7 @@ try:
         done = d.number(1); d.number(8); visits = d.number(8)
         pending, failed = d.number(8), d.number(8)
         d.number(8); d.string(); d.end()
-        return stage == 3 and done and visits == 3 and not pending and not failed
+        return stage == 3 and done and visits == expected_visits and not pending and not failed
     until(materialization_done)
     assert all(Path(path).read_bytes() == contents for path, contents in materialized_contents.items())
     stop(process)
@@ -583,6 +583,52 @@ try:
     assert get(materialized_failure) == (200, 'HIT', materialized_failure.encode())
     checks.append('background Invalidate persists three requirements across two zones without changing files; after controlled rule retirement and restart, fresh native headers still require validation')
     checks.append('persistent per-file Invalidate keeps strict failure handling and plain stale downgrade after all resident rules are removed')
+    late_alias_cases = []
+    for number, (kind, mode) in enumerate(((1, 1), (1, 2), (3, 1), (3, 2))):
+        source_uri = '/alias/source-' + str(number)
+        target_uri = '/alias/late-' + str(number) + '/new'
+        suffix = '?m=history-' + str(number)
+        assert get(source_uri + suffix) == (200, 'MISS', source_uri.encode())
+        assert get(source_uri + suffix + '&z=b') == (200, 'MISS', source_uri.encode())
+        original_ids = {item['id'] for item in records(source_uri, 2)}
+        name = 'retired-late-alias-' + str(number)
+        value = 'http://cache.test' + (target_uri if kind == 1 else target_uri.rsplit('/', 1)[0] + '/')
+        assert not query('http://cache.test' + target_uri)
+        fence(name, kind, value, mode=mode)
+        late_alias_cases.append((name, mode, source_uri, target_uri, suffix, original_ids))
+    stop(process)
+    for name, *_ in late_alias_cases:
+        subprocess.run([str(a.libraries / 'cache_purge_files_test'), '--activate-background',
+                        str(run / 'index'), name], check=True, timeout=15, stdout=subprocess.DEVNULL)
+    process = start()
+    until(lambda: (run / 'index/component.sock').exists())
+    until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
+    for name, *_ in late_alias_cases:
+        until(lambda name=name: materialization_done(name, 0))
+    stop(process)
+    for name, *_ in late_alias_cases:
+        subprocess.run([str(a.libraries / 'cache_purge_files_test'), '--retire-empty-fixture',
+                        str(run / 'index'), name], check=True, timeout=15, stdout=subprocess.DEVNULL)
+    process = start()
+    until(lambda: (run / 'index/component.sock').exists())
+    until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
+    for name, mode, source_uri, target_uri, suffix, original_ids in late_alias_cases:
+        conditional_paths.add(target_uri); conditional_paths.add(source_uri)
+        if mode == 1:
+            body = source_uri.encode()
+            assert get(target_uri + suffix) == (200, 'REVALIDATED', body)
+            assert get(source_uri + suffix + '&z=b') == (200, 'REVALIDATED', body)
+            assert {item['id'] for item in records(source_uri, 2)} == original_ids
+        else:
+            body = ('new-' + name).encode()
+            fresh_bodies[target_uri] = body; fresh_bodies[source_uri] = body
+            assert get(target_uri + suffix) == (200, 'BYPASS', body)
+            assert get(source_uri + suffix + '&z=b') == (200, 'BYPASS', body)
+            until(lambda: {item['id'] for item in records(source_uri, 2)}.isdisjoint(original_ids))
+            assert target_uri not in conditional_calls and source_uri not in conditional_calls
+        assert get(target_uri + suffix) == (200, 'HIT', body)
+        assert get(target_uri + suffix + '&z=b') == (200, 'HIT', body)
+        checks.append(name + ': a URL first observed after empty-scan retirement still enforces the durable exact/prefix rule across both zones')
     assert get('/background-native')[1] == 'MISS'
     assert get('/background-native?z=b')[1] == 'MISS'
     background_files = records('/background-native', 2)

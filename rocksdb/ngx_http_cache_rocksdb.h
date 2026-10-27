@@ -151,6 +151,15 @@ int ngx_http_cache_rocksdb_cursor_next(ngx_http_cache_rocksdb_cursor_t *cursor,
     ngx_http_cache_rocksdb_buffer_t *key,
     ngx_http_cache_rocksdb_buffer_t *value,
     ngx_http_cache_rocksdb_error_t *error);
+/* Seek to the greatest key <= target in this cursor's prefix and snapshot.
+ * target must include the prefix. BUFFER does not consume the selected row;
+ * success advances like next(). DONE means no predecessor in this prefix. */
+int ngx_http_cache_rocksdb_cursor_seek_le(
+    ngx_http_cache_rocksdb_cursor_t *cursor,
+    ngx_http_cache_rocksdb_bytes_t target,
+    ngx_http_cache_rocksdb_buffer_t *key,
+    ngx_http_cache_rocksdb_buffer_t *value,
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_rocksdb_cursor_get(ngx_http_cache_rocksdb_cursor_t *cursor,
     ngx_http_cache_rocksdb_cf_e cf, ngx_http_cache_rocksdb_bytes_t key,
     ngx_http_cache_rocksdb_buffer_t *value,
