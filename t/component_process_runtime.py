@@ -230,9 +230,10 @@ class Client:
         self.socket.sendall(packet[1:])
         reply = self.reply(22, code)
         if code == 0:
-            assert len(reply) >= 33
-            self.admission_stamp = int.from_bytes(reply[-8:], 'big')
-            return reply[:-8]
+            assert len(reply) >= 41
+            self.admission_stamp = int.from_bytes(reply[-16:-8], 'big')
+            self.invalidate_required = int.from_bytes(reply[-8:], 'big')
+            return reply[:-16]
         return reply
 
     def admit_file(self, target, key, url, fd, code=0):
@@ -241,10 +242,11 @@ class Client:
         self.socket.sendall(packet[1:])
         reply = self.reply(25, code)
         if code == 0:
-            assert len(reply) >= 33
-            self.admission_stamp = int.from_bytes(reply[-8:], 'big')
+            assert len(reply) >= 41
+            self.admission_stamp = int.from_bytes(reply[-16:-8], 'big')
+            self.invalidate_required = int.from_bytes(reply[-8:], 'big')
             assert self.admission_stamp != 0
-            return reply[:-8]
+            return reply[:-16]
         return reply
 
     def page(self, kind, value, scope='', bookmark=b'', limit=32):
@@ -723,8 +725,8 @@ try:
         return (identity(n) + struct.pack('>Q', revision) + identity(token) + string(before) + string(after)
                 + bytes([tags is not None, len(tags or [])]) + b''.join(map(string, tags or [])) + origin[4:])
 
-    def validation_operation(name, kind, value, scope=''):
-        data = (string(name) + b'\x01' + struct.pack('>Q', 1000) + bytes([kind])
+    def validation_operation(name, kind, value, scope='', mode=2):
+        data = (string(name) + bytes([mode]) + struct.pack('>Q', 1000) + bytes([kind])
                 + string(value) + string(scope) + string('validation-test'))
         v.call(14, data)
 
@@ -760,6 +762,39 @@ try:
     assert v.admit_file(address, key, 'https://a.test/discovered-alias', selected) == v.call(2, identity(606))
     os.close(lease); os.close(selected)
     check(True, 'a newer full entity satisfies the persisted alias FENCE and retains its key URL associations')
+
+    full_origin = validating.watermark()
+    target, lease, selected = make_validation_file(607, '/conditional', metadata=full_origin)
+    address = (str(validation_cache), 'zone-a', 'a/00/607')
+    key = 'team\x1fhttps\x1fa.test\x1f/conditional\x1f'
+    validation_operation('conditional-first', 5, 'tag-607', 'team', mode=1)
+    wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+    origin = validating.watermark()
+    v.admit_file(address, key, 'https://a.test/conditional', selected)
+    assert v.invalidate_required == int.from_bytes(origin[20:], 'big')
+    result = v.validate_file(validation_packet(607, origin=origin), lease, selected)
+    assert v.invalidate_required == 0 and v.admission_stamp != 0
+    at = result.index(b'NFW2')
+    assert result[at + 4:at + 28] == origin[4:] and result[at + 32:at + 60] == full_origin
+    assert target.read_bytes().startswith(b'new-head')
+    validation_operation('conditional-second', 5, 'tag-607', 'team', mode=1)
+    wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+    origin = validating.watermark()
+    again = v.validate_file(validation_packet(607, revision=4, token=2,
+                            before=b'new-head', after=b'rev-head', origin=origin), lease, selected)
+    assert len(again) == len(result) and v.invalidate_required == 0
+    at = again.index(b'NFW2')
+    assert again[at + 32:at + 60] == full_origin
+    check(True, 'successful conditional validation advances Invalidate coverage without changing full-entity origin or nesting metadata')
+    validation_operation('conditional-delete', 5, 'tag-607', 'team', mode=2)
+    wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+    v.admit_file(address, key, 'https://a.test/conditional', selected, code=7)
+    before = v.call(2, identity(607)); contents = target.read_bytes()
+    v.validate_file(validation_packet(607, revision=6, token=3, before=b'rev-head',
+                    origin=validating.watermark()), lease, selected, code=7)
+    assert v.call(2, identity(607)) == before and target.read_bytes() == contents
+    os.close(lease); os.close(selected)
+    check(True, 'Delete still requires a newer full entity even after successful Invalidate validation and a newer conditional request')
 
     target, lease, selected = make_validation_file(601, '/validate')
     packet = validation_packet(601, tags=['new-tag'])
@@ -920,7 +955,7 @@ try:
     source = validation_temp / 'invalid-watermark'; source.write_bytes(b'unmodified')
     destination = validation_cache / 'a/00/640'
     lease = v.lease(str(destination)); fd = os.open(source, os.O_RDWR | os.O_CLOEXEC)
-    for invalid, code in ((b'NFW1', 4), (b'NFW1' + b'X' * 16 + watermark[20:], 7),
+    for invalid, code in ((b'NFW1', 4), (b'NFW2' + watermark[4:] + string(watermark), 4), (b'NFW1' + b'X' * 16 + watermark[20:], 7),
                           (watermark[:20] + struct.pack('>Q', 999999), 7)):
         payload = record(640, root=str(validation_cache), zone='zone-a', metadata=invalid) + string(str(source))
         v.prepare_file(payload, [lease, fd], code=code)

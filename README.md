@@ -67,7 +67,9 @@ purge freshness. The native file-response consumer also checks key, URL, host,
 prefix and scoped TAG FENCEs, then commits its decision under a short shared
 control guard. It waits before slice, Range and client-conditional filters run.
 No shared guard spans IPC or asynchronous body streaming. Unknown files and
-unsatisfied FENCEs cause an unconditional upstream retry using the original key.
+unsatisfied Delete FENCEs cause an unconditional upstream retry using the
+original key. An unsatisfied Invalidate found at file admission retains the
+entity and validators for a conditional upstream request when configured.
 
 New entity fills persist the durable ledger identity and complete local operation
 sequence observed before origin dispatch. File admission can recognize rules
@@ -94,7 +96,8 @@ This changes the internal shared-control ABI to 3; nginx-ext ABI remains 2.
 Native file responses use `ADMIT_FILE` to verify the selected descriptor, bind
 the captured key, and persist the observed URL association. Repeated observations
 do not write the database. The executor checks persisted URL aliases against
-FENCEs within count/byte budgets and returns a publication stamp with the record.
+FENCEs within count/byte budgets and returns a publication stamp and the highest
+unsatisfied Invalidate sequence with the record.
 The worker requires the same publication at final admission, closing the gap
 between the database check and response reuse. No alias collection is sent to or
 retained by the worker. Physical `INSPECT_FILE` remains a diagnostic operation.
@@ -121,13 +124,20 @@ No complete file index is loaded into worker memory. Successful upstream 304
 responses capture TTL and TAG metadata before native cached-header parsing,
 persist the validation transaction, and pass final FENCE admission before
 reusing the entity. An absent direct upstream TAG header retains the old set;
-a present empty header clears it. General expressions replace the set. New,
-unsatisfied FENCEs and unverified transactions still force an unconditional refill;
-ordinary 304 retains the entity's existing local watermark. Validation receipts
-also carry an admission stamp; a durable receipt without current read clearance
-has stamp zero and cannot authorize response reuse. Forced Invalidate
-revalidation, unobserved alias handling and TAG/alias provenance for memory-only
-cached errors remain unfinished. Operation receipts
+a present empty header clears it. General expressions replace the set. A durable
+304 preserves the full entity's original watermark and records a separate
+conditional-validation boundary. That boundary satisfies Invalidate only; Delete
+still requires a new entity. Repeated 304 transactions replace the conditional
+proof without nesting it. Validation receipts carry the publication and any
+remaining Invalidate requirement; stamp zero cannot authorize response reuse.
+Under `NGX_RESTY_EXT`, a forced Invalidate sets the existing PURGE reason to
+prevent stale fallback and clears only that reason after successful validation.
+Without the macro, native configured stale fallback remains available.
+
+File admission supports this behavior for TAGs and persisted URL aliases. Current
+URL/key/prefix/host matches still conservatively bypass before native lookup.
+Complete Invalidate coverage, unobserved alias handling and TAG/alias provenance
+for memory-only cached errors remain unfinished. Operation receipts
 remain PREPARING; these partial consumers do not expose reliable public 202
 acceptance or completed immediate purge semantics yet.
 

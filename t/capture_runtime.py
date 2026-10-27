@@ -76,6 +76,9 @@ with tarfile.open(fileobj=io.BytesIO(archive)) as source:
 
 calls, policies = [], {}
 validation_tags = {'/revalidate-replace': 'new-tag', '/revalidate-clear': ''}
+conditional_paths = set()
+conditional_calls = []
+conditional_policies = {}
 validation_waiting, validation_release = threading.Event(), threading.Event()
 late_waiting, late_release = threading.Event(), threading.Event()
 retry_waiting, retry_release = threading.Event(), threading.Event()
@@ -104,11 +107,12 @@ class Origin(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b'x'); self.wfile.flush(); stream_waiting.set()
             assert stream_release.wait(15)
             self.wfile.write(b'x' * 4095); return
-        if path.startswith('/revalidate-') and self.headers.get('If-None-Match') == '"capture-v1"':
+        if (path.startswith('/revalidate-') or path in conditional_paths) and self.headers.get('If-None-Match') == '"capture-v1"':
+            conditional_calls.append(path)
             if path == '/revalidate-race':
                 validation_waiting.set()
                 assert validation_release.wait(15)
-            self.send_response(304); self.send_header('Cache-Control', 'max-age=60')
+            self.send_response(304); self.send_header('Cache-Control', conditional_policies.get(path, 'max-age=60'))
             if path in validation_tags: self.send_header('Cache-Tag', validation_tags[path])
             self.end_headers(); return
         if path == '/redirect-revalidated' and self.headers.get('If-None-Match') == '"capture-v1"':
@@ -235,9 +239,14 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
                   cache_purge_tag_namespace rawtenant;
                   proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /alias/ {{ cache_key_uri /alias/shared;
+                     proxy_cache_revalidate on;
                      cache_purge_key $cache_key_base;
                      cache_purge_url "$scheme://$host$uri";
                      proxy_pass http://127.0.0.1:{origin.server_port}; }}
+  location /invalidate/ {{ cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+                          proxy_cache_revalidate on;
+                          proxy_cache_use_stale error timeout http_500 updating;
+                          proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /revalidate- {{ cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
                           proxy_cache_revalidate on; proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /revalidate-expression {{ cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
@@ -364,9 +373,9 @@ def record(ident):
 def pending():
     return rpc(9, string('') + bytes([32]))[0]
 
-def fence(name, kind, value, scope=''):
+def fence(name, kind, value, scope='', mode=2):
     previous = struct.unpack('>IQ', rpc(16))[1]
-    payload = (string(name) + b'\x01' + struct.pack('>Q', int(time.time() * 1000))
+    payload = (string(name) + bytes([mode]) + struct.pack('>Q', int(time.time() * 1000))
                + bytes([kind]) + string(value) + string(scope) + string('read-test'))
     receipt = rpc(14, payload)
     assert receipt[len(payload) + 40] == 1
@@ -399,6 +408,10 @@ def watermark(item):
     at = 44 + int.from_bytes(metadata[40:44], 'big')
     size = int.from_bytes(metadata[at:at + 4], 'big')
     value = metadata[at + 4:]
+    if value.startswith(b'NFW2'):
+        assert size == len(value) and int.from_bytes(value[28:32], 'big') == len(value) - 32
+        value = value[32:]
+        size = len(value)
     assert size == 28 and len(value) == size and value[:4] == b'NFW1'
     return value[4:20], int.from_bytes(value[20:], 'big')
 
@@ -459,6 +472,68 @@ try:
     ready_file(alias)
     assert get('/alias/three') == (200, 'HIT', b'prefix-fresh-alias')
     checks.append('bytewise URL prefix FENCEs cover persisted aliases even when neither the current nor the original stored URL matches')
+    conditional_paths.add('/alias/one')
+    original_alias = alias
+    fence('invalidate-discovered-alias', 1, 'http://cache.test/alias/two', mode=1)
+    assert get('/alias/one') == (200, 'REVALIDATED', b'prefix-fresh-alias')
+    alias = records('/alias/one', 1)[0]
+    assert alias['id'] == original_alias['id'] and alias['revision'] == original_alias['revision'] + 2
+    assert watermark(alias) == watermark(original_alias)
+    assert get('/alias/three') == (200, 'HIT', b'prefix-fresh-alias')
+    checks.append('Invalidate on another persisted URL alias supports conditional 304 without replacing the shared entity')
+    conditional_paths.add('/invalidate/304')
+    policies['/invalidate/304'] = 'invalidate-304'
+    assert get('/invalidate/304') == (200, 'MISS', b'/invalidate/304')
+    invalidated = records('/invalidate/304', 1)[0]
+    target = ready_file(invalidated); old_inode = target.stat().st_ino
+    old_full = watermark(invalidated)
+    fence('force-invalidate-304', 5, 'invalidate-304', 'tenant', mode=1)
+    result = get('/invalidate/304')
+    assert result == (200, 'REVALIDATED', b'/invalidate/304'), result
+    refreshed = records('/invalidate/304', 1)[0]
+    assert refreshed['id'] == invalidated['id'] and refreshed['revision'] == invalidated['revision'] + 2
+    assert target.stat().st_ino == old_inode and watermark(refreshed) == old_full
+    assert conditional_calls.count('/invalidate/304') == 1
+    assert get('/invalidate/304') == (200, 'HIT', b'/invalidate/304')
+    checks.append('TAG Invalidate forces conditional origin validation; durable 304 retains the entity and full-origin proof, then permits HIT under the live FENCE')
+    fence('delete-after-invalidate-304', 5, 'invalidate-304', 'tenant', mode=2)
+    fresh_bodies['/invalidate/304'] = b'new-full-entity'
+    assert get('/invalidate/304') == (200, 'BYPASS', b'new-full-entity')
+    until(lambda: records('/invalidate/304', 1)[0]['id'] != invalidated['id'])
+    assert conditional_calls.count('/invalidate/304') == 1
+    assert get('/invalidate/304') == (200, 'HIT', b'new-full-entity')
+    checks.append('Delete after successful Invalidate cannot reuse the conditional proof and requires a new full entity')
+    policies['/invalidate/200'] = 'invalidate-200'
+    assert get('/invalidate/200')[1] == 'MISS'
+    old = records('/invalidate/200', 1)[0]
+    fence('force-invalidate-200', 5, 'invalidate-200', 'tenant', mode=1)
+    fresh_bodies['/invalidate/200'] = b'replaced-by-200'
+    assert get('/invalidate/200') == (200, 'EXPIRED', b'replaced-by-200')
+    until(lambda: records('/invalidate/200', 1)[0]['id'] != old['id'])
+    assert get('/invalidate/200') == (200, 'HIT', b'replaced-by-200')
+    checks.append('Invalidate accepts a successful full 200 replacement and then reuses the new indexed entity')
+    policies['/invalidate/failure'] = 'invalidate-failure'
+    assert get('/invalidate/failure')[1] == 'MISS'
+    failed_original = records('/invalidate/failure', 1)[0]
+    fence('force-invalidate-failure', 5, 'invalidate-failure', 'tenant', mode=1)
+    origin_failures.add('/invalidate/failure')
+    result = get('/invalidate/failure')
+    assert result == ((500, 'EXPIRED', b'') if extension else (200, 'STALE', b'/invalidate/failure')), result
+    assert records('/invalidate/failure', 1)[0]['revision'] == failed_original['revision']
+    origin_failures.remove('/invalidate/failure')
+    checks.append('NGX_RESTY_EXT Invalidate suppresses configured failure stale while plain nginx retains the agreed stale downgrade without validating the old entity')
+    conditional_paths.add('/invalidate/policy')
+    conditional_policies['/invalidate/policy'] = 'max-age=1, must-revalidate'
+    policies['/invalidate/policy'] = 'invalidate-policy'
+    assert get('/invalidate/policy')[1] == 'MISS'; records('/invalidate/policy', 1)
+    fence('force-invalidate-policy', 5, 'invalidate-policy', 'tenant', mode=1)
+    assert get('/invalidate/policy') == (200, 'REVALIDATED', b'/invalidate/policy')
+    origin_failures.add('/invalidate/policy')
+    time.sleep(2.1)
+    result = get('/invalidate/policy')
+    assert result == ((500, 'EXPIRED', b'') if extension else (200, 'STALE', b'/invalidate/policy')), result
+    origin_failures.remove('/invalidate/policy')
+    checks.append('a successful 304 persists a newly received origin must-revalidate policy while clearing only the purge reason in the extension build')
     assert get('/unmarked')[1] == 'MISS'
     unmarked = records('/unmarked', 1)[0]
     os.removexattr(ready_file(unmarked), 'user.ngx_cache_purge.id')
@@ -625,7 +700,7 @@ try:
     with concurrent.futures.ThreadPoolExecutor(1) as pool:
         request = pool.submit(get, '/revalidate-race')
         assert validation_waiting.wait(5)
-        race_sequence = fence('invalidate-during-304', 5, 'race-old', 'tenant')
+        race_sequence = fence('invalidate-during-304', 5, 'race-old', 'tenant', mode=1)
         until(lambda: (count := writers(race_sequence)) is not None and count > 0)
         policies['/revalidate-race'] = 'race-new'
         validation_tags['/revalidate-race'] = 'race-new'

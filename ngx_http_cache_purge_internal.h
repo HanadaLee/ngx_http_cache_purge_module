@@ -61,13 +61,14 @@ typedef enum {
     NGX_HTTP_CACHE_PURGE_OP_INSPECT_FILE,
     /* ID, revision, transaction, before/after, TAG mode/count/values,
      * request origin ledger[16]/sequence u64;
-     * two FDs: lease, selected file -> GET-format record and admission stamp */
+     * two FDs -> GET record, publication u64, Invalidate sequence u64 */
     NGX_HTTP_CACHE_PURGE_OP_VALIDATE_FILE,
     /* operation sequence u64 -> number of older active worker registrations */
     NGX_HTTP_CACHE_PURGE_OP_GET_WRITERS,
   /* ID/revision, one path lease FD -> removal outcome u32 and retired match */
     NGX_HTTP_CACHE_PURGE_OP_REMOVE_FILE,
-    /* root/zone/path/key/URL, one selected FD -> GET record + publication u64.
+    /* root/zone/path/key/URL, one FD -> GET record, publication u64,
+     * required Invalidate sequence u64 (zero permits ordinary reuse).
      * Registers the observed URL and checks all persisted aliases. */
     NGX_HTTP_CACHE_PURGE_OP_ADMIT_FILE
 } ngx_http_cache_purge_opcode_e;
@@ -765,6 +766,13 @@ int ngx_http_cache_purge_publication_watermark(
     ngx_http_cache_rocksdb_bytes_t metadata,
     ngx_http_cache_purge_watermark_t *watermark,
     ngx_http_cache_rocksdb_error_t *error);
+/* Conditional validation covers Invalidate only; full-entity origin covers
+ * both modes. Legacy metadata without either boundary returns NOT_FOUND. */
+int ngx_http_cache_purge_publication_watermarks(
+    ngx_http_cache_rocksdb_bytes_t metadata,
+    ngx_http_cache_purge_watermark_t *origin,
+    ngx_http_cache_purge_watermark_t *validated,
+    ngx_http_cache_rocksdb_error_t *error);
 
 typedef struct {
     ngx_http_cache_rocksdb_bytes_t  root;
@@ -858,12 +866,13 @@ int ngx_http_cache_purge_publications_remove(
     ngx_http_cache_rocksdb_error_t *error);
 
 typedef struct {
-    ngx_http_cache_purge_index_expected_t  file;
-    unsigned char                          transaction[16];
-    ngx_http_cache_rocksdb_bytes_t         before, after;
-    const ngx_http_cache_rocksdb_bytes_t  *tags;
-    size_t                                 tag_count;
-    int                                    replace_tags;
+    ngx_http_cache_purge_index_expected_t    file;
+    unsigned char                            transaction[16];
+    ngx_http_cache_rocksdb_bytes_t           before, after;
+    const ngx_http_cache_rocksdb_bytes_t    *tags;
+    size_t                                   tag_count;
+    int                                      replace_tags;
+    const ngx_http_cache_purge_watermark_t  *origin;
 } ngx_http_cache_purge_validation_t;
 
 /* Called on the owning executor immediately before the metadata transaction.

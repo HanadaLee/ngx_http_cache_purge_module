@@ -114,6 +114,17 @@ for cut in ('basic', 'intent', 'prefix', 'torn', 'done', 'missing', 'replaced', 
     if cut == 'replaced':
         assert (root / 'cache/file').read_bytes() == b'unrelated replacement'
 
+for cut in ('basic', 'intent', 'prefix', 'torn', 'done', 'automatic'):
+    if cut == 'automatic' and not a.component: continue
+    root = Path(tempfile.mkdtemp(prefix='cache-purge-conditional-', dir='/tmp'))
+    roots.append(str(root))
+    mode = '--validate-origin-basic' if cut == 'basic' else '--validate-origin-crash-' + ('intent' if cut == 'automatic' else cut)
+    checks.append(subprocess.check_output([str(a.binary), mode, str(root)], text=True, timeout=30).strip())
+    if cut == 'automatic': automatic(root)
+    if cut != 'basic':
+        for _ in range(2):
+            checks.append(subprocess.check_output([str(a.binary), '--validate-origin-recover', str(root)], text=True, timeout=30).strip())
+
 for cut in ('basic', 'retired', 'unlinked'):
     root = Path(tempfile.mkdtemp(prefix='cache-purge-removal-', dir='/tmp'))
     roots.append(str(root))

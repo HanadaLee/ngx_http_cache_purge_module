@@ -1212,6 +1212,11 @@ ngx_http_cache_purge_watermark_decode(ngx_http_cache_rocksdb_bytes_t data,
             NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid watermark output/input");
     }
     memset(watermark, 0, sizeof(*watermark));
+    if (data.len >= 4 && memcmp(data.data, "NFW2", 4) == 0) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+            "conditional proof is not a full-entity origin");
+    }
     if (data.len < 4 || memcmp(data.data, "NFW1", 4) != 0) {
         return ngx_http_cache_purge_result(error,
             NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND, "file has no origin watermark");
@@ -1228,23 +1233,87 @@ ngx_http_cache_purge_watermark_decode(ngx_http_cache_rocksdb_bytes_t data,
     return ngx_http_cache_purge_result(error, 0, "");
 }
 
+static int
+ngx_http_cache_purge_metadata_watermarks(ngx_http_cache_rocksdb_bytes_t data,
+    ngx_http_cache_purge_watermark_t *origin,
+    ngx_http_cache_purge_watermark_t *validated,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    int  rc;
+
+    memset(origin, 0, sizeof(*origin));
+    memset(validated, 0, sizeof(*validated));
+    if (data.len >= 4 && memcmp(data.data, "NFW2", 4) == 0) {
+        if (data.len < 32 || ngx_http_cache_purge_zero(data.data + 4)
+            || ngx_http_cache_purge_publication_number(data.data + 28, 4)
+               != data.len - 32)
+        {
+            return ngx_http_cache_purge_result(error,
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                "invalid conditional watermark");
+        }
+        memcpy(validated->ledger, data.data + 4, 16);
+        validated->sequence = ngx_http_cache_purge_publication_number(
+            data.data + 20, 8);
+        data.data += 32;
+        data.len -= 32;
+        rc = ngx_http_cache_purge_watermark_decode(data, origin, error);
+        if (rc != 0 && rc != NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) {
+            return rc;
+        }
+        if (rc == 0 && memcmp(origin->ledger, validated->ledger, 16) == 0
+            && origin->sequence > validated->sequence)
+        {
+            return ngx_http_cache_purge_result(error,
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                "conditional watermark regressed");
+        }
+        return ngx_http_cache_purge_result(error, 0, "");
+    }
+    rc = ngx_http_cache_purge_watermark_decode(data, origin, error);
+    if (rc == 0) {
+        *validated = *origin;
+    }
+    return rc;
+}
+
+int
+ngx_http_cache_purge_publication_watermarks(
+    ngx_http_cache_rocksdb_bytes_t metadata,
+    ngx_http_cache_purge_watermark_t *origin,
+    ngx_http_cache_purge_watermark_t *validated,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_publication_proof_t  proof;
+    int                                       rc;
+
+    if (origin == NULL || validated == NULL) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "missing watermark output");
+    }
+    memset(origin, 0, sizeof(*origin));
+    memset(validated, 0, sizeof(*validated));
+    rc = ngx_http_cache_purge_publication_proof(metadata, &proof, error);
+    return rc == 0 ? ngx_http_cache_purge_metadata_watermarks(proof.metadata,
+        origin, validated, error) : rc;
+}
+
 int
 ngx_http_cache_purge_publication_watermark(
     ngx_http_cache_rocksdb_bytes_t metadata,
     ngx_http_cache_purge_watermark_t *watermark,
     ngx_http_cache_rocksdb_error_t *error)
 {
-    ngx_http_cache_purge_publication_proof_t  proof;
-    int                                       rc;
+    ngx_http_cache_purge_watermark_t  validated;
+    int                               rc;
 
-    if (watermark == NULL) {
-        return ngx_http_cache_purge_result(error,
-            NGX_HTTP_CACHE_ROCKSDB_INVALID, "missing watermark output");
+    rc = ngx_http_cache_purge_publication_watermarks(metadata, watermark,
+                                                       &validated, error);
+    if (rc == 0 && ngx_http_cache_purge_zero(watermark->ledger)) {
+        rc = ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND, "file has no full-entity origin");
     }
-    memset(watermark, 0, sizeof(*watermark));
-    rc = ngx_http_cache_purge_publication_proof(metadata, &proof, error);
-    return rc == 0 ? ngx_http_cache_purge_watermark_decode(proof.metadata,
-        watermark, error) : rc;
+    return rc;
 }
 
 static int
@@ -2341,7 +2410,10 @@ ngx_http_cache_purge_validation_digest(
         || !ngx_http_cache_purge_publication_valid(input->before, 4096)
         || !ngx_http_cache_purge_publication_valid(input->after, 4096)
         || input->before.len == 0 || input->before.len != input->after.len
-        || *count > 64)
+        || *count > 64
+        || (input->origin != NULL
+            && (ngx_http_cache_purge_zero(input->origin->ledger)
+                || input->origin->sequence == UINT64_MAX)))
     {
         return ngx_http_cache_purge_result(error,
             NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid validation input");
@@ -2366,6 +2438,9 @@ ngx_http_cache_purge_validation_digest(
     }
     *count = used;
     length = 45 + input->before.len * 2;
+    if (input->origin != NULL) {
+        length += NGX_HTTP_CACHE_PURGE_WATERMARK_SIZE;
+    }
     for (i = 0; i < used; i++) {
         length += 4 + tags[i].len;
     }
@@ -2388,6 +2463,9 @@ ngx_http_cache_purge_validation_digest(
         p = ngx_http_cache_purge_publication_encode(p, tags[i].len, 4);
         memcpy(p, tags[i].data, tags[i].len);
         p += tags[i].len;
+    }
+    if (input->origin != NULL) {
+        ngx_http_cache_purge_watermark_encode(input->origin, p);
     }
     if (SHA256(raw, length, digest) == NULL) {
         free(raw);
@@ -2433,6 +2511,68 @@ ngx_http_cache_purge_validation_match(
     out->state = file->state;
 }
 
+static int
+ngx_http_cache_purge_validation_base(ngx_http_cache_rocksdb_bytes_t base,
+    const ngx_http_cache_purge_watermark_t *origin,
+    ngx_http_cache_rocksdb_bytes_t *out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_publication_proof_t  proof;
+    ngx_http_cache_purge_watermark_t          full, validated;
+    ngx_http_cache_rocksdb_bytes_t            original;
+    unsigned char                            *raw, *p;
+    size_t                                     prefix, length;
+    int                                        rc;
+
+    memset(out, 0, sizeof(*out));
+    rc = ngx_http_cache_purge_publication_proof(base, &proof, error);
+    if (rc != 0) {
+        return rc;
+    }
+    original = proof.metadata;
+    rc = ngx_http_cache_purge_metadata_watermarks(original, &full,
+                                                    &validated, error);
+    if (rc != 0 && rc != NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) {
+        return rc;
+    }
+    if (rc == 0 && memcmp(validated.ledger, origin->ledger, 16) == 0
+        && validated.sequence > origin->sequence)
+    {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "validation origin regressed");
+    }
+    if (original.len >= 4 && memcmp(original.data, "NFW2", 4) == 0) {
+        original.data += 32;
+        original.len -= 32;
+    }
+    prefix = base.len - proof.metadata.len - 4;
+    length = prefix + 4 + 32 + original.len;
+    if (length > 16384) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+            "validation origin metadata too large");
+    }
+    raw = malloc(length);
+    if (raw == NULL) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+            "validation origin allocation failed");
+    }
+    memcpy(raw, base.data, prefix);
+    p = ngx_http_cache_purge_publication_encode(raw + prefix,
+                                                  32 + original.len, 4);
+    memcpy(p, "NFW2", 4);
+    memcpy(p + 4, origin->ledger, 16);
+    ngx_http_cache_purge_publication_encode(p + 20, origin->sequence, 8);
+    ngx_http_cache_purge_publication_encode(p + 28, original.len, 4);
+    if (original.len) {
+        memcpy(p + 32, original.data, original.len);
+    }
+    out->data = raw;
+    out->len = length;
+    return ngx_http_cache_purge_result(error, 0, "");
+}
+
 int
 ngx_http_cache_purge_publications_validate_prepare(
     ngx_http_cache_purge_publications_t *p, ngx_http_cache_rocksdb_t *store,
@@ -2447,7 +2587,8 @@ ngx_http_cache_purge_publications_validate_prepare(
     ngx_http_cache_purge_publication_proof_t  proof;
     ngx_http_cache_purge_publication_root_t  *root;
     ngx_http_cache_purge_file_marker_t        marker;
-    ngx_http_cache_rocksdb_bytes_t            address, base, metadata, tags[64];
+    ngx_http_cache_rocksdb_bytes_t            address, base, updated;
+    ngx_http_cache_rocksdb_bytes_t            metadata, tags[64];
     struct stat                               st;
     unsigned char                             digest[32], identity[16];
     unsigned char                            *raw, *next, *before;
@@ -2473,6 +2614,7 @@ ngx_http_cache_purge_publications_validate_prepare(
     }
     memset(&checked, 0, sizeof(checked));
     memset(&address, 0, sizeof(address));
+    memset(&updated, 0, sizeof(updated));
     raw = NULL;
     before = NULL;
     rc = ngx_http_cache_purge_index_get_file(
@@ -2590,6 +2732,22 @@ ngx_http_cache_purge_publications_validate_prepare(
     if (plan.pending || file.revision != input->file.revision) {
         goto conflict;
     }
+    if (input->origin == NULL && proof.metadata.len >= 4
+        && memcmp(proof.metadata.data, "NFW2", 4) == 0)
+    {
+        rc = ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID,
+            "conditional metadata requires a request origin");
+        goto done;
+    }
+    if (input->origin != NULL) {
+        rc = ngx_http_cache_purge_validation_base(base, input->origin,
+                                                    &updated, error);
+        if (rc != 0) {
+            goto done;
+        }
+        base = updated;
+    }
     size = 72 + base.len + 2 * input->before.len;
     if (size > 16384 || base.len + 64 > 16384
         || input->before.len > proof.size)
@@ -2650,6 +2808,7 @@ conflict:
 done:
     free(raw);
     free(before);
+    free((void *) updated.data);
     free((void *) address.data);
     ngx_http_cache_purge_index_file_free(&checked);
     ngx_http_cache_purge_index_file_free(&file);
@@ -2667,6 +2826,7 @@ ngx_http_cache_purge_publications_validate_finish(
     ngx_http_cache_purge_index_file_t         file, checked;
     ngx_http_cache_purge_validation_plan_t    plan;
     ngx_http_cache_purge_validation_t         input;
+    ngx_http_cache_purge_watermark_t          origin, validated;
     ngx_http_cache_purge_index_expected_t     expected;
     ngx_http_cache_purge_publication_proof_t  proof;
     ngx_http_cache_purge_publication_root_t  *root;
@@ -2803,6 +2963,16 @@ ngx_http_cache_purge_publications_validate_finish(
     memcpy(input.transaction, plan.transaction, 16);
     input.before = plan.before;
     input.after = plan.after;
+    if (proof.metadata.len >= 4
+        && memcmp(proof.metadata.data, "NFW2", 4) == 0)
+    {
+        rc = ngx_http_cache_purge_metadata_watermarks(proof.metadata, &origin,
+                                                        &validated, error);
+        if (rc != 0) {
+            goto done;
+        }
+        input.origin = &validated;
+    }
     count = file.tag_count;
     memcpy(tags, file.tags, count * sizeof(tags[0]));
     rc = ngx_http_cache_purge_validation_digest(&input, tags, &count,

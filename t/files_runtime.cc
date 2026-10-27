@@ -113,7 +113,7 @@ static int validation_guard(void *data,
     return data ? NGX_HTTP_CACHE_ROCKSDB_CONFLICT : 0;
 }
 
-static int validation(const std::string &mode, const std::string &path) {
+static int validation(const std::string &mode, const std::string &path, bool with_origin = false) {
     bool recovering = mode.find("--validate-recover") == 0;
     std::filesystem::create_directories(path + "/cache");
     std::filesystem::create_directories(path + "/db");
@@ -131,6 +131,14 @@ static int validation(const std::string &mode, const std::string &path) {
     File file; file.id = id(42); file.key = "key"; file.url = "https://example.test/value";
     file.host = "example.test"; file.tag_namespace = "tenant"; file.tags = {"red"};
     file.root = path + "/cache"; file.zone = "cache"; file.path = "file"; file.metadata = "original-metadata";
+    ngx_http_cache_purge_watermark_t origin{};
+    if (with_origin) {
+        std::memset(origin.ledger, 0x17, 16); origin.sequence = 3;
+        unsigned char encoded[NGX_HTTP_CACHE_PURGE_WATERMARK_SIZE];
+        ngx_http_cache_purge_watermark_encode(&origin, encoded);
+        file.metadata.assign(reinterpret_cast<char *>(encoded), sizeof(encoded));
+        origin.sequence = 7;
+    }
     std::string target = file.root + "/file", before = "old-head", after = "new-head", tail(65536, 'B');
     unsigned char address[16]; uint64_t offset;
     check(ngx_http_cache_purge_file_address(bytes(target), address, &offset, &error) == 0, "validation address");
@@ -151,6 +159,7 @@ static int validation(const std::string &mode, const std::string &path) {
     std::memcpy(input.file.id, file.id.data(), 16); input.file.revision = 2;
     input.transaction[15] = 1; input.before = bytes(before); input.after = bytes(after);
     input.tags = tags; input.tag_count = 3; input.replace_tags = 1;
+    input.origin = with_origin ? &origin : nullptr;
     ngx_http_cache_purge_index_match_t result{};
     if (!recovering) {
         Descriptor selected(open(target.c_str(), O_RDONLY | O_CLOEXEC));
@@ -243,6 +252,18 @@ static int validation(const std::string &mode, const std::string &path) {
               bytes(file.path), selected.fd, getuid(), &inspected, &error) == 0
               && inspected.revision == 4 && inspected.metadata.len > 64
               && std::memcmp(inspected.metadata.data, "NFR1", 4) == 0, "updated physical proof passes descriptor inspection");
+        if (with_origin) {
+            ngx_http_cache_purge_watermark_t full{}, validated{};
+            check(ngx_http_cache_purge_publication_watermarks(inspected.metadata, &full, &validated, &error) == 0
+                  && full.sequence == 3 && validated.sequence == 7
+                  && std::memcmp(full.ledger, origin.ledger, 16) == 0,
+                  "recovery preserves distinct full and conditional coverage");
+            std::string malformed(reinterpret_cast<const char *>(inspected.metadata.data), inspected.metadata.len);
+            auto at = malformed.find("NFW2"); check(at != std::string::npos, "conditional proof exists");
+            malformed[at + 27] = 2;
+            check(ngx_http_cache_purge_publication_watermarks(bytes(malformed), &full, &validated, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "conditional proof cannot regress below the full origin");
+        }
         ngx_http_cache_purge_index_file_free(&inspected);
         ngx_http_cache_rocksdb_stats_t stats{}, retried{};
         check(ngx_http_cache_rocksdb_stats(store, &stats, &error) == 0, "read validation write count");
@@ -256,6 +277,14 @@ static int validation(const std::string &mode, const std::string &path) {
               "completed retries perform no database writes");
         if (mode == "--validate-basic") {
             auto previous_size = index.get(file.id).metadata.size();
+            if (with_origin) {
+                auto older = origin; older.sequence = 6;
+                auto regressed = input; regressed.file.revision = 4; regressed.transaction[15] = 2;
+                regressed.before = bytes(after); regressed.origin = &older;
+                check(ngx_http_cache_purge_publications_validate_prepare(publications.native(), store, &regressed,
+                      anchor.fd, lease.fd, selected.fd, getuid(), validation_guard, nullptr, &result, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "older conditional origin cannot regress a completed validation");
+            }
             auto previous = input;
             input.file.revision = 4; input.transaction[15] = 2; input.before = bytes(after); input.after = bytes(after);
             input.replace_tags = 0; input.tags = nullptr; input.tag_count = 0;
@@ -346,6 +375,8 @@ static int removal(const std::string &mode, const std::string &path) {
 
 int main(int argc, char **argv) {
     try {
+        if (argc == 3 && std::string(argv[1]).find("--validate-origin-") == 0)
+            return validation("--validate-" + std::string(argv[1]).substr(18), argv[2], true);
         if (argc == 3 && std::string(argv[1]).find("--remove-") == 0) return removal(argv[1], argv[2]);
         if (argc == 3) return std::string(argv[1]).find("--validate-") == 0
                                  ? validation(argv[1], argv[2]) : publication(argv[1], argv[2]);

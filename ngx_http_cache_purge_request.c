@@ -300,6 +300,12 @@ enum {
     NGX_HTTP_CACHE_PURGE_READ_WAITING,
     NGX_HTTP_CACHE_PURGE_READ_DONE
 };
+
+enum {
+    NGX_HTTP_CACHE_PURGE_ADMIT_DENY,
+    NGX_HTTP_CACHE_PURGE_ADMIT_ALLOW,
+    NGX_HTTP_CACHE_PURGE_ADMIT_REVALIDATE
+};
 typedef struct {
     ngx_http_complex_value_t *field[NGX_HTTP_CACHE_PURGE_FIELD_COUNT];
 } ngx_http_cache_purge_capture_conf_t;
@@ -372,10 +378,11 @@ typedef struct {
     unsigned  read_header_only : 1;
     unsigned  origin_valid : 1;
     unsigned  origin_registered : 1;
+    unsigned  invalidation_retry : 1;
 } ngx_http_cache_purge_capture_t;
 
 typedef struct {
-    uint64_t   covered;
+    uint64_t   covered, validated, required;
     ngx_int_t  fenced;
 } ngx_http_cache_purge_read_match_t;
 typedef struct {
@@ -1114,6 +1121,9 @@ ngx_http_cache_purge_read_validation_capture(
     v->after.date = ngx_time();
 #if (NGX_RESTY_EXT)
     v->after.valid_msec &= ~NGX_HTTP_CACHE_PURGE_REVALIDATE;
+    if (c->must_revalidate & NGX_HTTP_CACHE_REVALIDATE_ORIGIN) {
+        v->after.valid_msec |= NGX_HTTP_CACHE_MUST_REVALIDATE;
+    }
 #endif
     conf = ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_index_module);
     expression = conf->field[NGX_HTTP_CACHE_PURGE_FIELD_TAG];
@@ -1352,10 +1362,14 @@ ngx_http_cache_purge_read_complete(ngx_http_cache_purge_capture_t *ctx,
     ngx_http_upstream_conf_t  *conf;
     ngx_connection_t          *connection;
     ngx_int_t                  rc;
+    ngx_uint_t                 revalidate;
 
     r = ctx->request;
     u = ctx->read_upstream;
     connection = r->connection;
+    revalidate = allowed == NGX_HTTP_CACHE_PURGE_ADMIT_REVALIDATE
+                 && !ctx->invalidation_retry;
+    allowed = allowed == NGX_HTTP_CACHE_PURGE_ADMIT_ALLOW;
     if (ctx->validation != NULL) {
         if (allowed) {
             ctx->cache->valid_sec = ctx->validation->after.valid_sec;
@@ -1410,8 +1424,8 @@ ngx_http_cache_purge_read_complete(ngx_http_cache_purge_capture_t *ctx,
         return;
     }
 
-    /* Keep the native key and cache node, and start a fresh upstream request.
-     * No stale fallback or conditional reuse is possible on this attempt. */
+    /* Retain the native key, node, validators and entity for Invalidate.
+     * Delete/unknown instances instead require an unconditional replacement. */
     conf = ngx_palloc(r->pool, sizeof(*conf));
     if (conf == NULL) {
         ngx_http_file_cache_free(ctx->cache, NULL);
@@ -1422,8 +1436,16 @@ ngx_http_cache_purge_read_complete(ngx_http_cache_purge_capture_t *ctx,
     conf->cache = 0;
     u->conf = conf;
     r->cached = 0;
-    u->cache_status = NGX_HTTP_CACHE_BYPASS;
+    u->cache_status = revalidate ? NGX_HTTP_CACHE_EXPIRED :
+                                  NGX_HTTP_CACHE_BYPASS;
     u->cacheable = ngx_http_cache_purge_capture_origin(ctx) == NGX_OK;
+    if (revalidate) {
+        ctx->invalidation_retry = 1;
+        ctx->read_state = NGX_HTTP_CACHE_PURGE_READ_READY;
+#if (NGX_RESTY_EXT)
+        ctx->cache->must_revalidate |= NGX_HTTP_CACHE_REVALIDATE_PURGE;
+#endif
+    }
     u->buffer.start = NULL;
     u->request_sent = 1;
     ctx->cache->valid_sec = 0;
@@ -1473,9 +1495,16 @@ ngx_http_cache_purge_read_match(void *data,
 
     result = data;
     if ((match->flags & NGX_HTTP_CACHE_PURGE_CONTROL_FENCE)
-        && match->sequence > result->covered)
+        && match->sequence > (match->mode == NGX_HTTP_CACHE_PURGE_INVALIDATE
+                             ? result->validated : result->covered))
     {
-        result->fenced = 1;
+        if (match->mode == NGX_HTTP_CACHE_PURGE_INVALIDATE) {
+            if (match->sequence > result->required) {
+                result->required = match->sequence;
+            }
+        } else {
+            result->fenced = 1;
+        }
     }
     return 0;
 }
@@ -1508,7 +1537,7 @@ ngx_http_cache_purge_read_request(ngx_http_cache_purge_capture_t *ctx)
     ngx_memzero(&match, sizeof(match));
     rc = ngx_http_cache_purge_control_match(reader, &context, 64, 65536,
         ngx_http_cache_purge_read_match, &match, &publication, &error);
-    if (rc != 0 || match.fenced || !ctx->origin_valid
+    if (rc != 0 || match.fenced || match.required || !ctx->origin_valid
         || publication != ctx->origin_publication)
     {
         return NGX_DECLINED;
@@ -1531,23 +1560,23 @@ ngx_http_cache_purge_read_admit(ngx_http_cache_purge_capture_t *ctx,
     ngx_http_cache_purge_control_context_t  context;
     ngx_http_cache_rocksdb_error_t          error;
     ngx_http_cache_rocksdb_bytes_t           fields[10], tags[64], value;
-    ngx_http_cache_purge_watermark_t        current, stored;
+    ngx_http_cache_purge_watermark_t        current, stored, validated;
     uint64_t                                publication, first, stamp;
     ngx_uint_t                              i, count;
     ngx_http_cache_purge_read_match_t       match;
     u_char                                 *p, *end;
     int                                     rc;
 
-    if (payload.len < 37 || payload.data[0] != 2) {
+    if (payload.len < 45 || payload.data[0] != 2) {
         return 0;
     }
     stamp = ngx_http_cache_purge_capture_read_number(
-        payload.data + payload.len - 8, 8);
+        payload.data + payload.len - 16, 8);
     if (stamp == 0) {
         return 0;
     }
     p = payload.data + 25;
-    end = payload.data + payload.len - 8;
+    end = payload.data + payload.len - 16;
     for (i = 0; i < 10; i++) {
         if (ngx_http_cache_purge_read_field(&p, end, &fields[i]) != NGX_OK) {
             return 0;
@@ -1584,12 +1613,14 @@ ngx_http_cache_purge_read_admit(ngx_http_cache_purge_capture_t *ctx,
         return 0;
     }
     ngx_memzero(&match, sizeof(match));
+    match.required = ngx_http_cache_purge_capture_read_number(end + 8, 8);
     rc = ngx_http_cache_purge_control_watermark(reader, &current,
                                                  &first, &error);
-    if (rc != 0 || first != stamp) {
+    if (rc != 0 || first != stamp || match.required > current.sequence) {
         return 0;
     }
-    rc = ngx_http_cache_purge_publication_watermark(fields[9], &stored, &error);
+    rc = ngx_http_cache_purge_publication_watermarks(fields[9], &stored,
+                                                       &validated, &error);
     if (rc != 0 && rc != NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) {
         return 0;
     }
@@ -1598,6 +1629,12 @@ ngx_http_cache_purge_read_admit(ngx_http_cache_purge_capture_t *ctx,
             return 0;
         }
         match.covered = stored.sequence;
+    }
+    if (rc == 0 && ngx_memcmp(current.ledger, validated.ledger, 16) == 0) {
+        if (validated.sequence > current.sequence) {
+            return 0;
+        }
+        match.validated = validated.sequence;
     }
     ngx_memzero(&context, sizeof(context));
     context.key = fields[0];
@@ -1635,7 +1672,18 @@ ngx_http_cache_purge_read_admit(ngx_http_cache_purge_capture_t *ctx,
     /* Commit this synchronous admission before releasing the publication.
      * No guard spans IPC, output filters or asynchronous body streaming. */
     rc = ngx_http_cache_purge_control_guard_end(reader, &error);
-    return rc == 0;
+    if (rc != 0) {
+        return 0;
+    }
+#if !(NGX_RESTY_EXT)
+    if (ctx->read_upstream->cache_status == NGX_HTTP_CACHE_STALE
+        || ctx->read_upstream->cache_status == NGX_HTTP_CACHE_UPDATING)
+    {
+        return 1;
+    }
+#endif
+    return match.required ? NGX_HTTP_CACHE_PURGE_ADMIT_REVALIDATE :
+                            NGX_HTTP_CACHE_PURGE_ADMIT_ALLOW;
 }
 
 static void
