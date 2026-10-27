@@ -3533,10 +3533,12 @@ typedef struct {
     uint32_t       links;
     uint32_t       nodes;
     uint32_t       buckets;
+    uint32_t       scopes;
     uint32_t       records_at;
     uint32_t       nodes_at;
     uint32_t       links_at;
     uint32_t       buckets_at;
+    uint32_t       scopes_at;
     uint32_t       strings_at;
     uint64_t       sequence;
     unsigned char  ledger[16];
@@ -3587,6 +3589,7 @@ typedef struct {
     ngx_http_cache_purge_control_link_t    *links;
     ngx_http_cache_purge_control_node_t    *nodes;
     uint32_t                               *buckets;
+    uint32_t                               *scopes;
     unsigned char                          *strings;
     uint32_t                                nnodes;
     uint32_t                                max_nodes;
@@ -3601,12 +3604,15 @@ typedef struct {
     const ngx_http_cache_purge_control_link_t     *links;
     const ngx_http_cache_purge_control_node_t     *nodes;
     const uint32_t                                *buckets;
+    const uint32_t                                *scopes;
     const ngx_http_cache_purge_control_context_t  *context;
     size_t                                         count;
     size_t                                         remaining;
     size_t                                         limit;
     uint64_t                                      *seen;
     int                                            seen_initialized;
+    int                                            propagation;
+    int                                            tags_known;
     ngx_http_cache_purge_control_visit_pt         visit;
     void                            *data;
     ngx_http_cache_rocksdb_error_t  *error;
@@ -4299,9 +4305,12 @@ ngx_http_cache_purge_control_build(ngx_http_cache_purge_control_shared_t *s,
     ngx_http_cache_purge_control_record_t    *record;
     ngx_http_cache_purge_control_link_t      *link;
     ngx_http_cache_rocksdb_bytes_t            tags[64];
+    ngx_http_cache_rocksdb_bytes_t            empty = { NULL, 0 };
     size_t                                    i, j, members, links, next;
     size_t                                    strings;
     size_t                                    buckets;
+    size_t                                    scopes;
+    size_t                                    scoped;
     size_t                                    fixed;
     size_t                                    capacity;
     size_t                                    original;
@@ -4327,6 +4336,7 @@ ngx_http_cache_purge_control_build(ngx_http_cache_purge_control_shared_t *s,
     }
     strings = 0;
     links = 0;
+    scoped = 0;
     for (i = 0; i < count; i++) {
         if (!ngx_http_cache_purge_control_validate(&ops[i])) {
             free(ids);
@@ -4337,6 +4347,9 @@ ngx_http_cache_purge_control_build(ngx_http_cache_purge_control_shared_t *s,
         ids[i].id = ops[i].input.id;
         ids[i].sequence = ops[i].sequence;
         kind = ops[i].input.selector.kind;
+        if (kind >= NGX_HTTP_CACHE_PURGE_NAMESPACE_TAG) {
+            scoped++;
+        }
         members = 1;
         if (kind > NGX_HTTP_CACHE_PURGE_HOST_TAG) {
             (void) ngx_http_cache_purge_tags_decode(ops[i].input.selector.value,
@@ -4393,11 +4406,15 @@ ngx_http_cache_purge_control_build(ngx_http_cache_purge_control_shared_t *s,
     while (buckets < links * 2) {
         buckets *= 2;
     }
+    scopes = scoped ? 8 : 0;
+    while (scopes < scoped * 2) {
+        scopes *= 2;
+    }
 
     fixed = ngx_http_cache_purge_control_align(sizeof(*header))
             + count * sizeof(ngx_http_cache_purge_control_record_t)
             + links * sizeof(ngx_http_cache_purge_control_link_t)
-            + buckets * sizeof(uint32_t) + strings;
+            + (buckets + scopes) * sizeof(uint32_t) + strings;
     if (fixed > s->bank_bytes
         || 2 * sizeof(ngx_http_cache_purge_control_node_t)
                > s->bank_bytes - fixed)
@@ -4425,6 +4442,7 @@ ngx_http_cache_purge_control_build(ngx_http_cache_purge_control_shared_t *s,
     header->records = (uint32_t) count;
     header->links = (uint32_t) links;
     header->buckets = (uint32_t) buckets;
+    header->scopes = (uint32_t) scopes;
     header->records_at =
         (uint32_t) ngx_http_cache_purge_control_align(sizeof(*header));
     header->nodes_at = header->records_at
@@ -4433,7 +4451,8 @@ ngx_http_cache_purge_control_build(ngx_http_cache_purge_control_shared_t *s,
         header->nodes_at + nodes * sizeof(ngx_http_cache_purge_control_node_t);
     header->buckets_at = header->links_at
                         + links * sizeof(ngx_http_cache_purge_control_link_t);
-    header->strings_at = header->buckets_at + buckets * sizeof(uint32_t);
+    header->scopes_at = header->buckets_at + buckets * sizeof(uint32_t);
+    header->strings_at = header->scopes_at + scopes * sizeof(uint32_t);
 
     memset(&b, 0, sizeof(b));
     b.records =
@@ -4444,6 +4463,7 @@ ngx_http_cache_purge_control_build(ngx_http_cache_purge_control_shared_t *s,
     b.links = (ngx_http_cache_purge_control_link_t *) (image->data
                                                        + header->links_at);
     b.buckets = (uint32_t *) (image->data + header->buckets_at);
+    b.scopes = (uint32_t *) (image->data + header->scopes_at);
     b.strings = image->data + header->strings_at;
     b.max_nodes = nodes;
     b.nnodes = 2;
@@ -4451,6 +4471,9 @@ ngx_http_cache_purge_control_build(ngx_http_cache_purge_control_shared_t *s,
     ngx_http_cache_purge_control_node_init(&b.nodes[1]);
     for (i = 0; i < buckets; i++) {
         b.buckets[i] = NGX_HTTP_CACHE_PURGE_CONTROL_NONE;
+    }
+    for (i = 0; i < scopes; i++) {
+        b.scopes[i] = NGX_HTTP_CACHE_PURGE_CONTROL_NONE;
     }
 
     next = 0;
@@ -4510,6 +4533,13 @@ ngx_http_cache_purge_control_build(ngx_http_cache_purge_control_shared_t *s,
                 link->next = b.buckets[bucket];
                 b.buckets[bucket] = (uint32_t) next++;
             }
+            if (kind >= NGX_HTTP_CACHE_PURGE_NAMESPACE_TAG) {
+                bucket = (uint32_t) (ngx_http_cache_purge_control_key_hash(
+                    s->salt, kind, empty, ops[i].input.selector.scope)
+                    & (scopes - 1));
+                record->next = b.scopes[bucket];
+                b.scopes[bucket] = (uint32_t) i;
+            }
         }
     }
 
@@ -4521,11 +4551,12 @@ ngx_http_cache_purge_control_build(ngx_http_cache_purge_control_shared_t *s,
         + b.nnodes * sizeof(ngx_http_cache_purge_control_node_t);
     header->buckets_at = header->links_at
                         + links * sizeof(ngx_http_cache_purge_control_link_t);
-    header->strings_at = header->buckets_at + buckets * sizeof(uint32_t);
+    header->scopes_at = header->buckets_at + buckets * sizeof(uint32_t);
+    header->strings_at = header->scopes_at + scopes * sizeof(uint32_t);
     header->bytes = header->strings_at + strings;
     memmove(image->data + header->links_at, image->data + original,
             links * sizeof(ngx_http_cache_purge_control_link_t)
-            + buckets * sizeof(uint32_t) + strings);
+            + (buckets + scopes) * sizeof(uint32_t) + strings);
     b.links = (ngx_http_cache_purge_control_link_t *) (image->data
                                                        + header->links_at);
 
@@ -5091,6 +5122,8 @@ ngx_http_cache_purge_control_matcher_init(
         || h->links > NGX_HTTP_CACHE_PURGE_CONTROL_MAX || h->nodes < 2
         || h->nodes > 2 * h->records + 2 || h->buckets < 8
         || h->buckets > 131072 || (h->buckets & (h->buckets - 1))
+        || (h->scopes && (h->scopes < 8 || h->scopes > 131072
+                         || (h->scopes & (h->scopes - 1))))
         || h->records_at != ngx_http_cache_purge_control_align(sizeof(*h))
         || h->nodes_at
                != h->records_at
@@ -5102,7 +5135,8 @@ ngx_http_cache_purge_control_matcher_init(
         || h->buckets_at
                != h->links_at
                       + h->links * sizeof(ngx_http_cache_purge_control_link_t)
-        || h->strings_at != h->buckets_at + h->buckets * sizeof(uint32_t)
+        || h->scopes_at != h->buckets_at + h->buckets * sizeof(uint32_t)
+        || h->strings_at != h->scopes_at + h->scopes * sizeof(uint32_t)
         || h->strings_at > h->bytes)
     {
         return ngx_http_cache_purge_control_error(
@@ -5117,6 +5151,7 @@ ngx_http_cache_purge_control_matcher_init(
     m->links =
         (const ngx_http_cache_purge_control_link_t *) (m->base + h->links_at);
     m->buckets = (const uint32_t *) (m->base + h->buckets_at);
+    m->scopes = (const uint32_t *) (m->base + h->scopes_at);
     return 0;
 }
 
@@ -5167,8 +5202,16 @@ ngx_http_cache_purge_control_emit(ngx_http_cache_purge_control_matcher_t *m,
     if (!m->context->proxy || m->context->now_ms >= r->until) {
         match.flags &= ~NGX_HTTP_CACHE_PURGE_CONTROL_PROPAGATE;
     }
+    if (m->propagation) {
+        match.flags &= NGX_HTTP_CACHE_PURGE_CONTROL_PROPAGATE;
+    }
     if (!match.flags) {
         return 0;
+    }
+    if (m->propagation && !m->tags_known
+        && r->kind >= NGX_HTTP_CACHE_PURGE_NAMESPACE_TAG)
+    {
+        match.flags |= NGX_HTTP_CACHE_PURGE_CONTROL_TAG_CANDIDATE;
     }
     rc = ngx_http_cache_purge_control_string(m, r->id, &match.operation_id);
     if (rc == 0) {
@@ -5256,6 +5299,55 @@ ngx_http_cache_purge_control_exact(ngx_http_cache_purge_control_matcher_t *m,
             }
         }
         i = link->next;
+    }
+    return 0;
+}
+
+static int
+ngx_http_cache_purge_control_scope(ngx_http_cache_purge_control_matcher_t *m,
+    uint32_t kind, ngx_http_cache_rocksdb_bytes_t scope)
+{
+    const ngx_http_cache_purge_control_record_t  *r;
+    ngx_http_cache_rocksdb_bytes_t                empty = { NULL, 0 };
+    ngx_http_cache_rocksdb_bytes_t                rs;
+    uint32_t                                      i, steps, actual;
+    int                                           rc;
+
+    if (m->image->scopes == 0 || scope.len == 0) {
+        return 0;
+    }
+    i = m->scopes[ngx_http_cache_purge_control_key_hash(m->shared->salt, kind,
+                                                      empty, scope)
+                  & (m->image->scopes - 1)];
+    steps = 0;
+    while (i != NGX_HTTP_CACHE_PURGE_CONTROL_NONE) {
+        if (++steps > m->image->records || i >= m->image->records) {
+            return ngx_http_cache_purge_control_error(m->error,
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid control scope chain");
+        }
+        r = &m->records[i];
+        if (r->kind < NGX_HTTP_CACHE_PURGE_NAMESPACE_TAG
+            || r->kind > NGX_HTTP_CACHE_PURGE_HOST_TAGS)
+        {
+            return ngx_http_cache_purge_control_error(m->error,
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                "control scope references a non-TAG operation");
+        }
+        actual = r->kind > NGX_HTTP_CACHE_PURGE_HOST_TAG ? r->kind - 2 :
+                                                         r->kind;
+        if (actual == kind) {
+            rc = ngx_http_cache_purge_control_string(m, r->scope, &rs);
+            if (rc != 0) {
+                return rc;
+            }
+            if (ngx_http_cache_purge_control_bytes_equal(rs, scope)) {
+                rc = ngx_http_cache_purge_control_emit(m, i);
+                if (rc != 0) {
+                    return rc;
+                }
+            }
+        }
+        i = r->next;
     }
     return 0;
 }
@@ -5370,7 +5462,7 @@ ngx_http_cache_purge_control_match_run(
                 "invalid control TAG input");
         }
     }
-    if (m->image->records == 0) {
+    if (m->image->records == 0 || (m->propagation && !c->proxy)) {
         return 0;
     }
     rc = ngx_http_cache_purge_control_exact(m, NGX_HTTP_CACHE_PURGE_KEY, c->key,
@@ -5388,6 +5480,17 @@ ngx_http_cache_purge_control_match_run(
     if (rc == 0) {
         rc = ngx_http_cache_purge_control_exact(m, NGX_HTTP_CACHE_PURGE_HOST,
                                                 c->host, empty);
+    }
+    if (m->propagation && !m->tags_known) {
+        if (rc == 0) {
+            rc = ngx_http_cache_purge_control_scope(m,
+                NGX_HTTP_CACHE_PURGE_NAMESPACE_TAG, c->tag_namespace);
+        }
+        if (rc == 0) {
+            rc = ngx_http_cache_purge_control_scope(m,
+                NGX_HTTP_CACHE_PURGE_HOST_TAG, c->host);
+        }
+        return rc;
     }
     for (i = 0; rc == 0 && i < c->tag_count; i++) {
         for (j = 0; j < i; j++) {
@@ -5411,24 +5514,33 @@ ngx_http_cache_purge_control_match_run(
     return rc;
 }
 
-int
-ngx_http_cache_purge_control_match(ngx_http_cache_purge_control_reader_t *r,
-    const ngx_http_cache_purge_control_context_t *context, size_t max_matches,
+static int
+ngx_http_cache_purge_control_lookup(ngx_http_cache_purge_control_reader_t *r,
+    const ngx_http_cache_purge_control_context_t *context, int propagation,
+    int tags_known, size_t max_matches,
     size_t max_bytes, ngx_http_cache_purge_control_visit_pt visit, void *data,
-    uint64_t *publication, ngx_http_cache_rocksdb_error_t *error)
+    ngx_http_cache_purge_watermark_t *watermark, uint64_t *publication,
+    ngx_http_cache_rocksdb_error_t *error)
 {
     ngx_http_cache_purge_control_matcher_t  m;
     uint64_t                                version;
     uint64_t                                seen[NGX_HTTP_CACHE_PURGE_SEEN];
     int                                     rc;
+    static const unsigned char zero[16] = { 0 };
 
     ngx_http_cache_purge_control_clear(error);
     if (publication != NULL) {
         *publication = 0;
     }
+    if (watermark != NULL) {
+        memset(watermark, 0, sizeof(*watermark));
+    }
     if (context == NULL || visit == NULL || publication == NULL
         || max_matches == 0 || max_matches > NGX_HTTP_CACHE_PURGE_CONTROL_MAX
-        || max_bytes > NGX_HTTP_CACHE_PURGE_CONTROL_BYTES)
+        || max_bytes > NGX_HTTP_CACHE_PURGE_CONTROL_BYTES
+        || (propagation && (watermark == NULL
+                            || (tags_known != 0 && tags_known != 1)
+                            || (!tags_known && context->tag_count))))
     {
         return ngx_http_cache_purge_control_error(
             error, NGX_HTTP_CACHE_ROCKSDB_INVALID,
@@ -5451,8 +5563,16 @@ ngx_http_cache_purge_control_match(ngx_http_cache_purge_control_reader_t *r,
     m.data = data;
     m.error = error;
     m.seen = seen;
+    m.propagation = propagation;
+    m.tags_known = tags_known;
 
     rc = ngx_http_cache_purge_control_matcher_init(&m);
+    if (rc == 0 && propagation
+        && memcmp(m.image->ledger, zero, sizeof(zero)) == 0)
+    {
+        rc = ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND, "control has no durable ledger");
+    }
     if (rc == 0) {
         rc = ngx_http_cache_purge_control_match_run(&m);
     }
@@ -5466,6 +5586,10 @@ ngx_http_cache_purge_control_match(ngx_http_cache_purge_control_reader_t *r,
             "control image changed during lookup");
     }
     if (rc == 0) {
+        if (watermark != NULL) {
+            memcpy(watermark->ledger, m.image->ledger, 16);
+            watermark->sequence = m.image->sequence;
+        }
         *publication = version;
     }
     if (rc == NGX_HTTP_CACHE_ROCKSDB_CORRUPT) {
@@ -5473,6 +5597,29 @@ ngx_http_cache_purge_control_match(ngx_http_cache_purge_control_reader_t *r,
     }
     ngx_http_cache_purge_control_unpin(r);
     return rc;
+}
+
+int
+ngx_http_cache_purge_control_match(ngx_http_cache_purge_control_reader_t *r,
+    const ngx_http_cache_purge_control_context_t *context, size_t max_matches,
+    size_t max_bytes, ngx_http_cache_purge_control_visit_pt visit, void *data,
+    uint64_t *publication, ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_purge_control_lookup(r, context, 0, 1, max_matches,
+        max_bytes, visit, data, NULL, publication, error);
+}
+
+int
+ngx_http_cache_purge_control_propagation(
+    ngx_http_cache_purge_control_reader_t *r,
+    const ngx_http_cache_purge_control_context_t *context, int tags_known,
+    size_t max_matches, size_t max_bytes,
+    ngx_http_cache_purge_control_visit_pt visit, void *data,
+    ngx_http_cache_purge_watermark_t *watermark, uint64_t *publication,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_purge_control_lookup(r, context, 1, tags_known,
+        max_matches, max_bytes, visit, data, watermark, publication, error);
 }
 
 int

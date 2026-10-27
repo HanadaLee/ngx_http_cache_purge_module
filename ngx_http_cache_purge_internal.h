@@ -199,10 +199,11 @@ int ngx_http_cache_purge_component_stop(
 extern "C" {
 #endif
 
-#define NGX_HTTP_CACHE_PURGE_CONTROL_ABI 4
+#define NGX_HTTP_CACHE_PURGE_CONTROL_ABI 5
 #define NGX_HTTP_CACHE_PURGE_CONTROL_FENCE 1
 #define NGX_HTTP_CACHE_PURGE_CONTROL_PROPAGATE 2
 #define NGX_HTTP_CACHE_PURGE_CONTROL_PREPARING 4
+#define NGX_HTTP_CACHE_PURGE_CONTROL_TAG_CANDIDATE 8
 
 typedef struct ngx_http_cache_purge_control_reader_s
     ngx_http_cache_purge_control_reader_t;
@@ -253,6 +254,19 @@ int ngx_http_cache_purge_control_match(
     const ngx_http_cache_purge_control_context_t *context, size_t max_matches,
     size_t max_bytes, ngx_http_cache_purge_control_visit_pt visit, void *data,
     uint64_t *publication, ngx_http_cache_rocksdb_error_t *error);
+/* Local outgoing requirements and their ledger come from one pinned image.
+ * tags_known=0 requires an empty TAG input and returns scoped TAG candidates,
+ * not confirmed TAG matches. They must be resolved by the receiving cache.
+ * This lookup emits only PROPAGATE, optionally with TAG_CANDIDATE; it never
+ * authorizes local cache admission or filters requirements received from L1.
+ * Discard all callback output on error, including LIMIT. */
+int ngx_http_cache_purge_control_propagation(
+    ngx_http_cache_purge_control_reader_t *reader,
+    const ngx_http_cache_purge_control_context_t *context, int tags_known,
+    size_t max_matches, size_t max_bytes,
+    ngx_http_cache_purge_control_visit_pt visit, void *data,
+    ngx_http_cache_purge_watermark_t *watermark, uint64_t *publication,
+    ngx_http_cache_rocksdb_error_t *error);
 /* Copies the complete accepted local sequence from one serving image. It is
  * a local origin-start boundary, not proof of an upstream CDN's freshness. */
 int ngx_http_cache_purge_control_watermark(

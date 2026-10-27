@@ -148,7 +148,7 @@ Reload preserves old-worker registrations; only proven-dead processes are
 reclaimed. The executor can query pre-operation writer registrations through
 bounded IPC. A zero count alone does not permit FENCE removal: queued IPC,
 unfinished durable transactions and physical processing still need closure.
-The internal shared-control ABI is 4; nginx-ext ABI remains 1.
+The internal shared-control ABI is 5; nginx-ext ABI remains 1.
 
 Native file responses use `ADMIT_FILE` to verify the selected descriptor, bind
 the captured key, and persist the observed URL association. Repeated observations
@@ -416,8 +416,9 @@ long-lived HTTP responses do not keep the database owner indefinitely. Its
 executor finishes the current operation and closes the DB before the replacement
 opens it. The old worker can continue sending its response and joins the stopped
 executor when it exits. The component C ABI is 6; rebuild its archives together
-with the addon. Upgrading from shared-control ABI 3 requires a full nginx restart;
-persisted cache files and indexes are retained. Override `CACHE_PURGE_ROCKSDB_LIBS` to use
+with the addon. Upgrading from shared-control ABI 4 or earlier requires a full
+nginx restart; persisted cache files and indexes are retained.
+Override `CACHE_PURGE_ROCKSDB_LIBS` to use
 a fixed RocksDB archive and its compression/runtime dependencies. The default
 links the system shared RocksDB library. Static archives linked into a dynamic
 nginx module must be built with PIC.
@@ -473,6 +474,14 @@ Without the expression module, ordinary `on`/`off` remains available.
 Header names must be distinct after inheritance, valid HTTP tokens, and
 compatible with nginx's underscore handling; standard protocol/cache headers
 cannot be reused as control headers. Capabilities exposes the effective names.
+
+The control reader can collect bounded local propagation requirements and their
+ledger identity from one immutable publication. If an object's TAGs are unknown,
+it returns namespace/host-scoped TAG candidates for the receiving cache to resolve.
+Known empty TAGs remain distinct from missing metadata. The scope index reuses
+operation records; it does not copy cache-file metadata into shared memory.
+Output-budget exhaustion fails the lookup instead of silently truncating rules.
+This internal lookup is not yet connected to the HTTP propagation path.
 
 These configuration and policy evaluation interfaces are implemented; L2 header
 transfer and acknowledgement enforcement remain unfinished and

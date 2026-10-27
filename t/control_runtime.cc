@@ -182,6 +182,235 @@ notify(int fd)
     char byte = 1;
     check(write(fd, &byte, 1) == 1, "pipe notify");
 }
+
+static Matches
+propagation_reference(const std::vector<Operation> &ops, const Context &c,
+    bool known, bool proxy, uint64_t now)
+{
+    auto result = reference(ops, c, proxy, now);
+    for (auto it = result.begin(); it != result.end();) {
+        if (it->second & NGX_HTTP_CACHE_PURGE_CONTROL_PROPAGATE) {
+            it->second = NGX_HTTP_CACHE_PURGE_CONTROL_PROPAGATE;
+            ++it;
+        } else {
+            it = result.erase(it);
+        }
+    }
+    if (known || !proxy) {
+        return result;
+    }
+    for (const auto &op : ops) {
+        const auto &s = op.input.selector;
+        bool scoped = ((s.kind == SelectorKind::namespace_tag
+                           || s.kind == SelectorKind::namespace_tags)
+                          && s.scope == c.ns)
+                      || ((s.kind == SelectorKind::host_tag
+                              || s.kind == SelectorKind::host_tags)
+                          && s.scope == c.host);
+        if (scoped && op.propagate && now < op.propagation_until_ms) {
+            result[op.sequence] = NGX_HTTP_CACHE_PURGE_CONTROL_PROPAGATE
+                                  | NGX_HTTP_CACHE_PURGE_CONTROL_TAG_CANDIDATE;
+        }
+    }
+    return result;
+}
+
+static void
+propagation_tests()
+{
+    char path[] = "/tmp/ncp-propagation-control-XXXXXX";
+    check(mkdtemp(path) != nullptr, "propagation ledger directory");
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    expect(ngx_http_cache_rocksdb_open(path, &options, &store, &error), 0,
+        "propagation ledger");
+    size_t size = ngx_http_cache_purge_control_size(2 * 1024 * 1024, 8);
+    void *shared = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    check(shared != MAP_FAILED, "propagation shared region");
+    expect(ngx_http_cache_purge_control_init(
+               shared, size, 2 * 1024 * 1024, 8, &error),
+        0, "initialize propagation controls");
+    ngx_http_cache_purge_control_reader_t *reader = nullptr;
+    expect(
+        ngx_http_cache_purge_control_reader_open(shared, size, &reader, &error),
+        0, "propagation reader");
+    {
+        Index index(store);
+        Operations ledger(store);
+        std::vector<Operation> ops;
+        std::mt19937 random(20261027);
+        for (unsigned n = 1; n <= 420; n++) {
+            auto kind = static_cast<SelectorKind>(n % 9);
+            auto value = "/a/" + std::to_string(random() % 10);
+            std::string scope;
+            if (kind == SelectorKind::key_prefix
+                || kind == SelectorKind::url_prefix)
+            {
+                value.resize(random() % (value.size() + 1));
+            }
+            if (kind >= SelectorKind::namespace_tag) {
+                scope = "scope-" + std::to_string(random() % 6);
+                if (n % 13 == 0) {
+                    scope = std::string("scope-0\0tail", 12);
+                }
+                value = "tag-" + std::to_string(random() % 10);
+                if (kind >= SelectorKind::namespace_tags) {
+                    std::vector<std::string> tags{ value };
+                    for (unsigned j = 1; j < 64; j++) {
+                        tags.push_back("zz-" + std::to_string(j + 100));
+                    }
+                    value = tag_group(tags);
+                }
+            }
+            auto input = operation(n, kind, value, scope).input;
+            input.binding = "propagation-test";
+            auto op = ledger.accept(input, 2000);
+            if (n % 11) {
+                op = ledger.activate(input.id, op.revision, 2000);
+                if (n % 17 == 0) {
+                    OperationCheckpoint point;
+                    point.id = 1;
+                    point.scan_done = true;
+                    op = ledger.checkpoint(input.id, op.revision, point);
+                    op = ledger.materialize(input.id, op.revision, op.sequence);
+                }
+            }
+            ops.push_back(std::move(op));
+        }
+        Coordinator coordinator(ledger, shared, size);
+        auto ready = [&] {
+            for (unsigned n = 0; n < 1000; n++) {
+                if (coordinator.state() == Coordination::ready) {
+                    return;
+                }
+                check(coordinator.step(), "propagation coordinator progress");
+            }
+            throw std::runtime_error("propagation coordinator did not recover");
+        };
+        Context c;
+        ngx_http_cache_purge_watermark_t watermark{};
+        uint64_t publication = 0;
+        auto query = [&](bool known, bool proxy, uint64_t now,
+                         size_t count = 65536, size_t bytes = 8 * 1024 * 1024) {
+            Matches matches;
+            int rc = ngx_http_cache_purge_control_propagation(reader,
+                c.get(proxy, now), known, count, bytes, collect, &matches,
+                &watermark, &publication, &error);
+            return std::make_pair(rc, matches);
+        };
+        expect(query(false, true, 5000).first, NGX_HTTP_CACHE_ROCKSDB_BUSY,
+            "unrecovered propagation gate");
+        ready();
+        for (unsigned n = 0; n < 300; n++) {
+            c.key = "/a/" + std::to_string(random() % 12);
+            c.url = "/a/" + std::to_string(random() % 12);
+            c.host = "scope-" + std::to_string(random() % 8);
+            c.ns = "scope-" + std::to_string(random() % 8);
+            if (n % 9 == 0) {
+                c.ns = std::string("scope-0\0tail", 12);
+            }
+            if (n % 7 == 0) {
+                c.host = c.ns;
+            }
+            bool known = random() % 2;
+            bool proxy = random() % 2;
+            uint64_t now = random() % 3 ? 5000 : 302000;
+            c.tags = known ? std::vector<std::string>{ "tag-0", "tag-2",
+                "tag-2", "zz-101" } :
+                             std::vector<std::string>{};
+            const auto result = query(known, proxy, now);
+            expect(result.first, 0, "propagation snapshot");
+            check(result.second
+                      == propagation_reference(ops, c, known, proxy, now),
+                "propagation lookup matches independent scoped scan");
+            check(publication == coordinator.publication()
+                      && watermark.sequence == ops.size()
+                      && std::memcmp(
+                             watermark.ledger, ledger.native()->ledger, 16)
+                             == 0,
+                "requirements and ledger are from one publication");
+        }
+        c = Context{};
+        c.ns = "scope-0";
+        c.host = "scope-0";
+        auto unknown = query(false, true, 5000);
+        auto empty = query(true, true, 5000);
+        expect(unknown.first, 0, "unknown TAGs snapshot");
+        expect(empty.first, 0, "known empty TAGs snapshot");
+        check(unknown.second.size() > empty.second.size(),
+            "unknown TAGs differ from confirmed empty TAGs");
+        check(lookup(reader, c) == reference(ops, c, true, 5000),
+            "propagation candidates do not change local admission matching");
+        expect(query(false, true, 302000).first, 0, "expired propagation");
+        check(query(false, true, 302000).second.empty()
+                  && !lookup(reader, c, true, 302000).empty(),
+            "window end suppresses outgoing requirements without clearing "
+            "fences");
+        for (auto limits :
+            { std::make_pair(1U, 65536U), std::make_pair(64U, 1U) })
+        {
+            expect(query(false, true, 5000, limits.first, limits.second).first,
+                NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+                "candidate overflow cannot return a successful partial set");
+            check(publication == 0 && watermark.sequence == 0
+                      && watermark.ledger[0] == 0,
+                "failed propagation has no publication proof");
+        }
+        c.tags = { "tag-0" };
+        expect(query(false, true, 5000).first, NGX_HTTP_CACHE_ROCKSDB_INVALID,
+            "unknown TAG mode rejects a partial TAG list");
+        c.tags.clear();
+        expect(ngx_http_cache_purge_control_propagation(reader, c.get(), 2, 64,
+                   65536, ignore, nullptr, &watermark, &publication, &error),
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid TAG knowledge flag");
+        auto refresh =
+            [](void *data,
+                const ngx_http_cache_purge_control_match_t *) -> int {
+            static_cast<Coordinator *>(data)->refresh();
+            return NGX_HTTP_CACHE_ROCKSDB_BUSY;
+        };
+        expect(ngx_http_cache_purge_control_propagation(reader, c.get(), 0,
+                   65536, 8 * 1024 * 1024, refresh, &coordinator, &watermark,
+                   &publication, &error),
+            NGX_HTTP_CACHE_ROCKSDB_BUSY, "interrupted visitor releases image");
+        check(publication == 0 && watermark.sequence == 0,
+            "interrupted snapshot publishes no proof");
+        ready();
+        check(query(false, true, 5000).second == unknown.second,
+            "reader remains usable after interrupted propagation");
+        auto change = [](void *data,
+                          const ngx_http_cache_purge_control_match_t *) {
+            auto &state = *static_cast<std::pair<Coordinator *, bool> *>(data);
+            if (!state.second) {
+                state.first->refresh();
+                for (unsigned n = 0;
+                    state.first->state() != Coordination::draining; n++)
+                {
+                    check(n < 1000 && state.first->step(),
+                        "publish while propagation holds the prior image");
+                }
+                state.second = true;
+            }
+            return 0;
+        };
+        auto changed = std::make_pair(&coordinator, false);
+        expect(ngx_http_cache_purge_control_propagation(reader, c.get(), 0,
+                   65536, 8 * 1024 * 1024, change, &changed, &watermark,
+                   &publication, &error),
+            NGX_HTTP_CACHE_ROCKSDB_BUSY,
+            "gate change invalidates a completed visitor result");
+        check(publication == 0 && watermark.sequence == 0,
+            "stale publication never becomes a successful snapshot");
+        ready();
+    }
+    expect(ngx_http_cache_purge_control_reader_close(&reader, &error), 0,
+        "close propagation reader");
+    expect(ngx_http_cache_rocksdb_close(&store, &error), 0,
+        "close propagation ledger");
+    munmap(shared, size);
+}
 static void
 wait(int fd)
 {
@@ -210,6 +439,7 @@ int
 main()
 {
     try {
+        propagation_tests();
         size_t size = ngx_http_cache_purge_control_size(2 * 1024 * 1024, 32);
         void *memory = mmap(nullptr, size, PROT_READ | PROT_WRITE,
             MAP_SHARED | MAP_ANONYMOUS, -1, 0);
@@ -261,6 +491,11 @@ main()
         version = publish_controls(writer, ops);
         expect(ngx_http_cache_purge_control_gate_open(writer, &error), 0,
             "open recovered image");
+        ngx_http_cache_purge_watermark_t unstamped{};
+        expect(ngx_http_cache_purge_control_propagation(reader, context.get(),
+                   1, 64, 65536, ignore, nullptr, &unstamped, &version, &error),
+            NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND,
+            "unstamped control image cannot supply propagation identity");
         check(lookup(reader, context) == reference(ops, context, true, 5000),
             "all selector families and duplicate TAG input");
         check(lookup(reader, context, false)
