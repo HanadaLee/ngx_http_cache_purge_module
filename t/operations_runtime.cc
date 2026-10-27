@@ -87,6 +87,102 @@ raw_write(ngx_http_cache_rocksdb_t *store, const std::string &key,
 }
 
 static void
+ngx_http_cache_purge_test_submission()
+{
+    char path[] = "/tmp/cache-purge-submit-XXXXXX";
+    check(mkdtemp(path) != nullptr, "submission test directory");
+    auto *store = open(path);
+    ngx_http_cache_rocksdb_error_t error{};
+    ngx_http_cache_purge_operation_t accepted{}, queued{};
+    ngx_http_cache_purge_operation_input_t request{};
+    request.id = bytes("submitted");
+    request.mode = NGX_HTTP_CACHE_PURGE_DELETE;
+    request.issued_at_ms = 10;
+    request.selector = { NGX_HTTP_CACHE_PURGE_URL, bytes("https://a.test/a"),
+        {} };
+    request.binding = bytes("request-v1");
+    {
+        Index index(store);
+        Operations ops(store);
+        auto before = writes(store);
+        check(ngx_http_cache_purge_operations_submit(
+                  ops.native(), &request, 20, 300000, &accepted, &error)
+                      == 0
+                  && writes(store) == before + 1 && accepted.sequence == 1
+                  && accepted.stage == NGX_HTTP_CACHE_PURGE_PREPARING,
+            "acceptance and activation intent share one durable write");
+        check(ngx_http_cache_purge_operations_activation(
+                  ops.native(), &queued, &error)
+                      == 0
+                  && queued.sequence == 1,
+            "peek the bounded durable activation queue");
+        ngx_http_cache_purge_operation_free(&queued);
+        ngx_http_cache_purge_operation_free(&accepted);
+        before = writes(store);
+        check(ngx_http_cache_purge_operations_submit(
+                  ops.native(), &request, 30, 1, &accepted, &error)
+                      == 0
+                  && writes(store) == before && accepted.accepted_at_ms == 20
+                  && accepted.propagation_ms == 300000,
+            "queued retry preserves the first acceptance without writes");
+        ngx_http_cache_purge_operation_free(&accepted);
+        auto changed = request;
+        changed.binding = bytes("different");
+        check(ngx_http_cache_purge_operations_submit(
+                  ops.native(), &changed, 30, 300000, &accepted, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "same identity with changed input cannot alter the queue");
+    }
+    close(store);
+    store = open(path);
+    {
+        Index index(store);
+        Operations ops(store);
+        check(ngx_http_cache_purge_operations_activation(
+                  ops.native(), &queued, &error)
+                      == 0
+                  && queued.sequence == 1,
+            "activation survives owner reopen");
+        auto before = writes(store);
+        check(ngx_http_cache_purge_operations_activate(ops.native(), request.id,
+                  queued.revision, 40, &accepted, &error)
+                      == 0
+                  && writes(store) == before + 1
+                  && accepted.effective_at_ms == 40,
+            "activation atomically removes the durable intent");
+        ngx_http_cache_purge_operation_free(&queued);
+        ngx_http_cache_purge_operation_free(&accepted);
+        check(ngx_http_cache_purge_operations_activation(
+                  ops.native(), &queued, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND,
+            "activated work leaves no orphan activation entry");
+        auto ordinary = input("ordinary");
+        auto receipt = ops.accept(ordinary, 50);
+        ngx_http_cache_purge_operation_input_t promoted{ bytes(ordinary.id),
+            { static_cast<uint32_t>(ordinary.selector.kind),
+                bytes(ordinary.selector.value),
+                bytes(ordinary.selector.scope) },
+            static_cast<uint32_t>(ordinary.mode), ordinary.issued_at_ms,
+            bytes(ordinary.binding) };
+        check(ngx_http_cache_purge_operations_submit(
+                  ops.native(), &promoted, 60, 300000, &accepted, &error)
+                      == 0
+                  && accepted.sequence == receipt.sequence
+                  && accepted.accepted_at_ms == 50,
+            "an existing diagnostic acceptance can be submitted without a new "
+            "identity");
+        ngx_http_cache_purge_operation_free(&accepted);
+        check(ngx_http_cache_purge_operations_activation(
+                  ops.native(), &queued, &error)
+                      == 0
+                  && queued.sequence == receipt.sequence,
+            "promoted operation is queued for autonomous activation");
+        ngx_http_cache_purge_operation_free(&queued);
+    }
+    close(store);
+}
+
+static void
 ngx_http_cache_purge_test_requirements()
 {
     char path[] = "/tmp/cache-purge-rules-XXXXXX";
@@ -606,6 +702,7 @@ main(int argc, char **argv)
                 "normal reopen preserves the retired floor without writes");
         }
         close(store);
+        ngx_http_cache_purge_test_submission();
         ngx_http_cache_purge_test_requirements();
         std::cout << "PASS " << assertions << " operation assertions; database "
                   << path << std::endl;

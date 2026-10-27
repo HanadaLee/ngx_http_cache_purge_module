@@ -114,6 +114,7 @@ struct ngx_http_cache_purge_component_s {
     unsigned char                             work_after[17];
     size_t                                    work_after_len;
     uint64_t                                  work_at;
+    uint64_t                                  activation_at;
     ngx_http_cache_purge_component_buffer_t   collect_bookmark[2];
     uint64_t                                  collect_at;
     unsigned                                  collect_next, collect_idle;
@@ -752,6 +753,7 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
     ngx_http_cache_purge_watermark_t           watermark;
     ngx_http_cache_purge_operation_input_t     input;
     ngx_http_cache_purge_operation_t           operation;
+    ngx_http_cache_purge_operation_usage_t     usage;
     ngx_http_cache_purge_selector_t            selector;
     ngx_http_cache_purge_query_t              *query;
     ngx_http_cache_rocksdb_stats_t             stats;
@@ -1331,6 +1333,7 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
         break;
 
     case NGX_HTTP_CACHE_PURGE_OP_ACCEPT_OPERATION:
+    case NGX_HTTP_CACHE_PURGE_OP_SUBMIT_OPERATION:
         ngx_http_cache_purge_component_operation_input(&d, &input);
         if ((rc = ngx_http_cache_purge_component_end(&d)) != 0) {
             break;
@@ -1342,13 +1345,21 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
                 "invalid component wall clock");
             break;
         }
-        rc = c->coordinator ?
+        if (p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_SUBMIT_OPERATION) {
+            rc = ngx_http_cache_purge_coordinator_submit(c->coordinator,
+                &input, now, c->options.propagation_ms, &operation, error);
+            if (rc == 0 && operation.stage == NGX_HTTP_CACHE_PURGE_PREPARING) {
+                c->activation_at = 0;
+            }
+        } else {
+            rc = c->coordinator ?
                  ngx_http_cache_purge_coordinator_accept(
                      c->coordinator, &input, now, c->options.propagation_ms,
                      &operation, error) :
                  ngx_http_cache_purge_operations_accept(
                      &c->operations, &input, now, c->options.propagation_ms,
                      &operation, error);
+        }
         if (rc == 0) {
             ngx_http_cache_purge_component_put_operation(e, &operation);
         }
@@ -1379,6 +1390,7 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
         break;
 
     case NGX_HTTP_CACHE_PURGE_OP_GET_CONTROL_STATUS:
+    case NGX_HTTP_CACHE_PURGE_OP_GET_RUNTIME_STATUS:
         if ((rc = ngx_http_cache_purge_component_end(&d)) != 0) {
             break;
         }
@@ -1391,6 +1403,26 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
         if (rc == 0) {
             ngx_http_cache_purge_component_put_integer(e, state, 4);
             ngx_http_cache_purge_component_put_integer(e, publication, 8);
+        }
+        if (rc == 0
+            && p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_GET_RUNTIME_STATUS)
+        {
+            rc = ngx_http_cache_purge_operations_usage(&c->operations,
+                                                         &usage, error);
+            if (rc == 0) {
+                ngx_http_cache_purge_component_put_raw(e,
+                                                     c->operations.ledger, 16);
+                ngx_http_cache_purge_component_put_integer(e,
+                                                     usage.last_sequence, 8);
+                ngx_http_cache_purge_component_put_integer(e,
+                                                  usage.retired_sequence, 8);
+                ngx_http_cache_purge_component_put_integer(e,
+                                                      usage.live_records, 8);
+                ngx_http_cache_purge_component_put_integer(e,
+                                               usage.live_selector_bytes, 8);
+                ngx_http_cache_purge_component_put_integer(e,
+                                               c->options.propagation_ms, 4);
+            }
         }
         break;
 
@@ -2637,6 +2669,7 @@ static int
 ngx_http_cache_purge_component_controls(ngx_http_cache_purge_component_t *c,
     uint64_t *expire_at, int *progress, ngx_http_cache_rocksdb_error_t *error)
 {
+    ngx_http_cache_purge_operation_t  pending, activated;
     uint32_t  state;
     uint64_t  publication;
     uint64_t  now;
@@ -2659,6 +2692,25 @@ ngx_http_cache_purge_component_controls(ngx_http_cache_purge_component_t *c,
         } else if (rc == 0) {
             *progress = 1;
         }
+    } else if (ngx_http_cache_purge_component_now(CLOCK_MONOTONIC)
+               >= c->activation_at)
+    {
+        rc = ngx_http_cache_purge_operations_activation(&c->operations,
+                                                           &pending, error);
+        if (rc == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) {
+            rc = ngx_http_cache_purge_component_error(error, 0, "");
+            c->activation_at =
+                ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 1000;
+        } else if (rc == 0) {
+            now = ngx_http_cache_purge_component_now(CLOCK_REALTIME);
+            rc = ngx_http_cache_purge_coordinator_activate(c->coordinator,
+                pending.input.id, now, &activated, error);
+            ngx_http_cache_purge_operation_free(&activated);
+            if (rc == 0) {
+                *progress = 1;
+            }
+        }
+        ngx_http_cache_purge_operation_free(&pending);
     } else if (ngx_http_cache_purge_component_now(CLOCK_MONOTONIC)
                >= *expire_at)
     {
@@ -6427,10 +6479,11 @@ ngx_http_cache_purge_coordinator_step(ngx_http_cache_purge_coordinator_t *c,
     return rc;
 }
 
-int
-ngx_http_cache_purge_coordinator_accept(ngx_http_cache_purge_coordinator_t *c,
+static int
+ngx_http_cache_purge_coordinator_accept_internal(
+    ngx_http_cache_purge_coordinator_t *c,
     const ngx_http_cache_purge_operation_input_t *input, uint64_t now,
-    uint32_t propagation_ms, ngx_http_cache_purge_operation_t *out,
+    uint32_t propagation_ms, int submit, ngx_http_cache_purge_operation_t *out,
     ngx_http_cache_rocksdb_error_t *error)
 {
     ngx_http_cache_purge_operation_t        preview;
@@ -6459,6 +6512,16 @@ ngx_http_cache_purge_coordinator_accept(ngx_http_cache_purge_coordinator_t *c,
         return rc;
     }
     if (preview.sequence <= durable.last_sequence) {
+        if (submit) {
+            ngx_http_cache_purge_operation_free(&preview);
+            rc = ngx_http_cache_purge_operations_submit(&c->operations, input,
+                                            now, propagation_ms, out, error);
+            if (rc != 0) {
+                ngx_http_cache_purge_control_gate_close(c->writer, NULL);
+                ngx_http_cache_purge_control_load_begin(c, NULL);
+            }
+            return rc;
+        }
         *out = preview;
         return 0;
     }
@@ -6499,8 +6562,10 @@ ngx_http_cache_purge_coordinator_accept(ngx_http_cache_purge_coordinator_t *c,
         ngx_http_cache_purge_control_image_free(&image);
         goto done;
     }
-    rc = ngx_http_cache_purge_operations_accept(&c->operations, input, now,
-                                                propagation_ms, out, error);
+    rc = submit ? ngx_http_cache_purge_operations_submit(&c->operations, input,
+                                        now, propagation_ms, out, error) :
+                  ngx_http_cache_purge_operations_accept(&c->operations, input,
+                                        now, propagation_ms, out, error);
     if (rc == 0
         && (out->sequence != preview.sequence
             || out->revision != preview.revision))
@@ -6528,6 +6593,26 @@ ngx_http_cache_purge_coordinator_accept(ngx_http_cache_purge_coordinator_t *c,
 done:
     ngx_http_cache_purge_operation_free(&preview);
     return rc;
+}
+
+int
+ngx_http_cache_purge_coordinator_accept(ngx_http_cache_purge_coordinator_t *c,
+    const ngx_http_cache_purge_operation_input_t *input, uint64_t now,
+    uint32_t propagation_ms, ngx_http_cache_purge_operation_t *out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_purge_coordinator_accept_internal(c, input, now,
+                                                propagation_ms, 0, out, error);
+}
+
+int
+ngx_http_cache_purge_coordinator_submit(ngx_http_cache_purge_coordinator_t *c,
+    const ngx_http_cache_purge_operation_input_t *input, uint64_t now,
+    uint32_t propagation_ms, ngx_http_cache_purge_operation_t *out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_purge_coordinator_accept_internal(c, input, now,
+                                                propagation_ms, 1, out, error);
 }
 
 int

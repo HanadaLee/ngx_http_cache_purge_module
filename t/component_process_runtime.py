@@ -723,6 +723,47 @@ try:
     ac.close(); activation.stop()
     check(True, 'activation waits for FENCE publication and idempotent retries retain the original effective time and propagation deadline')
 
+    submitting = Component(root / 'submitting', shared=root / 'submitting.shm')
+    submitting.opened(); sc = Client(submitting.path)
+    wait_for(lambda: struct.unpack('>IQ', sc.call(16))[0] == 6)
+    snapshot = struct.unpack('>IQ16sQQQQI', sc.call(28))
+    assert snapshot[0] == 6 and snapshot[2] != bytes(16) and snapshot[3:7] == (0, 0, 0, 0)
+    assert snapshot[7] == 300000
+    submitting.match(); submitting.guard()
+    submitted_input = operation_input('autonomous-submit')
+    accepted = sc.call(27, submitted_input)
+    assert accepted[len(submitted_input) + 40] == 1
+    wait_for(lambda: struct.unpack('>IQ', sc.call(16))[0] == 5)
+    assert sc.call(15, string('autonomous-submit'))[len(submitted_input) + 40] == 1
+    sc.close()
+    # No activation RPC is sent. A pinned reader holds publication while the
+    # submitting connection disappears and the executor is killed.
+    submitting.process.kill(); submitting.process.wait(timeout=5)
+    submitting = Component(submitting.path, shared=root / 'submitting.shm')
+    submitting.opened(); sc = Client(submitting.path)
+    wait_for(lambda: sc.call(15, string('autonomous-submit'))[len(submitted_input) + 40] == 4)
+    wait_for(lambda: struct.unpack('>IQ', sc.call(16))[0] == 6)
+    completed = sc.call(15, string('autonomous-submit'))
+    current_snapshot = struct.unpack('>IQ16sQQQQI', sc.call(28))
+    assert current_snapshot[0] == 6 and current_snapshot[2] == snapshot[2]
+    assert current_snapshot[3:6] == (1, 1, 1)
+    assert completed[len(submitted_input) + 16:len(submitted_input) + 24] == accepted[len(submitted_input) + 16:len(submitted_input) + 24]
+    effective = int.from_bytes(completed[len(submitted_input) + 24:len(submitted_input) + 32], 'big')
+    deadline = int.from_bytes(completed[len(submitted_input) + 32:len(submitted_input) + 40], 'big')
+    assert effective > 0 and deadline - effective == 300000
+    before = struct.unpack('>9Q', sc.call(1))[1]
+    assert sc.call(27, submitted_input) == completed
+    assert struct.unpack('>9Q', sc.call(1))[1] == before
+    sc.call(27, operation_input('autonomous-submit', mode=2), code=7)
+    ordinary_input = operation_input('promote-preparing')
+    first = sc.call(14, ordinary_input)
+    wait_for(lambda: struct.unpack('>IQ', sc.call(16))[0] == 6)
+    assert sc.call(15, string('promote-preparing')) == first
+    sc.call(27, ordinary_input)
+    wait_for(lambda: sc.call(15, string('promote-preparing'))[len(ordinary_input) + 40] == 4)
+    sc.close(); submitting.stop()
+    check(True, 'reliable submission survives caller disconnection and executor death, activates autonomously, and retains its first acceptance and propagation deadline on retry')
+
     validation_cache, validation_temp = root / 'validation-cache', root / 'validation-temp'
     validation_cache.mkdir(); validation_temp.mkdir()
     validation_shared = root / 'validation.shm'

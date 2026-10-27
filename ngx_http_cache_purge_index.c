@@ -313,7 +313,8 @@ ngx_http_cache_purge_op_key(ngx_http_cache_purge_op_tx_t *tx,
     ngx_http_cache_rocksdb_bytes_t   key;
 
     codec.tx = tx;
-    codec.size = kind == 'D' ? 1 + op->input.id.len : kind == 'L' ? 9 : 17;
+    codec.size = kind == 'D' ? 1 + op->input.id.len :
+                 kind == 'L' || kind == 'J' ? 9 : 17;
     codec.data = ngx_http_cache_purge_op_alloc(tx, codec.size);
     codec.at = 0;
     ngx_http_cache_purge_op_put_number(&codec, kind, 1);
@@ -325,7 +326,7 @@ ngx_http_cache_purge_op_key(ngx_http_cache_purge_op_tx_t *tx,
             memcpy(codec.data + 1, op->input.id.data, op->input.id.len);
         }
     } else {
-        if (kind != 'L') {
+        if (kind != 'L' && kind != 'J') {
             ngx_http_cache_purge_op_put_number(
                 &codec,
                 kind == 'Q' ? op->next_run_ms : op->propagation_until_ms, 8);
@@ -864,6 +865,12 @@ ngx_http_cache_purge_op_save(ngx_http_cache_purge_op_tx_t *tx,
 
     a = &before->op;
     b = &after->op;
+    if (a->stage == NGX_HTTP_CACHE_PURGE_PREPARING
+        && b->stage != NGX_HTTP_CACHE_PURGE_PREPARING)
+    {
+        ngx_http_cache_purge_op_put(tx, ngx_http_cache_purge_op_key(tx, 'J', a),
+                                    ngx_http_cache_purge_op_empty, 0);
+    }
     if (ngx_http_cache_purge_op_scheduled(a)) {
         ngx_http_cache_purge_op_put(tx, ngx_http_cache_purge_op_key(tx, 'Q', a),
                                     ngx_http_cache_purge_op_empty, 0);
@@ -1281,7 +1288,7 @@ ngx_http_cache_purge_operations_init(ngx_http_cache_purge_operations_t *ops,
     size_t                          i;
     uint64_t                        next, retired;
     int                             changed, rc;
-    const char                       *prefixes[] = { "D", "L", "Q", "E", "T" };
+    const char                 *prefixes[] = { "D", "L", "Q", "E", "T", "J" };
     const char *keys[] =
         { "M:op-next", "M:op-live", "M:op-bytes",
           "M:rule-replay", "M:rule-cursor" };
@@ -1321,7 +1328,7 @@ ngx_http_cache_purge_operations_init(ngx_http_cache_purge_operations_t *ops,
     schema = ngx_http_cache_purge_op_get(
         &tx, ngx_http_cache_purge_op_literal("M:operations"));
     if (!schema.exists && tx.status == 0) {
-        for (i = 0; i < 5 && tx.status == 0; i++) {
+        for (i = 0; i < 6 && tx.status == 0; i++) {
             ngx_http_cache_purge_op_cursor_open(&tx, &cursor, prefixes[i],
                                                 ngx_http_cache_purge_op_empty);
             ngx_http_cache_purge_op_require(
@@ -1338,7 +1345,7 @@ ngx_http_cache_purge_operations_init(ngx_http_cache_purge_operations_t *ops,
         }
         ngx_http_cache_purge_op_put(
             &tx, ngx_http_cache_purge_op_literal("M:operations"),
-            ngx_http_cache_purge_op_literal("2"), 1);
+            ngx_http_cache_purge_op_literal("3"), 1);
         ngx_http_cache_purge_op_set_counter(&tx, "M:op-next", 1);
         ngx_http_cache_purge_op_set_counter(&tx, "M:op-live", 0);
         ngx_http_cache_purge_op_set_counter(&tx, "M:op-bytes", 0);
@@ -1350,7 +1357,9 @@ ngx_http_cache_purge_operations_init(ngx_http_cache_purge_operations_t *ops,
             ngx_http_cache_purge_op_equal(schema.bytes,
                                           ngx_http_cache_purge_op_literal("1"))
                 || ngx_http_cache_purge_op_equal(schema.bytes,
-                                          ngx_http_cache_purge_op_literal("2")),
+                                          ngx_http_cache_purge_op_literal("2"))
+                || ngx_http_cache_purge_op_equal(schema.bytes,
+                                          ngx_http_cache_purge_op_literal("3")),
             NGX_HTTP_CACHE_ROCKSDB_SCHEMA,
             "unsupported operation ledger schema");
         next = ngx_http_cache_purge_op_counter(&tx, "M:op-next");
@@ -1361,13 +1370,16 @@ ngx_http_cache_purge_operations_init(ngx_http_cache_purge_operations_t *ops,
         (void) ngx_http_cache_purge_op_counter(&tx, "M:op-live");
         (void) ngx_http_cache_purge_op_counter(&tx, "M:op-bytes");
         if (tx.status == 0 && schema.bytes.data[0] == '1') {
-            ngx_http_cache_purge_op_put(&tx,
-                ngx_http_cache_purge_op_literal("M:operations"),
-                ngx_http_cache_purge_op_literal("2"), 1);
             ngx_http_cache_purge_op_set_counter(&tx, "M:rule-replay", 0);
             ngx_http_cache_purge_op_put(&tx,
                 ngx_http_cache_purge_op_literal("M:rule-cursor"),
                 ngx_http_cache_purge_op_literal("D"), 1);
+            changed = 1;
+        }
+        if (tx.status == 0 && schema.bytes.data[0] != '3') {
+            ngx_http_cache_purge_op_put(&tx,
+                ngx_http_cache_purge_op_literal("M:operations"),
+                ngx_http_cache_purge_op_literal("3"), 1);
             changed = 1;
         }
     }
@@ -1579,7 +1591,8 @@ ngx_http_cache_purge_op_accept(ngx_http_cache_purge_operations_t *ops,
 {
     ngx_http_cache_purge_op_tx_t      tx;
     ngx_http_cache_purge_op_stored_t  stored;
-    ngx_http_cache_rocksdb_bytes_t    raw;
+    ngx_http_cache_rocksdb_bytes_t    raw, key;
+    ngx_http_cache_purge_op_value_t   queued;
     uint64_t                         count, size;
     int                              replay;
 
@@ -1616,6 +1629,20 @@ ngx_http_cache_purge_op_accept(ngx_http_cache_purge_operations_t *ops,
                 "selector requirements have not caught up with the ledger");
             ngx_http_cache_purge_op_set_counter(&tx, "M:rule-replay",
                                                 stored.op.sequence);
+        }
+        if (commit == 2 && stored.op.stage == NGX_HTTP_CACHE_PURGE_PREPARING) {
+            key = ngx_http_cache_purge_op_key(&tx, 'J', &stored.op);
+            queued = ngx_http_cache_purge_op_get(&tx, key);
+            if (queued.exists) {
+                ngx_http_cache_purge_op_require(&tx,
+                    ngx_http_cache_purge_op_equal(queued.bytes, input->id),
+                    NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                    "activation queue identity changed");
+            } else {
+                ngx_http_cache_purge_op_put(&tx, key, input->id, 1);
+            }
+        }
+        if (commit) {
             ngx_http_cache_purge_op_commit(&tx);
         }
     }
@@ -1640,6 +1667,53 @@ ngx_http_cache_purge_operations_accept(ngx_http_cache_purge_operations_t *ops,
 {
     return ngx_http_cache_purge_op_accept(ops, input, now, propagation_ms, 1,
                                           out, error);
+}
+
+int
+ngx_http_cache_purge_operations_submit(ngx_http_cache_purge_operations_t *ops,
+    const ngx_http_cache_purge_operation_input_t *input, uint64_t now,
+    uint32_t propagation_ms, ngx_http_cache_purge_operation_t *out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_purge_op_accept(ops, input, now, propagation_ms, 2,
+                                          out, error);
+}
+
+int
+ngx_http_cache_purge_operations_activation(
+    ngx_http_cache_purge_operations_t *ops,
+    ngx_http_cache_purge_operation_t *out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_op_tx_t      tx;
+    ngx_http_cache_purge_op_cursor_t  cursor;
+    ngx_http_cache_purge_op_stored_t  stored;
+
+    ngx_http_cache_purge_op_begin(&tx, ops, out);
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
+    }
+    ngx_http_cache_purge_op_cursor_open(&tx, &cursor, "J",
+                                          ngx_http_cache_purge_op_empty);
+    if (ngx_http_cache_purge_op_cursor_next(&tx, &cursor)) {
+        if (ngx_http_cache_purge_op_require(&tx, cursor.key.len == 9,
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid activation queue key")
+            && ngx_http_cache_purge_op_load(&tx, cursor.value, &stored) == 0
+            && ngx_http_cache_purge_op_require(&tx,
+                stored.op.stage == NGX_HTTP_CACHE_PURGE_PREPARING
+                && ngx_http_cache_purge_op_equal(cursor.key,
+                    ngx_http_cache_purge_op_key(&tx, 'J', &stored.op)),
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                "activation queue does not match its operation"))
+        {
+            ngx_http_cache_purge_op_clone(&tx, &stored.op, out);
+        }
+    } else if (tx.status == 0) {
+        ngx_http_cache_purge_op_fail(&tx, NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND,
+                                        "no operation awaits activation");
+    }
+    ngx_http_cache_purge_op_cursor_close(&tx, &cursor);
+    return ngx_http_cache_purge_op_result(&tx, out, error);
 }
 
 static int

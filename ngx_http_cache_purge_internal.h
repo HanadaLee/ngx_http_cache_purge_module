@@ -72,7 +72,11 @@ typedef enum {
      * Registers the observed URL/host and checks all persisted aliases. */
     NGX_HTTP_CACHE_PURGE_OP_ADMIT_FILE,
     /* operation ID; requires its FENCE publication to be READY */
-    NGX_HTTP_CACHE_PURGE_OP_ACTIVATE_OPERATION
+    NGX_HTTP_CACHE_PURGE_OP_ACTIVATE_OPERATION,
+    /* Persist acceptance and autonomous activation in one transaction. */
+    NGX_HTTP_CACHE_PURGE_OP_SUBMIT_OPERATION,
+    /* state u32, publication u64, ledger[16], usage[4] u64, propagation u32 */
+    NGX_HTTP_CACHE_PURGE_OP_GET_RUNTIME_STATUS
 } ngx_http_cache_purge_opcode_e;
 
 #define NGX_HTTP_CACHE_PURGE_ROOT_CACHE 1
@@ -528,6 +532,15 @@ int ngx_http_cache_purge_operations_accept(
 int ngx_http_cache_purge_operations_get(ngx_http_cache_purge_operations_t *ops,
     ngx_http_cache_rocksdb_bytes_t id, ngx_http_cache_purge_operation_t *out,
     ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_operations_submit(
+    ngx_http_cache_purge_operations_t *ops,
+    const ngx_http_cache_purge_operation_input_t *input, uint64_t now,
+    uint32_t propagation_ms, ngx_http_cache_purge_operation_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_operations_activation(
+    ngx_http_cache_purge_operations_t *ops,
+    ngx_http_cache_purge_operation_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_operations_usage(
     ngx_http_cache_purge_operations_t *ops,
     ngx_http_cache_purge_operation_usage_t *out,
@@ -622,6 +635,11 @@ int ngx_http_cache_purge_coordinator_writers(
     uint32_t *writers, ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_coordinator_step(
     ngx_http_cache_purge_coordinator_t *coordinator,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_coordinator_submit(
+    ngx_http_cache_purge_coordinator_t *coordinator,
+    const ngx_http_cache_purge_operation_input_t *input, uint64_t now,
+    uint32_t propagation_ms, ngx_http_cache_purge_operation_t *operation,
     ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_coordinator_refresh(
     ngx_http_cache_purge_coordinator_t *coordinator,

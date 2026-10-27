@@ -85,10 +85,18 @@ Delete, while a 304 alone cannot. Retired file IDs are diagnostic handles and
 may disappear after collection; operation receipts remain durable. Task completion
 covers its enumeration and drain, while subsequently discovered aliases use the
 persistent selector requirements and independent deferred cleanup queue.
-Acceptance still returns PREPARING. Internal IPC can now activate a task only
-after its FENCE publication is READY; retries preserve the effective time and
+Diagnostic acceptance still returns PREPARING. Internal IPC can activate a task
+only after its FENCE publication is READY; retries preserve the effective time and
 propagation deadline. Activation republishes its updated controls, so callers
-must also await READY afterwards. This is not the public HTTP/202 purge API.
+must also await READY afterwards. Reliable submission instead writes the operation
+and its autonomous activation intent in the same durable batch. The executor
+activates it after FENCE publication, including after the caller disconnects or
+the owner dies. No caller activation request is required. Retries preserve the
+original acceptance, first effective time and propagation deadline; completed
+operations are never requeued. A bounded runtime snapshot reports current READY
+state, publication, persistent ledger identity, operation usage and propagation
+policy. An HTTP caller must still wait for activation and READY before returning
+202; the public HTTP handler is not implemented yet.
 
 The filesystem backend also supports bounded in-place validation transactions.
 It reserves the existing path and persists an NFV2 plan while retaining the old
@@ -221,8 +229,10 @@ for each selector. Ordered predecessor seeks find matching bytewise prefixes
 without scanning unrelated operation history. File admission uses these records
 to protect URL aliases first observed after enumeration, across native zones.
 Full entities fetched after the latest accepted operation skip this historical
-lookup. Ledger schema 2 upgrades schema 1 through a bounded, checkpointed replay
-of operation records once; native cache files and their index are not rebuilt.
+lookup. Ledger schema 3 adds a sparse activation queue in the default CF; schema
+2 upgrades by changing its marker, and schema 1 additionally replays selector
+requirements through its existing bounded migration. Native cache files and
+their index are not rebuilt.
 
 Business `$host` is separate from `$cache_key_host`. The index records observed
 host-to-key relationships, shared across every slice, Vary file and zone of the

@@ -439,13 +439,16 @@ def retired(ident):
 def pending():
     return rpc(9, string('') + bytes([32]))[0]
 
-def fence(name, kind, value, scope='', mode=2):
+def fence(name, kind, value, scope='', mode=2, submit=False):
     previous = struct.unpack('>IQ', rpc(16))[1]
     payload = (string(name) + bytes([mode]) + struct.pack('>Q', int(time.time() * 1000))
                + bytes([kind]) + string(value) + string(scope) + string('read-test'))
-    receipt = rpc(14, payload)
+    receipt = rpc(27 if submit else 14, payload)
     assert receipt[len(payload) + 40] == 1
     until(lambda: (state := struct.unpack('>IQ', rpc(16)))[0] == 6 and state[1] != previous)
+    if submit:
+        until(lambda: rpc(15, string(name))[len(payload) + 40] >= 2
+              and struct.unpack('>IQ16sQQQQI', rpc(28))[0] == 6)
     return int.from_bytes(receipt[len(payload):len(payload) + 8], 'big')
 
 def writers(sequence):
@@ -719,8 +722,7 @@ try:
     background_paths = [ready_file(item) for item in background_files]
     background_inodes = {path.stat().st_ino for path in background_paths}
     cleanup_log_start = (run / 'error.log').stat().st_size
-    fence('background-native', 1, 'http://cache.test/invalidate/background-native')
-    rpc(26, string('background-native'))
+    fence('background-native', 1, 'http://cache.test/invalidate/background-native', submit=True)
     until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
     until(lambda: all(not path.exists() for path in background_paths))
     def background_done():
@@ -745,7 +747,7 @@ try:
     assert get('/invalidate/background-native?z=b') == (200, 'MISS', b'new-after-background')
     assert {item['id'] for item in records('/invalidate/background-native', 2)}.isdisjoint(
         {item['id'] for item in background_files})
-    checks.append('published FENCE activation starts Delete in the running worker; both hot zone instances are removed and their native size accounting is acknowledged before enumeration completes')
+    checks.append('durable submission autonomously activates Delete in the running worker; both hot zone instances are removed and their native size accounting is acknowledged before enumeration completes')
     assert get('/alias/one') == (200, 'MISS', b'/alias/one')
     alias = records('/alias/one', 1)[0]; ready_file(alias)
     assert get('/alias/two') == (200, 'HIT', b'/alias/one')
