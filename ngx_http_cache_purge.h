@@ -1070,6 +1070,10 @@ typedef struct {
     ngx_flag_t keep_conn;
 #endif
 
+#if (NGX_RESTY_EXT)
+    ngx_flag_t params_inherit;
+#endif
+
     ngx_http_complex_value_t cache_key;
 
 #if (NGX_PCRE)
@@ -1231,6 +1235,10 @@ typedef struct {
     ngx_array_t              *scgi_lengths;
     ngx_array_t              *scgi_values;
     ngx_http_complex_value_t  cache_key;
+
+#if (NGX_RESTY_EXT)
+    ngx_flag_t params_inherit;
+#endif
 } ngx_http_scgi_loc_conf_t;
 
 #endif
@@ -1273,6 +1281,11 @@ typedef struct {
     ngx_array_t              *uwsgi_lengths;
     ngx_array_t              *uwsgi_values;
     ngx_http_complex_value_t  cache_key;
+
+#if (NGX_RESTY_EXT)
+    ngx_flag_t params_inherit;
+#endif
+
     ngx_str_t                 uwsgi_string;
     ngx_uint_t                modifier1;
     ngx_uint_t                modifier2;

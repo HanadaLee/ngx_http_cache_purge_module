@@ -344,6 +344,12 @@ subtest 'native protocol and cache metadata layout' => sub {
                        . "typedef char check_${protocol}_${field}[(offsetof($type, $field)\n"
                        . " == offsetof(upstream_$type, $field)) ? 1 : -1];\n#endif\n";
         }
+        if ($protocol ne 'proxy') {
+            my $type = "ngx_http_${protocol}_loc_conf_t";
+            $layout .= '#if (NGX_RESTY_EXT && NGX_HTTP_' . uc($protocol) . ")\n"
+                       . "typedef char check_${protocol}_params_inherit[(offsetof($type, params_inherit)\n"
+                       . " == offsetof(upstream_$type, params_inherit)) ? 1 : -1];\n#endif\n";
+        }
     }
     write_file("$tmp/layout.c", $layout);
     run(@cc, @inc, '-c', "$tmp/layout.c", '-o', "$tmp/layout.o");
