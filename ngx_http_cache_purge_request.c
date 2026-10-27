@@ -764,9 +764,6 @@ ngx_http_cache_purge_capture(ngx_http_request_t *r)
     }
     value.data = host->data;
     value.len = host->len;
-    if (ctx->structured_key || ctx->structured_url) {
-        value = ctx->components[2];
-    }
     if (ngx_http_cache_purge_capture_borrow(ctx, &ctx->host, value) != NGX_OK
         || ctx->host.len == 0 || ctx->key.len == 0 || ctx->url.len == 0
         || ctx->namespace.len == 0 || ctx->namespace.len > 255)
@@ -1968,8 +1965,8 @@ ngx_http_cache_purge_read_event(ngx_event_t *event)
     ctx->root = root;
     ctx->zone = zone;
     ctx->path = path;
-    payload.len = 20 + root.len + zone.len + path.len
-                  + ctx->key.len + ctx->url.len;
+    payload.len = 24 + root.len + zone.len + path.len
+                  + ctx->key.len + ctx->url.len + ctx->host.len;
     if (payload.len > NGX_HTTP_CACHE_PURGE_CAPTURE_RECORD) {
         ngx_http_cache_purge_read_complete(ctx, 0);
         return;
@@ -1983,7 +1980,8 @@ ngx_http_cache_purge_read_event(ngx_event_t *event)
     p = ngx_http_cache_purge_capture_string(p, zone);
     p = ngx_http_cache_purge_capture_string(p, path);
     p = ngx_http_cache_purge_capture_string(p, ctx->key);
-    ngx_http_cache_purge_capture_string(p, ctx->url);
+    p = ngx_http_cache_purge_capture_string(p, ctx->url);
+    ngx_http_cache_purge_capture_string(p, ctx->host);
     rc = ngx_http_cache_purge_client_admit_file(
         ctx->client, &payload, c->file.fd, timeout,
         ngx_http_cache_purge_read_reply, ctx, &ctx->call);

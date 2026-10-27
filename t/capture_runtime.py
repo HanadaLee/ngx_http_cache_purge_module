@@ -250,6 +250,10 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
                      cache_purge_key $cache_key_base;
                      cache_purge_url "$scheme://$host$uri";
                      proxy_pass http://127.0.0.1:{origin.server_port}; }}
+  location /host-shared/ {{ cache_key_host cache.test;
+                           cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+                           proxy_cache_revalidate on;
+                           proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /invalidate/ {{ cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
                           proxy_cache_revalidate on;
                           proxy_cache_use_stale error timeout http_500 updating;
@@ -583,6 +587,55 @@ try:
     assert get(materialized_failure) == (200, 'HIT', materialized_failure.encode())
     checks.append('background Invalidate persists three requirements across two zones without changing files; after controlled rule retirement and restart, fresh native headers still require validation')
     checks.append('persistent per-file Invalidate keeps strict failure handling and plain stale downgrade after all resident rules are removed')
+    host_cases = []
+    late_host_cases = []
+    for number, (kind, mode) in enumerate(((4, 1), (4, 2), (6, 1), (6, 2))):
+        uri = '/host-shared/observed-' + str(number)
+        first_host, second_host, alias_host = (f'first-{number}.test', f'second-{number}.test', f'alias-{number}.test')
+        tag = 'host-tag-' + str(number)
+        policies[uri] = tag
+        assert get(uri, {'Host': first_host}) == (200, 'MISS', uri.encode())
+        assert get(uri + '?z=b', {'Host': second_host}) == (200, 'MISS', uri.encode())
+        files = records(uri, 2)
+        assert {item['host'] for item in files} == {first_host.encode(), second_host.encode()}, files
+        assert all(item['key'].split(b'\x1f')[2] == b'cache.test' for item in files), files
+        original_ids = {item['id'] for item in files}
+        assert (observed_reply := get(uri, {'Host': alias_host})) == (200, 'HIT', uri.encode()), observed_reply
+        assert {item[0] for item in query(alias_host, kind=4)} == original_ids
+        assert {item[0] for item in query(tag, kind=6, scope=alias_host)} == original_ids
+        conditional_paths.add(uri)
+        fence('shared-host-' + str(number), kind, alias_host if kind == 4 else tag,
+              scope='' if kind == 4 else alias_host, mode=mode)
+        if mode == 1:
+            body = uri.encode()
+            assert get(uri, {'Host': first_host}) == (200, 'REVALIDATED', body)
+            assert get(uri + '?z=b', {'Host': second_host}) == (200, 'REVALIDATED', body)
+            assert {item['id'] for item in records(uri, 2)} == original_ids
+        else:
+            body = ('fresh-host-' + str(number)).encode()
+            fresh_bodies[uri] = body
+            assert get(uri, {'Host': first_host}) == (200, 'BYPASS', body)
+            assert get(uri + '?z=b', {'Host': second_host}) == (200, 'BYPASS', body)
+            until(lambda: {item['id'] for item in records(uri, 2)}.isdisjoint(original_ids))
+            assert uri not in conditional_calls
+        assert get(uri, {'Host': alias_host}) == (200, 'HIT', body)
+        assert get(uri + '?z=b', {'Host': alias_host}) == (200, 'HIT', body)
+        host_cases.append((uri, alias_host, body))
+        checks.append(f'business host differs from cache-key host: kind={kind}, mode={mode} covers both zones and observed host aliases')
+
+        uri = '/host-shared/late-' + str(number)
+        first_host, late_host = f'old-{number}.test', f'late-{number}.test'
+        tag = 'late-host-tag-' + str(number)
+        policies[uri] = tag
+        assert get(uri, {'Host': first_host}) == (200, 'MISS', uri.encode())
+        assert get(uri + '?z=b', {'Host': first_host}) == (200, 'MISS', uri.encode())
+        original_ids = {item['id'] for item in records(uri, 2)}
+        name = 'retired-late-host-' + str(number)
+        assert not query(late_host, kind=4)
+        fence(name, kind, late_host if kind == 4 else tag,
+              scope='' if kind == 4 else late_host, mode=mode)
+        late_host_cases.append((name, mode, uri, first_host, late_host, kind, original_ids))
+
     late_alias_cases = []
     for number, (kind, mode) in enumerate(((1, 1), (1, 2), (3, 1), (3, 2))):
         source_uri = '/alias/source-' + str(number)
@@ -597,16 +650,16 @@ try:
         fence(name, kind, value, mode=mode)
         late_alias_cases.append((name, mode, source_uri, target_uri, suffix, original_ids))
     stop(process)
-    for name, *_ in late_alias_cases:
+    for name, *_ in late_alias_cases + late_host_cases:
         subprocess.run([str(a.libraries / 'cache_purge_files_test'), '--activate-background',
                         str(run / 'index'), name], check=True, timeout=15, stdout=subprocess.DEVNULL)
     process = start()
     until(lambda: (run / 'index/component.sock').exists())
     until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
-    for name, *_ in late_alias_cases:
+    for name, *_ in late_alias_cases + late_host_cases:
         until(lambda name=name: materialization_done(name, 0))
     stop(process)
-    for name, *_ in late_alias_cases:
+    for name, *_ in late_alias_cases + late_host_cases:
         subprocess.run([str(a.libraries / 'cache_purge_files_test'), '--retire-empty-fixture',
                         str(run / 'index'), name], check=True, timeout=15, stdout=subprocess.DEVNULL)
     process = start()
@@ -629,6 +682,23 @@ try:
         assert get(target_uri + suffix) == (200, 'HIT', body)
         assert get(target_uri + suffix + '&z=b') == (200, 'HIT', body)
         checks.append(name + ': a URL first observed after empty-scan retirement still enforces the durable exact/prefix rule across both zones')
+    for name, mode, uri, first_host, late_host, kind, original_ids in late_host_cases:
+        conditional_paths.add(uri)
+        if mode == 1:
+            body = uri.encode()
+            assert get(uri, {'Host': late_host}) == (200, 'REVALIDATED', body)
+            assert get(uri + '?z=b', {'Host': first_host}) == (200, 'REVALIDATED', body)
+            assert {item['id'] for item in records(uri, 2)} == original_ids
+        else:
+            body = ('new-' + name).encode()
+            fresh_bodies[uri] = body
+            assert get(uri, {'Host': late_host}) == (200, 'BYPASS', body)
+            assert get(uri + '?z=b', {'Host': first_host}) == (200, 'BYPASS', body)
+            until(lambda: {item['id'] for item in records(uri, 2)}.isdisjoint(original_ids))
+            assert uri not in conditional_calls
+        assert get(uri, {'Host': first_host}) == (200, 'HIT', body)
+        assert get(uri + '?z=b', {'Host': late_host}) == (200, 'HIT', body)
+        checks.append(name + ': a business host first observed after controlled rule retirement enforces host/host-tag history across two zones')
     assert get('/background-native')[1] == 'MISS'
     assert get('/background-native?z=b')[1] == 'MISS'
     background_files = records('/background-native', 2)
@@ -944,6 +1014,11 @@ try:
     assert records('/alias/two', 1)[0]['id'] == alias['id']
     assert calls.count('/alias/three') == 0
     checks.append('HIT-discovered aliases and their satisfied FENCE coverage survive a full nginx restart without index rebuilding')
+    for uri, alias_host, body in host_cases:
+        assert get(uri, {'Host': alias_host}) == (200, 'HIT', body)
+        assert get(uri + '?z=b', {'Host': alias_host}) == (200, 'HIT', body)
+        assert len(query(alias_host, kind=4)) == 2
+    checks.append('business host/key relations survive full restart and satisfied host rules do not force repeated origin requests')
     validation_files = {}
     policies['/revalidate-race'] = 'race-old'
     assert get('/revalidate-race') == (200, 'MISS', b'/revalidate-race')

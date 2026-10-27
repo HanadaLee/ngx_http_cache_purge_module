@@ -742,6 +742,7 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
     ngx_http_cache_rocksdb_bytes_t             bookmark;
     ngx_http_cache_rocksdb_bytes_t             key;
     ngx_http_cache_rocksdb_bytes_t             url;
+    ngx_http_cache_rocksdb_bytes_t             host;
     ngx_http_cache_rocksdb_bytes_t             metadata;
     ngx_http_cache_rocksdb_bytes_t             tags[64];
     unsigned char                              digest[16];
@@ -880,6 +881,7 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
         if (p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_ADMIT_FILE) {
             key = ngx_http_cache_purge_component_string(&d, 32768);
             url = ngx_http_cache_purge_component_string(&d, 32768);
+            host = ngx_http_cache_purge_component_string(&d, 32768);
         }
         if ((rc = ngx_http_cache_purge_component_end(&d)) != 0) {
             break;
@@ -890,7 +892,8 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
         if (rc == 0
             && p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_ADMIT_FILE)
         {
-            if (key.len == 0 || url.len == 0 || key.len != file.key.len
+            if (key.len == 0 || url.len == 0 || host.len == 0
+                || key.len != file.key.len
                 || memcmp(key.data, file.key.data, key.len))
             {
                 rc = ngx_http_cache_purge_component_error(error,
@@ -910,7 +913,8 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
                 }
             }
             if (rc == 0) {
-                rc = ngx_http_cache_purge_index_add_url(store, key, url, error);
+                rc = ngx_http_cache_purge_index_observe(store, key, url,
+                                                         host, error);
             }
             if (rc == 0) {
                 rc = ngx_http_cache_purge_component_read_stamp(c->coordinator,
@@ -4898,6 +4902,39 @@ ngx_http_cache_purge_component_validation_rules(
 }
 
 static int
+ngx_http_cache_purge_component_validation_host(void *data,
+    ngx_http_cache_rocksdb_bytes_t host, ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_validation_context_t  *v;
+    uint64_t                                    publication;
+    size_t                                      i;
+    int                                         rc;
+    static const ngx_http_cache_rocksdb_bytes_t empty = { NULL, 0 };
+
+    v = data;
+    v->context.host = host;
+    v->context.url = empty;
+    rc = ngx_http_cache_purge_component_validation_rules(v,
+        NGX_HTTP_CACHE_PURGE_HOST, host, empty, error);
+    for (i = 0; rc == 0 && i < v->context.tag_count; i++) {
+        rc = ngx_http_cache_purge_component_validation_rules(v,
+            NGX_HTTP_CACHE_PURGE_HOST_TAG, v->context.tags[i], host, error);
+    }
+    if (rc != 0 || v->coordinator->count == 0) {
+        return rc;
+    }
+    rc = ngx_http_cache_purge_control_match(
+        v->coordinator->validation_reader, &v->context, 64, 65536,
+        ngx_http_cache_purge_component_validation_match, v,
+        &publication, error);
+    if (rc == 0 && publication != v->coordinator->publication) {
+        rc = ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_BUSY, "host validation image changed");
+    }
+    return rc;
+}
+
+static int
 ngx_http_cache_purge_component_validation_url(void *data,
     ngx_http_cache_rocksdb_bytes_t url, ngx_http_cache_rocksdb_error_t *error)
 {
@@ -5017,30 +5054,27 @@ ngx_http_cache_purge_component_record_guard(
     empty.len = 0;
     rc = ngx_http_cache_purge_component_validation_rules(&v,
         NGX_HTTP_CACHE_PURGE_KEY, file->key, empty, error);
-    if (rc == 0 && file->host.len != 0) {
-        rc = ngx_http_cache_purge_component_validation_rules(&v,
-            NGX_HTTP_CACHE_PURGE_HOST, file->host, empty, error);
-    }
     for (i = 0; rc == 0 && i < file->tag_count; i++) {
         if (file->tag_namespace.len != 0) {
             rc = ngx_http_cache_purge_component_validation_rules(&v,
                 NGX_HTTP_CACHE_PURGE_NAMESPACE_TAG, file->tags[i],
                 file->tag_namespace, error);
         }
-        if (rc == 0 && file->host.len != 0) {
-            rc = ngx_http_cache_purge_component_validation_rules(&v,
-                NGX_HTTP_CACHE_PURGE_HOST_TAG, file->tags[i],
-                file->host, error);
-        }
     }
     if (rc != 0) {
         return rc;
     }
     v.context.key = file->key;
-    v.context.host = file->host;
     v.context.tag_namespace = file->tag_namespace;
     v.context.tags = file->tags;
     v.context.tag_count = file->tag_count;
+    rc = ngx_http_cache_purge_index_visit_hosts(c->operations.store,
+        &expected, 64, 65536, ngx_http_cache_purge_component_validation_host,
+        &v, error);
+    if (rc != 0) {
+        return rc;
+    }
+    v.context.host = empty;
 
     /* Each match unpins its image before the next database read. Acceptance
      * and metadata updates share this executor, so none can interleave here. */

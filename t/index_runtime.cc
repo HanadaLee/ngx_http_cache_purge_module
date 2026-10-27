@@ -179,6 +179,298 @@ raw_write(ngx_http_cache_rocksdb_t *store, ngx_http_cache_rocksdb_cf_e cf,
         "raw test mutation");
 }
 
+static std::string
+ngx_http_cache_purge_test_raw(
+    ngx_http_cache_rocksdb_t *store, const std::string &key)
+{
+    std::string data(262144, '\0');
+    ngx_http_cache_rocksdb_buffer_t value{
+        reinterpret_cast<unsigned char *>(data.data()), data.size(), 0
+    };
+    ngx_http_cache_rocksdb_error_t error{};
+    check(ngx_http_cache_rocksdb_get(
+              store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, bytes(key), &value, &error)
+              == 0,
+        "read raw host fixture");
+    data.resize(value.length);
+    return data;
+}
+
+static uint64_t
+ngx_http_cache_purge_test_number(const std::string &data, size_t offset)
+{
+    check(offset + 8 <= data.size(), "test integer bounds");
+    uint64_t value = 0;
+    for (size_t i = 0; i < 8; i++) {
+        value = (value << 8) | static_cast<unsigned char>(data[offset + i]);
+    }
+    return value;
+}
+
+static std::string
+ngx_http_cache_purge_test_number(uint64_t value)
+{
+    std::string result(8, '\0');
+    for (size_t i = 0; i < 8; i++) {
+        result[7 - i] = value & 255;
+        value >>= 8;
+    }
+    return result;
+}
+
+static int
+ngx_http_cache_purge_test_visit(void *data,
+    ngx_http_cache_rocksdb_bytes_t value, ngx_http_cache_rocksdb_error_t *)
+{
+    auto values = static_cast<std::set<std::string> *>(data);
+    values->emplace(reinterpret_cast<const char *>(value.data), value.len);
+    return 0;
+}
+
+static void
+ngx_http_cache_purge_test_hosts(const std::string &path)
+{
+    check(mkdir(path.c_str(), 0700) == 0, "host fixture directory");
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    ngx_http_cache_rocksdb_error_t error{};
+    check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
+              == 0,
+        "host fixture open");
+    const auto cf = NGX_HTTP_CACHE_ROCKSDB_DEFAULT;
+    auto a = file(401, "/host-shared", "", "first.test");
+    auto b = file(402, "/host-shared", "", "second.test", "/cache/b");
+    const std::string observed = "observed.test";
+    {
+        Index index(store);
+        install(index, a);
+        install(index, b);
+        check(ngx_http_cache_purge_index_observe(
+                  store, bytes(a.key), bytes(a.url), bytes(observed), &error)
+                  == 0,
+            "observe business host without rewriting file metadata");
+        ngx_http_cache_rocksdb_stats_t before{}, after{};
+        ngx_http_cache_rocksdb_stats(store, &before, &error);
+        check(ngx_http_cache_purge_index_observe(
+                  store, bytes(a.key), bytes(a.url), bytes(observed), &error)
+                  == 0,
+            "repeat host observation");
+        ngx_http_cache_rocksdb_stats(store, &after, &error);
+        check(before.writes == after.writes,
+            "repeated host observations require no WAL write");
+        auto expected = ngx_http_cache_purge_native_expected(a.id, 2);
+        std::set<std::string> hosts;
+        check(ngx_http_cache_purge_index_visit_hosts(store, &expected, 8, 1024,
+                  ngx_http_cache_purge_test_visit, &hosts, &error)
+                      == 0
+                  && hosts
+                         == std::set<std::string>{ "first.test", "second.test",
+                             observed },
+            "host visitor covers original and observed business hosts");
+        check(ngx_http_cache_purge_index_visit_hosts(store, &expected, 2, 1024,
+                  ngx_http_cache_purge_test_visit, &hosts, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+            "host visitor rejects partial coverage beyond count budget");
+        check(ngx_http_cache_purge_index_visit_hosts(store, &expected, 8, 1,
+                  ngx_http_cache_purge_test_visit, &hosts, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+            "host visitor enforces byte budget");
+        for (const auto &host : hosts) {
+            check(selected(index, { SelectorKind::host, host, "" })
+                      == std::set<unsigned>{ 401, 402 },
+                "each business host covers both zones");
+        }
+        check(selected(index, { SelectorKind::host, "shared.cache.test", "" })
+                  .empty(),
+            "cache-key host is not implicitly a business host");
+        Selector selector{ SelectorKind::host_tag, "photo", observed };
+        auto query = index.query(selector);
+        Match match;
+        check(query->next(match) && numeric(match.id) == 401,
+            "host-first query starts at the first shared file");
+        auto bookmark = query->bookmark();
+        query.reset();
+        check(ngx_http_cache_purge_test_number(bookmark, 41) == 17
+                  && bookmark[49] == 'B',
+            "bookmark records host-first plan");
+        for (unsigned i = 0; i < 8; i++) {
+            auto extra =
+                file(410 + i, "/other-" + std::to_string(i), "", observed);
+            extra.tags = { "unrelated" };
+            install(index, extra);
+        }
+        query = index.query(selector);
+        check(query->next(match), "new query uses current selectivity");
+        auto direct = query->bookmark();
+        query.reset();
+        check(ngx_http_cache_purge_test_number(direct, 41) == 0
+                  && direct[57] == 'T',
+            "new query chooses tag-first after host cardinality grows");
+        query = index.query(selector, bookmark);
+        check(query->next(match) && numeric(match.id) == 402
+                  && !query->next(match),
+            "continuation preserves host-first plan after selectivity changes");
+        query.reset();
+        pages(index, selector);
+        index.update_metadata(b.id, 2, "304-tag-update", { "new" });
+        check(
+            selected(index, selector) == std::set<unsigned>{ 401 }
+                && selected(index, { SelectorKind::host_tag, "new", observed })
+                       == std::set<unsigned>{ 402 },
+            "TAG changes update all business-host views");
+        auto object = ngx_http_cache_purge_test_raw(store,
+            "O" + std::string(reinterpret_cast<const char *>(a.id.data()), 16));
+        auto forward = "B" + object.substr(58, 8) + object.substr(42, 8);
+        auto reverse = "b" + object.substr(42, 8) + object.substr(58, 8);
+        raw_write(store, cf, reverse, "", true);
+        fails(NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+            [&] { selected(index, { SelectorKind::host, "first.test", "" }); });
+        check(ngx_http_cache_purge_index_observe(
+                  store, bytes(a.key), bytes(a.url), bytes(a.host), &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+            "one-sided host relationship cannot be silently rewritten");
+        raw_write(store, cf, reverse, "");
+        check(ngx_http_cache_purge_test_raw(store, forward).empty(),
+            "forward host posting remains intact");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
+        "close host fixture");
+    check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
+              == 0,
+        "reopen host fixture");
+    {
+        Index index(store);
+        check(selected(index, { SelectorKind::host, "first.test", "" })
+                  == std::set<unsigned>{ 401, 402 },
+            "host relations persist without a rebuild");
+        for (unsigned n : scan(index, { SelectorKind::key_prefix, "", "" })) {
+            auto value = index.get(id(n));
+            auto retired = index.retire(value.id, value.revision);
+            index.collect_file(value.id, retired.revision);
+        }
+        unsigned rounds = 0;
+        while (index.collect_keys(1)) {
+            check(++rounds < 100, "host GC progresses with one-item budget");
+        }
+        check(raw_keys(store, cf).size() == 3
+                  && raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_TAG).empty(),
+            "last-file GC reclaims every host link and dictionary reference");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
+        "close collected host fixture");
+}
+
+static void
+ngx_http_cache_purge_test_host_migration(const std::string &path)
+{
+    check(mkdir(path.c_str(), 0700) == 0, "host migration directory");
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    ngx_http_cache_rocksdb_error_t error{};
+    check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
+              == 0,
+        "open host migration fixture");
+    const auto cf = NGX_HTTP_CACHE_ROCKSDB_DEFAULT;
+    const auto tag_cf = NGX_HTTP_CACHE_ROCKSDB_TAG;
+    std::set<unsigned> all;
+    std::string damaged, original;
+    {
+        Index index(store);
+        for (unsigned i = 0; i < 40; i++) {
+            install(index, file(500 + i, "/migration", "",
+                               i % 2 ? "second.test" : "first.test"));
+            all.insert(500 + i);
+        }
+        for (const auto &key : raw_keys(store, cf)) {
+            if (key[0] == 'O') {
+                auto value = ngx_http_cache_purge_test_raw(store, key);
+                raw_write(
+                    store, cf, "H" + value.substr(58, 8) + key.substr(1), "");
+                if (static_cast<unsigned char>(key.back()) == (532 & 255)) {
+                    damaged = key;
+                    original = value;
+                }
+            } else if (key[0] == 'B') {
+                auto dict_key = "V" + key.substr(1, 8);
+                auto dict = ngx_http_cache_purge_test_raw(store, dict_key);
+                auto count = ngx_http_cache_purge_test_number(dict, 1);
+                check(count > 1, "migration host retains file references");
+                dict.replace(1, 8, ngx_http_cache_purge_test_number(count - 1));
+                raw_write(store, cf, dict_key, dict);
+                raw_write(store, cf, key, "", true);
+            } else if (key[0] == 'b') {
+                raw_write(store, cf, key, "", true);
+            }
+        }
+        for (const auto &key : raw_keys(store, tag_cf)) {
+            if (key[0] == 'T') {
+                auto object =
+                    ngx_http_cache_purge_test_raw(store, "O" + key.substr(9));
+                raw_write(store, tag_cf,
+                    "H" + object.substr(58, 8) + key.substr(1), "");
+                raw_write(store, tag_cf, key, "", true);
+            }
+        }
+        raw_write(store, cf, "M:index", "3");
+        check(!damaged.empty(), "select second migration batch failure");
+        raw_write(store, cf, damaged, "broken object");
+        fails(
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, [&] { Index interrupted(store); });
+        check(ngx_http_cache_purge_test_raw(store, "M:index") == "4"
+                  && ngx_http_cache_purge_test_raw(store, "M:host-cursor")
+                         == "O"
+                                + std::string(reinterpret_cast<const char *>(
+                                                  id(531).data()),
+                                    16),
+            "migration fences old readers and checkpoints only committed "
+            "batches");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
+        "close interrupted migration");
+    check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
+              == 0,
+        "reopen interrupted migration");
+    raw_write(store, cf, damaged, original);
+    {
+        Index index(store);
+        for (const auto &host : { "first.test", "second.test" }) {
+            check(selected(index, { SelectorKind::host, host, "" }) == all
+                      && selected(
+                             index, { SelectorKind::host_tag, "photo", host })
+                             == all,
+                "legacy per-file postings upgrade to shared host membership");
+        }
+        check(ngx_http_cache_purge_test_raw(store, damaged) == original,
+            "migration preserves file revision, fingerprint and metadata");
+        for (const auto &key : raw_keys(store, cf)) {
+            check(key[0] != 'H' && key != "M:host-cursor",
+                "migration removes old host postings and cursor");
+        }
+        for (const auto &key : raw_keys(store, tag_cf)) {
+            check(key[0] != 'H', "migration removes old host-tag postings");
+        }
+        ngx_http_cache_rocksdb_stats_t before{}, after{};
+        ngx_http_cache_rocksdb_stats(store, &before, &error);
+        Index reopened(store);
+        ngx_http_cache_rocksdb_stats(store, &after, &error);
+        check(before.writes == after.writes,
+            "completed schema migration is not replayed on reopen");
+        for (unsigned n : all) {
+            index.retire(id(n), 2);
+            index.collect_file(id(n), 3);
+        }
+        while (index.collect_keys(2)) {
+        }
+        check(
+            raw_keys(store, cf).size() == 3 && raw_keys(store, tag_cf).empty(),
+            "migrated dictionary references remain balanced after GC");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
+        "close migrated host fixture");
+}
+
 static void
 ngx_http_cache_purge_test_validation_policy(const std::string &path)
 {
@@ -650,16 +942,16 @@ main(int argc, char **argv)
                       == std::set<unsigned>({ 1, 2, 3, 4, 5, 6 }),
                 "byte prefix includes ab");
             check(selected(index, { SelectorKind::host, "b.example", "" })
-                      == std::set<unsigned>{ 2 },
-                "business host differs from cache host");
+                      == std::set<unsigned>({ 1, 2, 4 }),
+                "business host covers all files of its shared cache key");
             check(selected(
                       index, { SelectorKind::namespace_tag, "photo", "other" })
                       == std::set<unsigned>{ 4 },
                 "namespace-tag isolation");
             check(selected(
                       index, { SelectorKind::host_tag, "photo", "b.example" })
-                      == std::set<unsigned>{ 2 },
-                "host-tag isolation");
+                      == std::set<unsigned>({ 1, 2, 4 }),
+                "host-tag covers shared key files across zones");
             check(index.get(a.id).tags
                       == std::vector<std::string>({ "common", "photo" }),
                 "deduplicated canonical TAGs");
@@ -820,10 +1112,19 @@ main(int argc, char **argv)
             ngx_http_cache_rocksdb_stats_t before, after;
             check(ngx_http_cache_rocksdb_stats(store, &before, &error) == 0,
                 "batch initial stats");
-            auto batched = index.prepare_batch(fills);
+            fails(NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+                [&] { index.prepare_batch(fills); });
             check(ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
-                      && after.writes == before.writes + 1,
-                "32 prepares share one durable write");
+                      && after.writes == before.writes,
+                "oversized relationship batch is entirely rolled back");
+            auto batched = index.prepare_batch(
+                std::vector<Fill>(fills.begin(), fills.begin() + 16));
+            auto tail = index.prepare_batch(
+                std::vector<Fill>(fills.begin() + 16, fills.end()));
+            batched.insert(batched.end(), tail.begin(), tail.end());
+            check(ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
+                      && after.writes == before.writes + 2,
+                "smaller batches preserve the configured entry budget");
             std::vector<ExpectedFile> revisions;
             for (const auto &entry : batched) {
                 revisions.push_back({ entry.id, entry.revision });
@@ -925,6 +1226,9 @@ main(int argc, char **argv)
         }
         check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
         bounded_scan(std::string(path) + "-bounded");
+        ngx_http_cache_purge_test_hosts(std::string(path) + "-hosts");
+        ngx_http_cache_purge_test_host_migration(
+            std::string(path) + "-host-migration");
         ngx_http_cache_purge_test_validation_policy(
             std::string(path) + "-validation");
         std::cout << "PASS " << assertions << " index assertions; database "

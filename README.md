@@ -56,8 +56,8 @@ position; it does not retain all matching files in memory. These are work-unit
 bounds, not hard latency bounds for filesystem or database I/O. A file failure
 currently pauses that task at its pending instance while other tasks continue.
 Enumeration completion leaves the operation DRAINING and retains its FENCE.
-Native cache accounting, complete retirement and background Invalidate remain
-pending. Public activation is not enabled: acceptance still returns PREPARING;
+Native cache accounting and complete retirement remain pending.
+Public activation is not enabled: acceptance still returns PREPARING;
 integration tests activate tasks offline. This is not a public Delete API.
 
 The filesystem backend also supports bounded in-place validation transactions.
@@ -173,8 +173,8 @@ The existing worker executor resumes the bounded scan from durable checkpoints.
 Admission checks that requirement even when no resident rule remains; successful
 conditional validation satisfies it without replacing the entity. Requirements
 are monotonic within one ledger and are collected with their retired file.
-Index schema 3 upgrades schemas 1/2 in place without rebuilding file relations;
-older readers reject it instead of ignoring these requirements.
+Index schema 4 upgrades schemas 1/2/3 from existing index records; older readers
+reject it instead of ignoring newer requirements or host relationships.
 
 Persistent selector requirements also survive resident-rule retirement. The
 operation ledger retains the latest Invalidate and Delete sequence independently
@@ -185,9 +185,25 @@ Full entities fetched after the latest accepted operation skip this historical
 lookup. Ledger schema 2 upgrades schema 1 through a bounded, checkpointed replay
 of operation records once; native cache files and their index are not rebuilt.
 
-Automatic FENCE retirement, complete host relationships and full writer/migration
-coverage remain unfinished. Memory-only
-errors do not receive a separate TAG/alias index. Operation receipts
+Business `$host` is separate from `$cache_key_host`. The index records observed
+host-to-key relationships, shared across every slice, Vary file and zone of the
+key. File admission observes the current host and URL atomically before checking
+their persisted relationships. A host or host+TAG operation can therefore affect
+other business hosts sharing that key. Namespace+TAG remains explicitly scoped.
+Host+TAG enumeration chooses between host-to-key traversal and TAG postings,
+using dictionary reference counts as a bounded heuristic; bookmarks preserve the
+chosen plan. Associations are reclaimed when the key loses its last file.
+
+The schema upgrade resumes bounded batches from a durable cursor and does not
+read or rewrite native cache files. Legacy records only recover the host they
+actually stored; missing historical business hosts cannot be inferred from a
+canonical cache host. Subsequent requests register their actual business hosts,
+including checks against persistent requirements after resident-rule retirement.
+Completed upgrades do not replay on restart. This internal storage schema change
+does not change nginx-ext ABI, which remains 1.
+
+Automatic FENCE retirement and full writer/migration coverage remain unfinished.
+Memory-only errors do not receive a separate TAG/alias index. Operation receipts
 remain PREPARING; these partial consumers do not expose reliable public 202
 acceptance or completed immediate purge semantics yet.
 

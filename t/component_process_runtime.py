@@ -236,8 +236,11 @@ class Client:
             return reply[:-16]
         return reply
 
-    def admit_file(self, target, key, url, fd, code=0):
-        packet = self.packet(25, b''.join(map(string, (*target, key, url))))
+    def admit_file(self, target, key, url, fd, code=0, host='business.test'):
+        fields = (*target, key, url)
+        if host is not None:
+            fields += (host,)
+        packet = self.packet(25, b''.join(map(string, fields)))
         assert self.socket.sendmsg([packet[:1]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [fd]))]) == 1
         self.socket.sendall(packet[1:])
         reply = self.reply(25, code)
@@ -735,6 +738,8 @@ try:
     key = 'team\x1fhttps\x1fa.test\x1f/read-alias\x1f'
     original = v.call(2, identity(605))
     writes = struct.unpack('>9Q', v.call(1))[1]
+    v.admit_file(address, key, 'https://a.test/forbidden-alias', selected, code=4, host=None)
+    v.admit_file(address, key, 'https://a.test/forbidden-alias', selected, code=7, host='')
     v.admit_file(address, 'another-key', 'https://a.test/forbidden-alias', selected, code=7)
     assert struct.unpack('>9Q', v.call(1))[1] == writes and v.page(1, 'https://a.test/forbidden-alias')[0] == []
     assert v.admit_file(address, key, 'https://a.test/discovered-alias', selected) == original
@@ -744,7 +749,7 @@ try:
     writes = struct.unpack('>9Q', v.call(1))[1]
     assert v.admit_file(address, key, 'https://a.test/discovered-alias', selected) == original
     assert struct.unpack('>9Q', v.call(1))[1] == writes
-    check(True, 'ADMIT_FILE binds the native key, durably registers a new URL alias and returns a publication stamp without rewriting repeated observations')
+    check(True, 'ADMIT_FILE requires an explicit host, binds the native key and atomically registers request identities without rewriting repeated observations')
     validation_operation('discovered-alias-rule', 1, 'https://a.test/discovered-alias')
     wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
     assert stamp != struct.unpack('>IQ', v.call(16))[1]

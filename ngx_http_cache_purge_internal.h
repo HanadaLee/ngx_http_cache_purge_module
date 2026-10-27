@@ -752,14 +752,23 @@ int ngx_http_cache_purge_index_publish_update(ngx_http_cache_rocksdb_t *store,
 int ngx_http_cache_purge_index_add_url(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_bytes_t key, ngx_http_cache_rocksdb_bytes_t url,
     ngx_http_cache_rocksdb_error_t *error);
-/* Visits every persisted URL for the file's key, without retaining the set.
- * The callback borrows each URL until it returns. Exceeding either bound fails
- * with LIMIT; callers must not treat partial enumeration as full coverage. */
-typedef int (*ngx_http_cache_purge_index_url_pt)(void *data,
-    ngx_http_cache_rocksdb_bytes_t url, ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_observe(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_rocksdb_bytes_t key, ngx_http_cache_rocksdb_bytes_t url,
+    ngx_http_cache_rocksdb_bytes_t host,
+    ngx_http_cache_rocksdb_error_t *error);
+/* Visits every persisted URL or host for the key, without retaining the set.
+ * The callback borrows each value until it returns. Exceeding either bound
+ * fails with LIMIT; partial enumeration is not full coverage. */
+typedef int (*ngx_http_cache_purge_index_visit_pt)(void *data,
+    ngx_http_cache_rocksdb_bytes_t value,
+                                   ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_visit_urls(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_expected_t *file, size_t max_urls,
-    size_t max_bytes, ngx_http_cache_purge_index_url_pt visit, void *data,
+    size_t max_bytes, ngx_http_cache_purge_index_visit_pt visit, void *data,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_visit_hosts(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file, size_t max_hosts,
+    size_t max_bytes, ngx_http_cache_purge_index_visit_pt visit, void *data,
     ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_collect(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_expected_t *files, size_t count,
