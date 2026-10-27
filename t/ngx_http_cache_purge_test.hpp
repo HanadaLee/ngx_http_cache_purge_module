@@ -315,6 +315,7 @@ struct OperationPage {
 
 struct OperationUsage {
     uint64_t live_records = 0, live_selector_bytes = 0, last_sequence = 0;
+    uint64_t retired_sequence = 0;
 };
 
 /* Durable ledger, called only by the single component executor. It does not
@@ -407,7 +408,7 @@ public:
     OperationUsage usage() {
         ngx_http_cache_purge_operation_usage_t output{}; ngx_http_cache_rocksdb_error_t error;
         int rc = ngx_http_cache_purge_operations_usage(&native_, &output, &error);
-        checked(rc, error); return {output.live_records, output.live_selector_bytes, output.last_sequence};
+        checked(rc, error); return {output.live_records, output.live_selector_bytes, output.last_sequence, output.retired_sequence};
     }
     Operation activate(const std::string &id, uint64_t revision, uint64_t now) {
         Result output; ngx_http_cache_rocksdb_error_t error;

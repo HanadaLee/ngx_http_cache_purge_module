@@ -678,6 +678,7 @@ try:
                            roots=(validation_cache, validation_temp))
     validating.opened(); v = Client(validating.path)
     wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+    validation_origin = validating.watermark()
 
     def make_validation_file(n, uri, metadata='proof-v1'):
         target = validation_cache / f'a/00/{n}'
@@ -693,9 +694,11 @@ try:
         os.close(fd)
         return target, lease, os.open(target, os.O_RDONLY | os.O_CLOEXEC)
 
-    def validation_packet(n, revision=2, token=1, before=b'old-head', after=b'new-head', tags=None):
+    def validation_packet(n, revision=2, token=1, before=b'old-head', after=b'new-head', tags=None, origin=None):
+        if origin is None:
+            origin = validation_origin
         return (identity(n) + struct.pack('>Q', revision) + identity(token) + string(before) + string(after)
-                + bytes([tags is not None, len(tags or [])]) + b''.join(map(string, tags or [])))
+                + bytes([tags is not None, len(tags or [])]) + b''.join(map(string, tags or [])) + origin[4:])
 
     def validation_operation(name, kind, value, scope=''):
         data = (string(name) + b'\x01' + struct.pack('>Q', 1000) + bytes([kind])
@@ -863,6 +866,75 @@ try:
     v.call(2, identity(640), code=1)
     os.close(fd); os.close(lease)
     check(True, 'malformed, foreign-ledger and future origin watermarks are rejected before file or index mutation')
+    v.close(); validating.stop()
+
+    # Offline retirement supplies only the ledger transition. It deliberately
+    # does not stand in for a native physical-work/quiescence implementation.
+    validation_shared = root / 'retired.shm'
+    validating = Component(root / 'retired', shared=validation_shared,
+                           roots=(validation_cache, validation_temp))
+    validating.opened(); v = Client(validating.path)
+    wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+    validation_origin = validating.watermark()
+    target, lease, selected = make_validation_file(651, '/unrelated-committed', metadata=validation_origin)
+    replay = validation_packet(651)
+    committed = v.validate_file(replay, lease, selected)
+    os.close(lease); os.close(selected)
+    pending = []
+    for n in (652, 653):
+        source = validation_temp / str(n); source.write_bytes(b'abandoned full entity')
+        destination = validation_cache / f'a/00/{n}'
+        lease = v.lease(str(destination)); fd = os.open(source, os.O_RDWR | os.O_CLOEXEC)
+        payload = record(n, root=str(validation_cache), zone='zone-a', uri=f'/pending-{n}',
+                         metadata=validation_origin) + string(str(source))
+        v.prepare_file(payload, [lease, fd]); source.rename(destination)
+        os.close(fd); pending.append((n, destination, lease))
+    validation_operation('retired-rule', 1, 'https://a.test/no-matching-file')
+    wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+    v.close(); validating.stop()
+    subprocess.check_output([str(args.binary.with_name('cache_purge_operations_test')),
+                             '--retire-fixture', str(validating.path), 'retired-rule'],
+                            text=True, timeout=30)
+    os.close(pending[1][2])
+    validating = Component(validating.path, shared=validation_shared,
+                           roots=(validation_cache, validation_temp))
+    validating.opened(); v = Client(validating.path)
+    wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+    assert v.finish_file(652, pending[0][2])[-1] == 3
+    os.close(pending[0][2])
+    wait_for(lambda: v.call(2, identity(653))[0] == 3)
+    assert all(os.getxattr(path, 'user.ngx_cache_purge.id')[7] == 1 for _, path, _ in pending)
+    check(True, 'persisted retirement floor rejects explicit FINISH and automatic recovery after the matching FENCE is removed')
+
+    lease = v.lease(str(target), target=(str(validation_cache), 'zone-a', 'a/00/651'), previous=651)
+    selected = os.open(target, os.O_RDONLY | os.O_CLOEXEC)
+    assert v.inspect_file((str(validation_cache), 'zone-a', 'a/00/651'), selected) == committed
+    writes = struct.unpack('>9Q', v.call(1))[1]
+    assert v.validate_file(replay, lease, selected) == committed
+    stale = validation_packet(651, revision=4, token=2, before=b'new-head', after=b'nexthead')
+    v.validate_file(stale, lease, selected, code=7)
+    assert struct.unpack('>9Q', v.call(1))[1] == writes and target.read_bytes().startswith(b'new-head')
+    check(True, 'retirement preserves existing files and committed validation replay while rejecting a new old-origin 304 write')
+    current_origin = validating.watermark()
+    fresh = validation_packet(651, revision=4, token=2, before=b'new-head', after=b'nexthead', origin=current_origin)
+    assert v.validate_file(fresh, lease, selected)[:9] == b'\x02' + struct.pack('>Q', 6)
+    assert target.read_bytes().startswith(b'nexthead')
+    os.close(lease); os.close(selected)
+    check(True, 'a current request may validate an unrelated old entity without changing its full-entity origin watermark')
+
+    source = validation_temp / 'late-prepare'; source.write_bytes(b'unmodified')
+    destination = validation_cache / 'a/00/654'
+    lease = v.lease(str(destination)); fd = os.open(source, os.O_RDWR | os.O_CLOEXEC)
+    for origin in (validation_origin, b'legacy-no-watermark'):
+        payload = record(654, root=str(validation_cache), zone='zone-a', metadata=origin) + string(str(source))
+        v.prepare_file(payload, [lease, fd], code=7)
+        assert not os.listxattr(fd)
+    v.call(2, identity(654), code=1)
+    payload = record(654, root=str(validation_cache), zone='zone-a', metadata=current_origin) + string(str(source))
+    v.prepare_file(payload, [lease, fd]); source.rename(destination)
+    assert v.finish_file(654, lease)[-1] == 2
+    os.close(fd); os.close(lease)
+    check(True, 'queued old or unknown PREPARE cannot resurrect retired work; a current full entity remains publishable')
     v.close(); validating.stop()
 finally:
     for component in processes:

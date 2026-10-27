@@ -1057,11 +1057,15 @@ ngx_http_cache_purge_operations_init(ngx_http_cache_purge_operations_t *ops,
     ngx_http_cache_purge_op_value_t   schema, value;
     ngx_http_cache_rocksdb_bytes_t  index, ledger;
     size_t                          i;
+    uint64_t                        next, retired;
+    int                             changed;
     const char                       *prefixes[] = { "D", "L", "Q", "E" };
     const char *keys[] = { "M:op-next", "M:op-live", "M:op-bytes" };
     static const unsigned char zero[16] = { 0 };
 
     memset(&candidate, 0, sizeof(candidate));
+    changed = 0;
+    next = 1;
     candidate.store = store;
     candidate.limits.live_records = 4096;
     candidate.limits.live_selector_bytes = 4 * 1024 * 1024;
@@ -1114,6 +1118,7 @@ ngx_http_cache_purge_operations_init(ngx_http_cache_purge_operations_t *ops,
         ngx_http_cache_purge_op_set_counter(&tx, "M:op-next", 1);
         ngx_http_cache_purge_op_set_counter(&tx, "M:op-live", 0);
         ngx_http_cache_purge_op_set_counter(&tx, "M:op-bytes", 0);
+        changed = 1;
     } else if (tx.status == 0) {
         ngx_http_cache_purge_op_require(
             &tx,
@@ -1121,8 +1126,9 @@ ngx_http_cache_purge_operations_init(ngx_http_cache_purge_operations_t *ops,
                                           ngx_http_cache_purge_op_literal("1")),
             NGX_HTTP_CACHE_ROCKSDB_SCHEMA,
             "unsupported operation ledger schema");
+        next = ngx_http_cache_purge_op_counter(&tx, "M:op-next");
         ngx_http_cache_purge_op_require(
-            &tx, ngx_http_cache_purge_op_counter(&tx, "M:op-next") != 0,
+            &tx, next != 0,
             NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
             "invalid operation sequence allocator");
         (void) ngx_http_cache_purge_op_counter(&tx, "M:op-live");
@@ -1140,6 +1146,7 @@ ngx_http_cache_purge_operations_init(ngx_http_cache_purge_operations_t *ops,
             ledger.len = sizeof(candidate.ledger);
             ngx_http_cache_purge_op_put(&tx,
                 ngx_http_cache_purge_op_literal("M:op-ledger"), ledger, 1);
+            changed = 1;
         }
     } else if (tx.status == 0
                && ngx_http_cache_purge_op_require(&tx,
@@ -1149,7 +1156,20 @@ ngx_http_cache_purge_operations_init(ngx_http_cache_purge_operations_t *ops,
     {
         memcpy(candidate.ledger, value.bytes.data, sizeof(candidate.ledger));
     }
-    if (!schema.exists || !value.exists) {
+    value = ngx_http_cache_purge_op_get(&tx,
+        ngx_http_cache_purge_op_literal("M:op-retired"));
+    if (tx.status == 0 && !value.exists) {
+        /* A stopped upgrade cannot prove which older operations were removed.
+         * Reject old writes without scanning existing file records.
+         */
+        ngx_http_cache_purge_op_set_counter(&tx, "M:op-retired", next - 1);
+        changed = 1;
+    } else if (tx.status == 0) {
+        retired = ngx_http_cache_purge_op_integer(&tx, value.bytes);
+        ngx_http_cache_purge_op_require(&tx, retired < next,
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid retired origin boundary");
+    }
+    if (changed) {
         ngx_http_cache_purge_op_commit(&tx);
     }
     if (tx.status == 0) {
@@ -1194,6 +1214,10 @@ ngx_http_cache_purge_operations_usage(ngx_http_cache_purge_operations_t *ops,
                                     NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
                                     "invalid operation sequence allocator");
     usage.last_sequence = next - 1;
+    usage.retired_sequence =
+        ngx_http_cache_purge_op_counter(&tx, "M:op-retired");
+    ngx_http_cache_purge_op_require(&tx, usage.retired_sequence < next,
+        NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid retired origin boundary");
     usage.live_records = ngx_http_cache_purge_op_counter(&tx, "M:op-live");
     usage.live_selector_bytes =
         ngx_http_cache_purge_op_counter(&tx, "M:op-bytes");
@@ -1201,6 +1225,34 @@ ngx_http_cache_purge_operations_usage(ngx_http_cache_purge_operations_t *ops,
         *out = usage;
     }
     return ngx_http_cache_purge_op_end(&tx, error);
+}
+
+int
+ngx_http_cache_purge_operations_origin(ngx_http_cache_purge_operations_t *ops,
+    const ngx_http_cache_purge_watermark_t *origin,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_operation_usage_t  usage;
+    int                                     rc;
+
+    rc = ngx_http_cache_purge_operations_usage(ops, &usage, error);
+    if (rc != 0) {
+        return rc;
+    }
+    if ((origin == NULL && usage.retired_sequence != 0)
+        || (origin != NULL
+            && (memcmp(origin->ledger, ops->ledger, 16)
+                || origin->sequence < usage.retired_sequence
+                || origin->sequence > usage.last_sequence)))
+    {
+        if (error != NULL) {
+            error->code = NGX_HTTP_CACHE_ROCKSDB_CONFLICT;
+            snprintf(error->message, sizeof(error->message),
+                     "origin outside writable boundary");
+        }
+        return NGX_HTTP_CACHE_ROCKSDB_CONFLICT;
+    }
+    return 0;
 }
 
 static int
@@ -1522,6 +1574,7 @@ ngx_http_cache_purge_operations_materialize(
 {
     ngx_http_cache_purge_op_tx_t     tx;
     ngx_http_cache_purge_op_stored_t before, after;
+    uint64_t                        retired, next;
 
     ngx_http_cache_purge_op_begin(&tx, ops, out);
     if (out != NULL) {
@@ -1534,6 +1587,15 @@ ngx_http_cache_purge_operations_materialize(
     }
     if (before.op.stage == NGX_HTTP_CACHE_PURGE_MATERIALIZED) {
         ngx_http_cache_purge_op_clone(&tx, &before.op, out);
+        return ngx_http_cache_purge_op_result(&tx, out, error);
+    }
+    next = ngx_http_cache_purge_op_counter(&tx, "M:op-next");
+    retired = ngx_http_cache_purge_op_counter(&tx, "M:op-retired");
+    if (!ngx_http_cache_purge_op_require(&tx, retired < next,
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid retired origin boundary")
+        || !ngx_http_cache_purge_op_require(&tx, quiescent_sequence < next,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "quiescent boundary is in future"))
+    {
         return ngx_http_cache_purge_op_result(&tx, out, error);
     }
     if (!ngx_http_cache_purge_op_require(
@@ -1549,6 +1611,10 @@ ngx_http_cache_purge_operations_materialize(
     }
     after = before;
     after.op.stage = NGX_HTTP_CACHE_PURGE_MATERIALIZED;
+    if (before.op.sequence > retired) {
+        ngx_http_cache_purge_op_set_counter(&tx, "M:op-retired",
+                                              before.op.sequence);
+    }
     return ngx_http_cache_purge_op_update(&tx, &before, &after, out, error);
 }
 

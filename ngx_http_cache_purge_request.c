@@ -1682,7 +1682,10 @@ ngx_http_cache_purge_read_validation_reply(ngx_http_cache_purge_call_t *call,
     if (ctx->lease < 0) {
         goto done;
     }
-    size = 50 + 2 * sizeof(v->before);
+    if (!ctx->origin_valid) {
+        goto done;
+    }
+    size = 74 + 2 * sizeof(v->before);
     for (i = 0; i < ctx->tag_count; i++) {
         size += 4 + ctx->tags[i].len;
     }
@@ -1702,6 +1705,8 @@ ngx_http_cache_purge_read_validation_reply(ngx_http_cache_purge_call_t *call,
     for (i = 0; i < ctx->tag_count; i++) {
         p = ngx_http_cache_purge_capture_string(p, ctx->tags[i]);
     }
+    p = ngx_cpymem(p, ctx->origin.ledger, 16);
+    p = ngx_http_cache_purge_capture_number(p, ctx->origin.sequence, 8);
     fds[0] = ctx->lease;
     fds[1] = ctx->cache->file.fd;
     ctx->rpc = NGX_HTTP_CACHE_PURGE_RPC_VALIDATE;

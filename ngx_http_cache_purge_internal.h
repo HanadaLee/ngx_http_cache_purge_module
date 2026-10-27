@@ -59,7 +59,8 @@ typedef enum {
     NGX_HTTP_CACHE_PURGE_OP_ACQUIRE_PUBLICATION,
     /* root, zone, selected path; one FD -> GET-format verified file record */
     NGX_HTTP_CACHE_PURGE_OP_INSPECT_FILE,
-    /* ID, revision, transaction, before/after, TAG mode/count/values;
+    /* ID, revision, transaction, before/after, TAG mode/count/values,
+     * request origin ledger[16]/sequence u64;
      * two FDs: lease, selected file -> verified GET-format record */
     NGX_HTTP_CACHE_PURGE_OP_VALIDATE_FILE,
     /* operation sequence u64 -> number of older active worker registrations */
@@ -449,6 +450,7 @@ typedef struct {
     uint64_t  live_records;
     uint64_t  live_selector_bytes;
     uint64_t  last_sequence;
+    uint64_t  retired_sequence;
 } ngx_http_cache_purge_operation_usage_t;
 
 
@@ -493,6 +495,14 @@ int ngx_http_cache_purge_operations_usage(
     ngx_http_cache_purge_operations_t *ops,
     ngx_http_cache_purge_operation_usage_t *out,
     ngx_http_cache_rocksdb_error_t *error);
+/* Checks a new write's origin, not an existing committed file's freshness.
+ * NULL is legacy/unknown and is allowed only before any retirement boundary.
+ * The executor serializes this check with the subsequent catalogue commit.
+ */
+int ngx_http_cache_purge_operations_origin(
+    ngx_http_cache_purge_operations_t *ops,
+    const ngx_http_cache_purge_watermark_t *origin,
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_operations_activate(
     ngx_http_cache_purge_operations_t *ops, ngx_http_cache_rocksdb_bytes_t id,
     uint64_t revision, uint64_t now, ngx_http_cache_purge_operation_t *out,
@@ -502,6 +512,9 @@ int ngx_http_cache_purge_operations_checkpoint(
     uint64_t revision, const ngx_http_cache_purge_checkpoint_t *point,
     ngx_http_cache_purge_operation_t *out,
     ngx_http_cache_rocksdb_error_t *error);
+/* The caller must prove global old-origin quiescence and physical completion.
+ * Advances the durable write floor atomically with FENCE removal.
+ */
 int ngx_http_cache_purge_operations_materialize(
     ngx_http_cache_purge_operations_t *ops, ngx_http_cache_rocksdb_bytes_t id,
     uint64_t revision, uint64_t quiescent_sequence,

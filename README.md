@@ -82,6 +82,14 @@ bounded IPC. A zero count alone does not permit FENCE removal: queued IPC,
 unfinished durable transactions and physical processing still need closure.
 This changes the internal shared-control ABI to 3; nginx-ext ABI remains 2.
 
+The operation ledger also persists a monotonic write floor with each materialized
+operation. PREPARE, uncommitted FINISH/recovery and new 304 validation writes
+reject origins below that floor even after the rule leaves the resident table.
+Committed files and completed validation receipts are not invalidated by this
+check. A 304 request carries its own origin boundary separately from the stored
+entity's watermark. The native physical-work coordinator does not yet invoke
+materialization: these write guards do not establish complete FENCE retirement.
+
 Known request selectors are also checked before native cache lookup. This covers
 memory-only cached upstream errors before `error_page` runs. Cached
 `X-Accel-Redirect` responses wait for descriptor and TAG admission before selecting

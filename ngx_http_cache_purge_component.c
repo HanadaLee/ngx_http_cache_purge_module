@@ -104,6 +104,12 @@ struct ngx_http_cache_purge_component_s {
     uint64_t                                  recovery_at;
 };
 
+typedef struct {
+    ngx_http_cache_purge_coordinator_t  *coordinator;
+    ngx_http_cache_purge_operations_t   *operations;
+    ngx_http_cache_purge_watermark_t     origin;
+} ngx_http_cache_purge_validation_guard_t;
+
 static int ngx_http_cache_purge_component_validation_guard(void *data,
     const ngx_http_cache_purge_index_file_t *file,
     ngx_http_cache_rocksdb_error_t *error);
@@ -712,8 +718,8 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
     ngx_http_cache_purge_index_action_e       action;
     ngx_http_cache_purge_publication_target_t  target;
     ngx_http_cache_purge_validation_t          validation;
+    ngx_http_cache_purge_validation_guard_t    validation_guard;
     ngx_http_cache_purge_watermark_t           watermark;
-    ngx_http_cache_purge_operation_usage_t     usage;
     ngx_http_cache_purge_operation_input_t     input;
     ngx_http_cache_purge_operation_t           operation;
     ngx_http_cache_purge_selector_t            selector;
@@ -790,16 +796,21 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
         for (i = 0; i < validation.tag_count; i++) {
             tags[i] = ngx_http_cache_purge_component_string(&d, 1024);
         }
+        ngx_http_cache_purge_component_id(&d, validation_guard.origin.ledger);
+        validation_guard.origin.sequence =
+            ngx_http_cache_purge_component_integer(&d, 8);
         if ((rc = ngx_http_cache_purge_component_end(&d)) != 0) {
             break;
         }
+        validation_guard.coordinator = c->coordinator;
+        validation_guard.operations = &c->operations;
         rc = ngx_http_cache_purge_component_anchor(c, error);
         if (rc == 0) {
             rc = ngx_http_cache_purge_publications_validate_prepare(
                 c->publications, store, &validation, c->lease_anchor,
                 p->input_rights[0], p->input_rights[1], p->uid,
                 ngx_http_cache_purge_component_validation_guard,
-                c->coordinator, &matches[0], error);
+                &validation_guard, &matches[0], error);
         }
         if (rc == 0) {
             rc = ngx_http_cache_purge_publications_validate_finish(
@@ -877,7 +888,7 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
                 c->publications, store, expected[0].id, expected[0].revision,
                 c->lease_anchor, p->input_rights[0], p->uid,
                 ngx_http_cache_purge_component_publication_guard,
-                c->coordinator, &matches[0], error);
+                c, &matches[0], error);
         }
         if (rc == 0) {
             ngx_http_cache_purge_component_put_match(e, &matches[0]);
@@ -901,21 +912,14 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
         rc = ngx_http_cache_purge_watermark_decode(fills[0].file.metadata,
                                                     &watermark, error);
         if (rc == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) {
-            rc = 0;
+            rc = ngx_http_cache_purge_operations_origin(&c->operations,
+                                                          NULL, error);
         } else if (rc == NGX_HTTP_CACHE_ROCKSDB_CORRUPT) {
             rc = ngx_http_cache_purge_component_error(error,
                 NGX_HTTP_CACHE_ROCKSDB_INVALID, "malformed origin watermark");
         } else if (rc == 0) {
-            rc = ngx_http_cache_purge_operations_usage(&c->operations,
-                                                        &usage, error);
-            if (rc == 0
-                && (memcmp(watermark.ledger, c->operations.ledger, 16)
-                    || watermark.sequence > usage.last_sequence))
-            {
-                rc = ngx_http_cache_purge_component_error(error,
-                    NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
-                    "foreign or future origin watermark");
-            }
+            rc = ngx_http_cache_purge_operations_origin(&c->operations,
+                                                          &watermark, error);
         }
         if (rc != 0) {
             break;
@@ -1741,7 +1745,7 @@ ngx_http_cache_purge_component_recover(ngx_http_cache_purge_component_t *c,
                 c->publications, store, file.id, file.revision, c->lease_anchor,
                 lease, c->options.client_uid,
                 ngx_http_cache_purge_component_publication_guard,
-                c->coordinator, &match, error);
+                c, &match, error);
         }
     }
 
@@ -4560,7 +4564,17 @@ ngx_http_cache_purge_component_validation_guard(void *data,
     const ngx_http_cache_purge_index_file_t *file,
     ngx_http_cache_rocksdb_error_t *error)
 {
-    return ngx_http_cache_purge_component_record_guard(data, file,
+    ngx_http_cache_purge_validation_guard_t  *guard;
+    int                                       rc;
+
+    guard = data;
+    rc = ngx_http_cache_purge_operations_origin(guard->operations,
+                                                  &guard->origin, error);
+    if (rc != 0) {
+        return rc;
+    }
+    return ngx_http_cache_purge_component_record_guard(guard->coordinator,
+                                                         file,
                                                          file->metadata, error);
 }
 
@@ -4569,15 +4583,23 @@ ngx_http_cache_purge_component_publication_guard(void *data,
     const ngx_http_cache_purge_index_file_t *file,
     ngx_http_cache_rocksdb_error_t *error)
 {
+    ngx_http_cache_purge_component_t    *component;
     ngx_http_cache_purge_coordinator_t  *c;
     ngx_http_cache_purge_index_file_t    previous;
     ngx_http_cache_purge_watermark_t     older, newer;
     int                                  rc;
     static const unsigned char zero[16] = { 0 };
 
-    c = data;
-    if (c == NULL) {
-        return 0;
+    component = data;
+    c = component->coordinator;
+    rc = ngx_http_cache_purge_publication_watermark(file->metadata, &newer,
+                                                     error);
+    if (rc == 0 || rc == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) {
+        rc = ngx_http_cache_purge_operations_origin(&component->operations,
+            rc == 0 ? &newer : NULL, error);
+    }
+    if (rc != 0 || c == NULL) {
+        return rc;
     }
     rc = ngx_http_cache_purge_component_record_guard(c, file,
                                                       file->metadata, error);
@@ -4986,7 +5008,8 @@ ngx_http_cache_purge_control_load_page(ngx_http_cache_purge_coordinator_t *c,
             || c->loaded_bytes != c->expected.live_selector_bytes
             || usage.live_records != c->expected.live_records
             || usage.live_selector_bytes != c->expected.live_selector_bytes
-            || usage.last_sequence != c->expected.last_sequence)
+            || usage.last_sequence != c->expected.last_sequence
+            || usage.retired_sequence != c->expected.retired_sequence)
         {
             rc = ngx_http_cache_purge_control_error(
                 error, NGX_HTTP_CACHE_ROCKSDB_CORRUPT,

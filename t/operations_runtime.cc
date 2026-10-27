@@ -45,6 +45,17 @@ static void raw_write(ngx_http_cache_rocksdb_t *store, const std::string &key, c
 
 int main(int argc, char **argv) {
     try {
+        if (argc == 4 && std::string(argv[1]) == "--retire-fixture") {
+            // Offline fixture only: no claim of physical work or native quiescence.
+            auto *store = open(argv[2]); Index index(store); Operations ops(store);
+            auto op = ops.get(argv[3]);
+            op = ops.activate(argv[3], op.revision, 2000);
+            op = ops.checkpoint(argv[3], op.revision, point(1, true));
+            ops.materialize(argv[3], op.revision, op.sequence);
+            check(ops.usage().retired_sequence == op.sequence, "durable retirement floor");
+            std::cout << "PASS offline retirement fixture" << std::endl;
+            _exit(0);
+        }
         if (argc == 3) {
             auto *store = open(argv[2]); Index index(store); Operations ops(store);
             const std::string mode = argv[1];
@@ -73,6 +84,12 @@ int main(int argc, char **argv) {
             std::copy_n(ops.native()->ledger, ledger.size(), ledger.begin());
             check(ledger != FileId{}, "ledger identity is nonzero");
             auto initialized = writes(store);
+            ngx_http_cache_rocksdb_error_t origin_error;
+            ngx_http_cache_purge_watermark_t origin{};
+            std::copy(ledger.begin(), ledger.end(), origin.ledger);
+            check(ops.usage().retired_sequence == 0
+                  && ngx_http_cache_purge_operations_origin(ops.native(), nullptr, &origin_error) == 0,
+                  "new ledger has no retired boundary");
             Operations reopened(store, {2, 4096});
             check(std::equal(ledger.begin(), ledger.end(), reopened.native()->ledger)
                   && writes(store) == initialized, "reopening the ledger retains identity without writes");
@@ -114,7 +131,21 @@ int main(int argc, char **argv) {
             check(!a.propagate && ops.live().items.size() == 2 && !ops.due(400000).items.empty(), "propagation timeout never clears FENCE or jobs");
             p = point(2, true); a = ops.checkpoint("a", a.revision, p);
             fails(NGX_HTTP_CACHE_ROCKSDB_BUSY, [&] { ops.materialize("a", a.revision, 0); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_INVALID, [&] { ops.materialize("a", a.revision, 3); });
+            check(ops.usage().retired_sequence == 0, "failed materialization cannot advance the floor");
+            before = writes(store);
             a = ops.materialize("a", a.revision, a.sequence);
+            check(writes(store) == before + 1 && ops.usage().retired_sequence == 1,
+                  "retirement floor and FENCE removal share one durable batch");
+            check(ngx_http_cache_purge_operations_origin(ops.native(), &origin, &origin_error) == NGX_HTTP_CACHE_ROCKSDB_CONFLICT
+                  && ngx_http_cache_purge_operations_origin(ops.native(), nullptr, &origin_error) == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+                  "retired floor rejects abandoned old and unknown origins");
+            origin.sequence = 1;
+            check(ngx_http_cache_purge_operations_origin(ops.native(), &origin, &origin_error) == 0,
+                  "origin at the retirement boundary is writable");
+            origin.sequence = 3;
+            check(ngx_http_cache_purge_operations_origin(ops.native(), &origin, &origin_error) == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+                  "future origin cannot bypass the retirement floor");
             check(ops.live().items.size() == 1 && ops.due(400000).items.empty(), "verified drain releases fence and schedule");
             check(ops.accept(input("a"), 900000).stage == OperationStage::materialized, "completed ID remains a receipt");
             check(ops.checkpoint("a", 1, p).stage == OperationStage::materialized, "late identical checkpoint cannot resurrect task");
@@ -136,6 +167,7 @@ int main(int argc, char **argv) {
         {
             Index index(store); Operations ops(store, {64, 1024 * 1024});
             check(std::equal(ledger.begin(), ledger.end(), ops.native()->ledger), "ledger identity survives database reopen");
+            check(ops.usage().retired_sequence == 2, "retirement floor survives database reopen");
             check(ops.get("c").stage == OperationStage::active && ops.get("d").stage == OperationStage::preparing, "ledger stages survive reopen");
             auto c = ops.get("c"); c = ops.checkpoint("c", c.revision, point(1, true));
             ops.materialize("c", c.revision, c.sequence);
@@ -150,6 +182,10 @@ int main(int argc, char **argv) {
             check(ops.live().items.size() == 1 && ops.live().items[0].input.id == "d", "batch expiry preserves unpublished fence");
             fails(NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND, [&] { ops.get("missing"); });
             auto d = ops.get("d"); std::string link = "L";
+            auto floor = ops.usage().retired_sequence;
+            d = ops.activate("d", d.revision, 5000); d = ops.checkpoint("d", d.revision, point(1, true));
+            ops.materialize("d", d.revision, d.sequence);
+            check(ops.usage().retired_sequence == floor, "out-of-order materialization never regresses floor");
             for (int shift = 56; shift >= 0; shift -= 8) link += static_cast<char>(d.sequence >> shift);
             raw_write(store, link, "", true);
             fails(NGX_HTTP_CACHE_ROCKSDB_CORRUPT, [&] { ops.get("d"); });
@@ -172,6 +208,20 @@ int main(int argc, char **argv) {
             auto count = p.items.size();
             while (!p.done) { p = ops.live(p.after); count += p.items.size(); }
             check(count == ops.usage().live_records && count == 11, "paged recovery matches persisted live count");
+            auto last = ops.usage().last_sequence;
+            raw_write(store, "M:op-retired", "broken");
+            fails(NGX_HTTP_CACHE_ROCKSDB_CORRUPT, [&] { Operations broken(store); });
+            raw_write(store, "M:op-retired", std::string(8, '\xff'));
+            fails(NGX_HTTP_CACHE_ROCKSDB_CORRUPT, [&] { Operations future(store); });
+            raw_write(store, "M:op-retired", "", true);
+            before = writes(store);
+            Operations upgraded(store);
+            check(upgraded.usage().retired_sequence == last && writes(store) == before + 1,
+                  "old ledger upgrade establishes a conservative boundary without index rebuild");
+            before = writes(store);
+            Operations again(store);
+            check(again.usage().retired_sequence == last && writes(store) == before,
+                  "normal reopen preserves the retired floor without writes");
         }
         close(store);
         std::cout << "PASS " << assertions << " operation assertions; database " << path << std::endl; return 0;
