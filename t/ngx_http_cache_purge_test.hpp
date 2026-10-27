@@ -898,6 +898,11 @@ class Coordinator {
     }
 
 public:
+    ngx_http_cache_purge_coordinator_t *
+    native()
+    {
+        return native_;
+    }
     Coordinator(Operations &operations, void *shared, size_t shared_bytes)
     {
         ngx_http_cache_rocksdb_error_t error;

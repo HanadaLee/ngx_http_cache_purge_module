@@ -549,12 +549,16 @@ replacement or a successfully revalidated instance. Submission is bounded to
 32 jobs and 256 KiB per worker, with a five-second retry deadline. Once retired,
 normal persistent collection continues across executor restarts.
 
-Full propagation remains unfinished: the sender still needs local TAG and
-historical alias resolution after deletion. Until that is connected, an unknown
-TAG candidate fails before upstream I/O; it is never sent as a matched object
-or delegated to L2. Uncached proxy routes and large local match sets also need
-integration. Capabilities reports the sender
-transport as
+The executor has a bounded, read-only file propagation query. It checks the
+selected committed file's revision and actual TAGs, visits its key's persisted
+URL and business-host aliases, and returns the two object times with a control
+publication stamp. It never exports TAG candidates or grants cache admission.
+
+Full propagation remains unfinished: this query still needs request-path
+integration and retained associations after deletion. Until that is connected,
+an unknown TAG candidate fails before upstream I/O; it is never sent as a matched
+object or delegated to L2. Uncached proxy routes and large local match sets also
+need integration. Capabilities reports the sender transport as
 `filter` or `variables`, while `proxy_propagation_ready` remains false.
 The protocol has no module-side authentication, signatures, key management,
 or response verification exchange.

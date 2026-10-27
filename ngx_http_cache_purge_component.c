@@ -862,6 +862,8 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
     ngx_http_cache_purge_validation_t          validation;
     ngx_http_cache_purge_validation_guard_t    validation_guard;
     ngx_http_cache_purge_watermark_t           watermark;
+    ngx_http_cache_purge_fence_t               propagation;
+    ngx_http_cache_purge_control_context_t     propagation_request;
     ngx_http_cache_purge_operation_input_t     input;
     ngx_http_cache_purge_operation_t           operation;
     ngx_http_cache_purge_selector_t            selector;
@@ -906,6 +908,46 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
     rc = 0;
 
     switch (p->request.opcode) {
+    case NGX_HTTP_CACHE_PURGE_OP_FILE_PROPAGATION:
+        ngx_http_cache_purge_component_id(&d, expected[0].id);
+        expected[0].revision = ngx_http_cache_purge_component_integer(&d, 8);
+        memset(&propagation_request, 0, sizeof(propagation_request));
+        propagation_request.key =
+            ngx_http_cache_purge_component_string(&d, 32768);
+        propagation_request.url =
+            ngx_http_cache_purge_component_string(&d, 32768);
+        propagation_request.host =
+            ngx_http_cache_purge_component_string(&d, 32768);
+        if ((rc = ngx_http_cache_purge_component_end(&d)) != 0) {
+            break;
+        }
+        if (propagation_request.key.len == 0
+            && (propagation_request.url.len || propagation_request.host.len))
+        {
+            rc = ngx_http_cache_purge_component_error(error,
+                NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                "propagation request has no key");
+            break;
+        }
+        if (c->coordinator == NULL) {
+            rc = ngx_http_cache_purge_component_error(error,
+                NGX_HTTP_CACHE_ROCKSDB_BUSY, "propagation has no coordinator");
+            break;
+        }
+        now = ngx_http_cache_purge_component_now(CLOCK_REALTIME);
+        rc = ngx_http_cache_purge_coordinator_file_propagation(c->coordinator,
+            &expected[0], propagation_request.key.len ? &propagation_request
+                                                     : NULL,
+            now, &propagation, &publication, error);
+        if (rc == 0) {
+            ngx_http_cache_purge_component_put_integer(e,
+                propagation.invalidate_ms, 8);
+            ngx_http_cache_purge_component_put_integer(e,
+                propagation.delete_ms, 8);
+            ngx_http_cache_purge_component_put_integer(e, publication, 8);
+        }
+        break;
+
     case NGX_HTTP_CACHE_PURGE_OP_RETIRE_SELECTED:
         root = ngx_http_cache_purge_component_string(&d, 32768);
         zone = ngx_http_cache_purge_component_string(&d, 32768);
@@ -5937,6 +5979,194 @@ ngx_http_cache_purge_control_coordinator_owner(
             "control coordinator owner mismatch");
     }
     return 0;
+}
+
+typedef struct {
+    ngx_http_cache_purge_coordinator_t     *coordinator;
+    ngx_http_cache_purge_control_context_t  context;
+    ngx_http_cache_purge_fence_t            fence;
+    ngx_http_cache_rocksdb_bytes_t          observed_url, observed_host;
+    size_t                                  remaining;
+} ngx_http_cache_purge_propagation_context_t;
+
+static int
+ngx_http_cache_purge_component_propagation_match(void *data,
+    const ngx_http_cache_purge_control_match_t *match)
+{
+    ngx_http_cache_purge_propagation_context_t  *p = data;
+    uint64_t                                    *cutoff;
+
+    if (match->flags & NGX_HTTP_CACHE_PURGE_CONTROL_TAG_CANDIDATE) {
+        return NGX_HTTP_CACHE_ROCKSDB_CORRUPT;
+    }
+    if (p->remaining == 0) {
+        return NGX_HTTP_CACHE_ROCKSDB_LIMIT;
+    }
+    p->remaining--;
+    cutoff = match->mode == NGX_HTTP_CACHE_PURGE_INVALIDATE
+             ? &p->fence.invalidate_ms : &p->fence.delete_ms;
+    if (match->issued_at_ms > *cutoff) {
+        *cutoff = match->issued_at_ms;
+    }
+    return 0;
+}
+
+static int
+ngx_http_cache_purge_component_propagation_lookup(
+    ngx_http_cache_purge_propagation_context_t *p,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_watermark_t  watermark;
+    uint64_t                          publication;
+    int                               rc;
+
+    /* One callback completes before its caller advances the database cursor. */
+    rc = ngx_http_cache_purge_control_propagation(
+        p->coordinator->validation_reader, &p->context, 1, 1024, 262144,
+        ngx_http_cache_purge_component_propagation_match, p,
+        &watermark, &publication, error);
+    if (rc == 0 && publication != p->coordinator->publication) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_BUSY, "propagation control image changed");
+    }
+    return rc;
+}
+
+static int
+ngx_http_cache_purge_component_propagation_host(void *data,
+    ngx_http_cache_rocksdb_bytes_t host, ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_propagation_context_t  *p = data;
+
+    if (ngx_http_cache_purge_control_bytes_equal(host, p->observed_host)) {
+        return 0;
+    }
+    p->context.host = host;
+    return ngx_http_cache_purge_component_propagation_lookup(p, error);
+}
+
+static int
+ngx_http_cache_purge_component_propagation_url(void *data,
+    ngx_http_cache_rocksdb_bytes_t url, ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_propagation_context_t  *p = data;
+
+    if (ngx_http_cache_purge_control_bytes_equal(url, p->observed_url)) {
+        return 0;
+    }
+    p->context.url = url;
+    return ngx_http_cache_purge_component_propagation_lookup(p, error);
+}
+
+int
+ngx_http_cache_purge_coordinator_file_propagation(
+    ngx_http_cache_purge_coordinator_t *c,
+    const ngx_http_cache_purge_index_expected_t *expected,
+    const ngx_http_cache_purge_control_context_t *request, uint64_t now,
+    ngx_http_cache_purge_fence_t *out, uint64_t *publication,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_index_file_t           file;
+    ngx_http_cache_purge_propagation_context_t  p;
+    int                                         rc;
+
+    static const ngx_http_cache_rocksdb_bytes_t empty = { NULL, 0 };
+
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (publication != NULL) {
+        *publication = 0;
+    }
+    if (expected == NULL || out == NULL || publication == NULL || now == 0) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid file propagation query");
+    }
+    if (request != NULL
+        && (!request->key.len || !request->url.len || !request->host.len
+            || !ngx_http_cache_purge_control_bytes_valid(request->key, 32768)
+            || !ngx_http_cache_purge_control_bytes_valid(request->url, 32768)
+            || !ngx_http_cache_purge_control_bytes_valid(request->host, 32768)))
+    {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID,
+            "invalid current propagation identity");
+    }
+    rc = ngx_http_cache_purge_control_coordinator_owner(c, error);
+    if (rc != 0) {
+        return rc;
+    }
+    if (c->state != NGX_HTTP_CACHE_PURGE_COORD_READY) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_BUSY,
+            "propagation awaits control publication");
+    }
+    memset(&file, 0, sizeof(file));
+    rc = ngx_http_cache_purge_index_get_file(c->operations.store, expected->id,
+                                              &file, error);
+    if (rc != 0) {
+        return rc;
+    }
+    if (file.state != NGX_HTTP_CACHE_PURGE_INDEX_COMMITTED
+        || file.revision != expected->revision
+        || (request && !ngx_http_cache_purge_control_bytes_equal(file.key,
+                                                               request->key)))
+    {
+        rc = ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "selected propagation file changed");
+        goto done;
+    }
+    if (c->validation_reader == NULL) {
+        rc = ngx_http_cache_purge_control_reader_open(c->shared,
+            c->shared_bytes, &c->validation_reader, error);
+        if (rc != 0) {
+            goto done;
+        }
+    }
+    memset(&p, 0, sizeof(p));
+    p.coordinator = c;
+    p.remaining = 1024;
+    p.context.key = file.key;
+    p.context.tag_namespace = file.tag_namespace;
+    p.context.tags = file.tags;
+    p.context.tag_count = file.tag_count;
+    p.context.proxy = 1;
+    p.context.now_ms = now;
+    if (request != NULL) {
+        p.context.url = request->url;
+        p.context.host = request->host;
+        p.observed_url = request->url;
+        p.observed_host = request->host;
+    }
+    rc = ngx_http_cache_purge_component_propagation_lookup(&p, error);
+    if (rc != 0) {
+        goto done;
+    }
+    p.context.key = empty;
+    p.context.url = empty;
+    p.context.host = empty;
+    p.context.tag_namespace = empty;
+    rc = ngx_http_cache_purge_index_visit_hosts(c->operations.store,
+        expected, 64, 65536, ngx_http_cache_purge_component_propagation_host,
+        &p, error);
+    if (rc != 0) {
+        goto done;
+    }
+    p.context.host = empty;
+    p.context.tags = NULL;
+    p.context.tag_count = 0;
+    rc = ngx_http_cache_purge_index_visit_urls(c->operations.store,
+        expected, 64, 65536, ngx_http_cache_purge_component_propagation_url,
+        &p, error);
+    if (rc == 0) {
+        *out = p.fence;
+        *publication = c->publication;
+    }
+
+done:
+    ngx_http_cache_purge_index_file_free(&file);
+    return rc;
 }
 
 typedef struct {

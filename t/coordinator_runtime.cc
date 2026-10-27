@@ -67,10 +67,208 @@ lookup(ngx_http_cache_purge_control_reader_t *reader, uint64_t *out,
         reader, &context, 64, 65536, visit, out, &version, &error);
 }
 
+static void
+ngx_http_cache_purge_test_file_propagation()
+{
+    char path[] = "/tmp/ncp-file-propagation-XXXXXX";
+    check(mkdtemp(path) != nullptr, "file propagation directory");
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    check(ngx_http_cache_rocksdb_open(path, &options, &store, &error) == 0,
+        error.message);
+    size_t size = ngx_http_cache_purge_control_size(262144, 8);
+    void *shared = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    check(shared != MAP_FAILED
+              && ngx_http_cache_purge_control_init(
+                     shared, size, 262144, 8, &error)
+                     == 0,
+        "file propagation shared region");
+    {
+        Index index(store);
+        Operations operations(store);
+        File red;
+        red.id[15] = 1;
+        red.key = "shared-key";
+        red.url = "https://cache.test/item";
+        red.host = "cache.test";
+        red.tag_namespace = "tenant";
+        red.root = "/cache";
+        red.zone = "a";
+        red.path = "red";
+        red.tags = { "red" };
+        red.vary = "Accept-Language";
+        File blue = red;
+        blue.id[15] = 2;
+        blue.path = "blue";
+        blue.tags = { "blue" };
+        for (const auto &file : { red, blue }) {
+            auto prepared = index.prepare(file);
+            index.commit(file.id, prepared.revision);
+        }
+        Coordinator coordinator(operations, shared, size);
+        auto query =
+            [&](const File &file, uint64_t now, int code = 0,
+                uint64_t revision = 2,
+                const ngx_http_cache_purge_control_context_t *observed =
+                    nullptr) {
+                auto expected =
+                    ngx_http_cache_purge_native_expected(file.id, revision);
+                ngx_http_cache_purge_fence_t result{ 99, 99 };
+                uint64_t publication = 99;
+                int rc = ngx_http_cache_purge_coordinator_file_propagation(
+                    coordinator.native(), &expected, observed, now, &result,
+                    &publication, &error);
+                check(rc == code, error.message);
+                if (rc) {
+                    check(result.invalidate_ms == 0 && result.delete_ms == 0
+                              && publication == 0,
+                        "failed local query exposes no partial cutoffs");
+                } else {
+                    check(
+                        publication == coordinator.publication() && publication,
+                        "file propagation returns its control publication");
+                }
+                return result;
+            };
+        query(red, 2000, NGX_HTTP_CACHE_ROCKSDB_BUSY);
+        ready(coordinator);
+        auto result = query(red, 2000);
+        check(result.invalidate_ms == 0 && result.delete_ms == 0,
+            "empty control image has no propagation requirement");
+        auto add = [&](const std::string &id, Selector selector, PurgeMode mode,
+                       uint64_t issued) {
+            OperationInput input{ id, std::move(selector), mode, issued,
+                "file-propagation" };
+            auto operation = coordinator.accept(input, 2000, 100);
+            ready(coordinator);
+            return operation;
+        };
+        add("red", { SelectorKind::namespace_tag, "red", "tenant" },
+            PurgeMode::invalidate, 1000);
+        result = query(red, 900000);
+        check(result.invalidate_ms == 1000 && result.delete_ms == 0,
+            "published PREPARING propagates without an activation window");
+        result = query(blue, 2000);
+        check(result.invalidate_ms == 0 && result.delete_ms == 0,
+            "same-key Vary files do not inherit another file's TAGs");
+        add("wrong-scope", { SelectorKind::namespace_tag, "red", "other" },
+            PurgeMode::remove, 9000);
+        result = query(red, 2000);
+        check(result.invalidate_ms == 1000 && result.delete_ms == 0,
+            "namespace isolation uses indexed file metadata");
+        check(ngx_http_cache_purge_index_observe(store,
+                  ngx_http_cache_purge_native_bytes(red.key),
+                  ngx_http_cache_purge_native_bytes("https://alias.test/item"),
+                  ngx_http_cache_purge_native_bytes("alias.test"), &error)
+                  == 0,
+            "add URL and business-host aliases to the shared key");
+        add("host-blue", { SelectorKind::host_tag, "blue", "alias.test" },
+            PurgeMode::remove, 2000);
+        add("alias", { SelectorKind::url, "https://alias.test/item", "" },
+            PurgeMode::remove, 1100);
+        add("prefix", { SelectorKind::url_prefix, "https://alias.test/", "" },
+            PurgeMode::invalidate, 1300);
+        add("current-host", { SelectorKind::host_tag, "red", "fresh.test" },
+            PurgeMode::remove, 2200);
+        add("current-url", { SelectorKind::url, "https://fresh.test/item", "" },
+            PurgeMode::invalidate, 2300);
+        ngx_http_cache_purge_control_context_t observed{};
+        const std::string fresh_url = "https://fresh.test/item";
+        const std::string fresh_host = "fresh.test";
+        observed.key = ngx_http_cache_purge_native_bytes(red.key);
+        observed.url = ngx_http_cache_purge_native_bytes(fresh_url);
+        observed.host = ngx_http_cache_purge_native_bytes(fresh_host);
+        ngx_http_cache_rocksdb_stats_t before{}, after{};
+        check(ngx_http_cache_rocksdb_stats(store, &before, &error) == 0,
+            "read propagation baseline statistics");
+        result = query(red, 2000);
+        check(result.invalidate_ms == 1300 && result.delete_ms == 1100,
+            "historical URL alias contributes independent mode maxima");
+        result = query(blue, 2000);
+        check(result.invalidate_ms == 1300 && result.delete_ms == 2000,
+            "host TAG checks alias scope and this file's actual TAGs");
+        result = query(red, 2000, 0, 2, &observed);
+        check(result.invalidate_ms == 2300 && result.delete_ms == 2200,
+            "new request identities match before their aliases are persisted");
+        result = query(blue, 2000, 0, 2, &observed);
+        check(result.invalidate_ms == 2300 && result.delete_ms == 2000,
+            "current host TAG still uses the selected file's membership");
+        auto wrong = observed;
+        const std::string wrong_key = "other-key";
+        wrong.key = ngx_http_cache_purge_native_bytes(wrong_key);
+        query(red, 2000, NGX_HTTP_CACHE_ROCKSDB_CONFLICT, 2, &wrong);
+        wrong = observed;
+        wrong.host = { nullptr, 10 };
+        query(red, 2000, NGX_HTTP_CACHE_ROCKSDB_INVALID, 2, &wrong);
+        check(ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
+                  && before.writes == after.writes,
+            "local propagation queries perform no WAL writes");
+        for (const auto &id :
+            { "red", "wrong-scope", "host-blue", "alias", "prefix" })
+        {
+            auto operation = operations.get(id);
+            operations.activate(id, operation.revision, 3000);
+        }
+        coordinator.refresh();
+        ready(coordinator);
+        result = query(red, 3099);
+        check(result.invalidate_ms == 1300 && result.delete_ms == 1100,
+            "active local windows preserve object cutoffs");
+        result = query(red, 3100);
+        check(result.invalidate_ms == 0 && result.delete_ms == 0,
+            "expiry stops propagation while local FENCEs may remain");
+        auto operation = operations.get("red");
+        operation = operations.checkpoint("red", operation.revision,
+            OperationCheckpoint{ 1, "", true, 3000, 0, 0, 0, "" });
+        operations.materialize("red", operation.revision, operation.sequence);
+        coordinator.refresh();
+        ready(coordinator);
+        result = query(red, 3099);
+        check(result.invalidate_ms == 1300,
+            "file propagation is independent of local FENCE retirement");
+        query(red, 3001, NGX_HTTP_CACHE_ROCKSDB_CONFLICT, 1);
+        File missing = red;
+        missing.id[15] = 99;
+        query(missing, 3001, NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND);
+        query(red, 0, NGX_HTTP_CACHE_ROCKSDB_INVALID);
+        index.retire(blue.id, 2);
+        query(blue, 3001, NGX_HTTP_CACHE_ROCKSDB_CONFLICT, 3);
+        for (unsigned n = 0; n < 63; n++) {
+            index.add_url(red.key, "https://many.test/" + std::to_string(n));
+        }
+        query(red, 3001, NGX_HTTP_CACHE_ROCKSDB_LIMIT);
+        File bounded = red;
+        bounded.id[15] = 3;
+        bounded.key = "budget-key";
+        bounded.path = "budget";
+        bounded.tags.clear();
+        auto prepared = index.prepare(bounded);
+        index.commit(bounded.id, prepared.revision);
+        for (unsigned n = 0; n < 62; n++) {
+            index.add_url(
+                bounded.key, "https://budget.test/" + std::to_string(n));
+        }
+        for (unsigned n = 0; n < 20; n++) {
+            add("all-" + std::to_string(n),
+                { SelectorKind::url_prefix, "", "" }, PurgeMode::invalidate,
+                n + 1);
+        }
+        query(bounded, 3001, NGX_HTTP_CACHE_ROCKSDB_LIMIT);
+        query(red, 3001, NGX_HTTP_CACHE_ROCKSDB_CONFLICT, 1);
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
+    munmap(shared, size);
+}
+
 int
 main(int argc, char **argv)
 {
     try {
+        if (argc == 1) {
+            ngx_http_cache_purge_test_file_propagation();
+        }
         char temporary[] = "/tmp/ncp-coordinator-XXXXXX";
         const char *path = argc == 3 ? argv[2] : mkdtemp(temporary);
         check(path != nullptr, "coordinator database directory");

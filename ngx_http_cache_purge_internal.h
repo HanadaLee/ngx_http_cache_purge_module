@@ -81,7 +81,11 @@ typedef enum {
     NGX_HTTP_CACHE_PURGE_OP_GET_RECEIPT,
     /* root/zone/path/native header prefix, one selected FD -> retired match.
      * No push identity/time is stored. The existing collector deletes it. */
-    NGX_HTTP_CACHE_PURGE_OP_RETIRE_SELECTED
+    NGX_HTTP_CACHE_PURGE_OP_RETIRE_SELECTED,
+    /* file ID[16], revision u64, current key/URL/host strings -> three u64:
+     * Invalidate/Delete times and publication. Empty strings query only the
+     * persisted associations. Use the executor's current time. */
+    NGX_HTTP_CACHE_PURGE_OP_FILE_PROPAGATION
 } ngx_http_cache_purge_opcode_e;
 
 #define NGX_HTTP_CACHE_PURGE_ROOT_CACHE 1
@@ -799,6 +803,20 @@ int ngx_http_cache_purge_index_get_file(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_error_t *error);
 void
 ngx_http_cache_purge_index_file_free(ngx_http_cache_purge_index_file_t *file);
+/* Executor-only snapshot for a committed file at its exact revision. Match
+ * actual file TAGs and the key's persisted URL/host aliases. Optional request
+ * fields must identify the same key; match their URL/host without writing new
+ * associations. Only key/URL/host are read from request. No admission or
+ * file-write permission is implied. Errors
+ * clear both outputs. Asynchronous consumers must recheck the publication and
+ * selected instance. Request routing and retired-object retention are separate.
+ */
+int ngx_http_cache_purge_coordinator_file_propagation(
+    ngx_http_cache_purge_coordinator_t *coordinator,
+    const ngx_http_cache_purge_index_expected_t *file,
+    const ngx_http_cache_purge_control_context_t *request, uint64_t now,
+    ngx_http_cache_purge_fence_t *out, uint64_t *publication,
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_current(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_bytes_t root, ngx_http_cache_rocksdb_bytes_t path,
     ngx_http_cache_purge_index_match_t *out,

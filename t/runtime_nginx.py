@@ -424,7 +424,7 @@ print(struct.unpack('>Q',read(struct.unpack('>I',h[16:20])[0])[:8])[0])
         assert case.get(path)[0] == 503 and origin_calls[path] == 1
     assert case.get('/other')[:2] == (200, 'HIT')
     checks.append('test precontent consumer blocks matching HITs across two zones; unrelated HIT continues')
-    checks.append('accepted record stays PREPARING with default 300-second policy')
+    checks.append('accepted record stays PREPARING with default 120-second policy')
     for iteration in range(3):
         if iteration == 0:
             case.config = case.config.replace('cache_purge_state_zone control 4m;',

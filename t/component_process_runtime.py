@@ -1285,6 +1285,50 @@ try:
     os.close(lease)
     check(True, 'physical removal accepts validation receipts and collected PREPARED-marker instances stay absent')
     v.close(); validating.stop()
+    propagation_shared = root / 'local-propagation.shm'
+    local = Component(root / 'local-propagation', shared=propagation_shared)
+    local.opened(); lp = Client(local.path)
+    wait_for(lambda: struct.unpack('>IQ', lp.call(16))[0] == 6)
+    lp.call(3, b'\x02' + record(901, uri='/local-propagation', tags=('red',))
+            + record(902, uri='/local-propagation', tags=('blue',)))
+    lp.call(4, batch([(901, 1), (902, 1)]))
+    lp.call(31, b'', code=4)
+    lp.call(31, identity(901) + struct.pack('>Q', 1) + string('') * 3, code=7)
+    lp.call(31, identity(999) + struct.pack('>Q', 2) + string('') * 3, code=1)
+    selected_before = lp.call(2, identity(901))
+    data = string('local-tag') + b'\x01' + struct.pack('>Q', 1000)
+    data += b'\x05' + string('red') + string('team') + string('local-test')
+    lp.call(14, data)
+    wait_for(lambda: struct.unpack('>IQ', lp.call(16))[0] == 6)
+    first = struct.unpack('>QQQ', lp.call(31, identity(901) + struct.pack('>Q', 2) + string('') * 3))
+    other = struct.unpack('>QQQ', lp.call(31, identity(902) + struct.pack('>Q', 2) + string('') * 3))
+    assert first[:2] == (1000, 0) and other[:2] == (0, 0) and first[2] and other[2]
+    assert lp.call(2, identity(901)) == selected_before
+    check(True, 'FILE_PROPAGATION returns fixed object cutoffs for indexed TAG membership, rejects stale identities and does not rewrite file metadata')
+    logical = 'team\x1fhttps\x1fa.test\x1f/local-propagation\x1f'
+    alias = 'https://alias.test/local-propagation'
+    data = string('local-alias') + b'\x01' + struct.pack('>Q', 2000)
+    data += b'\x01' + string(alias) + string('') + string('local-test')
+    lp.call(14, data)
+    wait_for(lambda: struct.unpack('>IQ', lp.call(16))[0] == 6)
+    selected = identity(902) + struct.pack('>Q', 2)
+    assert struct.unpack('>QQQ', lp.call(31, selected + string('') * 3))[:2] == (0, 0)
+    current = string(logical) + string(alias) + string('alias.test')
+    assert struct.unpack('>QQQ', lp.call(31, selected + current))[:2] == (2000, 0)
+    assert struct.unpack('>QQQ', lp.call(31, selected + string('') * 3))[:2] == (0, 0)
+    lp.call(31, selected + string('wrong') + string(alias) + string('alias.test'), code=7)
+    lp.call(31, selected + string('') + string(alias) + string('alias.test'), code=4)
+    lp.call(12, string(logical) + string(alias))
+    assert struct.unpack('>QQQ', lp.call(31, identity(902) + struct.pack('>Q', 2) + string('') * 3))[:2] == (2000, 0)
+    lp.close(); local.stop()
+    local = Component(local.path, shared=propagation_shared)
+    local.opened(); lp = Client(local.path)
+    wait_for(lambda: struct.unpack('>IQ', lp.call(16))[0] == 6)
+    assert struct.unpack('>QQQ', lp.call(31, identity(901) + struct.pack('>Q', 2) + string('') * 3))[:2] == (2000, 0)
+    assert struct.unpack('>QQQ', lp.call(31, identity(902) + struct.pack('>Q', 2) + string('') * 3))[:2] == (2000, 0)
+    check(True, 'local propagation resolves persisted URL aliases and survives executor restart without index rebuilding')
+    lp.close(); local.stop()
+
 finally:
     for component in processes:
         if component.process.poll() is None:
