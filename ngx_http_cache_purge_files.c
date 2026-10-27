@@ -586,8 +586,10 @@ typedef struct {
     const unsigned char             *transaction, *digest;
     uint64_t                         revision;
     uint32_t                         uid;
-    int                              pending;
-    ngx_http_cache_rocksdb_bytes_t    base, before, after;
+    int                              pending, replace_tags;
+    ngx_http_cache_rocksdb_bytes_t   base, before, after;
+    ngx_http_cache_rocksdb_bytes_t   tags[64];
+    size_t                           tag_count;
 } ngx_http_cache_purge_validation_plan_t;
 
 static int ngx_http_cache_purge_validation_plan(
@@ -1285,6 +1287,7 @@ ngx_http_cache_purge_publication_watermarks(
     ngx_http_cache_rocksdb_error_t *error)
 {
     ngx_http_cache_purge_publication_proof_t  proof;
+    ngx_http_cache_purge_validation_plan_t    plan;
     int                                       rc;
 
     if (origin == NULL || validated == NULL) {
@@ -1293,6 +1296,15 @@ ngx_http_cache_purge_publication_watermarks(
     }
     memset(origin, 0, sizeof(*origin));
     memset(validated, 0, sizeof(*validated));
+    if (metadata.data != NULL && metadata.len >= 4
+        && memcmp(metadata.data, "NFV", 3) == 0)
+    {
+        rc = ngx_http_cache_purge_validation_plan(metadata, &plan, error);
+        if (rc != 0) {
+            return rc;
+        }
+        metadata = plan.base;
+    }
     rc = ngx_http_cache_purge_publication_proof(metadata, &proof, error);
     return rc == 0 ? ngx_http_cache_purge_metadata_watermarks(proof.metadata,
         origin, validated, error) : rc;
@@ -2072,12 +2084,13 @@ ngx_http_cache_purge_validation_plan(ngx_http_cache_rocksdb_bytes_t metadata,
     ngx_http_cache_rocksdb_error_t *error)
 {
     ngx_http_cache_purge_publication_proof_t  proof;
-    size_t                                   base, length, at;
+    size_t                                   base, length, at, i;
 
     memset(plan, 0, sizeof(*plan));
     if (!ngx_http_cache_purge_publication_valid(metadata, 16384)
         || metadata.len < 64
         || (memcmp(metadata.data, "NFV1", 4)
+            && memcmp(metadata.data, "NFV2", 4)
             && memcmp(metadata.data, "NFR1", 4)))
     {
         return ngx_http_cache_purge_result(error,
@@ -2111,7 +2124,7 @@ ngx_http_cache_purge_validation_plan(ngx_http_cache_rocksdb_bytes_t metadata,
         }
         length = ngx_http_cache_purge_publication_number(metadata.data + at, 4);
         at += 4;
-        if (length == 0 || length > 4096 || metadata.len - at != 2 * length) {
+        if (length == 0 || length > 4096 || metadata.len - at < 2 * length) {
             goto invalid;
         }
         plan->before.data = metadata.data + at;
@@ -2119,6 +2132,33 @@ ngx_http_cache_purge_validation_plan(ngx_http_cache_rocksdb_bytes_t metadata,
         plan->after.data = metadata.data + at + length;
         plan->after.len = length;
         at += 2 * length;
+        if (metadata.data[3] == '2') {
+            if (at == metadata.len) {
+                goto invalid;
+            }
+            plan->tag_count = metadata.data[at++];
+            plan->replace_tags = plan->tag_count != 255;
+            if (!plan->replace_tags) {
+                plan->tag_count = 0;
+            } else if (plan->tag_count > 64) {
+                goto invalid;
+            }
+            for (i = 0; i < plan->tag_count; i++) {
+                if (metadata.len - at < 4) {
+                    goto invalid;
+                }
+                length = ngx_http_cache_purge_publication_number(
+                    metadata.data + at, 4);
+                at += 4;
+                if (length == 0 || length > 1024 || length > metadata.len - at)
+                {
+                    goto invalid;
+                }
+                plan->tags[i].data = metadata.data + at;
+                plan->tags[i].len = length;
+                at += length;
+            }
+        }
     }
     if (at != metadata.len || base < 4
         || memcmp(plan->base.data, "NFP1", 4))
@@ -2145,7 +2185,7 @@ ngx_http_cache_purge_publication_inode(ngx_http_cache_rocksdb_bytes_t metadata,
             NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid publication inode input");
     }
     *inode = 0;
-    if (metadata.len >= 4 && memcmp(metadata.data, "NFV1", 4) == 0) {
+    if (metadata.len >= 4 && memcmp(metadata.data, "NFV", 3) == 0) {
         rc = ngx_http_cache_purge_validation_plan(metadata, &plan, error);
         if (rc != 0) {
             return rc;
@@ -2226,7 +2266,7 @@ ngx_http_cache_purge_publications_remove(ngx_http_cache_purge_publications_t *p,
         goto done;
     }
     base = file.metadata;
-    if (base.len >= 4 && memcmp(base.data, "NFV1", 4) == 0) {
+    if (base.len >= 4 && memcmp(base.data, "NFV", 3) == 0) {
         rc = ngx_http_cache_purge_validation_plan(base, &plan, error);
         if (rc != 0) {
             goto done;
@@ -2609,7 +2649,7 @@ ngx_http_cache_purge_publications_validate_prepare(
     ngx_http_cache_purge_index_match_t *out,
     ngx_http_cache_rocksdb_error_t *error)
 {
-    ngx_http_cache_purge_index_file_t         file, checked;
+    ngx_http_cache_purge_index_file_t         file, checked, candidate;
     ngx_http_cache_purge_validation_plan_t    plan;
     ngx_http_cache_purge_publication_proof_t  proof;
     ngx_http_cache_purge_publication_root_t  *root;
@@ -2620,7 +2660,7 @@ ngx_http_cache_purge_publications_validate_prepare(
     unsigned char                             digest[32], identity[16];
     unsigned char                            *raw, *next, *before;
     uint64_t                                  offset;
-    size_t                                    count, size;
+    size_t                                    count, size, i;
     int                                       rc, owned, flags;
 
     ngx_http_cache_purge_result(error, 0, "");
@@ -2664,7 +2704,7 @@ ngx_http_cache_purge_publications_validate_prepare(
     }
     base = file.metadata;
     memset(&plan, 0, sizeof(plan));
-    if (base.len >= 4 && (memcmp(base.data, "NFV1", 4) == 0
+    if (base.len >= 4 && (memcmp(base.data, "NFV", 3) == 0
                          || memcmp(base.data, "NFR1", 4) == 0))
     {
         rc = ngx_http_cache_purge_validation_plan(base, &plan, error);
@@ -2775,7 +2815,12 @@ ngx_http_cache_purge_publications_validate_prepare(
         }
         base = updated;
     }
-    size = 72 + base.len + 2 * input->before.len;
+    size = 73 + base.len + 2 * input->before.len;
+    if (input->replace_tags) {
+        for (i = 0; i < count; i++) {
+            size += 4 + tags[i].len;
+        }
+    }
     if (size > 16384 || base.len + 64 > 16384
         || input->before.len > proof.size)
     {
@@ -2807,10 +2852,16 @@ ngx_http_cache_purge_publications_validate_prepare(
         goto conflict;
     }
     rc = guard(guard_data, &checked, error);
+    if (rc == 0 && input->replace_tags) {
+        candidate = checked;
+        memcpy(candidate.tags, tags, count * sizeof(tags[0]));
+        candidate.tag_count = count;
+        rc = guard(guard_data, &candidate, error);
+    }
     if (rc != 0) {
         goto done;
     }
-    memcpy(raw, "NFV1", 4);
+    memcpy(raw, "NFV2", 4);
     memcpy(raw + 4, input->transaction, 16);
     memcpy(raw + 20, digest, 32);
     next = ngx_http_cache_purge_publication_encode(raw + 52,
@@ -2823,10 +2874,20 @@ ngx_http_cache_purge_publications_validate_prepare(
     memcpy(next, input->before.data, input->before.len);
     next += input->before.len;
     memcpy(next, input->after.data, input->after.len);
+    next += input->after.len;
+    *next++ = input->replace_tags ? (unsigned char) count : 255;
+    if (input->replace_tags) {
+        for (i = 0; i < count; i++) {
+            next = ngx_http_cache_purge_publication_encode(next,
+                                                          tags[i].len, 4);
+            memcpy(next, tags[i].data, tags[i].len);
+            next += tags[i].len;
+        }
+    }
     metadata.data = raw;
     metadata.len = size;
     rc = ngx_http_cache_purge_index_update_pending(store, &input->file,
-        metadata, tags, count, out, error);
+        metadata, file.tags, file.tag_count, out, error);
     goto done;
 
 conflict:
@@ -2843,14 +2904,15 @@ done:
 }
 
 int
-ngx_http_cache_purge_publications_validate_finish(
+ngx_http_cache_purge_publications_validate_finish_checked(
     ngx_http_cache_purge_publications_t *p, ngx_http_cache_rocksdb_t *store,
     const unsigned char id[16], const unsigned char transaction[16],
     uint64_t revision, int anchor, int lease, uint32_t uid,
+    ngx_http_cache_purge_validation_guard_pt guard, void *guard_data,
     ngx_http_cache_purge_index_match_t *out,
     ngx_http_cache_rocksdb_error_t *error)
 {
-    ngx_http_cache_purge_index_file_t         file, checked;
+    ngx_http_cache_purge_index_file_t         file, checked, candidate;
     ngx_http_cache_purge_validation_plan_t    plan;
     ngx_http_cache_purge_validation_t         input;
     ngx_http_cache_purge_watermark_t          origin, validated;
@@ -2984,6 +3046,11 @@ ngx_http_cache_purge_publications_validate_finish(
         }
         goto done;
     }
+    if (file.metadata.data[3] == '1') {
+        /* Legacy plans already discarded their old TAG membership. They
+         * cannot prove coverage for a rule accepted during recovery. */
+        goto discarded;
+    }
     memset(&input, 0, sizeof(input));
     memcpy(input.file.id, id, 16);
     input.file.revision = plan.revision;
@@ -3000,8 +3067,9 @@ ngx_http_cache_purge_publications_validate_finish(
         }
         input.origin = &validated;
     }
-    count = file.tag_count;
-    memcpy(tags, file.tags, count * sizeof(tags[0]));
+    count = plan.replace_tags ? plan.tag_count : file.tag_count;
+    memcpy(tags, plan.replace_tags ? plan.tags : file.tags,
+           count * sizeof(tags[0]));
     rc = ngx_http_cache_purge_validation_digest(&input, tags, &count,
                                                 digest, error);
     if (rc != 0) {
@@ -3009,6 +3077,22 @@ ngx_http_cache_purge_publications_validate_finish(
     }
     if (memcmp(digest, plan.digest, 32) || plan.before.len > proof.size) {
         goto conflict;
+    }
+    if (guard != NULL) {
+        candidate = file;
+        candidate.metadata = plan.base;
+        rc = guard(guard_data, &candidate, error);
+        if (rc == 0 && plan.replace_tags) {
+            memcpy(candidate.tags, tags, count * sizeof(tags[0]));
+            candidate.tag_count = count;
+            rc = guard(guard_data, &candidate, error);
+        }
+        if (rc == NGX_HTTP_CACHE_ROCKSDB_CONFLICT) {
+            goto discarded;
+        }
+        if (rc != 0) {
+            goto done;
+        }
     }
     prefix = malloc(plan.before.len);
     size = 64 + plan.base.len;
@@ -3086,8 +3170,8 @@ ngx_http_cache_purge_publications_validate_finish(
     metadata.len = size;
     memcpy(expected.id, id, 16);
     expected.revision = file.revision;
-    rc = ngx_http_cache_purge_index_publish_update(store, &expected, metadata,
-                                                   out, error);
+    rc = ngx_http_cache_purge_index_publish_tags(store, &expected, metadata,
+                                                   tags, count, out, error);
     goto done;
 
 discarded:
@@ -3113,4 +3197,16 @@ done:
     ngx_http_cache_purge_index_file_free(&checked);
     ngx_http_cache_purge_index_file_free(&file);
     return rc;
+}
+
+int
+ngx_http_cache_purge_publications_validate_finish(
+    ngx_http_cache_purge_publications_t *p, ngx_http_cache_rocksdb_t *store,
+    const unsigned char id[16], const unsigned char transaction[16],
+    uint64_t revision, int anchor, int lease, uint32_t uid,
+    ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_purge_publications_validate_finish_checked(p, store,
+        id, transaction, revision, anchor, lease, uid, NULL, NULL, out, error);
 }

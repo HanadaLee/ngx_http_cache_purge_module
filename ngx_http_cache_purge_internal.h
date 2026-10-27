@@ -778,9 +778,8 @@ int ngx_http_cache_purge_index_update(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_rocksdb_bytes_t *tags, size_t count,
     ngx_http_cache_purge_index_match_t *out,
     ngx_http_cache_rocksdb_error_t *error);
-/* Revalidation reuses the existing committed path intent. The first atomic
- * update changes TAGs/metadata and reserves the path without replacing the
- * body. Publication replaces its metadata proof and releases that intent. */
+/* Revalidation reserves the existing path. Native validation keeps the old
+ * TAGs visible until the final proof and new TAGs are published atomically. */
 int ngx_http_cache_purge_index_update_pending(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_expected_t *file,
     ngx_http_cache_rocksdb_bytes_t metadata,
@@ -790,6 +789,12 @@ int ngx_http_cache_purge_index_update_pending(ngx_http_cache_rocksdb_t *store,
 int ngx_http_cache_purge_index_publish_update(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_expected_t *file,
     ngx_http_cache_rocksdb_bytes_t metadata,
+    ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_publish_tags(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file,
+    ngx_http_cache_rocksdb_bytes_t metadata,
+    const ngx_http_cache_rocksdb_bytes_t *tags, size_t count,
     ngx_http_cache_purge_index_match_t *out,
     ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_add_url(ngx_http_cache_rocksdb_t *store,
@@ -987,6 +992,17 @@ int ngx_http_cache_purge_publications_validate_finish(
     ngx_http_cache_rocksdb_t *store, const unsigned char id[16],
     const unsigned char transaction[16], uint64_t revision,
     int anchor_fd, int lease_fd, uint32_t peer_uid,
+    ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+/* Production completion/recovery checks old and proposed TAGs before writing
+ * the header. CONFLICT discards the pending instance instead of publishing it.
+ * Completed receipt replay does not perform a new validation transaction. */
+int ngx_http_cache_purge_publications_validate_finish_checked(
+    ngx_http_cache_purge_publications_t *publications,
+    ngx_http_cache_rocksdb_t *store, const unsigned char id[16],
+    const unsigned char transaction[16], uint64_t revision,
+    int anchor_fd, int lease_fd, uint32_t peer_uid,
+    ngx_http_cache_purge_validation_guard_pt guard, void *guard_data,
     ngx_http_cache_purge_index_match_t *out,
     ngx_http_cache_rocksdb_error_t *error);
 

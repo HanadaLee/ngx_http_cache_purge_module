@@ -91,9 +91,13 @@ propagation deadline. Activation republishes its updated controls, so callers
 must also await READY afterwards. This is not the public HTTP/202 purge API.
 
 The filesystem backend also supports bounded in-place validation transactions.
-It atomically reserves the existing path intent with TAG and metadata changes,
-writes and fsyncs only a supplied header prefix, then publishes the new physical
-proof. Inspection excludes the pending instance. Retries and automatic recovery
+It reserves the existing path and persists an NFV2 plan while retaining the old
+TAG postings. Proposed TAGs remain in the bounded plan until completion. Both
+preparation and recovery check old and proposed TAGs against accepted controls;
+a conflicting recovery retires the instance before further header writes.
+Completion writes and fsyncs only the supplied prefix, then atomically publishes
+the new TAGs, physical proof and completed receipt. Inspection excludes the
+pending instance. Retries and automatic recovery
 share the same OFD lease protocol; completed receipts remain bounded across
 repeated validation. `VALIDATE_FILE` connects this transaction to native upstream
 304 handling. It transfers the lease and selected descriptor, verifies accepted
@@ -203,9 +207,13 @@ The existing worker executor resumes the bounded scan from durable checkpoints.
 Admission checks that requirement even when no resident rule remains; successful
 conditional validation satisfies it without replacing the entity. Requirements
 are monotonic within one ledger and are collected with their retired file.
-Index schema 5 upgrades schemas 1/2/3/4 from existing index records; the 4-to-5
-upgrade only changes the schema marker and adds no full scan. Older readers
-reject it instead of ignoring deferred Delete, validation or host requirements.
+Index schema 6 upgrades schemas 1/2/3/4/5 from existing index records; upgrades
+from 4/5 only change the schema marker and add no full scan. Older readers reject
+it instead of ignoring deferred Delete or staged TAG changes. Pending NFV1 plans
+cannot recover their removed old TAG membership and are conservatively discarded;
+completed NFR1 receipts and unrelated cache files remain valid. NFV2 plans retain
+the 16 KiB metadata limit; oversized proposed TAG/header combinations are rejected
+before mutation, while retaining existing TAGs needs only a one-byte marker.
 
 Persistent selector requirements also survive resident-rule retirement. The
 operation ledger retains the latest Invalidate and Delete sequence independently

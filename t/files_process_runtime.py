@@ -138,9 +138,11 @@ for cut in ('basic', 'retired', 'unlinked'):
 def background_delete(cut):
     root = Path(tempfile.mkdtemp(prefix='cache-purge-background-', dir='/tmp'))
     roots.append(str(root))
+    validation_case = cut.startswith('validation-')
     checks.append(subprocess.check_output(
-        [str(a.binary), '--background-seed-invalidate' if cut == 'invalidate' else '--background-seed', str(root)], text=True, timeout=30).strip())
-    first = root / 'cache/a/first'
+        [str(a.binary), '--validate-race-intent' if validation_case else
+         '--background-seed-invalidate' if cut == 'invalidate' else '--background-seed', str(root)], text=True, timeout=30).strip())
+    first = root / ('cache/file' if validation_case else 'cache/a/first')
     offset = int.from_bytes(hashlib.sha256(str(first).encode()).digest()[16:24], 'big') & 0x3fffffffffffffff
     lease = os.open(root / 'db/file.leases', os.O_RDWR | os.O_CLOEXEC)
     fcntl.fcntl(lease, fcntl.F_OFD_SETLK,
@@ -155,6 +157,8 @@ def background_delete(cut):
                            CACHE_PURGE_TEST_MATCH_URL='https://example.test/work/first')
     if cut == 'native':
         environment['CACHE_PURGE_TEST_NATIVE_ROOT'] = '1'
+    if validation_case:
+        environment.pop('CACHE_PURGE_TEST_SECOND_ROOT')
     log = (root / 'component.log').open('w')
     process = None
 
@@ -233,7 +237,42 @@ def background_delete(cut):
 
     try:
         start()
-        if cut == 'native':
+        if validation_case:
+            def string(value):
+                value = value.encode()
+                return struct.pack('>I', len(value)) + value
+            def tagged(tag):
+                return rpc(8, b'\x05' + string(tag) + string('tenant') + string('') + b'\x20')[0]
+            assert tagged('red') == 1 and tagged('blue') == tagged('green') == 0
+            raw = rpc(2, (42).to_bytes(16, 'big'))
+            assert raw[:9] == b'\x02' + struct.pack('>Q', 3) and b'NFV2' in raw
+            old = first.open('rb')
+            original = old.read()
+            kind = cut.split('-')[1]
+            tag = {'old': 'red', 'new': 'blue', 'unrelated': 'other'}[kind]
+            mode = 1 if cut.endswith('invalidate') else 2
+            rpc(14, string('race') + bytes([mode]) + struct.pack('>Q', 1) + b'\x05'
+                + string(tag) + string('tenant') + string(''))
+            until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
+            assert first.read_bytes() == original and tagged('red') == 1
+            # The intent and accepted rule both survive loss of the executor.
+            stop(kill=True)
+            start()
+            assert tagged('red') == 1 and tagged('blue') == 0
+            os.close(lease); lease = -1
+            if kind == 'unrelated':
+                until(lambda: int.from_bytes(rpc(2, (42).to_bytes(16, 'big'))[1:9], 'big') == 4)
+                assert tagged('red') == 0 and tagged('blue') == tagged('green') == 1
+                assert first.read_bytes() == b'new-head' + b'B' * 65536
+            else:
+                until(lambda: not first.exists())
+                rpc(2, (42).to_bytes(16, 'big'), code=1)
+                old.seek(0)
+                assert old.read() == original
+                assert tagged('red') == tagged('blue') == tagged('green') == 0
+            old.close()
+            stop()
+        elif cut == 'native':
             def native():
                 process.stdin.write('n\n'); process.stdin.flush()
                 assert select.select([process.stdout], [], [], 8)[0]
@@ -411,12 +450,17 @@ def background_delete(cut):
         log.close()
     diagnostics = (root / 'component.log').read_text()
     assert not any(word in diagnostics for word in ('AddressSanitizer', 'LeakSanitizer', 'runtime error:')), diagnostics
-    checks.append('native cleanup notification survives owner death, rejects stale replies, retries busy consumers and preserves durable per-file progress' if cut == 'native' else
+    checks.append('304 recovery retains old TAG membership, rechecks old/new rules before header mutation and atomically publishes new TAGs: ' + cut if validation_case else
+                  'native cleanup notification survives owner death, rejects stale replies, retries busy consumers and preserves durable per-file progress' if cut == 'native' else
                   'background Invalidate waits for origins and durable intents, resumes after owner death, retires FENCE while retaining PROPAGATE and rejects delayed old writes' if cut == 'invalidate' else
                   'background Delete survives ' + cut + ' restart, handles both zones, preserves new entities and retires the FENCE')
 
 if a.component:
     for cut in ('lease', 'retired', 'replaced', 'invalidate', 'native'):
+        background_delete(cut)
+    for cut in ('validation-old-invalidate', 'validation-new-invalidate',
+                'validation-old-delete', 'validation-new-delete',
+                'validation-unrelated-delete'):
         background_delete(cut)
 
 a.output.write_text(json.dumps({'checks': checks, 'directories': roots,

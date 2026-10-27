@@ -202,6 +202,8 @@ validation(
     const std::string &mode, const std::string &path, bool with_origin = false)
 {
     bool recovering = mode.find("--validate-recover") == 0;
+    bool race = mode == "--validate-race-intent";
+    with_origin = with_origin || race;
     std::filesystem::create_directories(path + "/cache");
     std::filesystem::create_directories(path + "/db");
     int lock_fd, lease_fd;
@@ -234,13 +236,23 @@ validation(
     file.metadata = "original-metadata";
     ngx_http_cache_purge_watermark_t origin{};
     if (with_origin) {
-        std::memset(origin.ledger, 0x17, 16);
-        origin.sequence = 3;
+        if (race) {
+            ngx_http_cache_purge_operations_t operations{};
+            ngx_http_cache_purge_operation_limits_t limits{ 4096, 4194304 };
+            check(ngx_http_cache_purge_operations_init(
+                      &operations, store, &limits, &error)
+                      == 0,
+                "validation race ledger");
+            std::memcpy(origin.ledger, operations.ledger, 16);
+        } else {
+            std::memset(origin.ledger, 0x17, 16);
+            origin.sequence = 3;
+        }
         unsigned char encoded[NGX_HTTP_CACHE_PURGE_WATERMARK_SIZE];
         ngx_http_cache_purge_watermark_encode(&origin, encoded);
         file.metadata.assign(
             reinterpret_cast<char *>(encoded), sizeof(encoded));
-        origin.sequence = 7;
+        origin.sequence = race ? 0 : 7;
     }
     std::string target = file.root + "/file", before = "old-head",
                 after = "new-head", tail(65536, 'B');
@@ -345,13 +357,12 @@ validation(
                   selected.fd, getuid(), validation_guard, nullptr, &result,
                   &error)
                   == 0,
-            "persist validation plan and TAG update");
+            "persist validation plan with proposed TAGs");
         check(result.state == 2 && result.revision == 3
                   && index.has_fill_intent(file.id),
             "validation owns committed path intent");
-        check(index.get(file.id).tags
-                  == std::vector<std::string>({ "blue", "green" }),
-            "pending TAG replacement is atomic and canonical");
+        check(index.get(file.id).tags == file.tags,
+            "pending validation retains committed TAG membership");
         ngx_http_cache_purge_index_file_t inspected{};
         check(ngx_http_cache_purge_publications_inspect(publications.native(),
                   store, bytes(file.root), bytes(file.zone), bytes(file.path),
@@ -374,7 +385,7 @@ validation(
                   &error)
                   == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
             "validation identity cannot change its bound header");
-        if (mode == "--validate-crash-intent") {
+        if (mode == "--validate-crash-intent" || race) {
             _exit(0);
         }
         if (mode == "--validate-crash-prefix"
@@ -436,6 +447,9 @@ validation(
     } else {
         check(result.state == 2 && result.revision == 4,
             "validation advances exactly two revisions");
+        check(index.get(file.id).tags
+                  == std::vector<std::string>({ "blue", "green" }),
+            "validation commit atomically publishes canonical TAGs");
         Descriptor selected(open(target.c_str(), O_RDONLY | O_CLOEXEC));
         std::string contents(8 + tail.size(), '\0');
         check(pread(selected.fd, contents.data(), contents.size(), 0)
@@ -941,6 +955,11 @@ main(int argc, char **argv)
         char root[] = "/tmp/cache-purge-files-XXXXXX";
         check(mkdtemp(root) != nullptr, "temporary directory");
         std::string path(root), target = path + "/final";
+        ngx_http_cache_purge_watermark_t invalid_origin{}, invalid_validation{};
+        check(ngx_http_cache_purge_publication_watermarks(
+                  { nullptr, 4 }, &invalid_origin, &invalid_validation, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_INVALID,
+            "watermark inspection rejects a missing metadata buffer");
         unsigned char address[16], again[16], different[16];
         uint64_t offset, second;
         check(ngx_http_cache_purge_file_address(

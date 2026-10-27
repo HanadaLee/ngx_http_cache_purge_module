@@ -825,6 +825,26 @@ try:
     os.close(lease); os.close(selected)
     check(True, 'Delete still requires a newer full entity even after successful Invalidate validation and a newer conditional request')
 
+    prior = validating.watermark()
+    target, lease, selected = make_validation_file(608, '/proposed-tags', metadata=prior)
+    original = v.call(2, identity(608)); contents = target.read_bytes()
+    validation_operation('proposed-invalidate', 5, 'proposed-invalidate', 'team', mode=1)
+    wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+    v.validate_file(validation_packet(608, tags=['proposed-invalidate'], origin=prior),
+                    lease, selected, code=7)
+    assert v.call(2, identity(608)) == original and target.read_bytes() == contents
+    current = validating.watermark()
+    validated = v.validate_file(validation_packet(608, tags=['proposed-invalidate'], origin=current), lease, selected)
+    assert validated[:9] == b'\x02' + struct.pack('>Q', 4)
+    validation_operation('proposed-delete', 5, 'proposed-delete', 'team', mode=2)
+    wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+    original = v.call(2, identity(608)); contents = target.read_bytes()
+    v.validate_file(validation_packet(608, revision=4, token=2, before=b'new-head',
+                    tags=['proposed-delete'], origin=validating.watermark()), lease, selected, code=7)
+    assert v.call(2, identity(608)) == original and target.read_bytes() == contents
+    os.close(lease); os.close(selected)
+    check(True, 'proposed TAGs are checked before preparation: newer 304 coverage satisfies Invalidate but cannot satisfy Delete for the old full entity')
+
     target, lease, selected = make_validation_file(601, '/validate')
     packet = validation_packet(601, tags=['new-tag'])
     outcome = v.validate_file(packet, lease, selected)

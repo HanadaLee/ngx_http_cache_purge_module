@@ -128,6 +128,9 @@ typedef struct {
 static int ngx_http_cache_purge_component_validation_guard(void *data,
     const ngx_http_cache_purge_index_file_t *file,
     ngx_http_cache_rocksdb_error_t *error);
+static int ngx_http_cache_purge_component_validation_finish_guard(void *data,
+    const ngx_http_cache_purge_index_file_t *file,
+    ngx_http_cache_rocksdb_error_t *error);
 static int ngx_http_cache_purge_component_publication_guard(void *data,
     const ngx_http_cache_purge_index_file_t *file,
     ngx_http_cache_rocksdb_error_t *error);
@@ -693,7 +696,7 @@ ngx_http_cache_purge_component_logical(ngx_http_cache_rocksdb_t *store,
     }
     if (file.metadata.len >= 4
         && (memcmp(file.metadata.data, "NFP1", 4) == 0
-            || memcmp(file.metadata.data, "NFV1", 4) == 0
+            || memcmp(file.metadata.data, "NFV", 3) == 0
             || memcmp(file.metadata.data, "NFR1", 4) == 0))
     {
         rc = ngx_http_cache_purge_component_error(
@@ -710,7 +713,7 @@ ngx_http_cache_purge_component_reserved(ngx_http_cache_rocksdb_bytes_t metadata,
 {
     if (metadata.len >= 4
         && (memcmp(metadata.data, "NFP1", 4) == 0
-            || memcmp(metadata.data, "NFV1", 4) == 0
+            || memcmp(metadata.data, "NFV", 3) == 0
             || memcmp(metadata.data, "NFR1", 4) == 0))
     {
         return ngx_http_cache_purge_component_error(
@@ -861,10 +864,11 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
                 &validation_guard, &matches[0], error);
         }
         if (rc == 0) {
-            rc = ngx_http_cache_purge_publications_validate_finish(
+            rc = ngx_http_cache_purge_publications_validate_finish_checked(
                 c->publications, store, validation.file.id,
                 validation.transaction, validation.file.revision,
                 c->lease_anchor, p->input_rights[0], p->uid,
+                ngx_http_cache_purge_component_validation_finish_guard, c,
                 &matches[0], error);
         }
         if (rc == 0) {
@@ -1848,7 +1852,7 @@ ngx_http_cache_purge_component_recover(ngx_http_cache_purge_component_t *c,
     /* Logical preparations are not native filesystem publication intents. */
     if (file.metadata.len < 4
         || (memcmp(file.metadata.data, "NFP1", 4)
-            && memcmp(file.metadata.data, "NFV1", 4)))
+            && memcmp(file.metadata.data, "NFV", 3)))
     {
         rc = 0;
         goto done;
@@ -1873,10 +1877,14 @@ ngx_http_cache_purge_component_recover(ngx_http_cache_purge_component_t *c,
          * keeps its OFD lease until writing/renaming is finished. Acquisition
          * on an independent description proves none of them still owns it.
          */
-        if (memcmp(file.metadata.data, "NFV1", 4) == 0) {
-            rc = ngx_http_cache_purge_publications_validate_finish(
+        if (memcmp(file.metadata.data, "NFV", 3) == 0) {
+            rc = ngx_http_cache_purge_publications_validate_finish_checked(
                 c->publications, store, file.id, NULL, 0, c->lease_anchor,
-                lease, c->options.client_uid, &match, error);
+                lease, c->options.client_uid,
+                c->coordinator ?
+                    ngx_http_cache_purge_component_validation_finish_guard :
+                    NULL,
+                c, &match, error);
         } else {
             rc = ngx_http_cache_purge_publications_finish_checked(
                 c->publications, store, file.id, file.revision, c->lease_anchor,
@@ -2393,13 +2401,17 @@ ngx_http_cache_purge_component_collect_file(ngx_http_cache_purge_component_t *c,
     memcpy(expected.id, file.id, 16);
     expected.revision = file.revision;
     /* Logical diagnostic records have no physical publication proof. */
-    rc = ngx_http_cache_purge_publication_watermarks(file.metadata,
-                                                     &origin, &validated,
-                                                     error);
+    rc = ngx_http_cache_purge_publication_inode(file.metadata, &offset, error);
     if (rc != 0) {
         goto done;
     }
     if (file.state == NGX_HTTP_CACHE_PURGE_INDEX_COMMITTED) {
+        rc = ngx_http_cache_purge_publication_watermarks(file.metadata,
+                                                       &origin, &validated,
+                                                       error);
+        if (rc != 0 && rc != NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) {
+            goto done;
+        }
         rc = ngx_http_cache_purge_index_delete_requirement(c->operations.store,
                                                         &expected, &required,
                                                         error);
@@ -5771,6 +5783,32 @@ ngx_http_cache_purge_component_validation_guard(void *data,
     }
     return ngx_http_cache_purge_component_record_guard(guard->coordinator,
         file, file->metadata, &guard->origin, NULL, NULL, error);
+}
+
+static int
+ngx_http_cache_purge_component_validation_finish_guard(void *data,
+    const ngx_http_cache_purge_index_file_t *file,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_component_t  *c;
+    ngx_http_cache_purge_watermark_t   origin, validated;
+    int                                 rc;
+
+    c = data;
+    rc = ngx_http_cache_purge_publication_watermarks(file->metadata,
+                                                      &origin, &validated,
+                                                      error);
+    if (rc != 0 && rc != NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) {
+        return rc;
+    }
+    rc = ngx_http_cache_purge_operations_origin(&c->operations,
+                                                  rc == 0 ? &validated : NULL,
+                                                  error);
+    if (rc != 0) {
+        return rc;
+    }
+    return ngx_http_cache_purge_component_record_guard(c->coordinator,
+        file, file->metadata, NULL, NULL, NULL, error);
 }
 
 static int
