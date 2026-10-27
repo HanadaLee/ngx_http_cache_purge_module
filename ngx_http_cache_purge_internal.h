@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define NGX_HTTP_CACHE_PURGE_COMPONENT_ABI 7
+#define NGX_HTTP_CACHE_PURGE_COMPONENT_ABI 8
 #define NGX_HTTP_CACHE_PURGE_PROTOCOL_VERSION 1
 #define NGX_HTTP_CACHE_PURGE_FRAME_SIZE 24
 
@@ -145,7 +145,7 @@ typedef struct {
 void ngx_http_cache_purge_component_options(
     ngx_http_cache_purge_component_options_t *options);
 /* Link-time header/archive compatibility marker. */
-uint32_t ngx_http_cache_purge_component_abi_7(void);
+uint32_t ngx_http_cache_purge_component_abi_8(void);
 
 /* Only start after fork in the selected nginx worker, never while parsing
  * configuration or in master. Copies its inputs and starts one executor thread.
@@ -455,38 +455,23 @@ typedef struct {
 int ngx_http_cache_purge_tags_decode(ngx_http_cache_rocksdb_bytes_t value,
     ngx_http_cache_rocksdb_bytes_t tags[64], size_t *count);
 
-#define NGX_HTTP_CACHE_PURGE_FENCE_MAX       65536
-#define NGX_HTTP_CACHE_PURGE_FENCE_COUNT     64
+#define NGX_HTTP_CACHE_PURGE_FENCE_SIZE  20
 
 typedef struct {
-    unsigned char                    ledger[16];
-    uint64_t                         sequence, issued_at_ms;
-    uint32_t                         mode;
-    int                              candidate;
-    ngx_http_cache_rocksdb_bytes_t   id;
-    ngx_http_cache_purge_selector_t  selector;
-} ngx_http_cache_purge_requirement_t;
-
-typedef struct {
-    ngx_http_cache_purge_requirement_t  *requirements;
-    size_t                               count;
+    uint64_t  invalidate_ms;
+    uint64_t  delete_ms;
 } ngx_http_cache_purge_fence_t;
 
-/* Binary v1 framing; HTTP base64 is handled by the nginx request adapter.
- * Caller owns all buffers. Encode with output=NULL/capacity=0 to size first.
- * Requirements are ordered by ledger/sequence; duplicate IDs are invalid
- * within a ledger. Decode borrows string bytes from input until it is freed.
- * This is a one-way request envelope. It has no response acknowledgement,
- * nonce, request/response digest, local window or authentication fields.
- * Failed encode writes no output; failed decode leaves out empty and its
- * caller-owned requirements array unspecified. Never use a partial set. */
+/* NPF2 is exactly 20 bytes: magic and two big-endian object cutoffs.
+ * Matching belongs to the sender. No selectors, TAGs or event identities
+ * cross layers. Zero means no requirement for that mode; both cannot be zero.
+ * Caller owns all buffers. Failed encode writes nothing; failed decode clears
+ * out. A response never carries an acknowledgement. */
 int ngx_http_cache_purge_fence_encode(const ngx_http_cache_purge_fence_t *fence,
     unsigned char *output, size_t capacity, size_t *length,
     ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_fence_decode(ngx_http_cache_rocksdb_bytes_t input,
-    ngx_http_cache_purge_fence_t *out,
-    ngx_http_cache_purge_requirement_t *requirements, size_t capacity,
-    ngx_http_cache_rocksdb_error_t *error);
+    ngx_http_cache_purge_fence_t *out, ngx_http_cache_rocksdb_error_t *error);
 
 
 typedef struct {

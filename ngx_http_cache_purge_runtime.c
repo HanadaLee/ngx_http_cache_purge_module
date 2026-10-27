@@ -73,7 +73,7 @@ ngx_http_cache_purge_runtime_create(ngx_conf_t *cf)
     }
     ngx_http_cache_purge_component_options(&rt->options);
     if (rt->options.abi != NGX_HTTP_CACHE_PURGE_COMPONENT_ABI
-        || ngx_http_cache_purge_component_abi_7()
+        || ngx_http_cache_purge_component_abi_8()
                != NGX_HTTP_CACHE_PURGE_COMPONENT_ABI
         || ngx_array_init(&rt->roots, cf->pool, 2, sizeof(ngx_str_t)) != NGX_OK
         || ngx_array_init(&rt->file_roots, cf->pool, 8,

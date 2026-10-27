@@ -493,7 +493,7 @@ cannot be reused as control headers. Capabilities exposes the effective names.
 
 The control reader can collect bounded local propagation requirements and their
 ledger identity from one immutable publication. If an object's TAGs are unknown,
-it returns namespace/host-scoped TAG candidates for the receiving cache to resolve.
+it returns namespace/host-scoped TAG candidates for local index resolution.
 Known empty TAGs remain distinct from missing metadata. The scope index reuses
 operation records; it does not copy cache-file metadata into shared memory.
 Output-budget exhaustion fails the lookup instead of silently truncating rules.
@@ -520,13 +520,15 @@ Native retries reuse their generated headers, including beyond the local
 window. Later new requests omit expired active requirements. Published PREPARING
 fences also propagate, closing the gap before first activation starts the clock.
 Identical snapshots within a main request are shared across slice subrequests.
-The initial inline transport limits a fence header line to 8192 bytes and bounds
-per-worker retained/construction bytes to 2 MiB, plus native request buffers and
-allocator overhead. It fails instead of truncating an oversized requirement set.
+The sender coalesces matching operations into one maximum time per mode. Its
+binary frame is always 20 bytes, or 28 base64 characters. Encoding uses stack
+buffers; shared per-worker retained input/output data has a 2 MiB budget, plus
+native request buffers and allocator overhead.
 
-The internal C codec provides bounded binary request frames. It preserves
-complete scoped TAG groups and rejects duplicate or unordered requirements.
-Local windows, nonces, and request/response digests are absent from the format.
+The NPF2 codec carries only the current object's Invalidate and Delete times.
+TAGs, selectors, event IDs, ledger sequences and local windows are not sent.
+Matching belongs to the sending node. Received times merge by mode and are not
+interpreted as requests to enumerate other objects on the receiving node.
 Indexed proxy requests now parse incoming requirements before cache use.
 Duplicate, incomplete, or inconsistent fields return 400; the incoming ignore
 flag discards them without affecting local rules. Admission compares the native
@@ -535,10 +537,9 @@ second. Equal times are covered. No received requirement or extra timestamp is
 written to the index.
 
 An older object is revalidated for Invalidate or fetched unconditionally for
-Delete. TAG candidates use the selected entity's stored namespace and TAGs.
-An already expired TAG object may receive a native 304 before this inspection;
-an unmet Delete rejects that reuse and starts a full fetch. Accepted incoming
-requirements join local outgoing requirements without a local expiry window.
+Delete. An unmet incoming Delete suppresses conditional revalidation before an
+expired object goes upstream. Accepted incoming requirements join local outgoing
+requirements without a local expiry window.
 Identical incoming envelopes are shared across slices of one main request.
 
 Selected incoming Delete instances now enter the existing durable retirement
@@ -548,10 +549,11 @@ replacement or a successfully revalidated instance. Submission is bounded to
 32 jobs and 256 KiB per worker, with a five-second retry deadline. Once retired,
 normal persistent collection continues across executor restarts.
 
-Full propagation remains unfinished: expired TAG objects whose origin fails
-before metadata inspection still need coverage. Request-frame simplification,
-historical alias coverage after deletion, uncached proxy routes,
-and large-set transport also need integration. Capabilities reports the sender
+Full propagation remains unfinished: the sender still needs local TAG and
+historical alias resolution after deletion. Until that is connected, an unknown
+TAG candidate fails before upstream I/O; it is never sent as a matched object
+or delegated to L2. Uncached proxy routes and large local match sets also need
+integration. Capabilities reports the sender
 transport as
 `filter` or `variables`, while `proxy_propagation_ready` remains false.
 The protocol has no module-side authentication, signatures, key management,
