@@ -153,6 +153,8 @@ def background_delete(cut):
     if cut == 'invalidate':
         environment.update(CACHE_PURGE_TEST_HOLD_ORIGIN='1',
                            CACHE_PURGE_TEST_MATCH_URL='https://example.test/work/first')
+    if cut == 'native':
+        environment['CACHE_PURGE_TEST_NATIVE_ROOT'] = '1'
     log = (root / 'component.log').open('w')
     process = None
 
@@ -231,7 +233,64 @@ def background_delete(cut):
 
     try:
         start()
-        if cut == 'invalidate':
+        if cut == 'native':
+            def native():
+                process.stdin.write('n\n'); process.stdin.flush()
+                assert select.select([process.stdout], [], [], 8)[0]
+                reply = process.stdout.readline().split()
+                assert reply[0] == 'NATIVE'
+                if reply[1] == '2': return None
+                assert reply[1] == '0', reply
+                return reply
+            def ack(command, expected='ACK 0'):
+                process.stdin.write(command + '\n'); process.stdin.flush()
+                assert select.select([process.stdout], [], [], 8)[0]
+                assert process.stdout.readline().strip() == expected
+            request = until(native)
+            assert operation('independent')['pending'] == 1
+            assert not (root / 'cache-b/a/other').exists()
+            assert len(rpc(1)) == 72
+            ack('z', 'ACK 7')
+            assert until(native)[2] == request[2]
+            probe = os.open(root / 'db/file.leases', os.O_RDWR | os.O_CLOEXEC)
+            target = root / 'cache-b' / request[5]
+            offset = int.from_bytes(hashlib.sha256(str(target).encode()).digest()[16:24], 'big') & 0x3fffffffffffffff
+            lock = struct.pack('hhqqi', fcntl.F_WRLCK, os.SEEK_SET, offset, 1, 0) + b'\0' * 4
+            def acquired():
+                try:
+                    fcntl.fcntl(probe, fcntl.F_OFD_SETLK, lock)
+                    return True
+                except BlockingIOError:
+                    return False
+            assert not acquired()
+            ack('h', 'REQUEST_STOP 0')
+            until(acquired)
+            assert process.poll() is None
+            os.close(probe)
+            stop()
+            start()
+            request = until(native)
+            stop(kill=True)
+            os.close(lease); lease = -1
+            start()
+            request = until(native)
+            ack('x')
+            # A busy consumer releases its file lease and retries; the exact
+            # retired instance remains in the durable task checkpoint.
+            completed = 0
+            while True:
+                request = until(lambda: native() or
+                                ('done' if operation()['done'] and operation('independent')['done'] else None))
+                if request == 'done': break
+                assert int(request[3]) > 0 and request[5] in ('a/first', 'a/second', 'a/other')
+                ack('y')
+                completed += 1
+                assert completed <= 4
+            assert completed == 3
+            assert not first.exists() and not (root / 'cache-b/a/second').exists()
+            assert (root / 'cache/a/fresh').exists()
+            stop()
+        elif cut == 'invalidate':
             until(lambda: operation()['done'] and operation('independent')['done'])
             assert operation()['stage'] == operation('independent')['stage'] == 3
             assert int.from_bytes(rpc(23, struct.pack('>Q', 1)), 'big') == 1
@@ -334,11 +393,12 @@ def background_delete(cut):
         log.close()
     diagnostics = (root / 'component.log').read_text()
     assert not any(word in diagnostics for word in ('AddressSanitizer', 'LeakSanitizer', 'runtime error:')), diagnostics
-    checks.append('background Invalidate waits for origins and durable intents, resumes after owner death, retires FENCE while retaining PROPAGATE and rejects delayed old writes' if cut == 'invalidate' else
+    checks.append('native cleanup notification survives owner death, rejects stale replies, retries busy consumers and preserves durable per-file progress' if cut == 'native' else
+                  'background Invalidate waits for origins and durable intents, resumes after owner death, retires FENCE while retaining PROPAGATE and rejects delayed old writes' if cut == 'invalidate' else
                   'background Delete survives ' + cut + ' restart, handles both zones, preserves new entities and retains the FENCE')
 
 if a.component:
-    for cut in ('lease', 'retired', 'replaced', 'invalidate'):
+    for cut in ('lease', 'retired', 'replaced', 'invalidate', 'native'):
         background_delete(cut)
 
 a.output.write_text(json.dumps({'checks': checks, 'directories': roots,

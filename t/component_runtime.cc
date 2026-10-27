@@ -56,6 +56,12 @@ main(int argc, char **argv)
                 NGX_HTTP_CACHE_PURGE_ROOT_CACHE };
             options.root_count = 3;
         }
+        if (std::getenv("CACHE_PURGE_TEST_NATIVE_ROOT")) {
+            roots[0].kind = NGX_HTTP_CACHE_PURGE_ROOT_NATIVE;
+            if (second) {
+                roots[2].kind = NGX_HTTP_CACHE_PURGE_ROOT_NATIVE;
+            }
+        }
     }
     ngx_http_cache_purge_component_t *component = nullptr;
     ngx_http_cache_rocksdb_error_t error;
@@ -64,6 +70,7 @@ main(int argc, char **argv)
     ngx_http_cache_purge_control_reader_t *reader = nullptr;
     bool guarded = false, origin = false;
     uint64_t version = 0;
+    ngx_http_cache_purge_cleanup_t cleanup{};
     if (argc == 7) {
         shared_size = ngx_http_cache_purge_control_size(1024 * 1024, 32);
         int fd = open(argv[6], O_RDWR | O_CREAT | O_EXCL, 0600);
@@ -125,6 +132,31 @@ main(int argc, char **argv)
     while (std::cin >> command) {
         if (command == 'q') {
             break;
+        }
+        if (command == 'h') {
+            rc = ngx_http_cache_purge_component_request_stop(component, &error);
+            std::cout << "REQUEST_STOP " << rc << std::endl;
+            continue;
+        }
+        if (command == 'n') {
+            rc = ngx_http_cache_purge_component_cleanup_next(
+                component, &cleanup, &error);
+            std::cout << "NATIVE " << rc << ' ' << cleanup.token << ' '
+                      << cleanup.inode << ' ' << cleanup.outcome << ' ';
+            if (rc == 0) {
+                std::cout.write(
+                    reinterpret_cast<const char *>(cleanup.path.data),
+                    cleanup.path.len);
+            }
+            std::cout << std::endl;
+            continue;
+        }
+        if (command == 'y' || command == 'x' || command == 'z') {
+            rc = ngx_http_cache_purge_component_cleanup_complete(component,
+                cleanup.token + (command == 'z'),
+                command == 'x' ? NGX_HTTP_CACHE_ROCKSDB_BUSY : 0, &error);
+            std::cout << "ACK " << rc << std::endl;
+            continue;
         }
         if (command == 'm' || command == 'g' || command == 'r' || command == 'w'
             || command == 'b' || command == 'e')

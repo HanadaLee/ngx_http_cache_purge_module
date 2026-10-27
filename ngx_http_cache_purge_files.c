@@ -717,9 +717,9 @@ ngx_http_cache_purge_publications_open(const ngx_http_cache_purge_root_t *roots,
             || !ngx_http_cache_purge_publication_valid(roots[i].zone, 128)
             || (roots[i].zone.len
                 && memchr(roots[i].zone.data, 0, roots[i].zone.len))
-            || (roots[i].kind != NGX_HTTP_CACHE_PURGE_ROOT_CACHE
-                && roots[i].kind != NGX_HTTP_CACHE_PURGE_ROOT_TEMP)
-            || (roots[i].kind == NGX_HTTP_CACHE_PURGE_ROOT_CACHE
+            || (roots[i].kind < NGX_HTTP_CACHE_PURGE_ROOT_CACHE
+                || roots[i].kind > NGX_HTTP_CACHE_PURGE_ROOT_NATIVE)
+            || (roots[i].kind != NGX_HTTP_CACHE_PURGE_ROOT_TEMP
                 && roots[i].zone.len == 0))
         {
             return ngx_http_cache_purge_result(error,
@@ -806,7 +806,7 @@ ngx_http_cache_purge_publications_open(const ngx_http_cache_purge_root_t *roots,
             goto failed;
         }
         canonical = ngx_http_cache_purge_publication_bytes(root->path);
-        if (root->configured.kind == NGX_HTTP_CACHE_PURGE_ROOT_CACHE
+        if (root->configured.kind != NGX_HTTP_CACHE_PURGE_ROOT_TEMP
             && (ngx_http_cache_purge_publication_equal(canonical, db)
                 || ngx_http_cache_purge_publication_contains(canonical, db)
                 || ngx_http_cache_purge_publication_contains(db, canonical)))
@@ -953,7 +953,7 @@ ngx_http_cache_purge_publication_find(ngx_http_cache_purge_publications_t *p,
     size_t i;
 
     for (i = 0; i < p->count; i++) {
-        if (p->roots[i].configured.kind == NGX_HTTP_CACHE_PURGE_ROOT_CACHE
+        if (p->roots[i].configured.kind != NGX_HTTP_CACHE_PURGE_ROOT_TEMP
             && ngx_http_cache_purge_publication_equal(
                 p->roots[i].configured.zone, zone)
             && (ngx_http_cache_purge_publication_equal(
@@ -1863,7 +1863,7 @@ ngx_http_cache_purge_publications_finish_checked(
     longest = 0;
     for (i = 0; i < p->count; i++) {
         prefix = ngx_http_cache_purge_publication_bytes(p->roots[i].path);
-        if (p->roots[i].configured.kind == NGX_HTTP_CACHE_PURGE_ROOT_CACHE
+        if (p->roots[i].configured.kind != NGX_HTTP_CACHE_PURGE_ROOT_TEMP
             && ngx_http_cache_purge_publication_equal(prefix, file.root)
             && ngx_http_cache_purge_publication_equal(
                 p->roots[i].configured.zone, file.zone))
@@ -2130,6 +2130,33 @@ ngx_http_cache_purge_validation_plan(ngx_http_cache_rocksdb_bytes_t metadata,
 invalid:
     return ngx_http_cache_purge_result(error, NGX_HTTP_CACHE_ROCKSDB_INVALID,
                                        "malformed validation plan");
+}
+
+int
+ngx_http_cache_purge_publication_inode(ngx_http_cache_rocksdb_bytes_t metadata,
+    uint64_t *inode, ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_publication_proof_t  proof;
+    ngx_http_cache_purge_validation_plan_t    plan;
+    int                                       rc;
+
+    if (inode == NULL || (metadata.len != 0 && metadata.data == NULL)) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid publication inode input");
+    }
+    *inode = 0;
+    if (metadata.len >= 4 && memcmp(metadata.data, "NFV1", 4) == 0) {
+        rc = ngx_http_cache_purge_validation_plan(metadata, &plan, error);
+        if (rc != 0) {
+            return rc;
+        }
+        metadata = plan.base;
+    }
+    rc = ngx_http_cache_purge_publication_proof(metadata, &proof, error);
+    if (rc == 0) {
+        *inode = proof.inode;
+    }
+    return rc;
 }
 
 int

@@ -50,13 +50,24 @@ enumeration, then resumes that exact instance after a crash. Busy leases and
 per-file failures retain a durable retry; other tasks and IPC continue. Full
 entities fetched after the operation are preserved, including replacements.
 
+For native nginx roots, background Delete now hands node accounting back to the
+owning worker through one bounded notification slot. The executor retains the
+path lease until the worker acknowledges the exact inode and physical key.
+The event handler uses a try-lock and bounded tree lookup, without database or
+filesystem I/O. It preserves replacements, retries nodes still in use or being
+loaded/deleted, and subtracts the old node's block count once. Task progress is
+not acknowledged before this step; a crash resumes the persisted file identity.
+Graceful executor shutdown releases the pending lease before DB ownership moves
+to a new worker. No nginx request or cache-node pointers cross into the database
+thread.
+
 Background scans yield after at most 32 cursor advances, including retired rows
 and empty URL/key branches. Every yield releases its snapshot and saves a resume
 position; it does not retain all matching files in memory. These are work-unit
 bounds, not hard latency bounds for filesystem or database I/O. A file failure
 currently pauses that task at its pending instance while other tasks continue.
-Enumeration completion leaves Delete DRAINING with its FENCE retained; native
-cache accounting and Delete retirement remain pending. An active Invalidate
+Enumeration completion leaves Delete DRAINING with its FENCE retained; deferred
+cleanup and Delete retirement remain pending. An active Invalidate
 automatically retires its FENCE after file processing finishes, no old or unknown
 origin registrations remain, and the durable file-intent catalog is empty.
 The checks and retirement run in one executor step. Retirement atomically raises
@@ -65,8 +76,10 @@ the control image through the existing reader gate. Per-file and selector
 requirements still enforce validation after FENCE removal. PROPAGATE keeps its
 independent deadline. Even a newer unrelated file intent conservatively delays
 retirement; retries neither scan all pending metadata nor rewrite checkpoints.
-Public activation is not enabled: acceptance still returns PREPARING;
-integration tests activate tasks offline. This is not a public Delete API.
+Acceptance still returns PREPARING. Internal IPC can now activate a task only
+after its FENCE publication is READY; retries preserve the effective time and
+propagation deadline. Activation republishes its updated controls, so callers
+must also await READY afterwards. This is not the public HTTP/202 purge API.
 
 The filesystem backend also supports bounded in-place validation transactions.
 It atomically reserves the existing path intent with TAG and metadata changes,
@@ -211,7 +224,7 @@ Completed upgrades do not replay on restart. This internal storage schema change
 does not change nginx-ext ABI, which remains 1.
 
 Automatic Delete retirement and full writer/migration coverage remain unfinished.
-Memory-only errors do not receive a separate TAG/alias index. Operation receipts
+Memory-only errors do not receive a separate TAG/alias index. Initial receipts
 remain PREPARING; these partial consumers do not expose reliable public 202
 acceptance or completed immediate purge semantics yet.
 

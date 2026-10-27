@@ -452,7 +452,11 @@ def ready_file(item):
     path = Path(os.fsdecode(item['root'])) / os.fsdecode(item['path'])
     marker = os.getxattr(path, 'user.ngx_cache_purge.id')
     assert len(marker) == 40 and marker[:8] == b'NCF1\0\0\0\2' and marker[8:24] == item['id'], (path, marker.hex(), item['id'].hex())
-    assert item['state'] == 2 and item['metadata'].startswith(b'NFP1')
+    metadata = item['metadata']
+    if metadata.startswith(b'NFR1'):
+        assert int.from_bytes(metadata[60:64], 'big') == len(metadata) - 64
+        metadata = metadata[64:]
+    assert item['state'] == 2 and metadata.startswith(b'NFP1')
     return path
 
 def watermark(item):
@@ -694,18 +698,20 @@ try:
         assert get(uri, {'Host': first_host}) == (200, 'HIT', body)
         assert get(uri + '?z=b', {'Host': late_host}) == (200, 'HIT', body)
         checks.append(name + ': a business host first observed after controlled rule retirement enforces host/host-tag history across two zones')
-    assert get('/background-native')[1] == 'MISS'
-    assert get('/background-native?z=b')[1] == 'MISS'
-    background_files = records('/background-native', 2)
+    assert get('/invalidate/background-native')[1] == 'MISS'
+    assert get('/invalidate/background-native?z=b')[1] == 'MISS'
+    for item in records('/invalidate/background-native', 2): ready_file(item)
+    conditional_paths.add('/invalidate/background-native')
+    fence('before-background-delete', 1, 'http://cache.test/invalidate/background-native', mode=1)
+    assert (reply := get('/invalidate/background-native')) == (200, 'REVALIDATED', b'/invalidate/background-native'), reply
+    assert (reply := get('/invalidate/background-native?z=b')) == (200, 'REVALIDATED', b'/invalidate/background-native'), reply
+    background_files = records('/invalidate/background-native', 2)
+    assert all(item['metadata'].startswith(b'NFR1') for item in background_files), background_files
     background_paths = [ready_file(item) for item in background_files]
-    fence('background-native', 1, 'http://cache.test/background-native')
-    stop(process)
-    # Activation is an offline fixture, not a public effective HTTP receipt.
-    subprocess.run([str(a.libraries / 'cache_purge_files_test'),
-                    '--activate-background', str(run / 'index'), 'background-native'],
-                   check=True, timeout=15, stdout=subprocess.DEVNULL)
-    process = start()
-    until(lambda: (run / 'index/component.sock').exists())
+    background_inodes = {path.stat().st_ino for path in background_paths}
+    cleanup_log_start = (run / 'error.log').stat().st_size
+    fence('background-native', 1, 'http://cache.test/invalidate/background-native')
+    rpc(26, string('background-native'))
     until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
     until(lambda: all(not path.exists() for path in background_paths))
     def background_done():
@@ -719,13 +725,18 @@ try:
         d.number(8); d.string(); d.end()
         return stage == 3 and done and not pending and not failed
     until(background_done)
-    assert query('http://cache.test/background-native') == []
-    fresh_bodies['/background-native'] = b'new-after-background'
-    assert get('/background-native') == (200, 'MISS', b'new-after-background')
-    assert get('/background-native?z=b') == (200, 'MISS', b'new-after-background')
-    assert {item['id'] for item in records('/background-native', 2)}.isdisjoint(
+    cleanup_log = (run / 'error.log').read_bytes()[cleanup_log_start:].decode()
+    cleaned = {int(inode): (int(blocks), int(size)) for inode, blocks, size in
+               re.findall(r'cache purge native cleanup inode:(\d+) blocks:(\d+) size:(\d+)', cleanup_log)}
+    assert background_inodes <= cleaned.keys(), (background_inodes, cleaned)
+    assert all(cleaned[inode][0] > 0 for inode in background_inodes)
+    assert query('http://cache.test/invalidate/background-native') == []
+    fresh_bodies['/invalidate/background-native'] = b'new-after-background'
+    assert get('/invalidate/background-native') == (200, 'MISS', b'new-after-background')
+    assert get('/invalidate/background-native?z=b') == (200, 'MISS', b'new-after-background')
+    assert {item['id'] for item in records('/invalidate/background-native', 2)}.isdisjoint(
         {item['id'] for item in background_files})
-    checks.append('persisted active Delete automatically processes both native zones after restart without per-file IPC, then retains its FENCE while node cleanup is pending')
+    checks.append('published FENCE activation starts Delete in the running worker; both hot zone instances are removed and their native size accounting is acknowledged before enumeration completes')
     assert get('/alias/one') == (200, 'MISS', b'/alias/one')
     alias = records('/alias/one', 1)[0]; ready_file(alias)
     assert get('/alias/two') == (200, 'HIT', b'/alias/one')

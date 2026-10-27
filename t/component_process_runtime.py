@@ -699,6 +699,30 @@ try:
     c.close()
     restored.stop()
 
+    activation = Component(root / 'activation', shared=root / 'activation.shm')
+    activation.opened(); ac = Client(activation.path)
+    wait_for(lambda: struct.unpack('>IQ', ac.call(16))[0] == 6)
+    activation.match(); activation.guard()
+    input_data = operation_input('activation-contract')
+    ac.call(14, input_data)
+    ac.call(26, string('activation-contract'), code=6)
+    activation.guard(release=True)
+    wait_for(lambda: struct.unpack('>IQ', ac.call(16))[0] == 6)
+    active = ac.call(26, string('activation-contract'))
+    assert active[len(input_data) + 40] == 2
+    wait_for(lambda: struct.unpack('>IQ', ac.call(16))[0] == 6)
+    assert activation.match()[:3] == [0, 1, 3]
+    again = ac.call(26, string('activation-contract'))
+    assert again[len(input_data) + 16:len(input_data) + 40] == active[len(input_data) + 16:len(input_data) + 40]
+    activation.match(); activation.guard()
+    ac.call(14, operation_input('activation-publication-race'))
+    ac.call(26, string('activation-contract'), code=6)
+    activation.guard(release=True)
+    wait_for(lambda: struct.unpack('>IQ', ac.call(16))[0] == 6)
+    ac.call(26, string('activation-contract'))
+    ac.close(); activation.stop()
+    check(True, 'activation waits for FENCE publication and idempotent retries retain the original effective time and propagation deadline')
+
     validation_cache, validation_temp = root / 'validation-cache', root / 'validation-temp'
     validation_cache.mkdir(); validation_temp.mkdir()
     validation_shared = root / 'validation.shm'

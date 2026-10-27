@@ -70,15 +70,25 @@ typedef enum {
     /* root/zone/path/key/URL/host, one FD -> GET record, publication u64,
      * required Invalidate sequence u64 (zero permits ordinary reuse).
      * Registers the observed URL/host and checks all persisted aliases. */
-    NGX_HTTP_CACHE_PURGE_OP_ADMIT_FILE
+    NGX_HTTP_CACHE_PURGE_OP_ADMIT_FILE,
+    /* operation ID; requires its FENCE publication to be READY */
+    NGX_HTTP_CACHE_PURGE_OP_ACTIVATE_OPERATION
 } ngx_http_cache_purge_opcode_e;
 
 #define NGX_HTTP_CACHE_PURGE_ROOT_CACHE 1
 #define NGX_HTTP_CACHE_PURGE_ROOT_TEMP  2
+#define NGX_HTTP_CACHE_PURGE_ROOT_NATIVE 3
 typedef struct {
     ngx_http_cache_rocksdb_bytes_t path, zone;
     uint32_t                       kind;
 } ngx_http_cache_purge_root_t;
+
+typedef struct {
+    uint64_t                       token;
+    uint64_t                       inode;
+    uint32_t                       outcome;
+    ngx_http_cache_rocksdb_bytes_t root, zone, path;
+} ngx_http_cache_purge_cleanup_t;
 
 typedef struct {
     uint32_t                          abi;
@@ -150,6 +160,18 @@ int ngx_http_cache_purge_component_start(const char *path,
 int ngx_http_cache_purge_component_status(
     ngx_http_cache_purge_component_t *component,
     ngx_http_cache_purge_component_status_t *status,
+    ngx_http_cache_rocksdb_error_t *error);
+/* Creator-thread notification channel for native node accounting. Descriptor
+ * and borrowed request bytes remain owned by the component. Unregister the
+ * descriptor before requesting stop. Complete or stop ends the byte borrow. */
+int ngx_http_cache_purge_component_cleanup_fd(
+    ngx_http_cache_purge_component_t *component);
+int ngx_http_cache_purge_component_cleanup_next(
+    ngx_http_cache_purge_component_t *component,
+    ngx_http_cache_purge_cleanup_t *cleanup,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_component_cleanup_complete(
+    ngx_http_cache_purge_component_t *component, uint64_t token, int result,
     ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_component_request_stop(
     ngx_http_cache_purge_component_t *component,
@@ -609,6 +631,11 @@ int ngx_http_cache_purge_coordinator_accept(
     const ngx_http_cache_purge_operation_input_t *input, uint64_t now,
     uint32_t propagation_ms, ngx_http_cache_purge_operation_t *out,
     ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_coordinator_activate(
+    ngx_http_cache_purge_coordinator_t *coordinator,
+    ngx_http_cache_rocksdb_bytes_t id, uint64_t now,
+    ngx_http_cache_purge_operation_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
 
 #define NGX_HTTP_CACHE_PURGE_QUERY_SELECT   0
 #define NGX_HTTP_CACHE_PURGE_QUERY_PENDING  1
@@ -901,6 +928,9 @@ int ngx_http_cache_purge_publications_remove(
     const ngx_http_cache_purge_index_expected_t *file,
     int anchor_fd, int lease_fd, uint32_t peer_uid, uint32_t *outcome,
     ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_publication_inode(
+    ngx_http_cache_rocksdb_bytes_t metadata, uint64_t *inode,
     ngx_http_cache_rocksdb_error_t *error);
 
 typedef struct {

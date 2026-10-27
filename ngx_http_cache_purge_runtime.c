@@ -14,6 +14,11 @@ typedef struct {
     ngx_str_t   path;
 } ngx_http_cache_purge_shared_t;
 
+typedef struct {
+    ngx_http_file_cache_t  *cache;
+    ngx_str_t               path;
+} ngx_http_cache_purge_native_t;
+
 struct ngx_http_cache_purge_runtime_s {
     ngx_path_t                               *path;
     ngx_shm_zone_t                           *zone;
@@ -28,6 +33,8 @@ struct ngx_http_cache_purge_runtime_s {
     ngx_uint_t                                failed;
     ngx_array_t                               roots;
     ngx_array_t                               file_roots;
+    ngx_array_t                               native;
+    ngx_connection_t                         *notification;
     ngx_event_t                               owner_event;
 };
 
@@ -38,6 +45,9 @@ static ngx_int_t  ngx_http_cache_purge_runtime_shared(ngx_shm_zone_t *zone,
 static ngx_int_t
 ngx_http_cache_purge_runtime_paths(ngx_http_cache_purge_runtime_t *rt,
     ngx_log_t *log);
+static void ngx_http_cache_purge_runtime_notify(ngx_event_t *event);
+static void ngx_http_cache_purge_runtime_unlisten(
+    ngx_http_cache_purge_runtime_t *rt);
 
 ngx_flag_t
 ngx_http_cache_purge_runtime_configured(ngx_conf_t *cf)
@@ -64,6 +74,11 @@ ngx_http_cache_purge_runtime_create(ngx_conf_t *cf)
         || ngx_array_init(&rt->file_roots, cf->pool, 8,
                           sizeof(ngx_http_cache_purge_root_t))
                != NGX_OK)
+    {
+        return NULL;
+    }
+    if (ngx_array_init(&rt->native, cf->pool, 8,
+                      sizeof(ngx_http_cache_purge_native_t)) != NGX_OK)
     {
         return NULL;
     }
@@ -307,6 +322,7 @@ ngx_http_cache_purge_runtime_post(ngx_conf_t *cf)
     ngx_uint_t                         i, j;
     ngx_http_cache_purge_root_t       *registered;
     ngx_http_file_cache_t            **caches;
+    ngx_http_cache_purge_native_t     *native;
     ngx_module_t                      *module;
     ngx_command_t                     *command;
     ngx_array_t                       *configured;
@@ -395,9 +411,19 @@ ngx_http_cache_purge_runtime_post(ngx_conf_t *cf)
                 ngx_memzero(registered, sizeof(*registered));
                 registered->path.data = caches[j]->path->name.data;
                 registered->path.len = caches[j]->path->name.len;
-                registered->kind = NGX_HTTP_CACHE_PURGE_ROOT_CACHE;
+                registered->kind = NGX_HTTP_CACHE_PURGE_ROOT_NATIVE;
                 registered->zone.data = caches[j]->shm_zone->shm.name.data;
                 registered->zone.len = caches[j]->shm_zone->shm.name.len;
+                native = ngx_array_push(&rt->native);
+                if (native == NULL) {
+                    return NGX_ERROR;
+                }
+                native->cache = caches[j];
+                native->path.data = ngx_pnalloc(cf->pool, NGX_MAX_PATH);
+                if (native->path.data == NULL) {
+                    return NGX_ERROR;
+                }
+                native->path.len = 0;
             }
         }
     }
@@ -442,9 +468,11 @@ static ngx_int_t
 ngx_http_cache_purge_runtime_paths(ngx_http_cache_purge_runtime_t *rt,
     ngx_log_t *log)
 {
-    u_char      database[NGX_MAX_PATH], cache[NGX_MAX_PATH];
-    ngx_str_t   db, current, *roots;
-    ngx_uint_t  i;
+    ngx_http_cache_purge_native_t  *native;
+    u_char                          database[NGX_MAX_PATH];
+    u_char                          cache[NGX_MAX_PATH];
+    ngx_str_t                       db, current, *roots;
+    ngx_uint_t                      i;
 
     if (ngx_realpath(rt->path->name.data, database) == NULL) {
         ngx_log_error(NGX_LOG_EMERG, log, ngx_errno,
@@ -471,6 +499,15 @@ ngx_http_cache_purge_runtime_paths(ngx_http_cache_purge_runtime_t *rt,
                           &current);
             return NGX_ERROR;
         }
+    }
+    native = rt->native.elts;
+    for (i = 0; i < rt->native.nelts; i++) {
+        if (ngx_realpath(native[i].cache->path->name.data,
+                         native[i].path.data) == NULL)
+        {
+            return NGX_ERROR;
+        }
+        native[i].path.len = ngx_strlen(native[i].path.data);
     }
     return NGX_OK;
 }
@@ -550,12 +587,168 @@ ngx_http_cache_purge_runtime_module_init(ngx_cycle_t *cycle)
     return NGX_OK;
 }
 
+static int
+ngx_http_cache_purge_runtime_node(ngx_http_file_cache_t *cache,
+    const ngx_http_cache_purge_cleanup_t *cleanup, ngx_log_t *log)
+{
+    ngx_rbtree_node_t           *node, *sentinel;
+    ngx_http_file_cache_node_t  *file;
+    ngx_rbtree_key_t             key;
+    u_char                       hash[NGX_HTTP_CACHE_KEY_LEN];
+    const u_char                *p;
+    ngx_uint_t                   i;
+    ngx_int_t                    value;
+    off_t                        released, remaining;
+    int                          compare, rc;
+
+    if (cleanup->outcome == NGX_HTTP_CACHE_PURGE_REPLACED) {
+        return 0;
+    }
+    if (cleanup->path.len < 32
+        || (cleanup->path.len > 32
+            && cleanup->path.data[cleanup->path.len - 33] != '/'))
+    {
+        return NGX_HTTP_CACHE_ROCKSDB_INVALID;
+    }
+    p = cleanup->path.data + cleanup->path.len - 32;
+    for (i = 0; i < NGX_HTTP_CACHE_KEY_LEN; i++) {
+        value = ngx_hextoi((u_char *) p + 2 * i, 2);
+        if (value == NGX_ERROR) {
+            return NGX_HTTP_CACHE_ROCKSDB_INVALID;
+        }
+        hash[i] = (u_char) value;
+    }
+    ngx_memcpy(&key, hash, sizeof(key));
+    if (!ngx_shmtx_trylock(&cache->shpool->mutex)) {
+        return NGX_HTTP_CACHE_ROCKSDB_BUSY;
+    }
+    released = 0;
+    remaining = 0;
+    rc = 0;
+    node = cache->sh->rbtree.root;
+    sentinel = cache->sh->rbtree.sentinel;
+    while (node != sentinel) {
+        if (key != node->key) {
+            node = key < node->key ? node->left : node->right;
+            continue;
+        }
+        file = (ngx_http_file_cache_node_t *) node;
+        compare = ngx_memcmp(hash + sizeof(key), file->key,
+                             NGX_HTTP_CACHE_KEY_LEN - sizeof(key));
+        if (compare != 0) {
+            node = compare < 0 ? node->left : node->right;
+            continue;
+        }
+        if (!file->exists
+            || (file->uniq != 0 && (uint64_t) file->uniq != cleanup->inode))
+        {
+            break;
+        }
+        /* The executor holds the path lease. A loader or an existing reader
+         * can still finish native accounting, so retry after they drain. */
+        if (file->count != 0 || file->deleting || cache->sh->loading) {
+            rc = NGX_HTTP_CACHE_ROCKSDB_BUSY;
+            break;
+        }
+        if (file->fs_size < 0 || file->fs_size > cache->sh->size) {
+            rc = NGX_HTTP_CACHE_ROCKSDB_INVALID;
+            break;
+        }
+        released = file->fs_size;
+        cache->sh->size -= released;
+        remaining = cache->sh->size;
+        file->fs_size = 0;
+        file->exists = 0;
+        break;
+    }
+    ngx_shmtx_unlock(&cache->shpool->mutex);
+    if (released != 0) {
+        ngx_log_debug3(NGX_LOG_DEBUG_HTTP, log, 0,
+            "cache purge native cleanup inode:%uL blocks:%O size:%O",
+            cleanup->inode, released, remaining);
+    }
+    return rc;
+}
+
+static void
+ngx_http_cache_purge_runtime_notify(ngx_event_t *event)
+{
+    ngx_connection_t                *connection;
+    ngx_http_cache_purge_runtime_t  *rt;
+    ngx_http_cache_purge_native_t   *native;
+    ngx_http_cache_purge_cleanup_t   cleanup;
+    ngx_http_cache_rocksdb_error_t   error;
+    ngx_str_t                       *zone;
+    ngx_uint_t                       i;
+    int                              rc, result;
+
+    connection = event->data;
+    rt = connection->data;
+    event->ready = 0;
+    rc = ngx_http_cache_purge_component_cleanup_next(rt->component,
+                                                       &cleanup, &error);
+    if (rc == NGX_HTTP_CACHE_ROCKSDB_DONE) {
+        return;
+    }
+    if (rc == 0) {
+        result = NGX_HTTP_CACHE_ROCKSDB_INVALID;
+        native = rt->native.elts;
+        for (i = 0; i < rt->native.nelts; i++) {
+            zone = &native[i].cache->shm_zone->shm.name;
+            if (zone->len == cleanup.zone.len
+                && native[i].path.len == cleanup.root.len
+                && ngx_memcmp(zone->data, cleanup.zone.data, zone->len) == 0
+                && ngx_memcmp(native[i].path.data, cleanup.root.data,
+                              cleanup.root.len) == 0)
+            {
+                result = ngx_http_cache_purge_runtime_node(native[i].cache,
+                                                           &cleanup,
+                                                           event->log);
+                break;
+            }
+        }
+        rc = ngx_http_cache_purge_component_cleanup_complete(rt->component,
+                                        cleanup.token, result, &error);
+    }
+    if (rc != 0) {
+        rt->failed = 1;
+        ngx_log_error(NGX_LOG_ALERT, event->log, 0,
+                      "cache purge native cleanup: %s", error.message);
+        ngx_http_cache_purge_runtime_unlisten(rt);
+        (void) ngx_http_cache_purge_component_request_stop(rt->component,
+                                                           &error);
+    }
+}
+
+static void
+ngx_http_cache_purge_runtime_unlisten(ngx_http_cache_purge_runtime_t *rt)
+{
+    ngx_connection_t  *connection;
+
+    connection = rt->notification;
+    if (connection == NULL) {
+        return;
+    }
+    if (connection->read->active) {
+        (void) ngx_del_event(connection->read, NGX_READ_EVENT, NGX_CLOSE_EVENT);
+    }
+    if (connection->read->posted) {
+        ngx_delete_posted_event(connection->read);
+    }
+    ngx_free_connection(connection);
+    connection->fd = (ngx_socket_t) -1;
+    rt->notification = NULL;
+    /* The component closes its descriptor only after joining the executor. */
+}
+
 static ngx_msec_t
 ngx_http_cache_purge_runtime_tick(void *data)
 {
     ngx_http_cache_purge_runtime_t          *rt = data;
     ngx_http_cache_rocksdb_error_t           error;
     ngx_http_cache_purge_component_status_t  status;
+    ngx_connection_t                        *connection;
+    int                                      fd;
 
     if (!rt->started) {
         rt->started = 1;
@@ -573,6 +766,26 @@ ngx_http_cache_purge_runtime_tick(void *data)
             rt->failed = 1;
             ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
                           "cache purge component start: %s", error.message);
+        }
+        if (!rt->failed) {
+            fd = ngx_http_cache_purge_component_cleanup_fd(rt->component);
+            connection = ngx_get_connection(fd, ngx_cycle->log);
+            if (connection == NULL) {
+                rt->failed = 1;
+                (void) ngx_http_cache_purge_component_request_stop(
+                    rt->component, &error);
+                return 1000;
+            }
+            rt->notification = connection;
+            connection->data = rt;
+            connection->read->log = ngx_cycle->log;
+            connection->read->handler = ngx_http_cache_purge_runtime_notify;
+            if (ngx_handle_read_event(connection->read, 0) != NGX_OK) {
+                ngx_http_cache_purge_runtime_unlisten(rt);
+                rt->failed = 1;
+                (void) ngx_http_cache_purge_component_request_stop(
+                    rt->component, &error);
+            }
         }
     }
     if (rt->component && !rt->failed
@@ -596,6 +809,7 @@ ngx_http_cache_purge_worker_owner_tick(ngx_event_t *ev)
     ngx_http_cache_rocksdb_error_t   error;
 
     if (ngx_terminate || ngx_quit || ngx_exiting) {
+        ngx_http_cache_purge_runtime_unlisten(rt);
         /* Let the executor release the DB without blocking an old worker's
          * still-active HTTP connections. Join only in exit_process. */
         if (rt->component
@@ -640,6 +854,7 @@ ngx_http_cache_purge_runtime_exit(void *data)
     ngx_http_cache_purge_runtime_t  *rt = data;
     ngx_http_cache_rocksdb_error_t   error;
 
+    ngx_http_cache_purge_runtime_unlisten(rt);
     if (rt->component
         && ngx_http_cache_purge_component_stop(&rt->component, &error) != 0)
     {

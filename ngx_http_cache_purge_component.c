@@ -79,6 +79,15 @@ struct ngx_http_cache_purge_component_s {
     int                                       wake_write;
     int                                       listener;
     int                                       lease_anchor;
+    int                                       cleanup_read;
+    int                                       cleanup_write;
+    int                                       cleanup_lease;
+    int                                       cleanup_result;
+    uint32_t                                  cleanup_state;
+    ngx_http_cache_purge_cleanup_t            cleanup;
+    ngx_http_cache_purge_component_buffer_t   cleanup_buffer;
+    ngx_http_cache_rocksdb_bytes_t            cleanup_operation;
+    unsigned char                             cleanup_file[16];
     int                                       socket_owned;
     dev_t                                     socket_device;
     ino_t                                     socket_inode;
@@ -1324,6 +1333,19 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
         }
         break;
 
+    case NGX_HTTP_CACHE_PURGE_OP_ACTIVATE_OPERATION:
+        id = ngx_http_cache_purge_component_string(&d, 128);
+        rc = ngx_http_cache_purge_component_end(&d);
+        if (rc == 0) {
+            now = ngx_http_cache_purge_component_now(CLOCK_REALTIME);
+            rc = ngx_http_cache_purge_coordinator_activate(c->coordinator,
+                                              id, now, &operation, error);
+        }
+        if (rc == 0) {
+            ngx_http_cache_purge_component_put_operation(e, &operation);
+        }
+        break;
+
     case NGX_HTTP_CACHE_PURGE_OP_GET_CONTROL_STATUS:
         if ((rc = ngx_http_cache_purge_component_end(&d)) != 0) {
             break;
@@ -1911,6 +1933,87 @@ ngx_http_cache_purge_component_checkpoint(ngx_http_cache_purge_component_t *c,
 }
 
 static int
+ngx_http_cache_purge_component_queue_cleanup(
+    ngx_http_cache_purge_component_t *c,
+    const ngx_http_cache_purge_operation_t *op,
+    const ngx_http_cache_purge_index_file_t *file,
+    uint32_t outcome, int *lease, int *waiting,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_rocksdb_bytes_t  fields[4], *target[4];
+    unsigned char                   *p;
+    size_t                            i, size;
+    ssize_t                           written;
+    int                               native, rc;
+
+    *waiting = 0;
+    native = 0;
+    for (i = 0; i < c->options.root_count; i++) {
+        native |= c->roots[i].kind == NGX_HTTP_CACHE_PURGE_ROOT_NATIVE
+                  && c->roots[i].zone.len == file->zone.len
+                  && memcmp(c->roots[i].zone.data, file->zone.data,
+                            file->zone.len) == 0;
+    }
+    if (!native) {
+        return 0;
+    }
+    if (ngx_http_cache_purge_component_load32(&c->cleanup_state) != 0
+        || c->cleanup.token == UINT64_MAX)
+    {
+        return ngx_http_cache_purge_component_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_BUSY, "native cleanup slot unavailable");
+    }
+    rc = ngx_http_cache_purge_publication_inode(file->metadata,
+                                                   &c->cleanup.inode, error);
+    if (rc != 0) {
+        return rc;
+    }
+    fields[0] = file->root;
+    fields[1] = file->zone;
+    fields[2] = file->path;
+    fields[3] = op->input.id;
+    target[0] = &c->cleanup.root;
+    target[1] = &c->cleanup.zone;
+    target[2] = &c->cleanup.path;
+    target[3] = &c->cleanup_operation;
+    size = 0;
+    for (i = 0; i < 4; i++) {
+        if (fields[i].len > 131072 - size) {
+            return ngx_http_cache_purge_component_error(error,
+                NGX_HTTP_CACHE_ROCKSDB_LIMIT, "native cleanup exceeds budget");
+        }
+        size += fields[i].len;
+    }
+    rc = ngx_http_cache_purge_component_buffer_size(&c->cleanup_buffer,
+                                                   size, 131072, 0, error);
+    if (rc != 0) {
+        return rc;
+    }
+    p = c->cleanup_buffer.data;
+    for (i = 0; i < 4; i++) {
+        target[i]->data = p;
+        target[i]->len = fields[i].len;
+        memcpy(p, fields[i].data, fields[i].len);
+        p += fields[i].len;
+    }
+    memcpy(c->cleanup_file, file->id, 16);
+    c->cleanup.outcome = outcome;
+    c->cleanup.token++;
+    c->cleanup_lease = *lease;
+    *lease = -1;
+    ngx_http_cache_purge_component_store32(&c->cleanup_state, 1);
+    do {
+        written = write(c->cleanup_write, "n", 1);
+    } while (written < 0 && errno == EINTR);
+    if (written != 1 && (written >= 0 || errno != EAGAIN)) {
+        return ngx_http_cache_purge_component_io(error,
+                                                "notify native cache cleanup");
+    }
+    *waiting = 1;
+    return 0;
+}
+
+static int
 ngx_http_cache_purge_component_process_file(ngx_http_cache_purge_component_t *c,
     const ngx_http_cache_purge_operation_t *op, uint64_t now,
     ngx_http_cache_rocksdb_error_t *error)
@@ -1926,7 +2029,7 @@ ngx_http_cache_purge_component_process_file(ngx_http_cache_purge_component_t *c,
     unsigned char                             digest[16], *path;
     uint64_t                                  offset;
     uint32_t                                  outcome;
-    int                                       pending, lease, rc;
+    int                                       pending, lease, rc, waiting;
 
     memset(&d, 0, sizeof(d));
     memset(&expected, 0, sizeof(expected));
@@ -1936,6 +2039,7 @@ ngx_http_cache_purge_component_process_file(ngx_http_cache_purge_component_t *c,
     path = NULL;
     lease = -1;
     pending = 0;
+    waiting = 0;
     if (op->bookmark.len != 0) {
         if (op->bookmark.len < 33
             || memcmp(op->bookmark.data, "NDW1", 4) != 0)
@@ -1962,6 +2066,19 @@ ngx_http_cache_purge_component_process_file(ngx_http_cache_purge_component_t *c,
     } else if (op->pending || op->failed || op->checkpoint_id) {
         return ngx_http_cache_purge_component_error(error,
             NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "missing purge checkpoint");
+    }
+
+    if (ngx_http_cache_purge_component_load32(&c->cleanup_state) == 2) {
+        if (!pending || memcmp(expected.id, c->cleanup_file, 16) != 0) {
+            return ngx_http_cache_purge_component_error(error,
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                "native cleanup does not match pending instance");
+        }
+        rc = ngx_http_cache_purge_component_error(error, c->cleanup_result,
+            c->cleanup_result == 0 ? "" : "native cache node is not drained");
+        ngx_http_cache_purge_component_close(&c->cleanup_lease);
+        ngx_http_cache_purge_component_store32(&c->cleanup_state, 0);
+        goto done;
     }
 
     if (!pending) {
@@ -2064,11 +2181,18 @@ ngx_http_cache_purge_component_process_file(ngx_http_cache_purge_component_t *c,
             c->operations.store, &expected, c->lease_anchor, lease,
             c->options.client_uid, &outcome, &match, error);
     }
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_component_queue_cleanup(c, op, &file,
+            outcome, &lease, &waiting, error);
+    }
 
 done:
     free(path);
     ngx_http_cache_purge_component_close(&lease);
     ngx_http_cache_purge_index_file_free(&file);
+    if (waiting) {
+        return 0;
+    }
     if (rc == 0) {
         return ngx_http_cache_purge_component_checkpoint(c, op, NULL,
             cursor, 0, 1, 0, now, "", error);
@@ -2155,11 +2279,15 @@ ngx_http_cache_purge_component_work(ngx_http_cache_purge_component_t *c,
 {
     ngx_http_cache_purge_operation_page_t     page;
     ngx_http_cache_purge_operation_t         *op;
+    ngx_http_cache_purge_operation_t          cleanup;
     ngx_http_cache_rocksdb_bytes_t            after;
     uint64_t                                  now;
     int                                       rc;
 
     c->work_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 1000;
+    if (ngx_http_cache_purge_component_load32(&c->cleanup_state) == 1) {
+        return 0;
+    }
     if (c->coordinator == NULL
         || ngx_http_cache_purge_component_load32(&c->control_state)
            != NGX_HTTP_CACHE_PURGE_COORD_READY)
@@ -2170,6 +2298,19 @@ ngx_http_cache_purge_component_work(ngx_http_cache_purge_component_t *c,
     if (now == 0 || now > UINT64_MAX - 1000) {
         return ngx_http_cache_purge_component_error(error,
             NGX_HTTP_CACHE_ROCKSDB_IO, "invalid background task clock");
+    }
+    if (ngx_http_cache_purge_component_load32(&c->cleanup_state) == 2) {
+        rc = ngx_http_cache_purge_operations_get(&c->operations,
+            c->cleanup_operation, &cleanup, error);
+        if (rc == 0) {
+            rc = ngx_http_cache_purge_component_process_file(c, &cleanup,
+                                                               now, error);
+        }
+        ngx_http_cache_purge_operation_free(&cleanup);
+        if (rc == 0) {
+            c->work_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC);
+        }
+        return rc;
     }
     after.data = c->work_after;
     after.len = c->work_after_len;
@@ -2323,7 +2464,9 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
                 return rc;
             }
         }
-        if (now >= c->work_at) {
+        if (now >= c->work_at
+            || ngx_http_cache_purge_component_load32(&c->cleanup_state) == 2)
+        {
             rc = ngx_http_cache_purge_component_work(c, error);
             if (rc != 0) {
                 return rc;
@@ -2497,6 +2640,11 @@ ngx_http_cache_purge_component_run(void *data)
     }
     /* Remove the rendezvous socket before releasing the database owner lock. */
     ngx_http_cache_purge_component_remove_socket(c);
+    if (ngx_http_cache_purge_component_load32(&c->stopping)) {
+        /* The creator has detached its event consumer before requesting stop.
+         * Release the pending path before handing the DB to a new worker. */
+        ngx_http_cache_purge_component_close(&c->cleanup_lease);
+    }
     ngx_http_cache_purge_component_close(&c->lease_anchor);
     if (c->publications != NULL) {
         rc = ngx_http_cache_purge_publications_close(&c->publications, &error);
@@ -2527,6 +2675,10 @@ ngx_http_cache_purge_component_owner(ngx_http_cache_purge_component_t *c)
 static void
 ngx_http_cache_purge_component_destroy(ngx_http_cache_purge_component_t *c)
 {
+    ngx_http_cache_purge_component_close(&c->cleanup_lease);
+    ngx_http_cache_purge_component_close(&c->cleanup_read);
+    ngx_http_cache_purge_component_close(&c->cleanup_write);
+    ngx_http_cache_purge_component_buffer_free(&c->cleanup_buffer);
     ngx_http_cache_purge_component_close(&c->wake_read);
     ngx_http_cache_purge_component_close(&c->wake_write);
     free(c->peers);
@@ -2621,9 +2773,9 @@ ngx_http_cache_purge_component_start(const char *path,
             || root->path.data[0] != '/'
             || memchr(root->path.data, 0, root->path.len)
             || (root->zone.len && memchr(root->zone.data, 0, root->zone.len))
-            || (root->kind != NGX_HTTP_CACHE_PURGE_ROOT_CACHE
-                && root->kind != NGX_HTTP_CACHE_PURGE_ROOT_TEMP)
-            || (root->kind == NGX_HTTP_CACHE_PURGE_ROOT_CACHE
+            || (root->kind < NGX_HTTP_CACHE_PURGE_ROOT_CACHE
+                || root->kind > NGX_HTTP_CACHE_PURGE_ROOT_NATIVE)
+            || (root->kind != NGX_HTTP_CACHE_PURGE_ROOT_TEMP
                 && !root->zone.len))
         {
             return ngx_http_cache_purge_component_error(
@@ -2646,6 +2798,9 @@ ngx_http_cache_purge_component_start(const char *path,
     c->wake_write = -1;
     c->listener = -1;
     c->lease_anchor = -1;
+    c->cleanup_read = -1;
+    c->cleanup_write = -1;
+    c->cleanup_lease = -1;
     c->pid = getpid();
     c->creator = pthread_self();
     c->state = NGX_HTTP_CACHE_PURGE_COMPONENT_STARTING;
@@ -2711,6 +2866,21 @@ ngx_http_cache_purge_component_start(const char *path,
     rc = ngx_http_cache_purge_component_nonblocking(c->wake_read, error);
     if (rc == 0) {
         rc = ngx_http_cache_purge_component_nonblocking(c->wake_write, error);
+    }
+    if (rc != 0) {
+        goto failed;
+    }
+    if (pipe(descriptors) != 0) {
+        rc = ngx_http_cache_purge_component_io(error,
+                                               "component notification pipe");
+        goto failed;
+    }
+    c->cleanup_read = descriptors[0];
+    c->cleanup_write = descriptors[1];
+    rc = ngx_http_cache_purge_component_nonblocking(c->cleanup_read, error);
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_component_nonblocking(c->cleanup_write,
+                                                         error);
     }
     if (rc != 0) {
         goto failed;
@@ -2783,6 +2953,70 @@ ngx_http_cache_purge_component_status(ngx_http_cache_purge_component_t *c,
     status->control_publication =
         ngx_http_cache_purge_component_load64(&c->control_publication);
     return 0;
+}
+
+int
+ngx_http_cache_purge_component_cleanup_fd(ngx_http_cache_purge_component_t *c)
+{
+    return ngx_http_cache_purge_component_owner(c) ? c->cleanup_read : -1;
+}
+
+int
+ngx_http_cache_purge_component_cleanup_next(ngx_http_cache_purge_component_t *c,
+    ngx_http_cache_purge_cleanup_t *out, ngx_http_cache_rocksdb_error_t *error)
+{
+    unsigned char  buffer[64];
+    ssize_t        n;
+
+    if (!ngx_http_cache_purge_component_owner(c) || out == NULL) {
+        return ngx_http_cache_purge_component_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_OWNER, "invalid cleanup consumer");
+    }
+    memset(out, 0, sizeof(*out));
+    do {
+        n = read(c->cleanup_read, buffer, sizeof(buffer));
+    } while (n > 0 || (n < 0 && errno == EINTR));
+    if (n == 0 || errno != EAGAIN) {
+        return ngx_http_cache_purge_component_io(error,
+                                                "read cleanup notification");
+    }
+    if (ngx_http_cache_purge_component_load32(&c->cleanup_state) != 1) {
+        return ngx_http_cache_purge_component_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_DONE, "no native cleanup request");
+    }
+    if (ngx_http_cache_purge_component_load32(&c->stopping)) {
+        return ngx_http_cache_purge_component_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_DONE, "cleanup consumer is stopping");
+    }
+    *out = c->cleanup;
+    return ngx_http_cache_purge_component_error(error, 0, "");
+}
+
+int
+ngx_http_cache_purge_component_cleanup_complete(
+    ngx_http_cache_purge_component_t *c, uint64_t token, int result,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    if (!ngx_http_cache_purge_component_owner(c)) {
+        return ngx_http_cache_purge_component_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_OWNER, "invalid cleanup consumer");
+    }
+    if (ngx_http_cache_purge_component_load32(&c->cleanup_state) != 1
+        || token != c->cleanup.token)
+    {
+        return ngx_http_cache_purge_component_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "stale native cleanup reply");
+    }
+    if (result != 0 && result != NGX_HTTP_CACHE_ROCKSDB_BUSY
+        && result != NGX_HTTP_CACHE_ROCKSDB_INVALID)
+    {
+        return ngx_http_cache_purge_component_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid native cleanup result");
+    }
+    c->cleanup_result = result;
+    ngx_http_cache_purge_component_store32(&c->cleanup_state, 2);
+    ngx_http_cache_purge_component_wake(c);
+    return ngx_http_cache_purge_component_error(error, 0, "");
 }
 
 int
@@ -5817,5 +6051,54 @@ ngx_http_cache_purge_coordinator_accept(ngx_http_cache_purge_coordinator_t *c,
 
 done:
     ngx_http_cache_purge_operation_free(&preview);
+    return rc;
+}
+
+int
+ngx_http_cache_purge_coordinator_activate(
+    ngx_http_cache_purge_coordinator_t *c, ngx_http_cache_rocksdb_bytes_t id,
+    uint64_t now, ngx_http_cache_purge_operation_t *out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_operation_t  before;
+    int                               rc;
+
+    if (out == NULL) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "null activation output");
+    }
+    memset(out, 0, sizeof(*out));
+    rc = ngx_http_cache_purge_control_coordinator_owner(c, error);
+    if (rc != 0) {
+        return rc;
+    }
+    rc = ngx_http_cache_purge_operations_get(&c->operations, id, &before,
+                                               error);
+    if (rc != 0) {
+        return rc;
+    }
+    if (c->state != NGX_HTTP_CACHE_PURGE_COORD_READY
+        || before.sequence > c->expected.last_sequence)
+    {
+        ngx_http_cache_purge_operation_free(&before);
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_BUSY, "activation awaits FENCE publication");
+    }
+    if (before.stage != NGX_HTTP_CACHE_PURGE_PREPARING) {
+        *out = before;
+        return 0;
+    }
+    rc = ngx_http_cache_purge_operations_activate(&c->operations, id,
+        before.revision, now, out, error);
+    ngx_http_cache_purge_operation_free(&before);
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_coordinator_refresh(c, error);
+    } else {
+        /* Activation write errors are ambiguous; recover from the ledger. */
+        (void) ngx_http_cache_purge_control_load_begin(c, NULL);
+    }
+    if (rc != 0) {
+        ngx_http_cache_purge_operation_free(out);
+    }
     return rc;
 }
