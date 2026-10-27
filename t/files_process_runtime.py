@@ -248,6 +248,8 @@ def background_delete(cut):
                 assert process.stdout.readline().strip() == expected
             request = until(native)
             assert operation('independent')['pending'] == 1
+            raw = rpc(2, (6).to_bytes(16, 'big'))
+            rpc(7, b'\x01' + (6).to_bytes(16, 'big') + raw[1:9], code=4)
             assert not (root / 'cache-b/a/other').exists()
             assert len(rpc(1)) == 72
             ack('z', 'ACK 7')
@@ -278,15 +280,31 @@ def background_delete(cut):
             # A busy consumer releases its file lease and retries; the exact
             # retired instance remains in the durable task checkpoint.
             completed = 0
+            seen = {}
+            restarted_collection = False
             while True:
                 request = until(lambda: native() or
-                                ('done' if operation()['done'] and operation('independent')['done'] else None))
+                                ('done' if operation()['stage'] == operation('independent')['stage'] == 4
+                                 and rpc(10, b'\0' * 4 + b'\x01')[0] == 0 else None))
                 if request == 'done': break
                 assert int(request[3]) > 0 and request[5] in ('a/first', 'a/second', 'a/other')
+                number = {'a/first': 1, 'a/second': 2, 'a/other': 6}[request[5]]
+                raw = rpc(2, number.to_bytes(16, 'big'))
+                rpc(7, b'\x01' + number.to_bytes(16, 'big') + raw[1:9], code=4)
+                if seen.get(request[5], 0) == 1 and not restarted_collection:
+                    # The task checkpoint has released this ID; the retired
+                    # queue alone must recover an unacknowledged GC removal.
+                    assert raw[0] == 3
+                    stop(kill=True)
+                    start()
+                    assert rpc(2, number.to_bytes(16, 'big'))[0] == 3
+                    restarted_collection = True
+                    continue
+                seen[request[5]] = seen.get(request[5], 0) + 1
                 ack('y')
                 completed += 1
-                assert completed <= 4
-            assert completed == 3
+                assert completed <= 6
+            assert completed == 6 and set(seen.values()) == {2} and restarted_collection, seen
             assert not first.exists() and not (root / 'cache-b/a/second').exists()
             assert (root / 'cache/a/fresh').exists()
             stop()
@@ -373,11 +391,11 @@ def background_delete(cut):
             elif cut == 'retired':
                 assert operation()['pending'] == 1 and operation()['failed'] == 1
                 os.chmod(first.parent, 0o700)
-            until(lambda: operation()['done'])
+            until(lambda: operation()['stage'] == 4)
             final = operation()
             # Visits count processing attempts, including busy/error retries and
             # the replacement's separate ID; they are not a deletion total.
-            assert final['stage'] == 3 and final['visits'] >= (4 if cut == 'replaced' else 3), (cut, final)
+            assert final['stage'] == 4 and final['visits'] >= (4 if cut == 'replaced' else 3), (cut, final)
             assert not final['pending'] and not final['failed'], (cut, final)
             assert not (root / 'cache-b/a/second').exists()
             assert first.exists() == (cut == 'replaced')
@@ -395,7 +413,7 @@ def background_delete(cut):
     assert not any(word in diagnostics for word in ('AddressSanitizer', 'LeakSanitizer', 'runtime error:')), diagnostics
     checks.append('native cleanup notification survives owner death, rejects stale replies, retries busy consumers and preserves durable per-file progress' if cut == 'native' else
                   'background Invalidate waits for origins and durable intents, resumes after owner death, retires FENCE while retaining PROPAGATE and rejects delayed old writes' if cut == 'invalidate' else
-                  'background Delete survives ' + cut + ' restart, handles both zones, preserves new entities and retains the FENCE')
+                  'background Delete survives ' + cut + ' restart, handles both zones, preserves new entities and retires the FENCE')
 
 if a.component:
     for cut in ('lease', 'retired', 'replaced', 'invalidate', 'native'):

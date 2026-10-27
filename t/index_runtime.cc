@@ -418,7 +418,7 @@ ngx_http_cache_purge_test_host_migration(const std::string &path)
         raw_write(store, cf, damaged, "broken object");
         fails(
             NGX_HTTP_CACHE_ROCKSDB_CORRUPT, [&] { Index interrupted(store); });
-        check(ngx_http_cache_purge_test_raw(store, "M:index") == "4"
+        check(ngx_http_cache_purge_test_raw(store, "M:index") == "5"
                   && ngx_http_cache_purge_test_raw(store, "M:host-cursor")
                          == "O"
                                 + std::string(reinterpret_cast<const char *>(
@@ -539,6 +539,50 @@ ngx_http_cache_purge_test_validation_policy(const std::string &path)
                   store, &expected, &policy, &error)
                   == NGX_HTTP_CACHE_ROCKSDB_BUSY,
             "pending replacement excludes policy mutation");
+        check(ngx_http_cache_purge_index_require_delete(
+                  store, &expected, &policy, &error)
+                  == 0,
+            "pending replacement retains a deferred Delete requirement");
+        policy.sequence = 11;
+        check(ngx_http_cache_purge_index_require_delete(
+                  store, &expected, &policy, &error)
+                  == 0,
+            "a later Delete advances the sparse queue");
+        policy.sequence = 9;
+        check(ngx_http_cache_purge_index_require_delete(
+                  store, &expected, &policy, &error)
+                      == 0
+                  && ngx_http_cache_purge_index_delete_requirement(
+                         store, &expected, &found, &error)
+                         == 0
+                  && found.sequence == 11,
+            "old admission cannot lower a queued Delete");
+        check(ngx_http_cache_purge_index_clear_delete(
+                  store, &expected, &policy, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "stale cancellation cannot erase a newer Delete");
+        check(ngx_http_cache_purge_index_clear_delete(
+                  store, &expected, &found, &error)
+                  == 0,
+            "cancel only the exact queued requirement");
+        check(ngx_http_cache_purge_index_require_delete(
+                  store, &expected, &policy, &error)
+                  == 0,
+            "requeue deferred Delete for restart");
+        ngx_http_cache_purge_query_t *queued = nullptr;
+        ngx_http_cache_purge_index_match_t item{};
+        check(ngx_http_cache_purge_query_open(store, nullptr,
+                  NGX_HTTP_CACHE_PURGE_QUERY_DELETE, {}, &queued, &error)
+                      == 0
+                  && ngx_http_cache_purge_query_step(queued, 32, &item, &error)
+                         == 0
+                  && std::memcmp(item.id, original.id.data(), 16) == 0
+                  && item.revision == 2
+                  && ngx_http_cache_purge_query_step(queued, 32, &item, &error)
+                         == NGX_HTTP_CACHE_ROCKSDB_DONE,
+            "bounded Delete query visits only the queued file");
+        check(ngx_http_cache_purge_query_close(&queued, &error) == 0,
+            "close Delete queue cursor");
         index.abort_prepare(replacement.id, 1);
         index.collect_file(replacement.id, 2);
         expected.revision = index
@@ -565,6 +609,11 @@ ngx_http_cache_purge_test_validation_policy(const std::string &path)
                   && found.sequence == 9
                   && std::memcmp(found.ledger, policy.ledger, 16) == 0,
             "schema v2 upgrades and persistent policy survives reopen");
+        check(ngx_http_cache_purge_index_delete_requirement(
+                  store, &expected, &found, &error)
+                      == 0
+                  && found.sequence == 9,
+            "deferred Delete survives metadata changes and reopen");
         raw_write(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, row, "bad");
         check(ngx_http_cache_purge_index_validation_requirement(
                   store, &expected, &found, &error)
@@ -582,6 +631,9 @@ ngx_http_cache_purge_test_validation_policy(const std::string &path)
         auto keys = raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT);
         check(std::find(keys.begin(), keys.end(), row) == keys.end(),
             "file collection also removes its sparse policy row");
+        check(std::find(keys.begin(), keys.end(), "d" + row.substr(1))
+                  == keys.end(),
+            "file collection removes the deferred Delete row");
     }
     check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
         "close recovered policy database");

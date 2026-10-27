@@ -640,6 +640,7 @@ int ngx_http_cache_purge_coordinator_activate(
 #define NGX_HTTP_CACHE_PURGE_QUERY_SELECT   0
 #define NGX_HTTP_CACHE_PURGE_QUERY_PENDING  1
 #define NGX_HTTP_CACHE_PURGE_QUERY_RETIRED  2
+#define NGX_HTTP_CACHE_PURGE_QUERY_DELETE   3
 
 typedef struct ngx_http_cache_purge_query_s  ngx_http_cache_purge_query_t;
 
@@ -755,6 +756,21 @@ int ngx_http_cache_purge_index_validation_requirement(
     ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_expected_t *file,
     ngx_http_cache_purge_watermark_t *required,
+    ngx_http_cache_rocksdb_error_t *error);
+/* Deferred Delete survives an overlapping path writer. It keeps the selected
+ * instance and accepted requirement durable without changing its revision. */
+int ngx_http_cache_purge_index_require_delete(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file,
+    const ngx_http_cache_purge_watermark_t *required,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_delete_requirement(
+    ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file,
+    ngx_http_cache_purge_watermark_t *required,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_clear_delete(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file,
+    const ngx_http_cache_purge_watermark_t *required,
     ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_update(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_expected_t *file,

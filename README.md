@@ -66,9 +66,8 @@ and empty URL/key branches. Every yield releases its snapshot and saves a resume
 position; it does not retain all matching files in memory. These are work-unit
 bounds, not hard latency bounds for filesystem or database I/O. A file failure
 currently pauses that task at its pending instance while other tasks continue.
-Enumeration completion leaves Delete DRAINING with its FENCE retained; deferred
-cleanup and Delete retirement remain pending. An active Invalidate
-automatically retires its FENCE after file processing finishes, no old or unknown
+Active Invalidate and Delete tasks automatically retire their FENCE after file
+processing finishes, no old or unknown
 origin registrations remain, and the durable file-intent catalog is empty.
 The checks and retirement run in one executor step. Retirement atomically raises
 the durable write floor, so delayed old publications are rejected, then republishes
@@ -76,6 +75,16 @@ the control image through the existing reader gate. Per-file and selector
 requirements still enforce validation after FENCE removal. PROPAGATE keeps its
 independent deadline. Even a newer unrelated file intent conservatively delays
 retirement; retries neither scan all pending metadata nor rewrite checkpoints.
+Admission of an old entity under a newly observed URL or host alias persists a
+sparse Delete requirement before rejecting reuse. The executor drains that queue
+and the retired-file queue in bounded passes, preserving path writers and file
+IDs referenced by unfinished tasks. Native cleanup requires worker acknowledgement
+before index collection. Busy entries remain durable and do not block other
+entries; completed passes back off for one second. A new full entity can satisfy
+Delete, while a 304 alone cannot. Retired file IDs are diagnostic handles and
+may disappear after collection; operation receipts remain durable. Task completion
+covers its enumeration and drain, while subsequently discovered aliases use the
+persistent selector requirements and independent deferred cleanup queue.
 Acceptance still returns PREPARING. Internal IPC can now activate a task only
 after its FENCE publication is READY; retries preserve the effective time and
 propagation deadline. Activation republishes its updated controls, so callers
@@ -194,8 +203,9 @@ The existing worker executor resumes the bounded scan from durable checkpoints.
 Admission checks that requirement even when no resident rule remains; successful
 conditional validation satisfies it without replacing the entity. Requirements
 are monotonic within one ledger and are collected with their retired file.
-Index schema 4 upgrades schemas 1/2/3 from existing index records; older readers
-reject it instead of ignoring newer requirements or host relationships.
+Index schema 5 upgrades schemas 1/2/3/4 from existing index records; the 4-to-5
+upgrade only changes the schema marker and adds no full scan. Older readers
+reject it instead of ignoring deferred Delete, validation or host requirements.
 
 Persistent selector requirements also survive resident-rule retirement. The
 operation ledger retains the latest Invalidate and Delete sequence independently

@@ -975,9 +975,10 @@ try:
     validating = Component(validating.path, shared=validation_shared,
                            roots=(validation_cache, validation_temp))
     validating.opened(); v = Client(validating.path)
-    wait_for(lambda: v.call(2, identity(633))[0] == 3)
-    assert os.getxattr(target, 'user.ngx_cache_purge.id')[7] == 1
-    check(True, 'automatic recovery applies the same old-instance FENCE check without a FINISH request')
+    wait_for(lambda: not target.exists())
+    v.call(2, identity(633), code=1)
+    assert 633 not in v.page(1, 'https://a.test/late-tag')[0]
+    check(True, 'automatic recovery rejects and collects the abandoned old instance without a FINISH request')
 
     wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
     watermark = validating.watermark()
@@ -1028,8 +1029,10 @@ try:
     wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
     assert v.finish_file(652, pending[0][2])[-1] == 3
     os.close(pending[0][2])
-    wait_for(lambda: v.call(2, identity(653))[0] == 3)
-    assert all(os.getxattr(path, 'user.ngx_cache_purge.id')[7] == 1 for _, path, _ in pending)
+    wait_for(lambda: all(not path.exists() for _, path, _ in pending))
+    for n, _, _ in pending:
+        wait_for(lambda: n not in v.page(1, f'https://a.test/pending-{n}')[0])
+        v.call(2, identity(n), code=1)
     check(True, 'persisted retirement floor rejects explicit FINISH and automatic recovery after the matching FENCE is removed')
 
     lease = v.lease(str(target), target=(str(validation_cache), 'zone-a', 'a/00/651'), previous=651)
@@ -1061,6 +1064,35 @@ try:
     assert v.finish_file(654, lease)[-1] == 2
     os.close(fd); os.close(lease)
     check(True, 'queued old or unknown PREPARE cannot resurrect retired work; a current full entity remains publishable')
+
+    target, lease, selected = make_validation_file(655, '/late-delete-alias', metadata=current_origin)
+    validation_operation('late-delete-alias', 1, 'https://a.test/new-delete-alias')
+    wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+    v.call(26, string('late-delete-alias'))
+    # Empty enumeration can finish while the unrelated old entity remains.
+    wait_for(lambda: v.call(15, string('late-delete-alias'))[len(
+        string('late-delete-alias') + b'\x02' + struct.pack('>Q', 1000) + b'\x01'
+        + string('https://a.test/new-delete-alias') + string('') + string('validation-test')) + 40] == 4)
+    wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+    address = (str(validation_cache), 'zone-a', 'a/00/655')
+    key = 'team\x1fhttps\x1fa.test\x1f/late-delete-alias\x1f'
+    v.admit_file(address, key, 'https://a.test/new-delete-alias', selected, code=7)
+    # A path lease keeps the newly queued Delete durable across owner death.
+    time.sleep(1.1)
+    assert target.exists() and v.call(2, identity(655))[0] == 2
+    v.close(); validating.process.kill(); validating.process.wait(timeout=5)
+    validating = Component(validating.path, shared=validation_shared,
+                           roots=(validation_cache, validation_temp))
+    validating.opened(); v = Client(validating.path)
+    wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+    assert target.exists()
+    os.close(lease); os.close(selected)
+    wait_for(lambda: not target.exists())
+    wait_for(lambda: v.page(1, 'https://a.test/new-delete-alias')[0] == [])
+    v.call(2, identity(655), code=1)
+    check(True, 'late URL aliases after FENCE retirement queue durable Delete, survive owner death and are collected after the path lease drains')
+
+    current_origin = validating.watermark()
 
     target, lease, selected = make_validation_file(660, '/remove', metadata=current_origin)
     original = v.call(2, identity(660)); contents = target.read_bytes()
@@ -1133,9 +1165,10 @@ try:
     os.close(lease)
     target = validation_cache / 'a/00/652'
     lease = v.lease(str(target))
-    assert v.remove_file(652, lease, revision=2)[:4] == struct.pack('>I', 1)
+    v.remove_file(652, lease, revision=2, code=1)
+    assert not target.exists()
     os.close(lease)
-    check(True, 'physical removal accepts completed validation receipts and retired PREPARED-marker candidates')
+    check(True, 'physical removal accepts validation receipts and collected PREPARED-marker instances stay absent')
     v.close(); validating.stop()
 finally:
     for component in processes:

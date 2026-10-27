@@ -369,7 +369,7 @@ class Decode:
     def number(self, n): return int.from_bytes(self.take(n), 'big')
     def string(self): return self.take(self.number(4))
     def end(self): assert self.at == len(self.data)
-def rpc(op, payload=b'', fds=(), receive_fd=False):
+def rpc(op, payload=b'', fds=(), receive_fd=False, codes=(0,)):
     with socket.socket(socket.AF_UNIX) as s:
         s.settimeout(8); s.connect(str(run / 'index/component.sock'))
         packet = struct.pack('>4sHHQII', b'NCP1', 1, op, 1, len(payload), 0) + payload
@@ -394,16 +394,20 @@ def rpc(op, payload=b'', fds=(), receive_fd=False):
                 assert len(received) == 1 and not flags & socket.MSG_CTRUNC
             magic, version, operation, ident, length, result = struct.unpack('>4sHHQII', first + read(24 - len(first)))
             body = read(length)
-            assert (magic, version, operation, ident, result) == (b'NCP1', 1, op, 1, 0), (result, body)
+            assert (magic, version, operation, ident) == (b'NCP1', 1, op, 1)
+            assert result in codes, (result, body)
+            if result != 0: return None
             return (body, received.pop()) if receive_fd else body
         finally:
             for fd in received: os.close(fd)
 
-def physical_remove(item, outcome=1):
+def physical_remove(item, outcome=1, collected=False):
     path = Path(os.fsdecode(item['root'])) / os.fsdecode(item['path'])
     _, lease = rpc(17, string(str(path)), receive_fd=True)
     try:
-        removed = rpc(24, item['id'] + struct.pack('>Q', item['revision']), (lease,))
+        removed = rpc(24, item['id'] + struct.pack('>Q', item['revision']), (lease,),
+                      codes=(0, 1) if collected else (0,))
+        if removed is None: return
         assert len(removed) == 29 and removed[:4] == struct.pack('>I', outcome)
         assert removed[4:20] == item['id'] and removed[-1] == 3
     finally:
@@ -418,14 +422,20 @@ def records(path, count):
     found = until(lambda: (v if len(v := query('http://cache.test' + path)) == count
                            and all(item[2] == 2 for item in v) else None))
     return [record(item[0]) for item in found]
-def record(ident):
-    d = Decode(rpc(2, ident)); state, revision = d.number(1), d.number(8); assert d.take(16) == ident
+def record(ident, optional=False):
+    raw = rpc(2, ident, codes=(0, 1) if optional else (0,))
+    if raw is None: return None
+    d = Decode(raw); state, revision = d.number(1), d.number(8); assert d.take(16) == ident
     names = ('key', 'url', 'host', 'namespace', 'root', 'zone', 'path', 'range', 'vary')
     result = {name: d.string() for name in names}
     result.update(id=ident, state=state, revision=revision, metadata=d.string())
     result['tags'] = [d.string() for _ in range(d.number(1))]
     result['flags'] = d.take(2); result['components'] = [d.string() for _ in range(6)]; d.end()
     return result
+
+def retired(ident):
+    item = record(ident, optional=True)
+    return item is None or item['state'] == 3
 def pending():
     return rpc(9, string('') + bytes([32]))[0]
 
@@ -535,7 +545,9 @@ try:
     assert get('/remove-native') == (200, 'MISS', b'new-after-removal')
     assert get('/remove-native?z=b') == (200, 'MISS', b'new-after-removal')
     replacements = records('/remove-native', 2)
-    for item in removed_instances: physical_remove(record(item['id']), outcome=3)
+    for item in removed_instances:
+        previous = record(item['id'], optional=True)
+        if previous is not None: physical_remove(previous, outcome=3, collected=True)
     assert {item['id'] for item in records('/remove-native', 2)} == {item['id'] for item in replacements}
     assert get('/remove-native') == (200, 'HIT', b'new-after-removal')
     assert get('/remove-native?z=b') == (200, 'HIT', b'new-after-removal')
@@ -656,11 +668,8 @@ try:
     until(lambda: (run / 'index/component.sock').exists())
     until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
     for name, mode, *_ in late_alias_cases + late_host_cases:
-        until(lambda name=name, mode=mode: materialization_done(name, 0, 4 if mode == 1 else 3))
+        until(lambda name=name: materialization_done(name, 0, 4))
     stop(process)
-    for name, *_ in late_alias_cases + late_host_cases:
-        subprocess.run([str(a.libraries / 'cache_purge_files_test'), '--retire-empty-fixture',
-                        str(run / 'index'), name], check=True, timeout=15, stdout=subprocess.DEVNULL)
     process = start()
     until(lambda: (run / 'index/component.sock').exists())
     until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
@@ -723,7 +732,7 @@ try:
         done = d.number(1); d.number(8); d.number(8)
         pending, failed = d.number(8), d.number(8)
         d.number(8); d.string(); d.end()
-        return stage == 3 and done and not pending and not failed
+        return stage == 4 and done and not pending and not failed
     until(background_done)
     cleanup_log = (run / 'error.log').read_bytes()[cleanup_log_start:].decode()
     cleaned = {int(inode): (int(blocks), int(size)) for inode, blocks, size in
@@ -874,7 +883,7 @@ try:
     assert get('/unmarked') == (200, 'BYPASS', b'/unmarked')
     until(lambda: records('/unmarked', 1)[0]['id'] != unmarked['id'])
     assert get('/unmarked')[1] == 'HIT' and calls.count('/unmarked') == 2
-    assert record(unmarked['id'])['state'] == 3
+    assert retired(unmarked['id'])
     checks.append('a native HIT with no publication marker refills and replaces its old index instance before later reuse')
     assert get('/read-wait')[1] == 'MISS'
     waiting_file = ready_file(records('/read-wait', 1)[0])
@@ -946,7 +955,7 @@ try:
     assert get('/tags?bypass=1')[1] == 'BYPASS'
     until(lambda: (v := records('/tags', 1)[0])['id'] != old['id'])
     new = records('/tags', 1)[0]; ready_file(new)
-    assert new['tags'] == [b'blue'] and record(old['id'])['state'] == 3
+    assert new['tags'] == [b'blue'] and retired(old['id'])
     assert new['id'] in [x[0] for x in query('blue', kind=5, scope='tenant')]
     assert not query('blue', kind=5, scope='another-tenant')
     checks.append('BYPASS replacement captures before origin, retires the prior instance and updates scoped TAG membership')
@@ -1088,15 +1097,13 @@ try:
     native_key = b'tenant\x1fhttp\x1fcache.test\x1f/late-fill\x1f\x1f'
     digest = hashlib.md5(native_key).hexdigest()
     target = run / 'cache-a' / digest[-1] / digest[-3:-1] / digest
-    until(target.exists)
-    marker = os.getxattr(target, 'user.ngx_cache_purge.id')
-    late = until(lambda: (item if (item := record(marker[8:24]))['state'] == 3 else None))
-    assert os.getxattr(target, 'user.ngx_cache_purge.id')[7] == 1
-    assert query('http://cache.test/late-fill') == []
     until(lambda: writers(late_sequence) == 0)
-    assert get('/late-fill') == (200, 'BYPASS', b'new-late-entity')
+    until(lambda: not target.exists() and pending() == 0)
+    assert query('http://cache.test/late-fill') == []
+    reply = get('/late-fill')
+    assert reply[0] == 200 and reply[1] in ('MISS', 'BYPASS') and reply[2] == b'new-late-entity', reply
     fresh = records('/late-fill', 1)[0]; ready_file(fresh)
-    assert watermark(fresh)[0] == ledger and watermark(fresh)[1] > watermark(late)[1]
+    assert watermark(fresh)[0] == ledger and watermark(fresh)[1] >= late_sequence
     assert get('/late-fill') == (200, 'HIT', b'new-late-entity') and calls.count('/late-fill') == 2
     checks.append('a pre-push late origin fill is retired, while a post-push entity carries durable coverage and reuses HIT under the same TAG FENCE')
     checks.append('worker reload and executor handoff retain the old worker origin registration until its file transaction finishes')
