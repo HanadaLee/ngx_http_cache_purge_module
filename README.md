@@ -471,6 +471,21 @@ when ignore_l1_purge {
 normal ordering and inheritance: the first matching or unconditional candidate
 wins, and a child with only conditional candidates falls back to its parent.
 Without the expression module, ordinary `on`/`off` remains available.
+
+`cache_purge_propagation on|off;` independently selects outgoing propagation,
+defaults to `off`, and uses the same native expression flag mechanism. Enable it
+for a CDN parent route; leave it off for a final origin. For example, with a
+deployment-provided `$upstream_type` variable:
+
+```nginx
+expr purge_parent str_eq $upstream_type parent;
+when purge_parent {
+    cache_purge_propagation on;
+}
+```
+
+These two flags have independent inheritance and condition lists. An incoming
+ignore decision does not disable this node's own outgoing requirements.
 Header names must be distinct after inheritance, valid HTTP tokens, and
 compatible with nginx's underscore handling; standard protocol/cache headers
 cannot be reused as control headers. Capabilities exposes the effective names.
@@ -482,6 +497,13 @@ Known empty TAGs remain distinct from missing metadata. The scope index reuses
 operation records; it does not copy cache-file metadata into shared memory.
 Output-budget exhaustion fails the lookup instead of silently truncating rules.
 This internal lookup is not yet connected to the HTTP propagation path.
+
+The internal C codec provides bounded binary request/acknowledgement frames.
+It preserves complete scoped TAG groups, rejects duplicate or unordered
+requirements, and binds acknowledgements to a request nonce and SHA-256 digest.
+The digest is not authentication. Local propagation windows are absent from
+the wire format. HTTP encoding, identity mapping, and request/response admission
+remain to be integrated; the codec alone does not enable L2 propagation.
 
 These configuration and policy evaluation interfaces are implemented; L2 header
 transfer and acknowledgement enforcement remain unfinished and

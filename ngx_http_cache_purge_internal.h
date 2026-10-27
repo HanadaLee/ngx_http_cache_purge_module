@@ -450,6 +450,61 @@ typedef struct {
 int ngx_http_cache_purge_tags_decode(ngx_http_cache_rocksdb_bytes_t value,
     ngx_http_cache_rocksdb_bytes_t tags[64], size_t *count);
 
+#define NGX_HTTP_CACHE_PURGE_FENCE_MAX       65536
+#define NGX_HTTP_CACHE_PURGE_FENCE_COUNT     64
+#define NGX_HTTP_CACHE_PURGE_ACK_SIZE        56
+#define NGX_HTTP_CACHE_PURGE_ACK_FRESH       1
+#define NGX_HTTP_CACHE_PURGE_ACK_STALE       2
+#define NGX_HTTP_CACHE_PURGE_STALE_STRICT    1
+#define NGX_HTTP_CACHE_PURGE_STALE_NATIVE    2
+
+typedef struct {
+    unsigned char                    ledger[16];
+    uint64_t                         sequence, issued_at_ms;
+    uint32_t                         mode;
+    int                              candidate;
+    ngx_http_cache_rocksdb_bytes_t   id;
+    ngx_http_cache_purge_selector_t  selector;
+} ngx_http_cache_purge_requirement_t;
+
+typedef struct {
+    unsigned char                        nonce[16], identity[32];
+    ngx_http_cache_purge_requirement_t  *requirements;
+    size_t                               count;
+} ngx_http_cache_purge_fence_t;
+
+typedef struct {
+    unsigned char  nonce[16], digest[32];
+    uint32_t       outcome, stale_policy;
+} ngx_http_cache_purge_ack_t;
+
+/* Binary v1 framing; HTTP base64 is handled by the nginx request adapter.
+ * Caller owns all buffers. Encode with output=NULL/capacity=0 to size first.
+ * Requirements are ordered by ledger/sequence; duplicate IDs are invalid
+ * within a ledger. Decode borrows string bytes from input until it is freed.
+ * No window/expiry or authentication fields are part of the wire contract.
+ * Failed encode writes no output; failed decode leaves out empty and its
+ * caller-owned requirements array unspecified. Never use a partial set. */
+int ngx_http_cache_purge_fence_encode(const ngx_http_cache_purge_fence_t *fence,
+    unsigned char *output, size_t capacity, size_t *length,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_fence_decode(ngx_http_cache_rocksdb_bytes_t input,
+    ngx_http_cache_purge_fence_t *out,
+    ngx_http_cache_purge_requirement_t *requirements, size_t capacity,
+    ngx_http_cache_rocksdb_error_t *error);
+/* Hash only a successfully encoded/decoded envelope. This binds a response
+ * to the exact request bytes; it is not a signature or node authentication. */
+int ngx_http_cache_purge_fence_digest(ngx_http_cache_rocksdb_bytes_t input,
+    unsigned char digest[32], ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_ack_encode(const ngx_http_cache_purge_ack_t *ack,
+    unsigned char output[NGX_HTTP_CACHE_PURGE_ACK_SIZE],
+    ngx_http_cache_rocksdb_error_t *error);
+/* Returns CONFLICT for a well-formed ack bound to another request. Callers
+ * separately decide whether the reported fresh/stale outcome is admissible. */
+int ngx_http_cache_purge_ack_check(ngx_http_cache_rocksdb_bytes_t input,
+    const unsigned char nonce[16], const unsigned char digest[32],
+    ngx_http_cache_purge_ack_t *out, ngx_http_cache_rocksdb_error_t *error);
+
 
 typedef struct {
     ngx_http_cache_rocksdb_bytes_t   id;

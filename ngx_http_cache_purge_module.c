@@ -138,6 +138,21 @@ static ngx_command_t  ngx_http_cache_purge_module_commands[] = {
       ngx_http_cache_purge_api_header_conf, NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_cache_purge_loc_conf_t, propagation_header[3]), NULL },
 
+    { ngx_string("cache_purge_propagation"),
+      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF
+#if (NGX_EXPR)
+      | NGX_HTTP_MAIN_WHEN_CONF | NGX_HTTP_SRV_WHEN_CONF
+      | NGX_HTTP_LOC_WHEN_CONF
+#endif
+      | NGX_CONF_FLAG,
+#if (NGX_EXPR)
+      ngx_conf_set_conditional_flag_slot,
+#else
+      ngx_conf_set_flag_slot,
+#endif
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_purge_loc_conf_t, propagation), NULL },
+
     { ngx_string("cache_purge_ignore_propagation"),
       NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF
 #if (NGX_EXPR)
@@ -1741,6 +1756,7 @@ ngx_http_cache_purge_create_loc_conf(ngx_conf_t *cf)
 
 #if (NGX_HTTP_CACHE_PURGE_ROCKSDB && !(NGX_EXPR))
     conf->ignore_propagation = NGX_CONF_UNSET;
+    conf->propagation = NGX_CONF_UNSET;
 #endif
 
     return conf;

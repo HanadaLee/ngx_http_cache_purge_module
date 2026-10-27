@@ -734,8 +734,10 @@ typedef struct {
     ngx_str_t                          propagation_header[4];
 #if (NGX_EXPR)
     ngx_array_t                       *ignore_propagation;
+    ngx_array_t                       *propagation;
 #else
     ngx_flag_t                         ignore_propagation;
+    ngx_flag_t                         propagation;
 #endif
 #endif
 #if (NGX_HTTP_PROXY)
@@ -766,6 +768,7 @@ char *ngx_http_cache_purge_api_merge(ngx_conf_t *cf,
     ngx_http_cache_purge_loc_conf_t *conf);
 ngx_int_t ngx_http_cache_purge_api_handler(ngx_http_request_t *r);
 ngx_flag_t ngx_http_cache_purge_ignore_propagation(ngx_http_request_t *r);
+ngx_flag_t ngx_http_cache_purge_propagation_enabled(ngx_http_request_t *r);
 #endif
 
 typedef struct {
