@@ -29,10 +29,11 @@ main(int argc, char **argv)
     options.io_timeout_ms = std::strtoul(argv[3], nullptr, 10);
     options.buffer_bytes = std::strtoul(argv[4], nullptr, 10);
     options.max_payload_bytes = std::strtoul(argv[5], nullptr, 10);
-    ngx_http_cache_purge_root_t roots[2]{};
+    ngx_http_cache_purge_root_t roots[3]{};
     const char *cache = std::getenv("CACHE_PURGE_TEST_CACHE_ROOT");
     const char *temporary = std::getenv("CACHE_PURGE_TEST_TEMP_ROOT");
     const char *zone = std::getenv("CACHE_PURGE_TEST_CACHE_ZONE");
+    const char *second = std::getenv("CACHE_PURGE_TEST_SECOND_ROOT");
     if (!zone) {
         zone = "zone-a";
     }
@@ -47,6 +48,14 @@ main(int argc, char **argv)
             { nullptr, 0 }, NGX_HTTP_CACHE_PURGE_ROOT_TEMP };
         options.roots = roots;
         options.root_count = 2;
+        if (second) {
+            static const unsigned char second_zone[] = "cache-b";
+            roots[2] = { { reinterpret_cast<const unsigned char *>(second),
+                             std::strlen(second) },
+                { second_zone, sizeof(second_zone) - 1 },
+                NGX_HTTP_CACHE_PURGE_ROOT_CACHE };
+            options.root_count = 3;
+        }
     }
     ngx_http_cache_purge_component_t *component = nullptr;
     ngx_http_cache_rocksdb_error_t error;

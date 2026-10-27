@@ -102,6 +102,9 @@ struct ngx_http_cache_purge_component_s {
     size_t                                    next_peer;
     ngx_http_cache_purge_component_buffer_t   recovery_bookmark;
     uint64_t                                  recovery_at;
+    unsigned char                             work_after[17];
+    size_t                                    work_after_len;
+    uint64_t                                  work_at;
 };
 
 typedef struct {
@@ -1855,6 +1858,263 @@ done:
 }
 
 static int
+ngx_http_cache_purge_component_checkpoint(ngx_http_cache_purge_component_t *c,
+    const ngx_http_cache_purge_operation_t *op,
+    const ngx_http_cache_purge_index_expected_t *file,
+    ngx_http_cache_rocksdb_bytes_t cursor, int done, uint64_t visits,
+    int failed, uint64_t next, const char *message,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_component_encoder_t  e;
+    ngx_http_cache_purge_checkpoint_t         point;
+    ngx_http_cache_purge_operation_t          updated;
+    unsigned char                             zero[16];
+    int                                       rc;
+
+    if (op->checkpoint_id == UINT64_MAX) {
+        return ngx_http_cache_purge_component_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "Delete checkpoint counter overflow");
+    }
+    memset(&e, 0, sizeof(e));
+    memset(&point, 0, sizeof(point));
+    memset(zero, 0, sizeof(zero));
+    e.limit = 33024;
+    e.error = error;
+    ngx_http_cache_purge_component_put_raw(&e, "NDW1", 4);
+    ngx_http_cache_purge_component_put_integer(&e, file != NULL, 1);
+    ngx_http_cache_purge_component_put_raw(&e, file ? file->id : zero, 16);
+    ngx_http_cache_purge_component_put_integer(&e,
+                                                 file ? file->revision : 0, 8);
+    ngx_http_cache_purge_component_put_string(&e, cursor);
+    rc = e.rc;
+    if (rc == 0) {
+        point.id = op->checkpoint_id + 1;
+        point.bookmark.data = e.buffer.data;
+        point.bookmark.len = e.buffer.len;
+        point.scan_done = done;
+        point.visits_delta = visits;
+        point.pending = file != NULL;
+        point.failed = failed;
+        point.next_run_ms = next;
+        point.last_error.data = (const unsigned char *) message;
+        point.last_error.len = strlen(message);
+        rc = ngx_http_cache_purge_operations_checkpoint(&c->operations,
+            op->input.id, op->revision, &point, &updated, error);
+        ngx_http_cache_purge_operation_free(&updated);
+    }
+    ngx_http_cache_purge_component_buffer_free(&e.buffer);
+    return rc;
+}
+
+static int
+ngx_http_cache_purge_component_delete(ngx_http_cache_purge_component_t *c,
+    const ngx_http_cache_purge_operation_t *op, uint64_t now,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_component_decoder_t  d;
+    ngx_http_cache_purge_query_t             *query;
+    ngx_http_cache_purge_index_expected_t     expected;
+    ngx_http_cache_purge_index_match_t        match;
+    ngx_http_cache_purge_index_file_t         file;
+    ngx_http_cache_purge_watermark_t          origin;
+    ngx_http_cache_rocksdb_bytes_t            cursor, address;
+    ngx_http_cache_rocksdb_error_t            failure;
+    unsigned char                             digest[16], *path;
+    uint64_t                                  offset;
+    uint32_t                                  outcome;
+    int                                       pending, lease, rc;
+
+    memset(&d, 0, sizeof(d));
+    memset(&expected, 0, sizeof(expected));
+    memset(&cursor, 0, sizeof(cursor));
+    memset(&file, 0, sizeof(file));
+    query = NULL;
+    path = NULL;
+    lease = -1;
+    pending = 0;
+    if (op->bookmark.len != 0) {
+        if (op->bookmark.len < 33
+            || memcmp(op->bookmark.data, "NDW1", 4) != 0)
+        {
+            return ngx_http_cache_purge_component_error(error,
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "unknown Delete checkpoint");
+        }
+        d.data = op->bookmark.data;
+        d.len = op->bookmark.len;
+        d.at = 4;
+        d.error = error;
+        pending = ngx_http_cache_purge_component_flag(&d);
+        ngx_http_cache_purge_component_id(&d, expected.id);
+        expected.revision = ngx_http_cache_purge_component_integer(&d, 8);
+        cursor = ngx_http_cache_purge_component_string(&d, 32991);
+        if (ngx_http_cache_purge_component_end(&d) != 0
+            || pending != (int) op->pending || op->pending > 1
+            || op->failed > 1 || (pending && expected.revision == 0)
+            || (!pending && expected.revision != 0))
+        {
+            return ngx_http_cache_purge_component_error(error,
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid Delete checkpoint");
+        }
+    } else if (op->pending || op->failed || op->checkpoint_id) {
+        return ngx_http_cache_purge_component_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "missing Delete checkpoint");
+    }
+
+    if (!pending) {
+        rc = ngx_http_cache_purge_query_open(c->operations.store,
+            &op->input.selector, NGX_HTTP_CACHE_PURGE_QUERY_SELECT,
+            cursor, &query, error);
+        if (rc != 0) {
+            return rc;
+        }
+        rc = ngx_http_cache_purge_query_step(query, 32, &match, error);
+        if (rc == 0) {
+            memcpy(expected.id, match.id, 16);
+            expected.revision = match.revision;
+            cursor = ngx_http_cache_purge_query_bookmark(query);
+            /* Reserve the exact instance before retirement can remove it
+             * from selector enumeration. The cursor advances only on replay. */
+            rc = ngx_http_cache_purge_component_checkpoint(c, op, &expected,
+                cursor, 0, 0, 0, now, "", error);
+        } else if (rc == NGX_HTTP_CACHE_ROCKSDB_DONE) {
+            rc = ngx_http_cache_purge_component_checkpoint(c, op, NULL,
+                cursor, 1, 0, 0, now + 1000,
+                "native cache cleanup and retirement remain pending", error);
+        } else if (rc == NGX_HTTP_CACHE_ROCKSDB_BUSY
+                   || rc == NGX_HTTP_CACHE_ROCKSDB_EXPIRED)
+        {
+            cursor = ngx_http_cache_purge_query_bookmark(query);
+            rc = ngx_http_cache_purge_component_checkpoint(c, op, NULL,
+                cursor, 0, 0, 0, now, "", error);
+        }
+        ngx_http_cache_purge_query_close(&query, NULL);
+        return rc;
+    }
+
+    rc = ngx_http_cache_purge_index_get_file(c->operations.store,
+                                               expected.id, &file, error);
+    if (rc != 0) {
+        goto done;
+    }
+    if (file.revision < expected.revision) {
+        rc = ngx_http_cache_purge_component_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "Delete file revision regressed");
+        goto done;
+    }
+    expected.revision = file.revision;
+    if (file.state == NGX_HTTP_CACHE_PURGE_INDEX_PREPARED) {
+        rc = ngx_http_cache_purge_component_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_BUSY, "Delete awaits file publication");
+        goto done;
+    }
+    rc = ngx_http_cache_purge_publication_watermark(file.metadata,
+                                                      &origin, error);
+    if (rc == 0 && memcmp(origin.ledger, c->operations.ledger, 16) == 0
+        && origin.sequence >= op->sequence)
+    {
+        /* Conditional coverage never satisfies Delete. Only a full entity
+         * fetched after this operation can survive its background scan. */
+        goto done;
+    }
+    if (rc != 0 && rc != NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) {
+        goto done;
+    }
+    address.len = file.root.len + 1 + file.path.len;
+    path = malloc(address.len);
+    if (path == NULL) {
+        rc = ngx_http_cache_purge_component_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "Delete path allocation failed");
+        goto done;
+    }
+    memcpy(path, file.root.data, file.root.len);
+    path[file.root.len] = '/';
+    memcpy(path + file.root.len + 1, file.path.data, file.path.len);
+    address.data = path;
+    rc = ngx_http_cache_purge_file_address(address, digest, &offset, error);
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_component_anchor(c, error);
+    }
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_file_lease_acquire(c->lease_path,
+            c->lease_anchor, offset, &lease, error);
+    }
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_publications_remove(c->publications,
+            c->operations.store, &expected, c->lease_anchor, lease,
+            c->options.client_uid, &outcome, &match, error);
+    }
+
+done:
+    free(path);
+    ngx_http_cache_purge_component_close(&lease);
+    ngx_http_cache_purge_index_file_free(&file);
+    if (rc == 0) {
+        return ngx_http_cache_purge_component_checkpoint(c, op, NULL,
+            cursor, 0, 1, 0, now, "", error);
+    }
+    if (rc == NGX_HTTP_CACHE_ROCKSDB_BUSY
+        || rc == NGX_HTTP_CACHE_ROCKSDB_CONFLICT
+        || rc == NGX_HTTP_CACHE_ROCKSDB_INVALID
+        || rc == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND
+        || rc == NGX_HTTP_CACHE_ROCKSDB_LIMIT
+        || rc == NGX_HTTP_CACHE_PURGE_FILE_ERROR)
+    {
+        failure = *error;
+        return ngx_http_cache_purge_component_checkpoint(c, op, &expected,
+            cursor, 0, 1, rc != NGX_HTTP_CACHE_ROCKSDB_BUSY, now + 1000,
+            failure.message, error);
+    }
+    return rc;
+}
+
+static int
+ngx_http_cache_purge_component_work(ngx_http_cache_purge_component_t *c,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_operation_page_t     page;
+    ngx_http_cache_purge_operation_t         *op;
+    ngx_http_cache_rocksdb_bytes_t            after;
+    uint64_t                                  now;
+    int                                       rc;
+
+    c->work_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 1000;
+    if (c->coordinator == NULL
+        || ngx_http_cache_purge_component_load32(&c->control_state)
+           != NGX_HTTP_CACHE_PURGE_COORD_READY)
+    {
+        return 0;
+    }
+    now = ngx_http_cache_purge_component_now(CLOCK_REALTIME);
+    if (now == 0 || now > UINT64_MAX - 1000) {
+        return ngx_http_cache_purge_component_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_IO, "invalid background task clock");
+    }
+    after.data = c->work_after;
+    after.len = c->work_after_len;
+    rc = ngx_http_cache_purge_operations_page(&c->operations, 1, now,
+                                                after, 1, &page, error);
+    if (rc != 0) {
+        return rc;
+    }
+    if (page.count != 0) {
+        c->work_after_len = page.after_len;
+        memcpy(c->work_after, page.after, page.after_len);
+        c->work_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC);
+        op = &page.items[0];
+        if (op->input.mode == NGX_HTTP_CACHE_PURGE_DELETE && !op->scan_done) {
+            rc = ngx_http_cache_purge_component_delete(c, op, now, error);
+        } else if (page.done) {
+            c->work_at += 1000;
+        }
+    }
+    if (page.done) {
+        c->work_after_len = 0;
+    }
+    ngx_http_cache_purge_operation_page_free(&page);
+    return rc;
+}
+
+static int
 ngx_http_cache_purge_component_controls(ngx_http_cache_purge_component_t *c,
     uint64_t *expire_at, int *progress, ngx_http_cache_rocksdb_error_t *error)
 {
@@ -1970,6 +2230,12 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
                 return rc;
             }
         }
+        if (now >= c->work_at) {
+            rc = ngx_http_cache_purge_component_work(c, error);
+            if (rc != 0) {
+                return rc;
+            }
+        }
         memset(events, 0, sizeof(events));
         events[0].fd = c->wake_read;
         events[0].events = POLLIN;
@@ -2004,6 +2270,11 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
             timeout = 0;
         } else if (c->recovery_at - now < 50) {
             timeout = (int) (c->recovery_at - now);
+        }
+        if (c->work_at <= now) {
+            timeout = 0;
+        } else if (c->work_at - now < (uint64_t) timeout) {
+            timeout = (int) (c->work_at - now);
         }
         rc = poll(events, c->options.max_connections + 2,
                   ready || (pending && progress) ? 0 : timeout);

@@ -8,6 +8,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <cstring>
+#include <ctime>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/xattr.h>
@@ -563,6 +564,165 @@ validation(
 }
 
 static int
+activate_background(const std::string &path, const std::string &name)
+{
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
+              == 0,
+        "offline activation database");
+    ngx_http_cache_purge_operations_t operations{};
+    ngx_http_cache_purge_operation_limits_t limits{ 4096, 4194304 };
+    check(ngx_http_cache_purge_operations_init(
+              &operations, store, &limits, &error)
+              == 0,
+        "offline activation ledger");
+    ngx_http_cache_purge_operation_t accepted{}, active{};
+    check(ngx_http_cache_purge_operations_get(
+              &operations, bytes(name), &accepted, &error)
+                  == 0
+              && accepted.input.mode == NGX_HTTP_CACHE_PURGE_DELETE,
+        "offline activation requires an existing Delete");
+    check(ngx_http_cache_purge_operations_activate(&operations, bytes(name),
+              accepted.revision,
+              static_cast<uint64_t>(std::time(nullptr)) * 1000, &active, &error)
+              == 0,
+        "offline activation for background integration only");
+    ngx_http_cache_purge_operation_free(&accepted);
+    ngx_http_cache_purge_operation_free(&active);
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
+        "close offline activation database");
+    return 0;
+}
+
+static int
+background_delete(const std::string &mode, const std::string &path)
+{
+    std::filesystem::create_directories(path + "/cache/a");
+    std::filesystem::create_directories(path + "/cache-b/a");
+    std::filesystem::create_directories(path + "/db");
+    int anchor_fd;
+    auto locks = path + "/db/file.leases";
+    check(ngx_http_cache_purge_file_locks_open(
+              locks.c_str(), getuid(), 1, &anchor_fd, &error)
+              == 0,
+        "background lease anchor");
+    Descriptor anchor(anchor_fd);
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    check(ngx_http_cache_rocksdb_open(
+              (path + "/db").c_str(), &options, &store, &error)
+              == 0,
+        "background database");
+    {
+        Index index(store);
+        Publications publications(
+            { { path + "/cache", "cache", NGX_HTTP_CACHE_PURGE_ROOT_CACHE },
+                { path + "/cache-b", "cache-b",
+                    NGX_HTTP_CACHE_PURGE_ROOT_CACHE } },
+            path + "/db");
+        ngx_http_cache_purge_operations_t operations{};
+        ngx_http_cache_purge_operation_limits_t limits{ 4096, 4194304 };
+        check(ngx_http_cache_purge_operations_init(
+                  &operations, store, &limits, &error)
+                  == 0,
+            "background operation ledger");
+        auto create = [&](unsigned number, const char *zone, const char *name,
+                          const char *url, uint64_t sequence, FileId previous) {
+            File file;
+            file.id = id(number);
+            file.key = std::string("background:") + name;
+            file.url = url;
+            file.host = "example.test";
+            file.tag_namespace = "tenant";
+            file.root = path + '/' + zone;
+            file.zone = zone;
+            file.path = std::string("a/") + name;
+            ngx_http_cache_purge_watermark_t watermark{};
+            std::memcpy(watermark.ledger, operations.ledger, 16);
+            watermark.sequence = sequence;
+            unsigned char encoded[NGX_HTTP_CACHE_PURGE_WATERMARK_SIZE];
+            ngx_http_cache_purge_watermark_encode(&watermark, encoded);
+            file.metadata.assign(
+                reinterpret_cast<const char *>(encoded), sizeof(encoded));
+            auto target = file.root + '/' + file.path;
+            unsigned char digest[16];
+            uint64_t offset;
+            int lease_fd;
+            check(ngx_http_cache_purge_file_address(
+                      bytes(target), digest, &offset, &error)
+                      == 0,
+                "background address");
+            check(ngx_http_cache_purge_file_lease_acquire(
+                      locks.c_str(), anchor.fd, offset, &lease_fd, &error)
+                      == 0,
+                "background path lease");
+            Descriptor lease(lease_fd);
+            auto temporary = file.root + "/temporary";
+            Descriptor fd(open(temporary.c_str(),
+                O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600));
+            body(fd.fd);
+            publications.prepare(index, { file, previous }, temporary,
+                anchor.fd, lease.fd, fd.fd, getuid());
+            check(rename(temporary.c_str(), target.c_str()) == 0,
+                "background rename");
+            check(publications
+                          .finish(
+                              index, file.id, 1, anchor.fd, lease.fd, getuid())
+                          .state
+                      == FileState::committed,
+                "background committed file");
+        };
+        if (mode == "--background-replace") {
+            create(8, "cache", "first", "https://example.test/work/first", 2,
+                id(1));
+        } else {
+            check(mode == "--background-seed", "background fixture mode");
+            create(
+                1, "cache", "first", "https://example.test/work/first", 0, {});
+            create(2, "cache-b", "second", "https://example.test/work/second",
+                0, {});
+            create(
+                4, "cache", "outside", "https://example.test/outside", 0, {});
+            create(6, "cache-b", "other", "https://example.test/other", 0, {});
+            for (const std::string name : { "background", "independent" }) {
+                std::string value = name == "background" ?
+                                        "https://example.test/work/" :
+                                        "https://example.test/other";
+                ngx_http_cache_purge_operation_input_t input{};
+                input.id = bytes(name);
+                input.mode = NGX_HTTP_CACHE_PURGE_DELETE;
+                input.issued_at_ms = 1;
+                input.selector.kind = name == "background" ?
+                                          NGX_HTTP_CACHE_PURGE_URL_PREFIX :
+                                          NGX_HTTP_CACHE_PURGE_URL;
+                input.selector.value = bytes(value);
+                ngx_http_cache_purge_operation_t accepted{}, active{};
+                check(ngx_http_cache_purge_operations_accept(
+                          &operations, &input, 1, 300000, &accepted, &error)
+                          == 0,
+                    "seed durable operation");
+                /* Offline setup does not claim native HTTP acceptance. */
+                check(ngx_http_cache_purge_operations_activate(&operations,
+                          input.id, accepted.revision, 1, &active, &error)
+                          == 0,
+                    "seed active background task");
+                ngx_http_cache_purge_operation_free(&accepted);
+                ngx_http_cache_purge_operation_free(&active);
+            }
+            create(
+                3, "cache", "fresh", "https://example.test/work/fresh", 2, {});
+        }
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
+        "close background fixture database");
+    std::cout << "PASS background fixture " << assertions << std::endl;
+    return 0;
+}
+
+static int
 removal(const std::string &mode, const std::string &path)
 {
     std::filesystem::create_directories(path + "/cache/a/00");
@@ -674,6 +834,12 @@ int
 main(int argc, char **argv)
 {
     try {
+        if (argc == 4 && std::string(argv[1]) == "--activate-background") {
+            return activate_background(argv[2], argv[3]);
+        }
+        if (argc == 3 && std::string(argv[1]).find("--background-") == 0) {
+            return background_delete(argv[1], argv[2]);
+        }
         if (argc == 3 && std::string(argv[1]).find("--validate-origin-") == 0) {
             return validation(
                 "--validate-" + std::string(argv[1]).substr(18), argv[2], true);

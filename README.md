@@ -43,8 +43,22 @@ lease. It durably retires the record before unlinking, checks the instance marke
 and inode, and synchronizes parent directories. Retries distinguish removed,
 missing and replaced files; a replacement is preserved. Per-file I/O failures
 remain retryable without stopping the database owner. Retired records remain for
-subsequent task and native-node cleanup. Background task integration, native cache
-accounting and FENCE retirement are still pending; this is not a public Delete API.
+subsequent task and native-node cleanup. The executor now advances persisted
+active Delete tasks automatically, one checkpoint or file attempt per event-loop
+pass. It records the selected instance before retirement can remove it from
+enumeration, then resumes that exact instance after a crash. Busy leases and
+per-file failures retain a durable retry; other tasks and IPC continue. Full
+entities fetched after the operation are preserved, including replacements.
+
+Background scans yield after at most 32 cursor advances, including retired rows
+and empty URL/key branches. Every yield releases its snapshot and saves a resume
+position; it does not retain all matching files in memory. These are work-unit
+bounds, not hard latency bounds for filesystem or database I/O. A file failure
+currently pauses that task at its pending instance while other tasks continue.
+Enumeration completion leaves the operation DRAINING and retains its FENCE.
+Native cache accounting, complete retirement and background Invalidate remain
+pending. Public activation is not enabled: acceptance still returns PREPARING;
+integration tests activate tasks offline. This is not a public Delete API.
 
 The filesystem backend also supports bounded in-place validation transactions.
 It atomically reserves the existing path intent with TAG and metadata changes,

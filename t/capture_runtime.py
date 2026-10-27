@@ -448,6 +448,38 @@ try:
     assert get('/remove-native') == (200, 'HIT', b'new-after-removal')
     assert get('/remove-native?z=b') == (200, 'HIT', b'new-after-removal')
     checks.append('physical removal of two indexed native zone instances refills fresh entities and old-instance retries preserve their replacements')
+    assert get('/background-native')[1] == 'MISS'
+    assert get('/background-native?z=b')[1] == 'MISS'
+    background_files = records('/background-native', 2)
+    background_paths = [ready_file(item) for item in background_files]
+    fence('background-native', 1, 'http://cache.test/background-native')
+    stop(process)
+    # Activation is an offline fixture, not a public effective HTTP receipt.
+    subprocess.run([str(a.libraries / 'cache_purge_files_test'),
+                    '--activate-background', str(run / 'index'), 'background-native'],
+                   check=True, timeout=15, stdout=subprocess.DEVNULL)
+    process = start()
+    until(lambda: (run / 'index/component.sock').exists())
+    until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
+    until(lambda: all(not path.exists() for path in background_paths))
+    def background_done():
+        d = Decode(rpc(15, string('background-native')))
+        d.string(); d.number(1); d.number(8); d.number(1)
+        d.string(); d.string(); d.string()
+        for _ in range(5): d.number(8)
+        stage = d.number(1); d.number(4); d.number(1); d.string()
+        done = d.number(1); d.number(8); d.number(8)
+        pending, failed = d.number(8), d.number(8)
+        d.number(8); d.string(); d.end()
+        return stage == 3 and done and not pending and not failed
+    until(background_done)
+    assert query('http://cache.test/background-native') == []
+    fresh_bodies['/background-native'] = b'new-after-background'
+    assert get('/background-native') == (200, 'BYPASS', b'new-after-background')
+    assert get('/background-native?z=b') == (200, 'BYPASS', b'new-after-background')
+    assert {item['id'] for item in records('/background-native', 2)}.isdisjoint(
+        {item['id'] for item in background_files})
+    checks.append('persisted active Delete automatically processes both native zones after restart without per-file IPC, then retains its FENCE while node cleanup is pending')
     assert get('/alias/one') == (200, 'MISS', b'/alias/one')
     alias = records('/alias/one', 1)[0]; ready_file(alias)
     assert get('/alias/two') == (200, 'HIT', b'/alias/one')

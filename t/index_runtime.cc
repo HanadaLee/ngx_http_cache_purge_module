@@ -1,5 +1,6 @@
 #include "ngx_http_cache_purge_test.hpp"
 #include <unistd.h>
+#include <sys/stat.h>
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -176,6 +177,101 @@ raw_write(ngx_http_cache_rocksdb_t *store, ngx_http_cache_rocksdb_cf_e cf,
     check(ngx_http_cache_rocksdb_write(store, &change, 1, nullptr, 0, &error)
               == 0,
         "raw test mutation");
+}
+
+static void
+bounded_scan(const std::string &path)
+{
+    check(mkdir(path.c_str(), 0700) == 0, "bounded query directory");
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    ngx_http_cache_rocksdb_error_t error;
+    check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
+              == 0,
+        "bounded query database");
+    {
+        Index index(store);
+        std::string shared_key;
+        for (unsigned i = 0; i < 100; i++) {
+            auto record = file(1000 + i,
+                i % 2 ? "/budget/" + std::to_string(i) : "/budget/shared", "",
+                "budget.example");
+            install(index, record);
+            if (i == 0) {
+                shared_key = record.key;
+            }
+            if (i < 98) {
+                auto retired = index.retire(record.id, 2);
+                if (i % 3 == 0) {
+                    index.collect_file(record.id, retired.revision);
+                }
+            }
+        }
+        std::vector<Selector> selectors{
+            { SelectorKind::url_prefix, "https://shared.cache.test/budget/",
+                "" },
+            { SelectorKind::key_prefix, "", "" },
+            { SelectorKind::url, "https://shared.cache.test/budget/shared",
+                "" },
+            { SelectorKind::key, shared_key, "" },
+            { SelectorKind::host, "budget.example", "" },
+            { SelectorKind::namespace_tag, "common", "team" },
+            { SelectorKind::host_tag, "common", "budget.example" }
+        };
+        unsigned yielded = 0;
+        for (const auto &selector : selectors) {
+            auto expected = scan(index, selector);
+            ngx_http_cache_purge_selector_t input{ static_cast<uint32_t>(
+                                                       selector.kind),
+                bytes(selector.value), bytes(selector.scope) };
+            std::string cursor;
+            std::vector<unsigned> actual;
+            unsigned pages = 0;
+            for (;;) {
+                ngx_http_cache_purge_query_t *query = nullptr;
+                ngx_http_cache_purge_index_match_t match{};
+                check(ngx_http_cache_purge_query_open(
+                          store, &input, 0, bytes(cursor), &query, &error)
+                          == 0,
+                    "open bounded query page");
+                check(ngx_http_cache_purge_query_step(query, 3, &match, &error)
+                          == NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                    "reject insufficient traversal budget");
+                auto rc =
+                    ngx_http_cache_purge_query_step(query, 4, &match, &error);
+                auto token = ngx_http_cache_purge_query_bookmark(query);
+                cursor.assign(
+                    reinterpret_cast<const char *>(token.data), token.len);
+                check(ngx_http_cache_purge_query_close(&query, &error) == 0,
+                    "close bounded snapshot before yielding executor");
+                ngx_http_cache_rocksdb_stats_t stats{};
+                check(ngx_http_cache_rocksdb_stats(store, &stats, &error) == 0
+                          && stats.cursor_handles == 0,
+                    "bounded pages retain no cursors");
+                check(
+                    ++pages < 500, "bounded empty/retired scans make progress");
+                if (rc == NGX_HTTP_CACHE_ROCKSDB_DONE) {
+                    break;
+                }
+                if (rc == NGX_HTTP_CACHE_ROCKSDB_BUSY) {
+                    yielded++;
+                    check(!cursor.empty(), "yielded scan has durable progress");
+                } else {
+                    check(rc == 0, "bounded query result");
+                    FileId found{};
+                    std::memcpy(found.data(), match.id, 16);
+                    actual.push_back(numeric(found));
+                }
+            }
+            check(actual == expected,
+                "bounded scans preserve all selector results");
+        }
+        check(
+            yielded > 10, "sparse scans yield repeatedly without starving IPC");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
+        "close bounded query database");
 }
 
 static int
@@ -692,6 +788,7 @@ main(int argc, char **argv)
                 "all file/value/component/alias records reclaimed");
         }
         check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
+        bounded_scan(std::string(path) + "-bounded");
         std::cout << "PASS " << assertions << " index assertions; database "
                   << path << std::endl;
         return 0;
