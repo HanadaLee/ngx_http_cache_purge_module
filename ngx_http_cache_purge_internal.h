@@ -223,6 +223,7 @@ typedef struct {
 } ngx_http_cache_purge_watermark_t;
 
 #define NGX_HTTP_CACHE_PURGE_WATERMARK_SIZE 28
+#define NGX_HTTP_CACHE_PURGE_VARIANT_SIZE 64
 
 typedef struct {
     ngx_http_cache_rocksdb_bytes_t        key, url, host, tag_namespace;
@@ -926,6 +927,11 @@ typedef struct ngx_http_cache_purge_publications_s
 void ngx_http_cache_purge_watermark_encode(
     const ngx_http_cache_purge_watermark_t *watermark,
     unsigned char output[NGX_HTTP_CACHE_PURGE_WATERMARK_SIZE]);
+/* Vary files append NFK1 and the native main/variant hashes to NFW1. */
+void ngx_http_cache_purge_variant_encode(
+    const ngx_http_cache_purge_watermark_t *watermark,
+    const unsigned char main[16], const unsigned char variant[16],
+    unsigned char output[NGX_HTTP_CACHE_PURGE_VARIANT_SIZE]);
 int ngx_http_cache_purge_watermark_decode(ngx_http_cache_rocksdb_bytes_t data,
     ngx_http_cache_purge_watermark_t *watermark,
     ngx_http_cache_rocksdb_error_t *error);
@@ -942,6 +948,11 @@ int ngx_http_cache_purge_publication_watermarks(
     ngx_http_cache_purge_watermark_t *origin,
     ngx_http_cache_purge_watermark_t *validated,
     ngx_http_cache_rocksdb_error_t *error);
+/* Read the published Vary identity, including a pending/completed 304 plan.
+ * Legacy/non-Vary metadata returns NOT_FOUND. Errors clear both hashes. */
+int ngx_http_cache_purge_publication_variant(
+    ngx_http_cache_rocksdb_bytes_t metadata, unsigned char main[16],
+    unsigned char variant[16], ngx_http_cache_rocksdb_error_t *error);
 
 typedef struct {
     ngx_http_cache_rocksdb_bytes_t  root;

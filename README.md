@@ -554,6 +554,10 @@ selected committed file's revision and actual TAGs, visits its key's persisted
 URL and business-host aliases, and returns the two object times with a control
 publication stamp. It never exports TAG candidates or grants cache admission.
 
+Vary files retain the native main and variant hashes in their publication
+metadata, including across conditional revalidation. Ordinary files keep the
+original metadata size.
+
 Full propagation remains unfinished: this query still needs request-path
 integration and retained associations after deletion. Until that is connected,
 an unknown TAG candidate fails before upstream I/O; it is never sent as a matched

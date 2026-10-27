@@ -235,6 +235,8 @@ validation(
     file.path = "file";
     file.metadata = "original-metadata";
     ngx_http_cache_purge_watermark_t origin{};
+    unsigned char native_main[16] = { 0x11 };
+    unsigned char native_variant[16] = { 0x22 };
     if (with_origin) {
         if (race) {
             ngx_http_cache_purge_operations_t operations{};
@@ -248,12 +250,29 @@ validation(
             std::memset(origin.ledger, 0x17, 16);
             origin.sequence = 3;
         }
-        unsigned char encoded[NGX_HTTP_CACHE_PURGE_WATERMARK_SIZE];
-        ngx_http_cache_purge_watermark_encode(&origin, encoded);
+        unsigned char encoded[NGX_HTTP_CACHE_PURGE_VARIANT_SIZE];
+        ngx_http_cache_purge_variant_encode(
+            &origin, native_main, native_variant, encoded);
+        file.vary = "Accept-Language";
         file.metadata.assign(
             reinterpret_cast<char *>(encoded), sizeof(encoded));
         origin.sequence = race ? 0 : 7;
     }
+    auto verify_variant = [&](const std::string &metadata) {
+        unsigned char main[16], variant[16];
+        std::memset(main, 0x33, sizeof(main));
+        std::memset(variant, 0x44, sizeof(variant));
+        int rc = ngx_http_cache_purge_publication_variant(
+            bytes(metadata), main, variant, &error);
+        const unsigned char zero[16] = {};
+        check(
+            rc == (with_origin ? 0 : NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND)
+                && std::memcmp(main, with_origin ? native_main : zero, 16) == 0
+                && std::memcmp(variant, with_origin ? native_variant : zero, 16)
+                       == 0,
+            "published and pending metadata preserve exact Vary hashes without "
+            "inventing legacy identities");
+    };
     std::string target = file.root + "/file", before = "old-head",
                 after = "new-head", tail(65536, 'B');
     unsigned char address[16];
@@ -281,6 +300,7 @@ validation(
             "publish validation fixture");
         publications.finish(index, file.id, 1, anchor.fd, lease.fd, getuid());
     }
+    verify_variant(index.get(file.id).metadata);
     std::string blue = "blue", green = "green";
     ngx_http_cache_rocksdb_bytes_t tags[] = { bytes(green), bytes(blue),
         bytes(green) };
@@ -363,6 +383,7 @@ validation(
             "validation owns committed path intent");
         check(index.get(file.id).tags == file.tags,
             "pending validation retains committed TAG membership");
+        verify_variant(index.get(file.id).metadata);
         ngx_http_cache_purge_index_file_t inspected{};
         check(ngx_http_cache_purge_publications_inspect(publications.native(),
                   store, bytes(file.root), bytes(file.zone), bytes(file.path),
@@ -447,6 +468,7 @@ validation(
     } else {
         check(result.state == 2 && result.revision == 4,
             "validation advances exactly two revisions");
+        verify_variant(index.get(file.id).metadata);
         check(index.get(file.id).tags
                   == std::vector<std::string>({ "blue", "green" }),
             "validation commit atomically publishes canonical TAGs");
@@ -482,6 +504,22 @@ validation(
                       bytes(malformed), &full, &validated, &error)
                       == NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
                 "conditional proof cannot regress below the full origin");
+            malformed.assign(
+                reinterpret_cast<const char *>(inspected.metadata.data),
+                inspected.metadata.len);
+            at = malformed.find("NFK1");
+            check(at != std::string::npos, "native hash extension exists");
+            malformed[at + 3] = '2';
+            unsigned char main[16], variant[16];
+            std::memset(main, 0x55, sizeof(main));
+            std::memset(variant, 0x55, sizeof(variant));
+            const unsigned char zero[16] = {};
+            check(ngx_http_cache_purge_publication_variant(
+                      bytes(malformed), main, variant, &error)
+                          == NGX_HTTP_CACHE_ROCKSDB_CORRUPT
+                      && std::memcmp(main, zero, 16) == 0
+                      && std::memcmp(variant, zero, 16) == 0,
+                "unknown native hash extension exposes no partial identity");
         }
         ngx_http_cache_purge_index_file_free(&inspected);
         ngx_http_cache_rocksdb_stats_t stats{}, retried{};
@@ -547,6 +585,7 @@ validation(
                           == std::vector<std::string>({ "blue", "green" })
                       && index.get(file.id).metadata.size() == previous_size,
                 "receipts remain bounded and retain TAGs");
+            verify_variant(index.get(file.id).metadata);
             check(ngx_http_cache_purge_publications_validate_prepare(
                       publications.native(), store, &previous, anchor.fd,
                       lease.fd, selected.fd, getuid(), validation_guard,

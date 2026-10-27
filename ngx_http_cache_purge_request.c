@@ -3021,14 +3021,19 @@ ngx_http_cache_purge_capture_submit_prepare(ngx_http_cache_purge_capture_t *ctx)
     ngx_int_t  rc;
     u_char    *p;
     int        fds[2] = { ctx->lease, ctx->temporary->file.fd };
-    u_char     watermark[NGX_HTTP_CACHE_PURGE_WATERMARK_SIZE];
+    u_char     watermark[NGX_HTTP_CACHE_PURGE_VARIANT_SIZE];
 
     if (!timeout || !ctx->origin_valid) {
         return NGX_ERROR;
     }
     ngx_http_cache_purge_watermark_encode(&ctx->origin, watermark);
     metadata.data = watermark;
-    metadata.len = sizeof(watermark);
+    metadata.len = NGX_HTTP_CACHE_PURGE_WATERMARK_SIZE;
+    if (ctx->cache->vary.len) {
+        ngx_http_cache_purge_variant_encode(&ctx->origin, ctx->cache->main,
+            ctx->cache->variant, watermark);
+        metadata.len = sizeof(watermark);
+    }
     size += metadata.len;
     for (i = 0; i < 9; i++) {
         if (fields[i].len > 32768) {

@@ -133,7 +133,7 @@ class Origin(http.server.BaseHTTPRequestHandler):
             body = b'old-late-entity'
             late_waiting.set()
             assert late_release.wait(15)
-        if path == '/vary': body += self.headers.get('Accept-Language', '').encode()
+        if path in ('/vary', '/revalidate-vary'): body += self.headers.get('Accept-Language', '').encode()
         if path == '/large': body *= 40000
         status, content_range = (500 if path.startswith('/error-') else 200), None
         if path in ('/error-disk-502', '/error-disk-504'): status = int(path[-3:])
@@ -148,7 +148,7 @@ class Origin(http.server.BaseHTTPRequestHandler):
             self.send_header('X-Accel-Redirect', redirects[path])
             self.send_header('X-Cached-Only', 'hidden-on-redirect')
         self.send_header('Cache-Tag', policies.get(path, 'news, red, news'))
-        if path == '/vary': self.send_header('Vary', 'Accept-Language')
+        if path in ('/vary', '/revalidate-vary'): self.send_header('Vary', 'Accept-Language')
         if content_range: self.send_header('Content-Range', content_range)
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
@@ -499,7 +499,7 @@ def ready_file(item):
     assert item['state'] == 2 and metadata.startswith(b'NFP1')
     return path
 
-def watermark(item):
+def origin_metadata(item):
     metadata = item['metadata']
     if metadata.startswith(b'NFR1'):
         assert int.from_bytes(metadata[60:64], 'big') == len(metadata) - 64
@@ -512,8 +512,24 @@ def watermark(item):
         assert size == len(value) and int.from_bytes(value[28:32], 'big') == len(value) - 32
         value = value[32:]
         size = len(value)
-    assert size == 28 and len(value) == size and value[:4] == b'NFW1'
-    return value[4:20], int.from_bytes(value[20:], 'big')
+    assert size in (28, 64) and len(value) == size and value[:4] == b'NFW1'
+    if size == 64: assert value[28:32] == b'NFK1'
+    return value
+
+def watermark(item):
+    value = origin_metadata(item)
+    return value[4:20], int.from_bytes(value[20:28], 'big')
+
+def variant_hashes(item, language):
+    value = origin_metadata(item)
+    assert len(value) == 64
+    contents = ready_file(item).read_bytes()
+    native_key = contents.split(b'\nKEY: ', 1)[1].split(b'\n', 1)[0]
+    main = hashlib.md5(native_key).digest()
+    variant = hashlib.md5(main + b'accept-language:' + language.encode() + b'\r\n').digest()
+    assert value[32:48] == main and value[48:64] == variant
+    assert item['path'].split(b'/')[-1] in (main.hex().encode(), variant.hex().encode())
+    return main, variant
 
 checks = []
 rogue = f'''  location = /rogue-cache {{
@@ -558,6 +574,7 @@ try:
     assert ledger != bytes(16) and sequence == 0
     assert first['key'] == b'tenant\x1fhttp\x1fcache.test\x1f/asset\x1f'
     assert first['namespace'] == b'tenant' and set(first['tags']) == {b'news', b'red'}
+    assert len(origin_metadata(first)) == 28
     assert get('/asset')[1] == 'HIT' and calls.count('/asset') == 1
     checks.append('real upstream fill is durably indexed with the native key snapshot, scoped tags and READY marker')
     assert get('/asset', method='HEAD') == (200, 'HIT', b'')
@@ -967,6 +984,12 @@ try:
     assert len({x['path'] for x in varied}) == 2 and all(x['vary'] == b'Accept-Language' for x in varied)
     assert get('/vary', {'Accept-Language': 'en'})[1] == 'HIT'
     assert get('/vary', {'Accept-Language': 'de'})[1] == 'HIT'
+    identities = []
+    for item in varied:
+        language = 'en' if ready_file(item).read_bytes().endswith(b'/varyen') else 'de'
+        identities.append(variant_hashes(item, language))
+    assert identities[0][0] == identities[1][0] and identities[0][1] != identities[1][1]
+    checks.append('Vary metadata stores native main and variant hashes while ordinary files keep the original metadata size')
     checks.append('native Vary secondary files are published under the same base key')
     german = next(item for item in varied if ready_file(item).read_bytes().endswith(b'/varyde'))
     os.removexattr(ready_file(german), 'user.ngx_cache_purge.id')
@@ -1074,6 +1097,9 @@ try:
         assert len(query(alias_host, kind=4)) == 2
     checks.append('business host/key relations survive full restart and satisfied host rules do not force repeated origin requests')
     validation_files = {}
+    assert get('/revalidate-vary', {'Accept-Language': 'en'}) == (200, 'MISS', b'/revalidate-varyen')
+    varying_validation = records('/revalidate-vary', 1)[0]
+    varying_hashes = variant_hashes(varying_validation, 'en')
     policies['/revalidate-race'] = 'race-old'
     assert get('/revalidate-race') == (200, 'MISS', b'/revalidate-race')
     race_original = records('/revalidate-race', 1)[0]
@@ -1096,6 +1122,11 @@ try:
         assert set(item['tags']) == expected, (path, item['tags'])
         assert get(path) == (200, 'HIT', path.encode()) and calls.count(path) == 2
     checks.append('304 validation preserves the file/entity, durably refreshes TTL and handles absent, replaced, empty and expression TAGs')
+    assert get('/revalidate-vary', {'Accept-Language': 'en'}) == (200, 'REVALIDATED', b'/revalidate-varyen')
+    varying_after = records('/revalidate-vary', 1)[0]
+    assert varying_after['id'] == varying_validation['id']
+    assert variant_hashes(varying_after, 'en') == varying_hashes
+    checks.append('304 keeps native Vary hashes alongside the refreshed conditional watermark')
     with concurrent.futures.ThreadPoolExecutor(1) as pool:
         request = pool.submit(get, '/revalidate-race')
         assert validation_waiting.wait(5)

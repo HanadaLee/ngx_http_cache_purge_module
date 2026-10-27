@@ -1202,6 +1202,18 @@ ngx_http_cache_purge_watermark_encode(
         output + 20, watermark->sequence, 8);
 }
 
+void
+ngx_http_cache_purge_variant_encode(
+    const ngx_http_cache_purge_watermark_t *watermark,
+    const unsigned char main[16], const unsigned char variant[16],
+    unsigned char output[NGX_HTTP_CACHE_PURGE_VARIANT_SIZE])
+{
+    ngx_http_cache_purge_watermark_encode(watermark, output);
+    memcpy(output + 28, "NFK1", 4);
+    memcpy(output + 32, main, 16);
+    memcpy(output + 48, variant, 16);
+}
+
 int
 ngx_http_cache_purge_watermark_decode(ngx_http_cache_rocksdb_bytes_t data,
     ngx_http_cache_purge_watermark_t *watermark,
@@ -1223,7 +1235,9 @@ ngx_http_cache_purge_watermark_decode(ngx_http_cache_rocksdb_bytes_t data,
         return ngx_http_cache_purge_result(error,
             NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND, "file has no origin watermark");
     }
-    if (data.len != NGX_HTTP_CACHE_PURGE_WATERMARK_SIZE
+    if ((data.len != NGX_HTTP_CACHE_PURGE_WATERMARK_SIZE
+         && (data.len != NGX_HTTP_CACHE_PURGE_VARIANT_SIZE
+             || memcmp(data.data + 28, "NFK1", 4) != 0))
         || ngx_http_cache_purge_zero(data.data + 4))
     {
         return ngx_http_cache_purge_result(error,
@@ -1308,6 +1322,62 @@ ngx_http_cache_purge_publication_watermarks(
     rc = ngx_http_cache_purge_publication_proof(metadata, &proof, error);
     return rc == 0 ? ngx_http_cache_purge_metadata_watermarks(proof.metadata,
         origin, validated, error) : rc;
+}
+
+int
+ngx_http_cache_purge_publication_variant(
+    ngx_http_cache_rocksdb_bytes_t metadata, unsigned char main[16],
+    unsigned char variant[16], ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_publication_proof_t  proof;
+    ngx_http_cache_purge_validation_plan_t    plan;
+    ngx_http_cache_purge_watermark_t          origin, validated;
+    int                                       rc;
+
+    if (main != NULL) {
+        memset(main, 0, 16);
+    }
+    if (variant != NULL) {
+        memset(variant, 0, 16);
+    }
+    if (main == NULL || variant == NULL
+        || !ngx_http_cache_purge_publication_valid(metadata, 16384))
+    {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid variant metadata/output");
+    }
+    if (metadata.len >= 4 && memcmp(metadata.data, "NFV", 3) == 0) {
+        rc = ngx_http_cache_purge_validation_plan(metadata, &plan, error);
+        if (rc != 0) {
+            return rc;
+        }
+        metadata = plan.base;
+    }
+    rc = ngx_http_cache_purge_publication_proof(metadata, &proof, error);
+    if (rc != 0) {
+        return rc;
+    }
+    metadata = proof.metadata;
+    rc = ngx_http_cache_purge_metadata_watermarks(metadata, &origin,
+        &validated, error);
+    if (rc != 0) {
+        return rc;
+    }
+    if (metadata.len >= 4 && memcmp(metadata.data, "NFW2", 4) == 0) {
+        metadata.data += 32;
+        metadata.len -= 32;
+    }
+    rc = ngx_http_cache_purge_watermark_decode(metadata, &origin, error);
+    if (rc != 0) {
+        return rc;
+    }
+    if (metadata.len != NGX_HTTP_CACHE_PURGE_VARIANT_SIZE) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND, "file has no stored Vary hashes");
+    }
+    memcpy(main, metadata.data + 32, 16);
+    memcpy(variant, metadata.data + 48, 16);
+    return ngx_http_cache_purge_result(error, 0, "");
 }
 
 int
