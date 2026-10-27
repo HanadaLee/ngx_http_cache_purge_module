@@ -6,7 +6,7 @@
 
 
 #define NGX_HTTP_CACHE_PURGE_RUNTIME_READERS  1024
-#define NGX_HTTP_CACHE_PURGE_RUNTIME_VERSION 1
+#define NGX_HTTP_CACHE_PURGE_RUNTIME_VERSION 2
 
 typedef struct {
     ngx_uint_t  version;
@@ -69,7 +69,7 @@ ngx_http_cache_purge_runtime_create(ngx_conf_t *cf)
     }
     ngx_http_cache_purge_component_options(&rt->options);
     if (rt->options.abi != NGX_HTTP_CACHE_PURGE_COMPONENT_ABI
-        || ngx_http_cache_purge_component_abi_5()
+        || ngx_http_cache_purge_component_abi_6()
                != NGX_HTTP_CACHE_PURGE_COMPONENT_ABI
         || ngx_array_init(&rt->roots, cf->pool, 2, sizeof(ngx_str_t)) != NGX_OK
         || ngx_array_init(&rt->file_roots, cf->pool, 8,
@@ -2267,6 +2267,52 @@ ngx_http_cache_purge_api_header(ngx_http_request_t *r, ngx_str_t name,
     return found ? NGX_OK : NGX_DECLINED;
 }
 
+static int
+ngx_http_cache_purge_api_tag_compare(const void *left, const void *right)
+{
+    const ngx_str_t  *a = left;
+    const ngx_str_t  *b = right;
+
+    return ngx_memn2cmp(a->data, b->data, a->len, b->len);
+}
+
+static ngx_int_t
+ngx_http_cache_purge_api_value(ngx_http_request_t *r, ngx_str_t encoding,
+    ngx_str_t input, size_t limit, ngx_str_t *value)
+{
+    ngx_str_t  encoded;
+
+    *value = input;
+    if (encoding.len && !ngx_http_cache_purge_api_equal(encoding, "utf8")) {
+        if (!ngx_http_cache_purge_api_equal(encoding, "base64")
+            || input.len > ngx_base64_encoded_length(limit))
+        {
+            return NGX_HTTP_BAD_REQUEST;
+        }
+        value->len = ngx_base64_decoded_length(input.len);
+        value->data = ngx_pnalloc(r->pool, value->len ? value->len : 1);
+        if (value->data == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        if (ngx_decode_base64(value, &input) != NGX_OK) {
+            return NGX_HTTP_BAD_REQUEST;
+        }
+        encoded.len = ngx_base64_encoded_length(value->len);
+        encoded.data = ngx_pnalloc(r->pool, encoded.len ? encoded.len : 1);
+        if (encoded.data == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        ngx_encode_base64(&encoded, value);
+        if (encoded.len != input.len
+            || ngx_memcmp(encoded.data, input.data, input.len) != 0)
+        {
+            return NGX_HTTP_BAD_REQUEST;
+        }
+    }
+    return value->len == 0 || value->len > limit ?
+           NGX_HTTP_BAD_REQUEST : NGX_OK;
+}
+
 static ngx_int_t
 ngx_http_cache_purge_api_prepare(ngx_http_cache_purge_api_t *ctx,
     ngx_str_t body, const char **error)
@@ -2274,13 +2320,14 @@ ngx_http_cache_purge_api_prepare(ngx_http_cache_purge_api_t *ctx,
     ngx_http_cache_purge_json_t        *json;
     ngx_http_cache_purge_json_value_t  *root, *selector, *event, *item, *values;
     ngx_http_cache_purge_loc_conf_t    *conf;
-    ngx_str_t version, mode, type, field, value, scope, encoding, decoded,
-              encoded;
+    ngx_str_t version, mode, type, field, value, scope, encoding, tags[64];
     ngx_str_t            issuer, stream, serial, issued, match, tag_scope,
                          binding;
     ngx_http_request_t  *r;
     uint64_t             timestamp, sequence;
     ngx_uint_t           kind, action;
+    ngx_uint_t           count, unique, i;
+    ngx_int_t            member, rc;
     size_t               size, prefix;
     u_char              *canonical, *p, digest[SHA256_DIGEST_LENGTH];
 
@@ -2330,20 +2377,62 @@ ngx_http_cache_purge_api_prepare(ngx_http_cache_purge_api_t *ctx,
         if (json->failed || values->child < 0) {
             return NGX_HTTP_BAD_REQUEST;
         }
-        item = &json->values[values->child];
-        if (item->next >= 0) {
-            *error = "multiple_tags_not_supported";
-            return NGX_HTTP_PRECONDITION_FAILED;
-        }
-        if (item->kind != '"'
-            || (match.len && !ngx_http_cache_purge_api_equal(match, "any")))
-        {
+        if (match.len && !ngx_http_cache_purge_api_equal(match, "any")) {
             return NGX_HTTP_BAD_REQUEST;
         }
-        value = item->value;
+        count = 0;
+        for (member = values->child; member >= 0; member = item->next) {
+            item = &json->values[member];
+            if (count == 64) {
+                *error = "too_many_tags";
+                return NGX_HTTP_PRECONDITION_FAILED;
+            }
+            if (item->kind != '"') {
+                return NGX_HTTP_BAD_REQUEST;
+            }
+            rc = ngx_http_cache_purge_api_value(r, encoding, item->value,
+                                               1024, &tags[count]);
+            if (rc != NGX_OK) {
+                return rc;
+            }
+            count++;
+        }
+        ngx_qsort(tags, count, sizeof(ngx_str_t),
+                  ngx_http_cache_purge_api_tag_compare);
+        unique = 1;
+        for (i = 1; i < count; i++) {
+            if (ngx_http_cache_purge_api_tag_compare(&tags[unique - 1],
+                                                      &tags[i]) != 0)
+            {
+                tags[unique++] = tags[i];
+            }
+        }
+        value = tags[0];
         kind = tag_scope.len == 0
                || ngx_http_cache_purge_api_equal(tag_scope, "namespace") ? 5 :
                ngx_http_cache_purge_api_equal(tag_scope, "host") ? 6 : 99;
+        if (unique > 1) {
+            size = 1;
+            for (i = 0; i < unique; i++) {
+                size += 2 + tags[i].len;
+            }
+            if (size > 32768) {
+                *error = "tag_set_too_large";
+                return NGX_HTTP_BAD_REQUEST;
+            }
+            value.data = ngx_pnalloc(r->pool, size);
+            value.len = size;
+            if (value.data == NULL) {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+            p = value.data;
+            *p++ = (u_char) unique;
+            for (i = 0; i < unique; i++) {
+                p = ngx_http_cache_purge_api_number(p, tags[i].len, 2);
+                p = ngx_cpymem(p, tags[i].data, tags[i].len);
+            }
+            kind += 2;
+        }
         conf = ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_module);
         if (ngx_http_cache_purge_api_header(r, conf->tag_namespace_header,
                                            &scope) != NGX_OK
@@ -2375,36 +2464,13 @@ ngx_http_cache_purge_api_prepare(ngx_http_cache_purge_api_t *ctx,
             kind = 99;
         }
     }
-    if (encoding.len && !ngx_http_cache_purge_api_equal(encoding, "utf8")) {
-        if (!ngx_http_cache_purge_api_equal(encoding, "base64")) {
-            return NGX_HTTP_BAD_REQUEST;
+    if (kind < 5) {
+        rc = ngx_http_cache_purge_api_value(r, encoding, value, 32768, &value);
+        if (rc != NGX_OK) {
+            return rc;
         }
-        if (value.len > ngx_base64_encoded_length(kind >= 5 ? 1024 : 32768)) {
-            return NGX_HTTP_BAD_REQUEST;
-        }
-        decoded.len = ngx_base64_decoded_length(value.len);
-        decoded.data = ngx_pnalloc(r->pool, decoded.len ? decoded.len : 1);
-        if (decoded.data == NULL) {
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
-        }
-        if (ngx_decode_base64(&decoded, &value) != NGX_OK) {
-            return NGX_HTTP_BAD_REQUEST;
-        }
-        encoded.len = ngx_base64_encoded_length(decoded.len);
-        encoded.data = ngx_pnalloc(r->pool, encoded.len ? encoded.len : 1);
-        if (encoded.data == NULL) {
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
-        }
-        ngx_encode_base64(&encoded, &decoded);
-        if (encoded.len != value.len
-            || ngx_memcmp(encoded.data, value.data, value.len) != 0)
-        {
-            return NGX_HTTP_BAD_REQUEST;
-        }
-        value = decoded;
     }
-    if (action == 0 || kind > 6 || value.len == 0
-        || value.len > (kind >= 5 ? 1024U : 32768U)
+    if (action == 0 || kind > 8 || value.len == 0 || value.len > 32768
         || !ngx_http_cache_purge_json_known(json, selector))
     {
         return NGX_HTTP_BAD_REQUEST;
@@ -2565,6 +2631,7 @@ ngx_http_cache_purge_api_render(ngx_http_cache_purge_api_t *ctx,
     ngx_http_request_t                *r;
     ngx_http_cache_purge_loc_conf_t   *conf;
     ngx_http_cache_purge_api_decode_t  d;
+    ngx_http_cache_rocksdb_bytes_t     raw, tags[64];
     ngx_buf_t                         *buffer;
     ngx_str_t                          id, value, scope, binding, message,
                                        encoded, route;
@@ -2577,9 +2644,9 @@ ngx_http_cache_purge_api_render(ngx_http_cache_purge_api_t *ctx,
                                        propagation, ready;
     ngx_uint_t                         binary;
     u_char                             ledger[32], *p, *identity;
-    size_t                             size;
+    size_t                             size, count, i;
     static const char *types[] = {"key", "url", "prefix", "prefix",
-                                  "host", "tag", "tag"};
+                                  "host", "tag", "tag", "tag", "tag"};
 
     r = ctx->request;
     conf = ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_module);
@@ -2642,14 +2709,15 @@ ngx_http_cache_purge_api_render(ngx_http_cache_purge_api_t *ctx,
             "\"durable_tasks\":true,\"idempotency\":true,\"status_query\":true,"
             "\"selectors\":[\"host\",\"url\",\"key\",\"prefix\",\"tag\"],"
             "\"modes\":[\"invalidate\",\"delete\"],\"binary_selectors\":true,"
-            "\"tag_scopes\":[\"namespace\",\"host\"],\"max_tags\":1,"
+            "\"tag_scopes\":[\"namespace\",\"host\"],\"max_tags\":64,"
             "\"index_schema\":6,\"ledger_schema\":4,"
             "\"propagation_timeout_ms\":\"%uL\","
             "\"propagation_protocols\":[],\"proxy_propagation_ready\":false,"
             "\"proxy_header_transport\":\"unavailable\","
             "\"invalidate_stale_policy\":\"%s\","
             "\"limits\":{\"body_bytes\":262144,\"selector_bytes\":32768,"
-            "\"tag_bytes\":1024,\"namespace_bytes\":32768,"
+            "\"tag_bytes\":1024,\"tag_set_bytes\":32768,"
+            "\"namespace_bytes\":32768,"
             "\"operation_id_bytes\":128,\"acceptance_timeout_ms\":5000},"
             "\"control_headers\":{\"tag_namespace\":",
             (size_t) 32, ledger, ready ? "true" : "false", publication,
@@ -2687,7 +2755,7 @@ ngx_http_cache_purge_api_render(ngx_http_cache_purge_api_t *ctx,
     failed = ngx_http_cache_purge_api_read(&d, 8);
     checkpoint = ngx_http_cache_purge_api_read(&d, 8);
     message = ngx_http_cache_purge_api_read_string(&d);
-    if (d.failed || d.at != d.end || kind > 6 || mode < 1 || mode > 2
+    if (d.failed || d.at != d.end || kind > 8 || mode < 1 || mode > 2
         || stage < 1 || stage > 4 || id.len != ctx->id.len
         || ngx_memcmp(id.data, ctx->id.data, id.len) || sequence > last
         || !ngx_http_cache_purge_api_utf8(scope)
@@ -2728,29 +2796,52 @@ ngx_http_cache_purge_api_render(ngx_http_cache_purge_api_t *ctx,
     if (kind == 2 || kind == 3) {
         p = ngx_sprintf(p, ",\"field\":\"%s\"", kind == 2 ? "key" : "url");
     }
-    binary = !ngx_http_cache_purge_api_utf8(value);
+    count = 1;
+    raw.data = value.data;
+    raw.len = value.len;
+    tags[0] = raw;
+    if (kind > 6 && ngx_http_cache_purge_tags_decode(raw, tags, &count) != 0) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    binary = 0;
+    for (i = 0; i < count; i++) {
+        value.data = (u_char *) tags[i].data;
+        value.len = tags[i].len;
+        binary |= !ngx_http_cache_purge_api_utf8(value);
+    }
     if (binary) {
-        encoded.len = ngx_base64_encoded_length(value.len);
-        encoded.data = ngx_pnalloc(r->pool, encoded.len);
-        if (encoded.data == NULL) {
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
-        }
-        ngx_encode_base64(&encoded, &value);
-        value = encoded;
         p = ngx_cpymem(p, ",\"encoding\":\"base64\"",
                       sizeof(",\"encoding\":\"base64\"") - 1);
     }
     if (kind >= 5) {
         p = ngx_sprintf(p, ",\"scope\":\"%s\",\"match\":\"any\",\"values\":[",
-                        kind == 5 ? "namespace" : "host");
-        p = ngx_http_cache_purge_api_quote(p, value);
-        p = ngx_cpymem(p, "]}", 2);
-        p = ngx_sprintf(p, ",\"%s\":",
-                        kind == 5 ? "tag_namespace" : "tag_host");
-        p = ngx_http_cache_purge_api_quote(p, scope);
+                        kind == 5 || kind == 7 ? "namespace" : "host");
     } else {
         p = ngx_cpymem(p, ",\"value\":", sizeof(",\"value\":") - 1);
+    }
+    for (i = 0; i < count; i++) {
+        if (i != 0) {
+            *p++ = ',';
+        }
+        value.data = (u_char *) tags[i].data;
+        value.len = tags[i].len;
+        if (binary) {
+            encoded.len = ngx_base64_encoded_length(value.len);
+            encoded.data = ngx_pnalloc(r->pool, encoded.len);
+            if (encoded.data == NULL) {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+            ngx_encode_base64(&encoded, &value);
+            value = encoded;
+        }
         p = ngx_http_cache_purge_api_quote(p, value);
+    }
+    if (kind >= 5) {
+        p = ngx_cpymem(p, "]}", 2);
+        p = ngx_sprintf(p, ",\"%s\":",
+                        kind == 5 || kind == 7 ? "tag_namespace" : "tag_host");
+        p = ngx_http_cache_purge_api_quote(p, scope);
+    } else {
         *p++ = '}';
     }
     p = ngx_cpymem(p, ",\"request_digest\":",

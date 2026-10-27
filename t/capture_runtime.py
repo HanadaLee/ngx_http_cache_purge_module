@@ -381,6 +381,10 @@ def api_input(name, selector, mode='delete'):
     return {'version': 'ngx-http-cache-purge/v2', 'operation_id': name, 'mode': mode,
             'selector': selector, 'event': {'issuer': 'scm', 'stream_id': 'test-stream',
             'sequence': '1042', 'issued_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}}
+def tag_group(*values):
+    tags = sorted({value.encode() for value in values})
+    return bytes([len(tags)]) + b''.join(struct.pack('>H', len(tag)) + tag for tag in tags)
+
 def string(value):
     if isinstance(value, str): value = value.encode()
     return struct.pack('>I', len(value)) + value
@@ -1085,7 +1089,8 @@ try:
     with concurrent.futures.ThreadPoolExecutor(1) as pool:
         request = pool.submit(get, '/revalidate-race')
         assert validation_waiting.wait(5)
-        race_sequence = fence('invalidate-during-304', 5, 'race-old', 'tenant', mode=1)
+        race_sequence = fence('invalidate-during-304', 7,
+                              tag_group('race-old', 'race-unused'), 'tenant', mode=1)
         until(lambda: (count := writers(race_sequence)) is not None and count > 0)
         policies['/revalidate-race'] = 'race-new'
         validation_tags['/revalidate-race'] = 'race-new'
@@ -1099,12 +1104,13 @@ try:
     assert get('/revalidate-race') == (200, 'HIT', b'fresh-entity')
     assert calls.count('/revalidate-race') == 3
     until(lambda: writers(race_sequence) == 0)
-    checks.append('a TAG FENCE accepted while origin 304 is pending forces a fresh entity even when the 304 replaces that TAG')
+    checks.append('a TAG-group FENCE accepted while origin 304 is pending forces a fresh entity even when the 304 replaces its matched TAG')
     policies['/late-fill'] = 'late-tag'
     with concurrent.futures.ThreadPoolExecutor(1) as pool:
         request = pool.submit(get, '/late-fill')
         assert late_waiting.wait(5)
-        late_sequence = fence('late-fill-rule', 5, 'late-tag', 'tenant')
+        late_sequence = fence('late-fill-rule', 7,
+                              tag_group('late-tag', 'late-unused'), 'tenant')
         until(lambda: (count := writers(late_sequence)) is not None and count > 0)
         publication = struct.unpack('>IQ', rpc(16))[1]
         process.send_signal(signal.SIGHUP)
@@ -1295,7 +1301,7 @@ try:
     assert status == 200 and headers['Cache-Control'] == 'no-store' and caps['ready'], (status, caps)
     assert caps['authentication'] == 'nginx-configuration' and 'signed_events' not in caps
     assert caps['control_headers']['tag_namespace'] == 'X-Cache-Purge-Namespace'
-    assert caps['index_id'] == ledger.hex() and caps['max_tags'] == 1
+    assert caps['index_id'] == ledger.hex() and caps['max_tags'] == 64
     assert caps['invalidate_stale_policy'] == ('forbid' if extension else 'native')
     assert not caps['proxy_propagation_ready'] and caps['propagation_protocols'] == []
     assert api('/__purge/v2/capabilities', method='HEAD')[0::2] == (200, None)
@@ -1398,6 +1404,72 @@ try:
     assert reply[0] == 202 and reply[2]['tag_host'] == 'cache.test'
     checks.append('HTTP namespace/host TAG scope uses the configured control header, and header renaming does not change semantic idempotency')
 
+    group_a, group_b = '/invalidate/api-group-a', '/invalidate/api-group-b'
+    group_other = '/api-group-unrelated'
+    policies[group_a] = 'multi-blue,multi-red'
+    policies[group_b] = 'multi-blue'
+    policies[group_other] = 'multi-green'
+    conditional_paths.update((group_a, group_b))
+    for path in (group_a, group_a + '?z=b', group_b, group_other):
+        assert get(path)[0] == 200
+    group_files = records(group_a, 2) + records(group_b, 1)
+    for item in group_files: ready_file(item)
+    ready_file(records(group_other, 1)[0])
+    scope_headers = {'X-Cache-Purge-Namespace': 'tenant'}
+    group_input = api_input('api-tag-group',
+        {'type': 'tag', 'values': ['multi-red', 'multi-blue', 'multi-red']}, 'invalidate')
+    wrong = dict(group_input, operation_id='api-tag-group-wrong-scope')
+    assert api('/__purge/v2/operations', wrong,
+               headers={'X-Cache-Purge-Namespace': 'another-tenant'})[0] == 202
+    assert get(group_a)[1] == 'HIT'
+    grouped = api('/__purge/v2/operations', group_input, headers=scope_headers)
+    assert grouped[0] == 202 and grouped[2]['selector']['values'] == ['multi-blue', 'multi-red'], grouped
+    for path in (group_a, group_a + '?z=b', group_b):
+        reply = get(path)
+        assert reply[0] == 200 and reply[1] == 'REVALIDATED', reply
+    assert get(group_other)[1] == 'HIT'
+    retry = dict(group_input, selector={'type': 'tag', 'values': ['multi-blue', 'multi-red']})
+    repeated = api('/__purge/v2/operations', retry, headers=scope_headers)
+    assert repeated[0] == 202
+    for name in ('request_digest', 'sequence', 'accepted_at', 'effective_at'):
+        assert repeated[2][name] == grouped[2][name], name
+    until(lambda: api('/__purge/v2/operations/api-tag-group')[2]['cleanup']['state'] == 'done')
+    finished = api('/__purge/v2/operations/api-tag-group')[2]
+    assert finished['cleanup']['visits'] == '3', finished
+    assert {item['id'] for item in group_files} == {item['id'] for item in records(group_a, 2) + records(group_b, 1)}
+    checks.append('HTTP multi-TAG Invalidate normalizes order/duplicates, covers both zones once per file, preserves 304 entities and isolates its namespace')
+
+    host_group = api_input('api-host-tag-group',
+        {'type': 'tag', 'values': ['multi-red', 'multi-blue'], 'scope': 'host'})
+    for path in (group_a, group_b): fresh_bodies[path] = b'new-group-body'
+    host_group_reply = api('/__purge/v2/operations', host_group,
+                          headers={'X-Cache-Purge-Namespace': 'cache.test'})
+    assert host_group_reply[0] == 202 and host_group_reply[2]['tag_host'] == 'cache.test'
+    for path in (group_a, group_a + '?z=b', group_b):
+        reply = get(path)
+        assert reply[0] == 200 and reply[2] == b'new-group-body', reply
+    assert get(group_other)[1] == 'HIT'
+    until(lambda: api('/__purge/v2/operations/api-host-tag-group')[2]['cleanup']['state'] == 'done')
+    checks.append('HTTP host TAG-group Delete prevents old responses across zones while unrelated TAGs remain HITs')
+
+    many_tags = ['unused-tag-' + str(i) for i in range(64)]
+    maximum = api('/__purge/v2/operations', api_input('api-64-tags',
+                  {'type': 'tag', 'values': many_tags}), headers=scope_headers)
+    assert maximum[0] == 202 and maximum[2]['selector']['values'] == sorted(many_tags)
+    binary_values = [b'normal', b'\xff\x00']
+    binary_group = api('/__purge/v2/operations', api_input('api-binary-tags',
+        {'type': 'tag', 'values': [base64.b64encode(value).decode() for value in binary_values],
+         'encoding': 'base64'}), headers=scope_headers)
+    assert binary_group[0] == 202 and binary_group[2]['selector']['encoding'] == 'base64'
+    assert [base64.b64decode(value) for value in binary_group[2]['selector']['values']] == binary_values
+    singleton = api_input('api-singleton-tag', {'type': 'tag', 'values': ['same', 'same']})
+    singleton_reply = api('/__purge/v2/operations', singleton, headers=scope_headers)
+    singleton['selector']['values'] = ['same']
+    singleton_retry = api('/__purge/v2/operations', singleton, headers=scope_headers)
+    assert singleton_reply[0] == singleton_retry[0] == 202
+    assert singleton_reply[2]['request_digest'] == singleton_retry[2]['request_digest']
+    checks.append('HTTP accepts 64 TAG members, preserves binary TAG arrays and canonicalizes duplicate singleton sets')
+
     malformed = api_input('api-invalid', {'type': 'url', 'value': 'absent'})
     raw = json.dumps(malformed).encode()
     cases = [raw[:-1] + b',"mode":"delete"}', raw + b' trailing',
@@ -1411,11 +1483,16 @@ try:
     assert api('/__purge/v2/operations', bad_base64)[0] == 400
     signed = dict(malformed, event={**malformed['event'], 'signature': 'not-verified'})
     assert api('/__purge/v2/operations', signed)[0] == 400
-    assert api('/__purge/v2/operations', api_input('api-multiple-tags',
-               {'type': 'tag', 'values': ['one', 'two']}),
+    assert api('/__purge/v2/operations', api_input('api-too-many-tags',
+               {'type': 'tag', 'values': ['tag-' + str(i) for i in range(65)]}),
                headers={'X-Cache-Purge-Namespace': 'tenant'})[0] == 412
+    oversized = [str(i).zfill(2) + 'x' * 1022 for i in range(33)]
+    assert api('/__purge/v2/operations', api_input('api-tags-too-large',
+               {'type': 'tag', 'values': oversized}), headers=scope_headers)[0] == 400
+    assert api('/__purge/v2/operations/api-tags-too-large')[0] == 404
+    assert api('/__purge/v2/operations/api-too-many-tags')[0] == 404
     assert api('/__purge/v2/operations/api-invalid')[0] == 404
-    checks.append('HTTP parser rejects duplicate keys, trailing input, malformed UTF-8/surrogates, unknown fields, unsupported signatures and unsupported TAG groups without acceptance')
+    checks.append('HTTP parser rejects duplicate keys, trailing input, malformed UTF-8/surrogates, unknown fields, unsupported signatures and oversized TAG groups without acceptance')
 
     chunked = api_input('api-chunked', {'type': 'url', 'value': 'http://absent.test/chunked'})
     raw = json.dumps(chunked).encode()
@@ -1448,15 +1525,18 @@ try:
     checks.append('HTTP handles chunked JSON and rejects duplicate namespace headers and oversized bodies')
 
     held_uri = '/invalidate/api-held'
+    policies[held_uri] = 'api-held-member'
     assert get(held_uri)[0] == 200
     held_file = records(held_uri, 1)[0]
     held_path = ready_file(held_file)
     _, lease = rpc(17, string(str(held_path)), receive_fd=True)
     try:
-        operation = api_input('api-disconnected', {'type': 'url', 'value': 'http://cache.test' + held_uri})
+        operation = api_input('api-disconnected',
+                              {'type': 'tag', 'values': ['api-held-member', 'api-held-unused']})
         conn = http.client.HTTPConnection('127.0.0.1', port, timeout=15)
         conn.request('POST', '/__purge/v2/operations', json.dumps(operation),
-                     {'Host': 'cache.test', 'Content-Type': 'application/json'})
+                     {'Host': 'cache.test', 'Content-Type': 'application/json',
+                      'X-Cache-Purge-Namespace': 'tenant'})
         response = conn.getresponse()
         assert response.status == 202
         response.close()
@@ -1478,7 +1558,7 @@ try:
               'writers', writers(int(restored['sequence'])), 'file_exists', held_path.exists(), flush=True)
         raise
     assert not held_path.exists()
-    checks.append('HTTP acceptance does not wait for a held file lease; disconnection and nginx restart preserve autonomous cleanup and the original effective time')
+    checks.append('HTTP TAG-group acceptance does not wait for a held file lease; disconnection and nginx restart preserve autonomous cleanup and the original effective time')
 finally:
     capacity_gate.set()
     validation_release.set()

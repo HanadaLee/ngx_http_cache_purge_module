@@ -19,8 +19,8 @@ connects RocksDB ownership, durable operations, and shared control publication t
 one executor in ordinary nginx worker 0. Real upstream fills now enter the
 persistent index through standard module interfaces. File-response admission now
 checks the selected descriptor and shared FENCE table. The development HTTP API
-supports durable Invalidate/Delete submission and status queries. Multi-TAG
-operations, SCM integration, and multilevel propagation remain unfinished.
+supports durable Invalidate/Delete submission, scoped multi-TAG operations and
+status queries. SCM integration and multilevel propagation remain unfinished.
 
 The repository now contains a bounded RocksDB storage bridge and a persistent
 URL/key/file index. They support cross-zone lookup, scoped TAG postings, full
@@ -148,7 +148,7 @@ Reload preserves old-worker registrations; only proven-dead processes are
 reclaimed. The executor can query pre-operation writer registrations through
 bounded IPC. A zero count alone does not permit FENCE removal: queued IPC,
 unfinished durable transactions and physical processing still need closure.
-This changes the internal shared-control ABI to 3; nginx-ext ABI remains 1.
+The internal shared-control ABI is 4; nginx-ext ABI remains 1.
 
 Native file responses use `ADMIT_FILE` to verify the selected descriptor, bind
 the captured key, and persist the observed URL association. Repeated observations
@@ -238,8 +238,10 @@ The storage layer can encode up to 64 sorted, unique TAG members as one operatio
 and persist their requirements in the same atomic write. Its namespace/host OR
 queries traverse one member posting list at a time, with resumable work bounds
 and no result-sized deduplication set. Parent and member queries share the
-existing memory budget. Group support in the resident control table and public
-HTTP API is still pending; the API continues to advertise `max_tags: 1`.
+existing memory budget. The resident table stores one operation record and compact
+TAG membership links, so overlapping members emit the operation once. Matching
+does not allocate memory or access RocksDB. The public API accepts up to 64 TAGs,
+sorts and deduplicates them, and uses one durable submission and effective time.
 
 Business `$host` is separate from `$cache_key_host`. The index records observed
 host-to-key relationships, shared across every slice, Vary file and zone of the
@@ -413,8 +415,9 @@ On graceful reload, the old worker requests asynchronous executor shutdown so
 long-lived HTTP responses do not keep the database owner indefinitely. Its
 executor finishes the current operation and closes the DB before the replacement
 opens it. The old worker can continue sending its response and joins the stopped
-executor when it exits. The component C ABI is 5; rebuild its archives together
-with the addon. Override `CACHE_PURGE_ROCKSDB_LIBS` to use
+executor when it exits. The component C ABI is 6; rebuild its archives together
+with the addon. Upgrading from shared-control ABI 3 requires a full nginx restart;
+persisted cache files and indexes are retained. Override `CACHE_PURGE_ROCKSDB_LIBS` to use
 a fixed RocksDB archive and its compression/runtime dependencies. The default
 links the system shared RocksDB library. Static archives linked into a dynamic
 nginx module must be built with PIC.
@@ -483,13 +486,18 @@ Example request body:
 
 Selectors include exact `key`, `url`, `host`, `prefix` with `field: key|url`,
 and scoped `tag`. Matching uses the index across zones. Binary selector values
-use `encoding: base64`. TAG accepts `values: ["tag"]` with `scope: namespace|host`;
+use `encoding: base64`. TAG accepts `values: ["tag-a", "tag-b"]` with
+`match: any` and `scope: namespace|host`;
 the scope value comes from the configured namespace header. Its default name is
 `X-Cache-Purge-Namespace`, and the directive inherits at http/server/location
 scope. Header renaming does not change the operation's semantic identity.
 
-The current API supports one TAG per operation and exact hosts; capabilities
-advertise that limit. Multi-TAG operations and subdomain expansion remain pending.
+The API accepts at most 64 input TAG values, each at most 1024 bytes. After
+sorting and deduplication, their internal encoding must fit 32768 bytes. A
+duplicate singleton normalizes to the original single-TAG operation. Array order
+and duplicate values do not change idempotency. With `encoding: base64`, each
+array member is encoded separately. Only `match: any` and exact hosts are
+supported; subdomain expansion remains pending.
 Bodies are bounded at 256 KiB. Duplicate or unknown JSON fields, duplicate scope
 headers, and malformed UTF-8/base64 are rejected. The module reserves an in-memory
 body buffer and rejects file-only request buffering for API locations.

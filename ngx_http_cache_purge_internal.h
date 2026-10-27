@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define NGX_HTTP_CACHE_PURGE_COMPONENT_ABI 5
+#define NGX_HTTP_CACHE_PURGE_COMPONENT_ABI 6
 #define NGX_HTTP_CACHE_PURGE_PROTOCOL_VERSION 1
 #define NGX_HTTP_CACHE_PURGE_FRAME_SIZE 24
 
@@ -142,7 +142,7 @@ typedef struct {
 void ngx_http_cache_purge_component_options(
     ngx_http_cache_purge_component_options_t *options);
 /* Link-time header/archive compatibility marker. */
-uint32_t ngx_http_cache_purge_component_abi_5(void);
+uint32_t ngx_http_cache_purge_component_abi_6(void);
 
 /* Only start after fork in the selected nginx worker, never while parsing
  * configuration or in master. Copies its inputs and starts one executor thread.
@@ -199,7 +199,7 @@ int ngx_http_cache_purge_component_stop(
 extern "C" {
 #endif
 
-#define NGX_HTTP_CACHE_PURGE_CONTROL_ABI 3
+#define NGX_HTTP_CACHE_PURGE_CONTROL_ABI 4
 #define NGX_HTTP_CACHE_PURGE_CONTROL_FENCE 1
 #define NGX_HTTP_CACHE_PURGE_CONTROL_PROPAGATE 2
 #define NGX_HTTP_CACHE_PURGE_CONTROL_PREPARING 4

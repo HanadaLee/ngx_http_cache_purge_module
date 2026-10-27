@@ -100,8 +100,14 @@ workload(void *memory, size_t size, std::vector<Request> &requests,
 }
 
 int
-main()
+main(int argc, char **argv)
 {
+    bool groups = argc == 2
+                  && (std::string(argv[1]) == "--tag-groups"
+                      || std::string(argv[1]) == "--tag-groups-64");
+    unsigned members =
+        argc == 2 && std::string(argv[1]) == "--tag-groups-64" ? 64 : 2;
+    check(argc == 1 || groups);
     size_t size = ngx_http_cache_purge_control_size(8 * 1024 * 1024, 32);
     void *memory = mmap(nullptr, size, PROT_READ | PROT_WRITE,
         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
@@ -114,9 +120,11 @@ main()
     check(
         ngx_http_cache_purge_control_writer_open(memory, size, &writer, &error)
         == 0);
-    std::printf("{\"reserved_shm_bytes\":%zu,\"iterations_per_worker\":200000,"
+    std::printf("{\"tag_groups\":%s,\"members_per_group\":%u,"
+                "\"reserved_shm_bytes\":%zu,\"iterations_"
+                "per_worker\":200000,"
                 "\"scenarios\":[",
-        size);
+        groups ? "true" : "false", groups ? members : 0, size);
     bool first = true;
     for (unsigned count : { 0, 16, 256, 4096 }) {
         std::vector<Operation> operations;
@@ -129,7 +137,8 @@ main()
             op.stage = OperationStage::active;
             op.propagate = true;
             op.propagation_until_ms = 305000;
-            op.input.selector.kind = static_cast<SelectorKind>(i % 7);
+            op.input.selector.kind =
+                static_cast<SelectorKind>(i % (groups ? 9 : 7));
             switch (op.input.selector.kind) {
             case SelectorKind::key:
                 op.input.selector.value = r.key;
@@ -155,8 +164,18 @@ main()
                 op.input.selector.scope = r.host;
                 break;
             case SelectorKind::namespace_tags:
-            case SelectorKind::host_tags:
-                throw std::runtime_error("group fixture is not generated");
+            case SelectorKind::host_tags: {
+                std::vector<std::string> values{ r.tag };
+                for (unsigned n = 1; n < members; n++) {
+                    values.push_back("zz-" + std::to_string(100 + n));
+                }
+                op.input.selector.value = tag_group(values);
+                op.input.selector.scope =
+                    op.input.selector.kind == SelectorKind::namespace_tags ?
+                        r.ns :
+                        r.host;
+                break;
+            }
             }
             operations.push_back(std::move(op));
         }

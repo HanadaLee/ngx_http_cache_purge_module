@@ -142,7 +142,21 @@ reference(const std::vector<Operation> &ops, const Context &c, bool proxy,
             break;
         case SelectorKind::namespace_tags:
         case SelectorKind::host_tags:
-            throw std::runtime_error("group controls are not enabled yet");
+            if ((s.kind == SelectorKind::namespace_tags ? c.ns : c.host)
+                == s.scope)
+            {
+                size_t at = 1;
+                while (at < s.value.size()) {
+                    size_t size = static_cast<unsigned char>(s.value[at]) * 256
+                                  + static_cast<unsigned char>(s.value[at + 1]);
+                    at += 2;
+                    match |= std::find(c.tags.begin(), c.tags.end(),
+                                 s.value.substr(at, size))
+                             != c.tags.end();
+                    at += size;
+                }
+            }
+            break;
         }
         if (!match) {
             continue;
@@ -234,7 +248,13 @@ main()
             operation(7, SelectorKind::host_tag, "photo", context.host),
             operation(8, SelectorKind::namespace_tag, "photo", "other"),
             operation(9, SelectorKind::url_prefix, "https://cache.test/ax"),
-            operation(10, SelectorKind::key_prefix, "") };
+            operation(10, SelectorKind::key_prefix, ""),
+            operation(11, SelectorKind::namespace_tags,
+                tag_group({ "other", "photo" }), context.ns),
+            operation(12, SelectorKind::host_tags,
+                tag_group({ "other", "photo" }), context.host),
+            operation(13, SelectorKind::namespace_tags,
+                tag_group({ "other", "photo" }), "wrong-namespace") };
         ops[1].stage = OperationStage::materialized;
         ops[4].stage = OperationStage::preparing;
         ops[4].propagate = false;
@@ -249,6 +269,53 @@ main()
         check(lookup(reader, context, true, 302000)
                   == reference(ops, context, true, 302000),
             "window expiry does not clear FENCE");
+        std::vector<std::string> members;
+        for (unsigned n = 100; n < 164; n++) {
+            members.push_back("tag-" + std::to_string(n));
+        }
+        const auto grouped = operation(
+            101, SelectorKind::namespace_tags, tag_group(members), context.ns);
+        expect(ngx_http_cache_purge_control_gate_close(writer, &error), 0,
+            "close before group budget test");
+        publish_controls(writer, { grouped });
+        expect(ngx_http_cache_purge_control_gate_open(writer, &error), 0,
+            "open group budget test");
+        Context many = context;
+        many.tags = members;
+        Matches emitted;
+        expect(ngx_http_cache_purge_control_match(reader, many.get(), 1, 65536,
+                   collect, &emitted, &version, &error),
+            0, "64 matched members consume exactly one operation budget");
+        check(emitted.size() == 1, "group callback emitted once");
+        auto complete = [](void *data,
+                            const ngx_http_cache_purge_control_match_t *match) {
+            auto &op = *static_cast<const Operation *>(data);
+            check(match->kind == NGX_HTTP_CACHE_PURGE_NAMESPACE_TAGS
+                      && std::string(
+                             reinterpret_cast<const char *>(match->value.data),
+                             match->value.len)
+                             == op.input.selector.value,
+                "group callback retains the complete canonical operation");
+            return 0;
+        };
+        expect(
+            ngx_http_cache_purge_control_match(reader, many.get(), 1, 65536,
+                complete, const_cast<Operation *>(&grouped), &version, &error),
+            0, "complete group callback");
+        for (const auto &bad : { tag_group({ "b", "a" }),
+                 tag_group({ "a", "a" }), tag_group({ "a" }) })
+        {
+            fails(NGX_HTTP_CACHE_ROCKSDB_INVALID, [&] {
+                prepare_controls(
+                    writer, { operation(102, SelectorKind::namespace_tags, bad,
+                                context.ns) });
+            });
+        }
+        expect(ngx_http_cache_purge_control_gate_close(writer, &error), 0,
+            "restore selector image after group checks");
+        publish_controls(writer, ops);
+        expect(ngx_http_cache_purge_control_gate_open(writer, &error), 0,
+            "open restored selector image");
         expect(ngx_http_cache_purge_control_match(reader, context.get(), 1,
                    4096, ignore, nullptr, &version, &error),
             NGX_HTTP_CACHE_ROCKSDB_LIMIT, "match count overflow fails closed");
@@ -310,7 +377,7 @@ main()
         std::mt19937 random(20261026);
         ops.clear();
         for (unsigned n = 1; n <= 700; ++n) {
-            auto kind = static_cast<SelectorKind>(random() % 7);
+            auto kind = static_cast<SelectorKind>(random() % 9);
             auto value = "/a/" + std::to_string(random() % 30);
             if (kind == SelectorKind::host) {
                 value = "host-" + std::to_string(random() % 5);
@@ -322,10 +389,17 @@ main()
             }
             std::string scope;
             if (kind == SelectorKind::namespace_tag
-                || kind == SelectorKind::host_tag)
+                || kind == SelectorKind::host_tag
+                || kind == SelectorKind::namespace_tags
+                || kind == SelectorKind::host_tags)
             {
                 value = "tag-" + std::to_string(random() % 5);
                 scope = "scope-" + std::to_string(random() % 3);
+                if (kind == SelectorKind::namespace_tags
+                    || kind == SelectorKind::host_tags)
+                {
+                    value = tag_group({ value, "zz-other" });
+                }
             }
             auto op = operation(n, kind, value, scope);
             if (n % 11 == 0) {
