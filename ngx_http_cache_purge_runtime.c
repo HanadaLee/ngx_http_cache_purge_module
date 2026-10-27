@@ -603,8 +603,11 @@ ngx_http_cache_purge_runtime_node(ngx_http_file_cache_t *cache,
     const u_char                *p;
     ngx_uint_t                   i;
     ngx_int_t                    value;
-    off_t                        released, remaining;
+    off_t                        released;
     int                          compare, rc;
+#if (NGX_DEBUG)
+    off_t                        remaining = 0;
+#endif
 
     if (cleanup->outcome == NGX_HTTP_CACHE_PURGE_REPLACED) {
         return 0;
@@ -628,7 +631,6 @@ ngx_http_cache_purge_runtime_node(ngx_http_file_cache_t *cache,
         return NGX_HTTP_CACHE_ROCKSDB_BUSY;
     }
     released = 0;
-    remaining = 0;
     rc = 0;
     node = cache->sh->rbtree.root;
     sentinel = cache->sh->rbtree.sentinel;
@@ -661,7 +663,9 @@ ngx_http_cache_purge_runtime_node(ngx_http_file_cache_t *cache,
         }
         released = file->fs_size;
         cache->sh->size -= released;
+#if (NGX_DEBUG)
         remaining = cache->sh->size;
+#endif
         file->fs_size = 0;
         file->exists = 0;
         break;
