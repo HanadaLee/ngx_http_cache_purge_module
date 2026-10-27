@@ -415,7 +415,7 @@ On graceful reload, the old worker requests asynchronous executor shutdown so
 long-lived HTTP responses do not keep the database owner indefinitely. Its
 executor finishes the current operation and closes the DB before the replacement
 opens it. The old worker can continue sending its response and joins the stopped
-executor when it exits. The component C ABI is 6; rebuild its archives together
+executor when it exits. The component C ABI is 7; rebuild its archives together
 with the addon. Upgrading from shared-control ABI 4 or earlier requires a full
 nginx restart; persisted cache files and indexes are retained.
 Override `CACHE_PURGE_ROCKSDB_LIBS` to use
@@ -444,16 +444,15 @@ management location to expose the development HTTP API.
 
 ## Persistent management API
 
-The propagation configuration is being integrated with the L2 request/response
-path. It provides four independently inherited header-name directives with
-defaults `X-Cache-Purge-Time`, `X-Cache-Purge-Mode`, `X-Cache-Purge-Fence`, and
-`X-Cache-Purge-Ack`:
+Propagation is one-way: L1 sends request headers to L2. L2 validates the
+requirements, then serves a suitable cached response or applies Invalidate/Delete
+and fetches upstream. Responses carry no propagation metadata or acknowledgement.
+The configuration provides three independently inherited header-name directives:
 
 ```nginx
 cache_purge_propagation_time_header X-Cache-Purge-Time;
 cache_purge_propagation_mode_header X-Cache-Purge-Mode;
 cache_purge_propagation_fence_header X-Cache-Purge-Fence;
-cache_purge_propagation_ack_header X-Cache-Purge-Ack;
 ```
 
 `cache_purge_ignore_propagation on|off;` configures whether L2 should ignore
@@ -498,18 +497,16 @@ operation records; it does not copy cache-file metadata into shared memory.
 Output-budget exhaustion fails the lookup instead of silently truncating rules.
 This internal lookup is not yet connected to the HTTP propagation path.
 
-The internal C codec provides bounded binary request/acknowledgement frames.
-It preserves complete scoped TAG groups, rejects duplicate or unordered
-requirements, and binds acknowledgements to a request nonce and SHA-256 digest.
-The digest is not authentication. Local propagation windows are absent from
-the wire format. HTTP encoding, identity mapping, and request/response admission
-remain to be integrated; the codec alone does not enable L2 propagation.
+The internal C codec provides bounded binary request frames. It preserves
+complete scoped TAG groups and rejects duplicate or unordered requirements.
+Local windows, nonces, and request/response digests are absent from the format.
+HTTP encoding and L2 request admission remain to be integrated; the codec alone
+does not enable propagation.
 
-These configuration and policy evaluation interfaces are implemented; L2 header
-transfer and acknowledgement enforcement remain unfinished and
-`proxy_propagation_ready` remains false. The planned protocol has no module-side
-authentication, signatures, or key management. An acknowledgement binds results
-to a request and does not authenticate a node.
+These configuration and policy evaluation interfaces are implemented; L2 request
+header transfer and local cache decisions remain unfinished, and
+`proxy_propagation_ready` remains false. The protocol has no module-side
+authentication, signatures, key management, or response verification exchange.
 
 ```nginx
 location /__scm/cache/v2/ {

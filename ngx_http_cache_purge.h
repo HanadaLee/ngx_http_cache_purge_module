@@ -731,7 +731,7 @@ typedef struct {
 #if (NGX_HTTP_CACHE_PURGE_ROCKSDB)
     ngx_str_t                          api_prefix;
     ngx_str_t                          tag_namespace_header;
-    ngx_str_t                          propagation_header[4];
+    ngx_str_t                          propagation_header[3];
 #if (NGX_EXPR)
     ngx_array_t                       *ignore_propagation;
     ngx_array_t                       *propagation;

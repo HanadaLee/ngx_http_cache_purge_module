@@ -505,19 +505,22 @@ ngx_http_cache_purge_test_fence(void)
 {
     ngx_http_cache_purge_fence_t        fence, decoded;
     ngx_http_cache_purge_requirement_t  item[64], parsed[64], temporary;
-    ngx_http_cache_purge_ack_t          ack, response;
     ngx_http_cache_rocksdb_bytes_t      input;
     ngx_http_cache_rocksdb_error_t     *error;
-    unsigned char                      raw[65537], copy[65537], digest[32];
-    unsigned char                      reply[NGX_HTTP_CACHE_PURGE_ACK_SIZE + 1];
+    unsigned char                      raw[65537], copy[65537];
     char                               ids[64][16];
     size_t                             length, needed, i, bit, roundtrip;
     int                                rc;
-    static const unsigned char expected[32] = {
-        0xe7, 0xf8, 0xa9, 0xf5, 0x10, 0x27, 0x18, 0x88,
-        0x93, 0x8e, 0x9e, 0x77, 0x40, 0x54, 0x4e, 0x23,
-        0x1d, 0xb0, 0x2d, 0x51, 0x3a, 0x1c, 0x0d, 0xab,
-        0x77, 0x41, 0x67, 0x82, 0x68, 0x04, 0xc6, 0xf5
+    static const unsigned char expected[] = {
+        0x4e, 0x50, 0x46, 0x31, 0x00, 0x01, 0x20, 0x21,
+        0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29,
+        0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x01, 0x02,
+        0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x01, 0x01,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x6f, 0x70,
+        0x31, 0x00, 0x00, 0x00, 0x0d, 0x68, 0x74, 0x74,
+        0x70, 0x73, 0x3a, 0x2f, 0x2f, 0x61, 0x2f, 0x78,
+        0x00, 0x79, 0x00, 0x00, 0x00, 0x00
     };
     static const unsigned char group[] = {
         2, 0, 4, 'b', 'l', 'u', 'e', 0, 3, 'r', 'e', 'd'
@@ -527,11 +530,7 @@ ngx_http_cache_purge_test_fence(void)
     memset(&fence, 0, sizeof(fence));
     memset(item, 0, sizeof(item));
     for (i = 0; i < 16; i++) {
-        fence.nonce[i] = (unsigned char) i;
         item[0].ledger[i] = (unsigned char) (i + 32);
-    }
-    for (i = 0; i < 32; i++) {
-        fence.identity[i] = (unsigned char) (i + 1);
     }
     item[0].sequence = UINT64_C(0x0102030405060708);
     item[0].issued_at_ms = UINT64_MAX - 1;
@@ -544,7 +543,7 @@ ngx_http_cache_purge_test_fence(void)
     fence.requirements = item;
     rc = ngx_http_cache_purge_fence_encode(&fence, NULL, 0, &needed,
                                             error);
-    ngx_http_cache_purge_test_check(rc == 0 && needed == 118,
+    ngx_http_cache_purge_test_check(rc == 0 && needed == sizeof(expected),
         "propagation sizing matches independent wire layout");
     memset(raw, 0xa5, sizeof(raw));
     rc = ngx_http_cache_purge_fence_encode(&fence, raw, needed - 1, &length,
@@ -558,11 +557,9 @@ ngx_http_cache_purge_test_fence(void)
         "encode binary URL and full-width event time");
     input.data = raw;
     input.len = length;
-    rc = ngx_http_cache_purge_fence_digest(input, digest,
-                                            error);
     ngx_http_cache_purge_test_check(
-        rc == 0 && memcmp(digest, expected, 32) == 0,
-        "envelope digest matches independent Python struct/SHA256 vector");
+        memcmp(raw, expected, sizeof(expected)) == 0,
+        "envelope matches independent Python wire vector without reply fields");
     rc = ngx_http_cache_purge_fence_decode(input, &decoded, parsed, 64,
                                             error);
     ngx_http_cache_purge_test_check(rc == 0 && decoded.count == 1
@@ -611,66 +608,6 @@ ngx_http_cache_purge_test_fence(void)
             raw[i] ^= (unsigned char) bit;
         }
     }
-    memset(&ack, 0, sizeof(ack));
-    memcpy(ack.nonce, fence.nonce, 16);
-    memcpy(ack.digest, digest, 32);
-    ack.outcome = NGX_HTTP_CACHE_PURGE_ACK_FRESH;
-    ack.stale_policy = NGX_HTTP_CACHE_PURGE_STALE_STRICT;
-    rc = ngx_http_cache_purge_ack_encode(&ack, reply,
-                                            error);
-    ngx_http_cache_purge_test_check(rc == 0, "encode strict fresh ack");
-    input.data = reply;
-    input.len = NGX_HTTP_CACHE_PURGE_ACK_SIZE;
-    rc = ngx_http_cache_purge_ack_check(input, fence.nonce, digest, &response,
-                                            error);
-    ngx_http_cache_purge_test_check(rc == 0
-        && response.outcome == NGX_HTTP_CACHE_PURGE_ACK_FRESH,
-        "matching request-bound ack");
-    reply[4] ^= 1;
-    rc = ngx_http_cache_purge_ack_check(input, fence.nonce, digest, &response,
-                                            error);
-    ngx_http_cache_purge_test_check(rc == NGX_HTTP_CACHE_ROCKSDB_CONFLICT
-                                        && response.outcome == 0,
-        "another request nonce cannot satisfy the current request");
-    reply[4] ^= 1;
-    reply[20] ^= 1;
-    rc = ngx_http_cache_purge_ack_check(input, fence.nonce, digest, &response,
-                                            error);
-    ngx_http_cache_purge_test_check(rc == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
-        "same nonce with a different requirement set is rejected");
-    reply[20] ^= 1;
-    for (i = 0; i <= sizeof(reply); i++) {
-        if (i == NGX_HTTP_CACHE_PURGE_ACK_SIZE) {
-            continue;
-        }
-        input.len = i;
-        rc = ngx_http_cache_purge_ack_check(input, fence.nonce, digest,
-            &response, error);
-        ngx_http_cache_purge_test_check(rc == NGX_HTTP_CACHE_ROCKSDB_INVALID
-                                            && response.outcome == 0,
-            "truncated or extended ack rejected");
-    }
-    ack.outcome = NGX_HTTP_CACHE_PURGE_ACK_STALE;
-    rc = ngx_http_cache_purge_ack_encode(&ack, reply,
-                                            error);
-    ngx_http_cache_purge_test_check(rc == NGX_HTTP_CACHE_ROCKSDB_INVALID,
-        "strict stale outcome is contradictory");
-    ack.stale_policy = NGX_HTTP_CACHE_PURGE_STALE_NATIVE;
-    rc = ngx_http_cache_purge_ack_encode(&ack, reply,
-                                            error);
-    input.len = NGX_HTTP_CACHE_PURGE_ACK_SIZE;
-    ngx_http_cache_purge_test_check(rc == 0
-        && ngx_http_cache_purge_ack_check(input, fence.nonce, digest, &response,
-                                            error) == 0
-        && response.outcome == NGX_HTTP_CACHE_PURGE_ACK_STALE,
-        "native stale outcome remains explicitly distinguishable");
-    reply[54] = 1;
-    ngx_http_cache_purge_test_check(
-        ngx_http_cache_purge_ack_check(input, fence.nonce, digest, &response,
-                                            error)
-            == NGX_HTTP_CACHE_ROCKSDB_INVALID,
-        "unknown ack flags are not silently accepted");
-
     item[1] = item[0];
     item[1].sequence++;
     item[1].id = ngx_http_cache_purge_test_bytes("op2");

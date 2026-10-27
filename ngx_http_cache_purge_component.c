@@ -19,7 +19,6 @@
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
-#include <openssl/sha.h>
 
 typedef struct {
     unsigned char  *data;
@@ -3095,7 +3094,7 @@ ngx_http_cache_purge_component_options(
 }
 
 uint32_t
-ngx_http_cache_purge_component_abi_6(void)
+ngx_http_cache_purge_component_abi_7(void)
 {
     return NGX_HTTP_CACHE_PURGE_COMPONENT_ABI;
 }
@@ -5635,14 +5634,12 @@ ngx_http_cache_purge_fence_valid(const ngx_http_cache_purge_fence_t *fence,
 
     if (fence == NULL || fence->count == 0
         || fence->count > NGX_HTTP_CACHE_PURGE_FENCE_COUNT
-        || fence->requirements == NULL
-        || memcmp(fence->nonce, zero, 16) == 0
-        || memcmp(fence->identity, zero, 32) == 0)
+        || fence->requirements == NULL)
     {
         return ngx_http_cache_purge_control_error(error,
             NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid propagation envelope");
     }
-    size = 54;
+    size = 6;
     for (i = 0; i < fence->count; i++) {
         r = &fence->requirements[i];
         memset(&operation, 0, sizeof(operation));
@@ -5729,8 +5726,6 @@ ngx_http_cache_purge_fence_encode(const ngx_http_cache_purge_fence_t *fence,
     e.limit = size;
     e.error = error;
     ngx_http_cache_purge_component_put_raw(&e, "NPF1", 4);
-    ngx_http_cache_purge_component_put_raw(&e, fence->nonce, 16);
-    ngx_http_cache_purge_component_put_raw(&e, fence->identity, 32);
     ngx_http_cache_purge_component_put_integer(&e, fence->count, 2);
     for (i = 0; i < fence->count; i++) {
         r = &fence->requirements[i];
@@ -5771,7 +5766,7 @@ ngx_http_cache_purge_fence_decode(ngx_http_cache_rocksdb_bytes_t input,
             NGX_HTTP_CACHE_ROCKSDB_INVALID, "missing propagation output");
     }
     memset(out, 0, sizeof(*out));
-    if (input.data == NULL || input.len < 54) {
+    if (input.data == NULL || input.len < 6) {
         return ngx_http_cache_purge_control_error(error,
             NGX_HTTP_CACHE_ROCKSDB_INVALID, "truncated propagation envelope");
     }
@@ -5784,9 +5779,7 @@ ngx_http_cache_purge_fence_decode(ngx_http_cache_rocksdb_bytes_t input,
             NGX_HTTP_CACHE_ROCKSDB_INVALID, "unsupported propagation version");
     }
     memset(&fence, 0, sizeof(fence));
-    memcpy(fence.nonce, input.data + 4, 16);
-    memcpy(fence.identity, input.data + 20, 32);
-    fence.count = ((size_t) input.data[52] << 8) | input.data[53];
+    fence.count = ((size_t) input.data[4] << 8) | input.data[5];
     if (fence.count == 0 || fence.count > NGX_HTTP_CACHE_PURGE_FENCE_COUNT) {
         return ngx_http_cache_purge_control_error(error,
             NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid propagation count");
@@ -5798,7 +5791,7 @@ ngx_http_cache_purge_fence_decode(ngx_http_cache_rocksdb_bytes_t input,
     memset(&d, 0, sizeof(d));
     d.data = input.data;
     d.len = input.len;
-    d.at = 54;
+    d.at = 6;
     d.error = error;
     fence.requirements = requirements;
     for (i = 0; i < fence.count && d.rc == 0; i++) {
@@ -5832,98 +5825,6 @@ ngx_http_cache_purge_fence_decode(ngx_http_cache_rocksdb_bytes_t input,
         *out = fence;
     }
     return rc;
-}
-
-int
-ngx_http_cache_purge_fence_digest(ngx_http_cache_rocksdb_bytes_t input,
-    unsigned char digest[32], ngx_http_cache_rocksdb_error_t *error)
-{
-    ngx_http_cache_purge_control_clear(error);
-    if (digest == NULL || input.data == NULL || input.len < 54
-        || input.len > NGX_HTTP_CACHE_PURGE_FENCE_MAX)
-    {
-        return ngx_http_cache_purge_control_error(error,
-            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid propagation digest input");
-    }
-    if (SHA256(input.data, input.len, digest) == NULL) {
-        return ngx_http_cache_purge_control_error(error,
-            NGX_HTTP_CACHE_ROCKSDB_IO, "propagation digest failed");
-    }
-    return 0;
-}
-
-static int
-ngx_http_cache_purge_ack_valid(const ngx_http_cache_purge_ack_t *ack)
-{
-    static const unsigned char zero[32] = { 0 };
-
-    return ack != NULL && memcmp(ack->nonce, zero, 16) != 0
-           && memcmp(ack->digest, zero, 32) != 0
-           && (ack->stale_policy == NGX_HTTP_CACHE_PURGE_STALE_STRICT
-               || ack->stale_policy == NGX_HTTP_CACHE_PURGE_STALE_NATIVE)
-           && (ack->outcome == NGX_HTTP_CACHE_PURGE_ACK_FRESH
-               || (ack->outcome == NGX_HTTP_CACHE_PURGE_ACK_STALE
-                   && ack->stale_policy == NGX_HTTP_CACHE_PURGE_STALE_NATIVE));
-}
-
-int
-ngx_http_cache_purge_ack_encode(const ngx_http_cache_purge_ack_t *ack,
-    unsigned char output[NGX_HTTP_CACHE_PURGE_ACK_SIZE],
-    ngx_http_cache_rocksdb_error_t *error)
-{
-    ngx_http_cache_purge_control_clear(error);
-    if (output == NULL || !ngx_http_cache_purge_ack_valid(ack)) {
-        return ngx_http_cache_purge_control_error(error,
-            NGX_HTTP_CACHE_ROCKSDB_INVALID,
-            "invalid propagation acknowledgement");
-    }
-    memcpy(output, "NPA1", 4);
-    memcpy(output + 4, ack->nonce, 16);
-    memcpy(output + 20, ack->digest, 32);
-    output[52] = (unsigned char) ack->outcome;
-    output[53] = (unsigned char) ack->stale_policy;
-    output[54] = 0;
-    output[55] = 0;
-    return 0;
-}
-
-int
-ngx_http_cache_purge_ack_check(ngx_http_cache_rocksdb_bytes_t input,
-    const unsigned char nonce[16], const unsigned char digest[32],
-    ngx_http_cache_purge_ack_t *out, ngx_http_cache_rocksdb_error_t *error)
-{
-    ngx_http_cache_purge_ack_t  ack;
-
-    ngx_http_cache_purge_control_clear(error);
-    if (out == NULL) {
-        return ngx_http_cache_purge_control_error(error,
-            NGX_HTTP_CACHE_ROCKSDB_INVALID, "missing acknowledgement output");
-    }
-    memset(out, 0, sizeof(*out));
-    if (input.data == NULL || input.len != NGX_HTTP_CACHE_PURGE_ACK_SIZE
-        || nonce == NULL || digest == NULL
-        || memcmp(input.data, "NPA1", 4) != 0
-        || input.data[54] || input.data[55])
-    {
-        return ngx_http_cache_purge_control_error(error,
-            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid acknowledgement frame");
-    }
-    memset(&ack, 0, sizeof(ack));
-    memcpy(ack.nonce, input.data + 4, 16);
-    memcpy(ack.digest, input.data + 20, 32);
-    ack.outcome = input.data[52];
-    ack.stale_policy = input.data[53];
-    if (!ngx_http_cache_purge_ack_valid(&ack)) {
-        return ngx_http_cache_purge_control_error(error,
-            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid acknowledgement outcome");
-    }
-    if (memcmp(ack.nonce, nonce, 16) != 0 || memcmp(ack.digest, digest, 32)) {
-        return ngx_http_cache_purge_control_error(error,
-            NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
-            "acknowledgement does not match the generated request");
-    }
-    *out = ack;
-    return 0;
 }
 
 int

@@ -73,7 +73,7 @@ ngx_http_cache_purge_runtime_create(ngx_conf_t *cf)
     }
     ngx_http_cache_purge_component_options(&rt->options);
     if (rt->options.abi != NGX_HTTP_CACHE_PURGE_COMPONENT_ABI
-        || ngx_http_cache_purge_component_abi_6()
+        || ngx_http_cache_purge_component_abi_7()
                != NGX_HTTP_CACHE_PURGE_COMPONENT_ABI
         || ngx_array_init(&rt->roots, cf->pool, 2, sizeof(ngx_str_t)) != NGX_OK
         || ngx_array_init(&rt->file_roots, cf->pool, 8,
@@ -1844,11 +1844,11 @@ ngx_http_cache_purge_api_merge(ngx_conf_t *cf,
 {
     ngx_http_core_loc_conf_t  *core;
     ngx_http_core_srv_conf_t  *server;
-    ngx_str_t                *headers[5], *previous[5];
+    ngx_str_t                *headers[4], *previous[4];
     ngx_uint_t                i, j;
     static const char *defaults[] = {
         "X-Cache-Purge-Namespace", "X-Cache-Purge-Time", "X-Cache-Purge-Mode",
-        "X-Cache-Purge-Fence", "X-Cache-Purge-Ack"
+        "X-Cache-Purge-Fence"
     };
 
 #if (NGX_EXPR)
@@ -1868,12 +1868,12 @@ ngx_http_cache_purge_api_merge(ngx_conf_t *cf,
 #endif
     headers[0] = &conf->tag_namespace_header;
     previous[0] = &prev->tag_namespace_header;
-    for (i = 1; i < 5; i++) {
+    for (i = 1; i < 4; i++) {
         headers[i] = &conf->propagation_header[i - 1];
         previous[i] = &prev->propagation_header[i - 1];
     }
     server = ngx_http_conf_get_module_srv_conf(cf, ngx_http_core_module);
-    for (i = 0; i < 5; i++) {
+    for (i = 0; i < 4; i++) {
         if (headers[i]->data == NULL) {
             *headers[i] = *previous[i];
         }
@@ -2736,7 +2736,7 @@ ngx_http_cache_purge_api_render(ngx_http_cache_purge_api_t *ctx,
     static const char *types[] = {"key", "url", "prefix", "prefix",
                                   "host", "tag", "tag", "tag", "tag"};
     static const char *roles[] = {"propagation_time", "propagation_mode",
-                                  "propagation_fence", "propagation_ack"};
+                                  "propagation_fence"};
 
     r = ctx->request;
     conf = ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_module);
@@ -2819,7 +2819,7 @@ ngx_http_cache_purge_api_render(ngx_http_cache_purge_api_t *ctx,
 #endif
             );
         p = ngx_http_cache_purge_api_quote(p, conf->tag_namespace_header);
-        for (i = 0; i < 4; i++) {
+        for (i = 0; i < 3; i++) {
             p = ngx_sprintf(p, ",\"%s\":", roles[i]);
             p = ngx_http_cache_purge_api_quote(p, conf->propagation_header[i]);
         }

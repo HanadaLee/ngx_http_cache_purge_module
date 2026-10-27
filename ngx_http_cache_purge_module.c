@@ -132,12 +132,6 @@ static ngx_command_t  ngx_http_cache_purge_module_commands[] = {
       ngx_http_cache_purge_api_header_conf, NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_cache_purge_loc_conf_t, propagation_header[2]), NULL },
 
-    { ngx_string("cache_purge_propagation_ack_header"),
-      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF
-      | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
-      ngx_http_cache_purge_api_header_conf, NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_cache_purge_loc_conf_t, propagation_header[3]), NULL },
-
     { ngx_string("cache_purge_propagation"),
       NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF
 #if (NGX_EXPR)
