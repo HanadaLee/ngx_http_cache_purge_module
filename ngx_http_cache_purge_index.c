@@ -6,6 +6,7 @@
 
 #include <openssl/sha.h>
 #include <openssl/evp.h>
+#include <openssl/rand.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1054,11 +1055,13 @@ ngx_http_cache_purge_operations_init(ngx_http_cache_purge_operations_t *ops,
     ngx_http_cache_purge_op_tx_t       tx;
     ngx_http_cache_purge_op_cursor_t   cursor;
     ngx_http_cache_purge_op_value_t   schema, value;
-    ngx_http_cache_rocksdb_bytes_t  index;
+    ngx_http_cache_rocksdb_bytes_t  index, ledger;
     size_t                          i;
     const char                       *prefixes[] = { "D", "L", "Q", "E" };
     const char *keys[] = { "M:op-next", "M:op-live", "M:op-bytes" };
+    static const unsigned char zero[16] = { 0 };
 
+    memset(&candidate, 0, sizeof(candidate));
     candidate.store = store;
     candidate.limits.live_records = 4096;
     candidate.limits.live_selector_bytes = 4 * 1024 * 1024;
@@ -1111,8 +1114,6 @@ ngx_http_cache_purge_operations_init(ngx_http_cache_purge_operations_t *ops,
         ngx_http_cache_purge_op_set_counter(&tx, "M:op-next", 1);
         ngx_http_cache_purge_op_set_counter(&tx, "M:op-live", 0);
         ngx_http_cache_purge_op_set_counter(&tx, "M:op-bytes", 0);
-        ngx_http_cache_purge_op_commit(&tx);
-
     } else if (tx.status == 0) {
         ngx_http_cache_purge_op_require(
             &tx,
@@ -1126,6 +1127,30 @@ ngx_http_cache_purge_operations_init(ngx_http_cache_purge_operations_t *ops,
             "invalid operation sequence allocator");
         (void) ngx_http_cache_purge_op_counter(&tx, "M:op-live");
         (void) ngx_http_cache_purge_op_counter(&tx, "M:op-bytes");
+    }
+    value = ngx_http_cache_purge_op_get(&tx,
+        ngx_http_cache_purge_op_literal("M:op-ledger"));
+    if (tx.status == 0 && !value.exists) {
+        if (ngx_http_cache_purge_op_require(&tx,
+                RAND_bytes(candidate.ledger, sizeof(candidate.ledger)) == 1
+                && memcmp(candidate.ledger, zero, sizeof(zero)) != 0,
+                NGX_HTTP_CACHE_ROCKSDB_IO, "cannot create ledger identity"))
+        {
+            ledger.data = candidate.ledger;
+            ledger.len = sizeof(candidate.ledger);
+            ngx_http_cache_purge_op_put(&tx,
+                ngx_http_cache_purge_op_literal("M:op-ledger"), ledger, 1);
+        }
+    } else if (tx.status == 0
+               && ngx_http_cache_purge_op_require(&tx,
+                   value.bytes.len == sizeof(candidate.ledger)
+                   && memcmp(value.bytes.data, zero, sizeof(zero)) != 0,
+                   NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid ledger identity"))
+    {
+        memcpy(candidate.ledger, value.bytes.data, sizeof(candidate.ledger));
+    }
+    if (!schema.exists || !value.exists) {
+        ngx_http_cache_purge_op_commit(&tx);
     }
     if (tx.status == 0) {
         *ops = candidate;
@@ -5014,6 +5039,7 @@ ngx_http_cache_purge_index_get_file(ngx_http_cache_rocksdb_t *store,
         q->bytes -= q->token.capacity;
         memset(&q->token, 0, sizeof(q->token));
         memcpy(out->id, id, 16);
+        memcpy(out->previous, record.previous, 16);
         out->state = record.state;
         out->revision = record.revision;
         out->tag_count = record.tag_count;
@@ -5415,8 +5441,9 @@ ngx_http_cache_purge_index_visit_urls(ngx_http_cache_rocksdb_t *store,
     }
     q = tx->context;
     if (!ngx_http_cache_purge_index_load(tx, file, &record)
-        || !ngx_http_cache_purge_index_require(q, record.state == 2,
-            NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "URL owner is not committed"))
+        || !ngx_http_cache_purge_index_require(q,
+            record.state == 1 || record.state == 2,
+            NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "URL owner is not live"))
     {
         return ngx_http_cache_purge_index_tx_end(tx, error);
     }

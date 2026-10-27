@@ -84,6 +84,12 @@ class Component:
         self.process.stdin.flush()
         assert self.line() == ('RELEASE 0' if release else 'GUARD 0')
 
+    def watermark(self):
+        self.process.stdin.write('w\n'); self.process.stdin.flush()
+        kind, code, sequence, ledger = self.line().split()
+        assert kind == 'WATERMARK' and code == '0', (kind, code)
+        return b'NFW1' + bytes.fromhex(ledger) + struct.pack('>Q', int(sequence))
+
     def stop(self, expected=0):
         self.process.stdin.write('q\n')
         self.process.stdin.flush()
@@ -654,7 +660,7 @@ try:
     validating.opened(); v = Client(validating.path)
     wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
 
-    def make_validation_file(n, uri):
+    def make_validation_file(n, uri, metadata='proof-v1'):
         target = validation_cache / f'a/00/{n}'
         target.parent.mkdir(parents=True, exist_ok=True)
         source = validation_temp / str(n)
@@ -662,7 +668,8 @@ try:
         lease = v.lease(str(target))
         fd = os.open(source, os.O_RDWR | os.O_CLOEXEC)
         v.prepare_file(record(n, root=str(validation_cache), zone='zone-a', uri=uri,
-                              tags=(f'tag-{n}', 'shared')) + string(str(source)), [lease, fd])
+                              tags=(f'tag-{n}', 'shared'), metadata=metadata)
+                       + string(str(source)), [lease, fd])
         source.rename(target); v.finish_file(n, lease)
         os.close(fd)
         return target, lease, os.open(target, os.O_RDONLY | os.O_CLOEXEC)
@@ -751,6 +758,7 @@ try:
     previous = v.call(2, identity(621))
     v.validate_file(validation_packet(621), lease, selected, code=7)
     assert v.call(2, identity(621)) == previous
+    ledger_before_restart = validating.watermark()
     v.close(); validating.process.kill(); validating.process.wait(timeout=5)
     validating = Component(validating.path, shared=validation_shared,
                            roots=(validation_cache, validation_temp))
@@ -758,8 +766,84 @@ try:
     wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
     v.validate_file(validation_packet(621), lease, selected, code=7)
     assert v.call(2, identity(621)) == previous
+    assert validating.watermark() == ledger_before_restart
     os.close(lease); os.close(selected)
     check(True, 'host FENCE rejection survives owner crash and control recovery')
+
+    watermark = validating.watermark()
+    early_watermark = watermark
+    target, lease, selected = make_validation_file(630, '/late-tag', metadata=watermark)
+    assert v.call(2, identity(630))[0] == 2
+    os.close(lease); os.close(selected)
+    source = validation_temp / 'late-631'; source.write_bytes(b'old request with changed TAG')
+    lease = v.lease(str(target), target=(str(validation_cache), 'zone-a', 'a/00/630'), previous=630)
+    fd = os.open(source, os.O_RDWR | os.O_CLOEXEC)
+    payload = record(631, root=str(validation_cache), zone='zone-a', uri='/late-tag',
+                     path='a/00/630', tags=('replacement-tag',), metadata=watermark)
+    payload = payload[:-16] + identity(630) + string(str(source))
+    v.prepare_file(payload, [lease, fd])
+    validation_operation('old-tag-after-prepare', 5, 'tag-630', 'team')
+    wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+    source.rename(target)
+    retired = v.finish_file(631, lease)
+    assert retired[-1] == 3 and v.call(2, identity(631))[0] == 3
+    assert os.getxattr(target, 'user.ngx_cache_purge.id')[7] == 1
+    os.close(fd)
+    check(True, 'FINISH rejects a late prepared replacement whose old TAG was invalidated before its catalogue commit')
+
+    watermark = validating.watermark()
+    source = validation_temp / 'fresh-632'; source.write_bytes(b'fresh request with changed TAG')
+    fd = os.open(source, os.O_RDWR | os.O_CLOEXEC)
+    payload = record(632, root=str(validation_cache), zone='zone-a', uri='/late-tag',
+                     path='a/00/630', tags=('replacement-tag',), metadata=watermark)
+    v.prepare_file(payload[:-16] + identity(630) + string(str(source)), [lease, fd])
+    source.rename(target)
+    assert v.finish_file(632, lease)[-1] == 2
+    assert os.getxattr(target, 'user.ngx_cache_purge.id')[7] == 2
+    os.close(fd)
+    check(True, 'an origin watermark after the accepted rule permits a new entity to replace that old TAG')
+
+    source = validation_temp / 'regressed-634'; source.write_bytes(b'older request started first')
+    fd = os.open(source, os.O_RDWR | os.O_CLOEXEC)
+    payload = record(634, root=str(validation_cache), zone='zone-a', uri='/late-tag',
+                     path='a/00/630', tags=('replacement-tag',), metadata=early_watermark)
+    v.prepare_file(payload[:-16] + identity(632) + string(str(source)), [lease, fd])
+    source.rename(target)
+    assert v.finish_file(634, lease)[-1] == 3
+    assert os.getxattr(target, 'user.ngx_cache_purge.id')[7] == 1
+    os.close(fd)
+    check(True, 'a late fill cannot regress its predecessor watermark even when its current TAGs do not match a newer rule')
+
+    source = validation_temp / 'abandoned-633'; source.write_bytes(b'abandoned late replacement')
+    fd = os.open(source, os.O_RDWR | os.O_CLOEXEC)
+    payload = record(633, root=str(validation_cache), zone='zone-a', uri='/late-tag',
+                     path='a/00/630', tags=('third-tag',), metadata=watermark)
+    v.prepare_file(payload[:-16] + identity(632) + string(str(source)), [lease, fd])
+    validation_operation('old-tag-before-recovery', 5, 'replacement-tag', 'team')
+    wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+    source.rename(target)
+    v.close(); validating.process.kill(); validating.process.wait(timeout=5)
+    os.close(fd); os.close(lease)
+    validating = Component(validating.path, shared=validation_shared,
+                           roots=(validation_cache, validation_temp))
+    validating.opened(); v = Client(validating.path)
+    wait_for(lambda: v.call(2, identity(633))[0] == 3)
+    assert os.getxattr(target, 'user.ngx_cache_purge.id')[7] == 1
+    check(True, 'automatic recovery applies the same old-instance FENCE check without a FINISH request')
+
+    wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+    watermark = validating.watermark()
+    source = validation_temp / 'invalid-watermark'; source.write_bytes(b'unmodified')
+    destination = validation_cache / 'a/00/640'
+    lease = v.lease(str(destination)); fd = os.open(source, os.O_RDWR | os.O_CLOEXEC)
+    for invalid, code in ((b'NFW1', 4), (b'NFW1' + b'X' * 16 + watermark[20:], 7),
+                          (watermark[:20] + struct.pack('>Q', 999999), 7)):
+        payload = record(640, root=str(validation_cache), zone='zone-a', metadata=invalid) + string(str(source))
+        v.prepare_file(payload, [lease, fd], code=code)
+        assert not os.listxattr(fd)
+    v.call(2, identity(640), code=1)
+    os.close(fd); os.close(lease)
+    check(True, 'malformed, foreign-ledger and future origin watermarks are rejected before file or index mutation')
     v.close(); validating.stop()
 finally:
     for component in processes:

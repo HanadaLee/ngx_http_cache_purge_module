@@ -1,6 +1,7 @@
 #include "ngx_http_cache_purge_test.hpp"
 #include <unistd.h>
 #include <iostream>
+#include <algorithm>
 
 using namespace ngx_http_cache_purge;
 static unsigned assertions;
@@ -66,8 +67,15 @@ int main(int argc, char **argv) {
         char path[] = "/tmp/cache-purge-operations-XXXXXX";
         check(mkdtemp(path) != nullptr, "test directory");
         auto *store = open(path);
+        FileId ledger{};
         {
             Index index(store); Operations ops(store, {2, 4096});
+            std::copy_n(ops.native()->ledger, ledger.size(), ledger.begin());
+            check(ledger != FileId{}, "ledger identity is nonzero");
+            auto initialized = writes(store);
+            Operations reopened(store, {2, 4096});
+            check(std::equal(ledger.begin(), ledger.end(), reopened.native()->ledger)
+                  && writes(store) == initialized, "reopening the ledger retains identity without writes");
             auto invalid = input("bad id"); fails(NGX_HTTP_CACHE_ROCKSDB_INVALID, [&] { ops.accept(invalid, 1000); });
             invalid = input("bad"); invalid.selector.scope.clear();
             fails(NGX_HTTP_CACHE_ROCKSDB_INVALID, [&] { ops.accept(invalid, 1000); });
@@ -127,6 +135,7 @@ int main(int argc, char **argv) {
         close(store); store = open(path);
         {
             Index index(store); Operations ops(store, {64, 1024 * 1024});
+            check(std::equal(ledger.begin(), ledger.end(), ops.native()->ledger), "ledger identity survives database reopen");
             check(ops.get("c").stage == OperationStage::active && ops.get("d").stage == OperationStage::preparing, "ledger stages survive reopen");
             auto c = ops.get("c"); c = ops.checkpoint("c", c.revision, point(1, true));
             ops.materialize("c", c.revision, c.sequence);
@@ -149,6 +158,9 @@ int main(int argc, char **argv) {
             raw_write(store, "M:operations", "future");
             fails(NGX_HTTP_CACHE_ROCKSDB_SCHEMA, [&] { Operations unsupported(store); });
             raw_write(store, "M:operations", "1");
+            raw_write(store, "M:op-ledger", "broken");
+            fails(NGX_HTTP_CACHE_ROCKSDB_CORRUPT, [&] { Operations corrupted(store); });
+            raw_write(store, "M:op-ledger", std::string(reinterpret_cast<char *>(ledger.data()), ledger.size()));
             check(ops.get("d").sequence == d.sequence, "schema rejection preserves existing operation");
             for (unsigned n = 0; n != 10; ++n) {
                 auto large = input("large-" + std::to_string(n));

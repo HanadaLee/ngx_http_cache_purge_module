@@ -62,7 +62,7 @@ int main(int argc, char **argv) {
     char command;
     while (std::cin >> command) {
         if (command == 'q') break;
-        if (command == 'm' || command == 'g' || command == 'r') {
+        if (command == 'm' || command == 'g' || command == 'r' || command == 'w') {
             if (!reader) {
                 rc = ngx_http_cache_purge_control_reader_open(shared, shared_size, &reader, &error);
                 if (rc) { std::cout << "MATCH " << rc << " 0 0 0" << std::endl; continue; }
@@ -71,6 +71,18 @@ int main(int argc, char **argv) {
                 rc = ngx_http_cache_purge_control_guard_begin(reader, version, &error);
                 if (!rc) guarded = true;
                 std::cout << "GUARD " << rc << std::endl; continue;
+            }
+            if (command == 'w') {
+                ngx_http_cache_purge_watermark_t watermark{};
+                uint64_t publication = 0;
+                rc = ngx_http_cache_purge_control_watermark(reader, &watermark, &publication, &error);
+                const char hex[] = "0123456789abcdef";
+                std::string ledger;
+                for (auto byte : watermark.ledger) {
+                    ledger += hex[byte >> 4]; ledger += hex[byte & 15];
+                }
+                std::cout << "WATERMARK " << rc << ' ' << watermark.sequence << ' ' << ledger << std::endl;
+                continue;
             }
             if (command == 'r') {
                 rc = ngx_http_cache_purge_control_guard_end(reader, &error);

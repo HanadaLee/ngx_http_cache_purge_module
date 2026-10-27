@@ -76,6 +76,7 @@ with tarfile.open(fileobj=io.BytesIO(archive)) as source:
 calls, policies = [], {}
 validation_tags = {'/revalidate-replace': 'new-tag', '/revalidate-clear': ''}
 validation_waiting, validation_release = threading.Event(), threading.Event()
+late_waiting, late_release = threading.Event(), threading.Event()
 fresh_bodies = {}
 redirects = {'/redirect-cache': '/redirect-old', '/redirect-tag': '/redirect-old',
              '/redirect-unknown': '/redirect-old', '/redirect-named': '@redirect_named',
@@ -106,6 +107,10 @@ class Origin(http.server.BaseHTTPRequestHandler):
         if path == '/capacity': capacity_gate.wait(20)
         body = path.encode() if not path.startswith('/slice') else slice_body
         body = fresh_bodies.get(path, body)
+        if path == '/late-fill' and calls.count(path) == 1:
+            body = b'old-late-entity'
+            late_waiting.set()
+            assert late_release.wait(15)
         if path == '/vary': body += self.headers.get('Accept-Language', '').encode()
         if path == '/large': body *= 40000
         status, content_range = 200, None
@@ -331,6 +336,18 @@ def ready_file(item):
     assert item['state'] == 2 and item['metadata'].startswith(b'NFP1')
     return path
 
+def watermark(item):
+    metadata = item['metadata']
+    if metadata.startswith(b'NFR1'):
+        assert int.from_bytes(metadata[60:64], 'big') == len(metadata) - 64
+        metadata = metadata[64:]
+    assert metadata.startswith(b'NFP1')
+    at = 44 + int.from_bytes(metadata[40:44], 'big')
+    size = int.from_bytes(metadata[at:at + 4], 'big')
+    value = metadata[at + 4:]
+    assert size == 28 and len(value) == size and value[:4] == b'NFW1'
+    return value[4:20], int.from_bytes(value[20:], 'big')
+
 checks = []
 process = start()
 try:
@@ -338,6 +355,8 @@ try:
     until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
     assert get('/asset') == (200, 'MISS', b'/asset')
     first = records('/asset', 1)[0]; ready_file(first)
+    ledger, sequence = watermark(first)
+    assert ledger != bytes(16) and sequence == 0
     assert first['key'] == b'tenant\x1fhttp\x1fcache.test\x1f/asset\x1f'
     assert first['namespace'] == b'tenant' and set(first['tags']) == {b'news', b'red'}
     assert get('/asset')[1] == 'HIT' and calls.count('/asset') == 1
@@ -480,6 +499,7 @@ try:
     until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
     assert {x[0] for x in query('http://cache.test/asset')} == before
     assert get('/asset')[1] == 'HIT'
+    assert {watermark(record(ident))[0] for ident in before} == {ledger}
     checks.append('full nginx restart reuses persisted file relations without rebuilding the index')
     validation_files = {}
     policies['/revalidate-race'] = 'race-old'
@@ -517,6 +537,27 @@ try:
     assert get('/revalidate-race') == (200, 'HIT', b'fresh-entity')
     assert calls.count('/revalidate-race') == 3
     checks.append('a TAG FENCE accepted while origin 304 is pending forces a fresh entity even when the 304 replaces that TAG')
+    policies['/late-fill'] = 'late-tag'
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        request = pool.submit(get, '/late-fill')
+        assert late_waiting.wait(5)
+        fence('late-fill-rule', 5, 'late-tag', 'tenant')
+        fresh_bodies['/late-fill'] = b'new-late-entity'
+        late_release.set()
+        assert request.result(timeout=15) == (200, 'MISS', b'old-late-entity')
+    native_key = b'tenant\x1fhttp\x1fcache.test\x1f/late-fill\x1f\x1f'
+    digest = hashlib.md5(native_key).hexdigest()
+    target = run / 'cache-a' / digest[-1] / digest[-3:-1] / digest
+    until(target.exists)
+    marker = os.getxattr(target, 'user.ngx_cache_purge.id')
+    late = until(lambda: (item if (item := record(marker[8:24]))['state'] == 3 else None))
+    assert os.getxattr(target, 'user.ngx_cache_purge.id')[7] == 1
+    assert query('http://cache.test/late-fill') == []
+    assert get('/late-fill') == (200, 'BYPASS', b'new-late-entity')
+    fresh = records('/late-fill', 1)[0]; ready_file(fresh)
+    assert watermark(fresh)[0] == ledger and watermark(fresh)[1] > watermark(late)[1]
+    assert get('/late-fill') == (200, 'HIT', b'new-late-entity') and calls.count('/late-fill') == 2
+    checks.append('a pre-push late origin fill is retired, while a post-push entity carries durable coverage and reuses HIT under the same TAG FENCE')
     assert get('/fenced-url')[1] == 'MISS'; records('/fenced-url', 1)
     assert get('/fenced-url?z=b')[1] == 'MISS'; records('/fenced-url', 2)
     assert get('/fenced-url')[1] == 'HIT'
@@ -540,8 +581,22 @@ try:
     assert get('/fenced-tag')[1] == 'HIT'
     fence('read-tag', 5, 'only-this-tag', 'tenant')
     assert get('/fenced-tag')[1] == 'BYPASS'
+    until(lambda: watermark(records('/fenced-tag', 1)[0])[1] > 0)
+    assert get('/fenced-tag')[1] == 'HIT' and calls.count('/fenced-tag') == 2
     assert get('/asset')[1] == 'HIT'
     checks.append('native TAG admission uses persisted entity tags with namespace isolation')
+    policies['/revalidate-covered'] = 'covered-tag'
+    assert get('/revalidate-covered')[1] == 'MISS'
+    original = records('/revalidate-covered', 1)[0]
+    fence('covered-tag-rule', 5, 'covered-tag', 'tenant')
+    assert get('/revalidate-covered')[1] == 'BYPASS'
+    current = until(lambda: (item if (item := records('/revalidate-covered', 1)[0])['id'] != original['id'] else None))
+    covered = watermark(current)
+    time.sleep(2.1)
+    assert get('/revalidate-covered') == (200, 'REVALIDATED', b'/revalidate-covered')
+    assert watermark(records('/revalidate-covered', 1)[0]) == covered
+    assert get('/revalidate-covered')[1] == 'HIT' and calls.count('/revalidate-covered') == 3
+    checks.append('ordinary 304 validation preserves prior durable coverage while its already-satisfied TAG FENCE remains active')
     assert get('/negative-cache') == (200, 'MISS', b'negative-old')
     assert get('/negative-cache') == (200, 'HIT', b'negative-old')
     assert calls.count('/negative-cache') == 1
@@ -605,6 +660,7 @@ try:
 finally:
     capacity_gate.set()
     validation_release.set()
+    late_release.set()
     for process, log in processes: stop(process); log.close()
     origin.shutdown(); origin.server_close()
     for server in gateways.values(): server.shutdown(); server.server_close()

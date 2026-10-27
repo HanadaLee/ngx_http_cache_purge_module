@@ -59,7 +59,18 @@ purge freshness. The native file-response consumer also checks key, URL, host,
 prefix and scoped TAG FENCEs, then commits its decision under a short shared
 control guard. It waits before slice, Range and client-conditional filters run.
 No shared guard spans IPC or asynchronous body streaming. Unknown files and
-matching FENCEs cause an unconditional upstream retry using the original key.
+unsatisfied FENCEs cause an unconditional upstream retry using the original key.
+
+New entity fills persist the durable ledger identity and complete local operation
+sequence observed before origin dispatch. File admission can recognize rules
+already covered by that entity, allowing HIT under an existing TAG FENCE.
+Publication and automatic recovery check both the candidate and its predecessor,
+including old TAGs and watermark regression, before committing a replacement.
+Conflicting late candidates are retired without being stamped READY. This local
+watermark neither changes the cache key nor proves upstream CDN freshness.
+Known selectors still conservatively bypass before native lookup to cover
+memory-only cached errors; rule retirement and in-flight origin-response
+admission remain unfinished.
 
 Known request selectors are also checked before native cache lookup. This covers
 memory-only cached upstream errors before `error_page` runs. Cached
@@ -75,9 +86,10 @@ No complete file index is loaded into worker memory. Successful upstream 304
 responses capture TTL and TAG metadata before native cached-header parsing,
 persist the validation transaction, and pass final FENCE admission before
 reusing the entity. An absent direct upstream TAG header retains the old set;
-a present empty header clears it. General expressions replace the set. Matching
-FENCEs and unverified transactions still force an unconditional refill until
-freshness watermarks are implemented. Complete persistent-alias discovery and
+a present empty header clears it. General expressions replace the set. New,
+unsatisfied FENCEs and unverified transactions still force an unconditional refill;
+ordinary 304 retains the entity's existing local watermark. Forced Invalidate
+revalidation, complete persistent-alias discovery and
 read matching, and TAG/alias provenance for memory-only cached errors, remain
 unfinished. Operation receipts
 remain PREPARING; these partial consumers do not expose reliable public 202

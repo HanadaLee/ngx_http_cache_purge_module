@@ -579,6 +579,7 @@ typedef struct {
     uint64_t                        seconds;
     uint32_t                        nanoseconds;
     ngx_http_cache_rocksdb_bytes_t  temporary;
+    ngx_http_cache_rocksdb_bytes_t  metadata;
 } ngx_http_cache_purge_publication_proof_t;
 
 typedef struct {
@@ -1183,7 +1184,67 @@ ngx_http_cache_purge_publication_proof(ngx_http_cache_rocksdb_bytes_t metadata,
                                            NGX_HTTP_CACHE_ROCKSDB_INVALID,
                                            "invalid publication identity");
     }
+    proof->metadata.data = metadata.data + at + 4;
+    proof->metadata.len = length;
     return 0;
+}
+
+void
+ngx_http_cache_purge_watermark_encode(
+    const ngx_http_cache_purge_watermark_t *watermark,
+    unsigned char output[NGX_HTTP_CACHE_PURGE_WATERMARK_SIZE])
+{
+    memcpy(output, "NFW1", 4);
+    memcpy(output + 4, watermark->ledger, 16);
+    ngx_http_cache_purge_publication_encode(
+        output + 20, watermark->sequence, 8);
+}
+
+int
+ngx_http_cache_purge_watermark_decode(ngx_http_cache_rocksdb_bytes_t data,
+    ngx_http_cache_purge_watermark_t *watermark,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    if (watermark == NULL
+        || !ngx_http_cache_purge_publication_valid(data, 16384))
+    {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid watermark output/input");
+    }
+    memset(watermark, 0, sizeof(*watermark));
+    if (data.len < 4 || memcmp(data.data, "NFW1", 4) != 0) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND, "file has no origin watermark");
+    }
+    if (data.len != NGX_HTTP_CACHE_PURGE_WATERMARK_SIZE
+        || ngx_http_cache_purge_zero(data.data + 4))
+    {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid origin watermark");
+    }
+    memcpy(watermark->ledger, data.data + 4, 16);
+    watermark->sequence = ngx_http_cache_purge_publication_number(
+        data.data + 20, 8);
+    return ngx_http_cache_purge_result(error, 0, "");
+}
+
+int
+ngx_http_cache_purge_publication_watermark(
+    ngx_http_cache_rocksdb_bytes_t metadata,
+    ngx_http_cache_purge_watermark_t *watermark,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_publication_proof_t  proof;
+    int                                       rc;
+
+    if (watermark == NULL) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "missing watermark output");
+    }
+    memset(watermark, 0, sizeof(*watermark));
+    rc = ngx_http_cache_purge_publication_proof(metadata, &proof, error);
+    return rc == 0 ? ngx_http_cache_purge_watermark_decode(proof.metadata,
+        watermark, error) : rc;
 }
 
 static int
@@ -1659,9 +1720,11 @@ done:
 }
 
 int
-ngx_http_cache_purge_publications_finish(ngx_http_cache_purge_publications_t *p,
+ngx_http_cache_purge_publications_finish_checked(
+    ngx_http_cache_purge_publications_t *p,
     ngx_http_cache_rocksdb_t *store, const unsigned char id[16],
     uint64_t revision, int anchor, int lease, uint32_t peer_uid,
+    ngx_http_cache_purge_publication_guard_pt guard, void *data,
     ngx_http_cache_purge_index_match_t *out,
     ngx_http_cache_rocksdb_error_t *error)
 {
@@ -1849,6 +1912,15 @@ ngx_http_cache_purge_publications_finish(ngx_http_cache_purge_publications_t *p,
     result.revision = file.revision;
     result.state = file.state;
     if (file.state == NGX_HTTP_CACHE_PURGE_INDEX_PREPARED) {
+        if (guard != NULL) {
+            rc = guard(data, &file, error);
+            if (rc == NGX_HTTP_CACHE_ROCKSDB_CONFLICT) {
+                goto abandon;
+            }
+            if (rc != 0) {
+                goto done;
+            }
+        }
         rc = ngx_http_cache_purge_publication_apply(
             store, NGX_HTTP_CACHE_PURGE_INDEX_COMMIT_PENDING, id, file.revision,
             &result, error);
@@ -1912,6 +1984,17 @@ done:
     free((void *) address.data);
     ngx_http_cache_purge_index_file_free(&file);
     return rc;
+}
+
+int
+ngx_http_cache_purge_publications_finish(ngx_http_cache_purge_publications_t *p,
+    ngx_http_cache_rocksdb_t *store, const unsigned char id[16],
+    uint64_t revision, int anchor, int lease, uint32_t peer_uid,
+    ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_purge_publications_finish_checked(p, store, id,
+        revision, anchor, lease, peer_uid, NULL, NULL, out, error);
 }
 
 static int

@@ -353,8 +353,10 @@ typedef struct {
     ngx_uint_t                      tag_count, rpc;
     ngx_uint_t                      read_state;
     size_t                          reserved, input_bytes;
-    ngx_msec_t                      deadline;
-    int                             lease;
+    ngx_msec_t                        deadline;
+    ngx_http_cache_purge_watermark_t  origin;
+    uint64_t                          origin_publication;
+    int                               lease;
     u_char                          id[16], previous[16];
     uint64_t  revision;
     unsigned  admitted : 1;
@@ -365,7 +367,13 @@ typedef struct {
     unsigned  read_held : 1;
     unsigned  read_ref : 1;
     unsigned  read_header_only : 1;
+    unsigned  origin_valid : 1;
 } ngx_http_cache_purge_capture_t;
+
+typedef struct {
+    uint64_t   covered;
+    ngx_int_t  fenced;
+} ngx_http_cache_purge_read_match_t;
 typedef struct {
     ngx_http_script_code_pt code;
     ngx_array_t  *predicates;
@@ -747,12 +755,32 @@ ngx_http_cache_purge_capture_guard_length(ngx_http_script_engine_t *engine)
     return 1;
 }
 
+static ngx_int_t
+ngx_http_cache_purge_capture_origin(ngx_http_cache_purge_capture_t *ctx)
+{
+    ngx_http_cache_purge_control_reader_t  *reader;
+    ngx_http_cache_rocksdb_error_t          error;
+
+    ctx->origin_valid = 0;
+    if (ngx_http_cache_purge_runtime_reader(ctx->request, &reader, &error) != 0
+        || ngx_http_cache_purge_control_watermark(reader, &ctx->origin,
+            &ctx->origin_publication, &error) != 0)
+    {
+        return NGX_ERROR;
+    }
+    ctx->origin_valid = 1;
+    return NGX_OK;
+}
+
 static void
 ngx_http_cache_purge_capture_guard_value(ngx_http_script_engine_t *engine)
 {
     ngx_http_cache_purge_capture_code_t *code =
         (ngx_http_cache_purge_capture_code_t *) engine->ip;
     ngx_int_t rc = ngx_http_test_predicates(engine->request, code->predicates);
+    ngx_http_cache_purge_capture_t  *ctx;
+    ngx_http_request_t              *r;
+
     engine->ip += sizeof(*code) - sizeof(uintptr_t);
     if (rc == NGX_ERROR) {
         engine->status = NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -765,12 +793,15 @@ ngx_http_cache_purge_capture_guard_value(ngx_http_script_engine_t *engine)
             NGX_LOG_WARN, engine->request->connection->log, 0,
             "cache index snapshot unavailable or over budget; skipping cache");
     }
+    r = engine->request;
+    ctx = ngx_http_get_module_ctx(r, ngx_http_cache_purge_index_module);
+    if (ctx && !ctx->origin_valid
+        && ngx_http_cache_purge_capture_origin(ctx) != NGX_OK)
+    {
+        r->upstream->cacheable = 0;
+        rc = NGX_DECLINED;
+    }
     if (rc == NGX_OK) {
-        ngx_http_cache_purge_capture_t  *ctx;
-        ngx_http_request_t              *r;
-
-        r = engine->request;
-        ctx = ngx_http_get_module_ctx(r, ngx_http_cache_purge_index_module);
         if (ctx && ctx->read_state == NGX_HTTP_CACHE_PURGE_READ_OFF) {
             if (ngx_http_cache_purge_read_request(ctx) != NGX_OK
                 || r->main->blocked >= NGX_HTTP_MAX_BLOCKED
@@ -1282,7 +1313,7 @@ ngx_http_cache_purge_read_complete(ngx_http_cache_purge_capture_t *ctx,
     u->conf = conf;
     r->cached = 0;
     u->cache_status = NGX_HTTP_CACHE_BYPASS;
-    u->cacheable = 1;
+    u->cacheable = ngx_http_cache_purge_capture_origin(ctx) == NGX_OK;
     u->buffer.start = NULL;
     u->request_sent = 1;
     ctx->cache->valid_sec = 0;
@@ -1328,11 +1359,13 @@ static int
 ngx_http_cache_purge_read_match(void *data,
     const ngx_http_cache_purge_control_match_t *match)
 {
-    ngx_int_t  *fenced;
+    ngx_http_cache_purge_read_match_t  *result;
 
-    fenced = data;
-    if (match->flags & NGX_HTTP_CACHE_PURGE_CONTROL_FENCE) {
-        *fenced = 1;
+    result = data;
+    if ((match->flags & NGX_HTTP_CACHE_PURGE_CONTROL_FENCE)
+        && match->sequence > result->covered)
+    {
+        result->fenced = 1;
     }
     return 0;
 }
@@ -1344,7 +1377,7 @@ ngx_http_cache_purge_read_request(ngx_http_cache_purge_capture_t *ctx)
     ngx_http_cache_purge_control_context_t  context;
     ngx_http_cache_rocksdb_error_t          error;
     uint64_t                                publication;
-    ngx_int_t                               fenced;
+    ngx_http_cache_purge_read_match_t       match;
     int                                     rc;
 
     if (ngx_http_cache_purge_runtime_reader(ctx->request, &reader, &error)
@@ -1362,10 +1395,12 @@ ngx_http_cache_purge_read_request(ngx_http_cache_purge_capture_t *ctx)
     context.tag_namespace.data = ctx->namespace.data;
     context.tag_namespace.len = ctx->namespace.len;
     context.now_ms = (uint64_t) ngx_time() * 1000;
-    fenced = 0;
+    ngx_memzero(&match, sizeof(match));
     rc = ngx_http_cache_purge_control_match(reader, &context, 64, 65536,
-        ngx_http_cache_purge_read_match, &fenced, &publication, &error);
-    if (rc != 0 || fenced) {
+        ngx_http_cache_purge_read_match, &match, &publication, &error);
+    if (rc != 0 || match.fenced || !ctx->origin_valid
+        || publication != ctx->origin_publication)
+    {
         return NGX_DECLINED;
     }
     rc = ngx_http_cache_purge_control_guard_begin(reader, publication, &error);
@@ -1386,9 +1421,10 @@ ngx_http_cache_purge_read_admit(ngx_http_cache_purge_capture_t *ctx,
     ngx_http_cache_purge_control_context_t  context;
     ngx_http_cache_rocksdb_error_t          error;
     ngx_http_cache_rocksdb_bytes_t           fields[10], tags[64], value;
+    ngx_http_cache_purge_watermark_t        current, stored;
     uint64_t                                publication, first;
     ngx_uint_t                              i, count;
-    ngx_int_t                               fenced;
+    ngx_http_cache_purge_read_match_t       match;
     u_char                                 *p, *end;
     int                                     rc;
 
@@ -1432,6 +1468,22 @@ ngx_http_cache_purge_read_admit(ngx_http_cache_purge_capture_t *ctx,
     {
         return 0;
     }
+    ngx_memzero(&match, sizeof(match));
+    rc = ngx_http_cache_purge_control_watermark(reader, &current,
+                                                 &first, &error);
+    if (rc != 0) {
+        return 0;
+    }
+    rc = ngx_http_cache_purge_publication_watermark(fields[9], &stored, &error);
+    if (rc != 0 && rc != NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) {
+        return 0;
+    }
+    if (rc == 0 && ngx_memcmp(current.ledger, stored.ledger, 16) == 0) {
+        if (stored.sequence > current.sequence) {
+            return 0;
+        }
+        match.covered = stored.sequence;
+    }
     ngx_memzero(&context, sizeof(context));
     context.key = fields[0];
     context.url.data = ctx->url.data;
@@ -1442,10 +1494,9 @@ ngx_http_cache_purge_read_admit(ngx_http_cache_purge_capture_t *ctx,
     context.tags = tags;
     context.tag_count = count;
     context.now_ms = (uint64_t) ngx_time() * 1000;
-    fenced = 0;
     rc = ngx_http_cache_purge_control_match(reader, &context, 64, 65536,
-        ngx_http_cache_purge_read_match, &fenced, &publication, &error);
-    if (rc != 0 || fenced) {
+        ngx_http_cache_purge_read_match, &match, &publication, &error);
+    if (rc != 0 || match.fenced || publication != first) {
         return 0;
     }
     first = publication;
@@ -1457,8 +1508,8 @@ ngx_http_cache_purge_read_admit(ngx_http_cache_purge_capture_t *ctx,
         context.url = fields[1];
         context.host = fields[2];
         rc = ngx_http_cache_purge_control_match(reader, &context, 64, 65536,
-            ngx_http_cache_purge_read_match, &fenced, &publication, &error);
-        if (rc != 0 || fenced || publication != first) {
+            ngx_http_cache_purge_read_match, &match, &publication, &error);
+        if (rc != 0 || match.fenced || publication != first) {
             return 0;
         }
     }
@@ -1779,7 +1830,7 @@ ngx_http_cache_purge_capture_remaining(ngx_http_cache_purge_capture_t *ctx)
 static ngx_int_t
 ngx_http_cache_purge_capture_submit_prepare(ngx_http_cache_purge_capture_t *ctx)
 {
-    ngx_str_t payload, empty = ngx_null_string;
+    ngx_str_t payload, metadata;
     ngx_str_t fields[] = {
         ctx->key,  ctx->url,  ctx->host,          ctx->namespace,  ctx->root,
         ctx->zone, ctx->path, ctx->components[5], ctx->cache->vary
@@ -1790,9 +1841,15 @@ ngx_http_cache_purge_capture_submit_prepare(ngx_http_cache_purge_capture_t *ctx)
     ngx_int_t  rc;
     u_char    *p;
     int        fds[2] = { ctx->lease, ctx->temporary->file.fd };
-    if (!timeout) {
+    u_char     watermark[NGX_HTTP_CACHE_PURGE_WATERMARK_SIZE];
+
+    if (!timeout || !ctx->origin_valid) {
         return NGX_ERROR;
     }
+    ngx_http_cache_purge_watermark_encode(&ctx->origin, watermark);
+    metadata.data = watermark;
+    metadata.len = sizeof(watermark);
+    size += metadata.len;
     for (i = 0; i < 9; i++) {
         if (fields[i].len > 32768) {
             return NGX_ERROR;
@@ -1813,7 +1870,7 @@ ngx_http_cache_purge_capture_submit_prepare(ngx_http_cache_purge_capture_t *ctx)
     for (i = 0; i < 9; i++) {
         p = ngx_http_cache_purge_capture_string(p, fields[i]);
     }
-    p = ngx_http_cache_purge_capture_string(p, empty);
+    p = ngx_http_cache_purge_capture_string(p, metadata);
     *p++ = (u_char) ctx->tag_count;
     for (i = 0; i < ctx->tag_count; i++) {
         p = ngx_http_cache_purge_capture_string(p, ctx->tags[i]);

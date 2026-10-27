@@ -50,9 +50,13 @@ int main(int argc, char **argv) {
         check(ngx_http_cache_purge_control_reader_open(shared, size, &reader, &error) == 0, "register test reader");
         Index index(store); Operations operations(store);
         uint64_t found[2], version = 0;
+        ngx_http_cache_purge_watermark_t watermark{};
+        uint64_t boundary = 0;
         {
             Coordinator coordinator(operations, shared, size);
             check(lookup(reader, found, version) == NGX_HTTP_CACHE_ROCKSDB_BUSY, "startup stays closed before ledger recovery");
+            check(ngx_http_cache_purge_control_watermark(reader, &watermark, &boundary, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_BUSY, "no origin watermark before recovery");
             if (argc == 3) {
                 std::string mode = argv[1]; ready(coordinator);
                 if (mode == "--crash-accept") {
@@ -70,6 +74,10 @@ int main(int argc, char **argv) {
                 check(preview.sequence == 1 && operations.usage().live_records == 0, "preview does not allocate durable identity");
                 ready(coordinator);
                 check(lookup(reader, found, version) == 0 && !found[0], "empty recovered table is usable");
+                check(ngx_http_cache_purge_control_watermark(reader, &watermark, &boundary, &error) == 0
+                      && watermark.sequence == 0 && boundary == version
+                      && std::memcmp(watermark.ledger, operations.native()->ledger, 16) == 0,
+                      "empty serving table exposes its durable ledger and zero sequence");
                 check(ngx_http_cache_purge_control_guard_begin(reader, version, &error) == 0, "pin earlier synchronous admission");
                 auto first = coordinator.accept(input("first"), 1000, 300000);
                 check(first.stage == OperationStage::preparing && operations.get("first").revision == 1, "acceptance is durable preparing");
@@ -77,6 +85,8 @@ int main(int argc, char **argv) {
                 fails(NGX_HTTP_CACHE_ROCKSDB_BUSY, [&] { coordinator.accept(input("second"), 1000, 300000); });
                 check(coordinator.step() && !coordinator.step(), "old admission blocks readiness but not publication work");
                 check(ngx_http_cache_purge_control_guard_end(reader, &error) == 0, "release earlier admission");
+                check(ngx_http_cache_purge_control_watermark(reader, &watermark, &boundary, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_BUSY, "no watermark while acceptance publication is pending");
                 ready(coordinator);
                 check(lookup(reader, found, version) == 0 && found[0] == 1 && found[1] == 5, "published preparing barrier matches");
                 check(!operations.get("first").effective_at_ms, "SHM publication alone cannot claim native hook effectiveness");
@@ -93,6 +103,8 @@ int main(int argc, char **argv) {
                 check(operations.expire_propagation(302000) == 1, "expire durable propagation");
                 coordinator.refresh(); ready(coordinator);
                 check(lookup(reader, found, version) == 0 && !found[0], "finished duties release shared control");
+                check(ngx_http_cache_purge_control_watermark(reader, &watermark, &boundary, &error) == 0
+                      && watermark.sequence == 1, "watermark does not regress when all live rules are removed");
 
                 for (unsigned n = 0; n != 2; ++n) {
                     auto large = input("large-" + std::to_string(n));

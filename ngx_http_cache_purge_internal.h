@@ -162,7 +162,7 @@ int ngx_http_cache_purge_component_stop(
 extern "C" {
 #endif
 
-#define NGX_HTTP_CACHE_PURGE_CONTROL_ABI 1
+#define NGX_HTTP_CACHE_PURGE_CONTROL_ABI 2
 #define NGX_HTTP_CACHE_PURGE_CONTROL_FENCE 1
 #define NGX_HTTP_CACHE_PURGE_CONTROL_PROPAGATE 2
 #define NGX_HTTP_CACHE_PURGE_CONTROL_PREPARING 4
@@ -171,6 +171,13 @@ typedef struct ngx_http_cache_purge_control_reader_s
     ngx_http_cache_purge_control_reader_t;
 typedef struct ngx_http_cache_purge_control_writer_s
     ngx_http_cache_purge_control_writer_t;
+
+typedef struct {
+    unsigned char  ledger[16];
+    uint64_t       sequence;
+} ngx_http_cache_purge_watermark_t;
+
+#define NGX_HTTP_CACHE_PURGE_WATERMARK_SIZE 28
 
 typedef struct {
     ngx_http_cache_rocksdb_bytes_t        key, url, host, tag_namespace;
@@ -209,6 +216,12 @@ int ngx_http_cache_purge_control_match(
     const ngx_http_cache_purge_control_context_t *context, size_t max_matches,
     size_t max_bytes, ngx_http_cache_purge_control_visit_pt visit, void *data,
     uint64_t *publication, ngx_http_cache_rocksdb_error_t *error);
+/* Copies the complete accepted local sequence from one serving image. It is
+ * a local origin-start boundary, not proof of an upstream CDN's freshness. */
+int ngx_http_cache_purge_control_watermark(
+    ngx_http_cache_purge_control_reader_t *reader,
+    ngx_http_cache_purge_watermark_t *watermark, uint64_t *publication,
+    ngx_http_cache_rocksdb_error_t *error);
 /* Pin the exact matched publication across a short synchronous admission step.
  * A new effective publication cannot reopen its gate until this guard leaves.
  * Do not hold a guard across event waits, upstream I/O or response body
@@ -442,6 +455,7 @@ typedef struct {
 typedef struct {
     ngx_http_cache_rocksdb_t                *store;
     ngx_http_cache_purge_operation_limits_t  limits;
+    unsigned char                            ledger[16];
 } ngx_http_cache_purge_operations_t;
 
 
@@ -611,6 +625,7 @@ typedef struct {
     unsigned char  id[16];
     uint32_t       state;
     uint64_t       revision;
+    unsigned char  previous[16];
     ngx_http_cache_rocksdb_bytes_t key, url, host, tag_namespace;
     ngx_http_cache_rocksdb_bytes_t root, zone, path, range, vary, metadata;
     ngx_http_cache_rocksdb_bytes_t  components[6];
@@ -705,6 +720,19 @@ extern "C" {
 typedef struct ngx_http_cache_purge_publications_s
     ngx_http_cache_purge_publications_t;
 
+void ngx_http_cache_purge_watermark_encode(
+    const ngx_http_cache_purge_watermark_t *watermark,
+    unsigned char output[NGX_HTTP_CACHE_PURGE_WATERMARK_SIZE]);
+int ngx_http_cache_purge_watermark_decode(ngx_http_cache_rocksdb_bytes_t data,
+    ngx_http_cache_purge_watermark_t *watermark,
+    ngx_http_cache_rocksdb_error_t *error);
+/* Extracts only committed NFP1/NFR1 user metadata. Missing legacy watermarks
+ * return NOT_FOUND and never grant coverage of a later operation. */
+int ngx_http_cache_purge_publication_watermark(
+    ngx_http_cache_rocksdb_bytes_t metadata,
+    ngx_http_cache_purge_watermark_t *watermark,
+    ngx_http_cache_rocksdb_error_t *error);
+
 typedef struct {
     ngx_http_cache_rocksdb_bytes_t  root;
     ngx_http_cache_rocksdb_bytes_t  address;
@@ -745,6 +773,19 @@ int ngx_http_cache_purge_publications_finish(
     ngx_http_cache_purge_publications_t *publications,
     ngx_http_cache_rocksdb_t *store, const unsigned char id[16],
     uint64_t prepared_revision, int anchor_fd, int lease_fd, uint32_t peer_uid,
+    ngx_http_cache_purge_index_match_t *match,
+    ngx_http_cache_rocksdb_error_t *error);
+/* Production publishers check accepted rules before the first index commit.
+ * CONFLICT retires an uncommitted candidate; BUSY keeps it recoverable. The
+ * guard is never repeated after its catalogue commit has already happened. */
+typedef int (*ngx_http_cache_purge_publication_guard_pt)(void *data,
+    const ngx_http_cache_purge_index_file_t *file,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_publications_finish_checked(
+    ngx_http_cache_purge_publications_t *publications,
+    ngx_http_cache_rocksdb_t *store, const unsigned char id[16],
+    uint64_t prepared_revision, int anchor_fd, int lease_fd, uint32_t peer_uid,
+    ngx_http_cache_purge_publication_guard_pt guard, void *data,
     ngx_http_cache_purge_index_match_t *match,
     ngx_http_cache_rocksdb_error_t *error);
 
