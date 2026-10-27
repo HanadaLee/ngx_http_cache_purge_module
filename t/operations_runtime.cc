@@ -87,6 +87,108 @@ raw_write(ngx_http_cache_rocksdb_t *store, const std::string &key,
 }
 
 static void
+ngx_http_cache_purge_test_tag_groups()
+{
+    char path[] = "/tmp/cache-purge-tag-operations-XXXXXX";
+    check(mkdtemp(path) != nullptr, "TAG operation directory");
+    auto *store = open(path);
+    std::vector<std::string> members;
+    for (unsigned i = 0; i < 64; i++) {
+        members.push_back("tag-" + std::to_string(100 + i));
+    }
+    auto request = input("tag-group");
+    request.selector = { SelectorKind::namespace_tags, tag_group(members),
+        "team" };
+    uint64_t sequence;
+    ngx_http_cache_rocksdb_error_t error{};
+    auto require = [&](Operations &ops, const Selector &selector, size_t budget,
+                       uint64_t expected) {
+        ngx_http_cache_purge_selector_t raw{ static_cast<uint32_t>(
+                                                 selector.kind),
+            bytes(selector.value), bytes(selector.scope) };
+        uint64_t invalidate = 0, remove = 0;
+        check(ngx_http_cache_purge_operations_requirements(
+                  ops.native(), &raw, &budget, &invalidate, &remove, &error)
+                      == 0
+                  && invalidate == expected && remove == 0,
+            "TAG member requirement shares the group operation sequence");
+    };
+    {
+        Index index(store);
+        Operations ops(store);
+        raw_write(store, "M:operations", "3");
+        auto before = writes(store);
+        Operations upgraded(store);
+        check(writes(store) == before + 1,
+            "schema 3 upgrades with one metadata write and no index scan");
+        before = writes(store);
+        auto accepted = ops.accept(request, 1000);
+        sequence = accepted.sequence;
+        check(writes(store) == before + 1
+                  && ops.get(request.id).input.selector.value
+                         == request.selector.value,
+            "one write atomically accepts the TAG set and all member rules");
+        for (const auto &member : members) {
+            require(ops, { SelectorKind::namespace_tag, member, "team" }, 1,
+                sequence);
+            require(
+                ops, { SelectorKind::namespace_tag, member, "other" }, 1, 0);
+        }
+        require(ops, request.selector, 64, sequence);
+        auto invalid = request;
+        for (auto bad : { tag_group({ "b", "a" }), tag_group({ "a", "a" }),
+                 tag_group({ "a" }), request.selector.value + "suffix" })
+        {
+            invalid.id = "invalid";
+            invalid.selector.value = bad;
+            before = writes(store);
+            fails(NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                [&] { ops.accept(invalid, 2000); });
+            check(writes(store) == before,
+                "bad TAG lists cannot partially write requirements");
+        }
+        before = writes(store);
+        check(ops.accept(request, 9999).sequence == sequence
+                  && writes(store) == before,
+            "TAG group replay keeps its operation without writes");
+        auto changed = request;
+        changed.selector.value = tag_group({ "different", "tags" });
+        fails(NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            [&] { ops.accept(changed, 3000); });
+        auto active = ops.activate(request.id, accepted.revision, 1001);
+        active = ops.checkpoint(request.id, active.revision, point(1, true));
+        ops.materialize(request.id, active.revision, active.sequence);
+        require(ops, request.selector, 64, sequence);
+    }
+    close(store);
+    store = open(path);
+    {
+        Index index(store);
+        auto before = writes(store);
+        Operations ops(store);
+        check(
+            writes(store) == before && ops.get(request.id).sequence == sequence,
+            "group receipt reopens without rebuilding or rewriting");
+        for (const auto &member : members) {
+            require(ops, { SelectorKind::namespace_tag, member, "team" }, 1,
+                sequence);
+        }
+        ngx_http_cache_purge_selector_t raw{
+            NGX_HTTP_CACHE_PURGE_NAMESPACE_TAGS, bytes(request.selector.value),
+            bytes(request.selector.scope)
+        };
+        size_t budget = 63;
+        uint64_t invalidate = 99, remove = 99;
+        check(ngx_http_cache_purge_operations_requirements(
+                  ops.native(), &raw, &budget, &invalidate, &remove, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_LIMIT
+                  && invalidate == 0 && remove == 0,
+            "group requirement budget failure cannot expose partial coverage");
+    }
+    close(store);
+}
+
+static void
 ngx_http_cache_purge_test_submission()
 {
     char path[] = "/tmp/cache-purge-submit-XXXXXX";
@@ -704,6 +806,7 @@ main(int argc, char **argv)
         close(store);
         ngx_http_cache_purge_test_submission();
         ngx_http_cache_purge_test_requirements();
+        ngx_http_cache_purge_test_tag_groups();
         std::cout << "PASS " << assertions << " operation assertions; database "
                   << path << std::endl;
         return 0;

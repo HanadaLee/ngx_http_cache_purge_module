@@ -420,6 +420,8 @@ extern "C" {
 #define NGX_HTTP_CACHE_PURGE_HOST          4
 #define NGX_HTTP_CACHE_PURGE_NAMESPACE_TAG 5
 #define NGX_HTTP_CACHE_PURGE_HOST_TAG      6
+#define NGX_HTTP_CACHE_PURGE_NAMESPACE_TAGS 7
+#define NGX_HTTP_CACHE_PURGE_HOST_TAGS      8
 
 
 typedef struct {
@@ -427,6 +429,12 @@ typedef struct {
     ngx_http_cache_rocksdb_bytes_t  value;
     ngx_http_cache_rocksdb_bytes_t  scope;
 } ngx_http_cache_purge_selector_t;
+
+/* Canonical OR list: count u8 (2..64), then length u16 + bytes per TAG.
+ * Members are nonempty, at most 1024 bytes, strictly bytewise sorted;
+ * the complete encoding is at most 32768 bytes. Singletons use kind 5/6. */
+int ngx_http_cache_purge_tags_decode(ngx_http_cache_rocksdb_bytes_t value,
+    ngx_http_cache_rocksdb_bytes_t tags[64], size_t *count);
 
 
 typedef struct {

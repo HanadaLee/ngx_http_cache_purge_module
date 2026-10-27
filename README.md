@@ -229,10 +229,17 @@ for each selector. Ordered predecessor seeks find matching bytewise prefixes
 without scanning unrelated operation history. File admission uses these records
 to protect URL aliases first observed after enumeration, across native zones.
 Full entities fetched after the latest accepted operation skip this historical
-lookup. Ledger schema 3 adds a sparse activation queue in the default CF; schema
-2 upgrades by changing its marker, and schema 1 additionally replays selector
-requirements through its existing bounded migration. Native cache files and
-their index are not rebuilt.
+lookup. Ledger schema 4 adds canonical TAG-set records on top of schema 3's
+sparse activation queue. Schemas 2 and 3 upgrade by changing their marker;
+schema 1 additionally replays selector requirements through its existing bounded
+migration. Native cache files and their index are not rebuilt.
+
+The storage layer can encode up to 64 sorted, unique TAG members as one operation
+and persist their requirements in the same atomic write. Its namespace/host OR
+queries traverse one member posting list at a time, with resumable work bounds
+and no result-sized deduplication set. Parent and member queries share the
+existing memory budget. Group support in the resident control table and public
+HTTP API is still pending; the API continues to advertise `max_tags: 1`.
 
 Business `$host` is separate from `$cache_key_host`. The index records observed
 host-to-key relationships, shared across every slice, Vary file and zone of the

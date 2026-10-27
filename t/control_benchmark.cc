@@ -154,6 +154,9 @@ main()
                 op.input.selector.value = r.tag;
                 op.input.selector.scope = r.host;
                 break;
+            case SelectorKind::namespace_tags:
+            case SelectorKind::host_tags:
+                throw std::runtime_error("group fixture is not generated");
             }
             operations.push_back(std::move(op));
         }

@@ -77,13 +77,27 @@ enum class SelectorKind : uint8_t {
     url_prefix,
     host,
     namespace_tag,
-    host_tag
+    host_tag,
+    namespace_tags,
+    host_tags
 };
 struct Selector {
     SelectorKind kind = SelectorKind::url;
     std::string value;
     std::string scope; /* namespace or host for the two TAG selectors */
 };
+
+inline std::string
+tag_group(const std::vector<std::string> &tags)
+{
+    std::string value(1, static_cast<char>(tags.size()));
+    for (const auto &tag : tags) {
+        value += static_cast<char>(tag.size() >> 8);
+        value += static_cast<char>(tag.size());
+        value += tag;
+    }
+    return value;
+}
 
 inline ngx_http_cache_rocksdb_bytes_t
 ngx_http_cache_purge_native_bytes(const std::string &s)

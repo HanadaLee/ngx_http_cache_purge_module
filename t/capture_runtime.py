@@ -1349,6 +1349,15 @@ try:
         reply = get(uri + suffix)
         assert reply[0] == 200 and reply[1] in ('MISS', 'BYPASS') and reply[2] == b'api-new-entity', reply
     until(lambda: api('/__purge/v2/operations/api-delete-prefix')[2]['cleanup']['state'] == 'done')
+    def refilled_api_zones():
+        # A fresh response may skip its cache write while background deletion
+        # owns the path lease. Verify reuse after cleanup with another request.
+        for suffix in ('', '?z=b'):
+            reply = get(uri + suffix)
+            assert reply[0] == 200 and reply[2] == b'api-new-entity', reply
+        found = query('http://cache.test' + uri)
+        return len(found) == 2 and all(item[2] == 2 for item in found)
+    until(refilled_api_zones)
     assert {item['id'] for item in records(uri, 2)}.isdisjoint({item['id'] for item in files})
     checks.append('HTTP URL-prefix Delete rejects old hits immediately and finishes physical cleanup independently of response delivery')
 

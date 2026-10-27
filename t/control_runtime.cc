@@ -140,6 +140,9 @@ reference(const std::vector<Operation> &ops, const Context &c, bool proxy,
                     && std::find(c.tags.begin(), c.tags.end(), s.value)
                            != c.tags.end();
             break;
+        case SelectorKind::namespace_tags:
+        case SelectorKind::host_tags:
+            throw std::runtime_error("group controls are not enabled yet");
         }
         if (!match) {
             continue;

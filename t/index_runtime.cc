@@ -846,6 +846,109 @@ process_test(const std::string &mode, const char *path)
     return 0;
 }
 
+static void
+ngx_http_cache_purge_test_tag_groups()
+{
+    char path[] = "/tmp/cache-index-tag-groups-XXXXXX";
+    check(mkdtemp(path) != nullptr, "TAG group directory");
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    ngx_http_cache_rocksdb_error_t error{};
+    check(ngx_http_cache_rocksdb_open(path, &options, &store, &error) == 0,
+        "TAG group store open");
+    {
+        Index index(store);
+        auto a = file(301, "/tags/a"), b = file(302, "/tags/b"),
+             c = file(303, "/tags/c"), d = file(304, "/tags/d"),
+             e = file(305, "/tags/e", "", "other.test"),
+             f = file(306, "/tags/f");
+        a.tags = { "alpha", "beta" };
+        b.tags = d.tags = { "beta" };
+        c.tags = { "gamma" };
+        d.tag_namespace = "other";
+        e.tags = { "alpha" };
+        f.tags = { std::string("\0a", 2) };
+        b.root = "/cache/b";
+        b.zone = "zone-b";
+        for (const auto &item : { a, b, c, d, e, f }) {
+            install(index, item);
+        }
+        const auto group = tag_group({ "absent", "alpha", "beta" });
+        const Selector ns{ SelectorKind::namespace_tags, group, "team" },
+            host{ SelectorKind::host_tags, group, "a.example" };
+        check(selected(index, ns) == std::set<unsigned>({ 301, 302, 305 })
+                  && scan(index, ns).size() == 3,
+            "namespace TAG OR spans roots and deduplicates intersecting files");
+        check(selected(index, host) == std::set<unsigned>({ 301, 302, 304 })
+                  && scan(index, host).size() == 3,
+            "host TAG OR isolates business hosts across namespaces");
+        check(selected(index,
+                  { SelectorKind::namespace_tags,
+                      tag_group({ std::string("\0a", 2), "alpha" }), "team" })
+                  == std::set<unsigned>({ 301, 305, 306 }),
+            "TAG group encoding preserves binary members");
+        pages(index, ns);
+        pages(index, host);
+
+        std::vector<unsigned> emitted;
+        std::string bookmark;
+        bool done = false, yielded = false;
+        for (unsigned step = 0; step < 256 && !done; step++) {
+            ngx_http_cache_purge_selector_t selector{
+                NGX_HTTP_CACHE_PURGE_NAMESPACE_TAGS, bytes(group),
+                bytes(ns.scope)
+            };
+            ngx_http_cache_purge_query_t *query = nullptr;
+            ngx_http_cache_purge_index_match_t match{};
+            check(ngx_http_cache_purge_query_open(
+                      store, &selector, 0, bytes(bookmark), &query, &error)
+                      == 0,
+                "bounded group resume open");
+            auto rc = ngx_http_cache_purge_query_step(query, 4, &match, &error);
+            check(rc == 0 || rc == NGX_HTTP_CACHE_ROCKSDB_BUSY
+                      || rc == NGX_HTTP_CACHE_ROCKSDB_DONE,
+                "bounded TAG scan result");
+            if (rc == 0) {
+                emitted.push_back((match.id[14] << 8) | match.id[15]);
+            }
+            yielded |= rc == NGX_HTTP_CACHE_ROCKSDB_BUSY;
+            done = rc == NGX_HTTP_CACHE_ROCKSDB_DONE;
+            auto saved = ngx_http_cache_purge_query_bookmark(query);
+            bookmark.assign(
+                reinterpret_cast<const char *>(saved.data), saved.len);
+            check(ngx_http_cache_purge_query_close(&query, &error) == 0,
+                "group closes its member snapshot");
+        }
+        check(done && yielded && emitted.size() == 3
+                  && std::set<unsigned>(emitted.begin(), emitted.end())
+                         == std::set<unsigned>({ 301, 302, 305 }),
+            "bounded continuation neither skips nor duplicates group members");
+        fails(NGX_HTTP_CACHE_ROCKSDB_INVALID, [&] {
+            index.query(
+                { SelectorKind::namespace_tags, group, "other" }, bookmark);
+        });
+        for (const auto &bad : { tag_group({ "beta", "alpha" }),
+                 tag_group({ "alpha", "alpha" }), tag_group({ "alpha" }),
+                 group + "trailing", group.substr(0, group.size() - 1) })
+        {
+            fails(NGX_HTTP_CACHE_ROCKSDB_INVALID, [&] {
+                index.query({ SelectorKind::namespace_tags, bad, "team" });
+            });
+        }
+        std::vector<std::string> absent;
+        for (unsigned i = 0; i < 64; i++) {
+            absent.push_back("missing-" + std::to_string(100 + i));
+        }
+        check(scan(index,
+                  { SelectorKind::namespace_tags, tag_group(absent), "team" })
+                  .empty(),
+            "64 absent TAG members terminate without scanning other indexes");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
+        "TAG group store close");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -855,6 +958,7 @@ main(int argc, char **argv)
         }
         char path[] = "/tmp/cache-purge-index-test-XXXXXX";
         check(mkdtemp(path) != nullptr, "test directory");
+        ngx_http_cache_purge_test_tag_groups();
         ngx_http_cache_rocksdb_options_t options;
         ngx_http_cache_rocksdb_options(&options);
         options.cursor_lifetime_ms = 5000;
