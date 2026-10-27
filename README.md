@@ -215,11 +215,12 @@ The existing worker executor resumes the bounded scan from durable checkpoints.
 Admission checks that requirement even when no resident rule remains; successful
 conditional validation satisfies it without replacing the entity. Requirements
 are monotonic within one ledger and are collected with their retired file.
-Index schema 6 upgrades schemas 1/2/3/4/5 from existing index records; upgrades
-from 4/5 only change the schema marker and add no full scan. Older readers reject
-it instead of ignoring deferred Delete or staged TAG changes. Pending NFV1 plans
-cannot recover their removed old TAG membership and are conservatively discarded;
-completed NFR1 receipts and unrelated cache files remain valid. NFV2 plans retain
+Index schema 7 upgrades schemas 1/2/3/4/5/6 from existing index records; upgrades
+from 4/5/6 only change the schema marker and add no full scan. Older readers reject
+it instead of ignoring deferred Delete, staged TAG changes or retained key
+references. Pending NFV1 plans cannot recover their removed old TAG membership
+and are conservatively discarded; completed NFR1 receipts and unrelated cache
+files remain valid. NFV2 plans retain
 the 16 KiB metadata limit; oversized proposed TAG/header combinations are rejected
 before mutation, while retaining existing TAGs needs only a one-byte marker.
 
@@ -557,6 +558,11 @@ publication stamp. It never exports TAG candidates or grants cache admission.
 Vary files retain the native main and variant hashes in their publication
 metadata, including across conditional revalidation. Ordinary files keep the
 original metadata size.
+
+The index also provides sparse retention of resolved object times, local
+deadlines and immutable TAG memberships, with bounded lookup and expiry. These
+records keep key aliases alive after the last file is collected. Automatic
+mutation capture, later-rule matching and request-path use remain unfinished.
 
 Full propagation remains unfinished: this query still needs request-path
 integration and retained associations after deletion. Until that is connected,

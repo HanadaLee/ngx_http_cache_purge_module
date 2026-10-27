@@ -418,7 +418,7 @@ ngx_http_cache_purge_test_host_migration(const std::string &path)
         raw_write(store, cf, damaged, "broken object");
         fails(
             NGX_HTTP_CACHE_ROCKSDB_CORRUPT, [&] { Index interrupted(store); });
-        check(ngx_http_cache_purge_test_raw(store, "M:index") == "6"
+        check(ngx_http_cache_purge_test_raw(store, "M:index") == "7"
                   && ngx_http_cache_purge_test_raw(store, "M:host-cursor")
                          == "O"
                                 + std::string(reinterpret_cast<const char *>(
@@ -949,6 +949,219 @@ ngx_http_cache_purge_test_tag_groups()
         "TAG group store close");
 }
 
+static void
+ngx_http_cache_purge_test_retention(const std::string &path)
+{
+    check(mkdir(path.c_str(), 0700) == 0, "retention directory");
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    ngx_http_cache_rocksdb_error_t error{};
+    const auto cf = NGX_HTTP_CACHE_ROCKSDB_DEFAULT;
+    unsigned char main[16] = { 1 }, english[16] = { 2 }, german[16] = { 3 };
+    auto first = file(701, "/retained");
+    auto other_zone = file(702, "/retained", "", "b.example", "/cache/b");
+    auto other_variant = file(703, "/retained");
+    auto open = [&] {
+        check(
+            ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
+                == 0,
+            "open retention database");
+    };
+    auto keep = [&](const File &file, const unsigned char *variant,
+                    ngx_http_cache_purge_retention_t value, int code = 0,
+                    uint64_t revision = 2) {
+        auto expected = ngx_http_cache_purge_native_expected(file.id, revision);
+        check(ngx_http_cache_purge_index_keep_propagation(
+                  store, &expected, main, variant, 100, &value, &error)
+                  == code,
+            error.message);
+    };
+    auto get = [&](const unsigned char *variant, uint64_t now, int code = 0) {
+        ngx_http_cache_purge_fence_t result{ 99, 99 };
+        check(ngx_http_cache_purge_index_get_propagation(store,
+                  ngx_http_cache_purge_native_bytes(first.key), main,
+                  ngx_http_cache_purge_native_bytes(first.vary), variant, now,
+                  &result, &error)
+                  == code,
+            error.message);
+        if (code) {
+            check(!result.invalidate_ms && !result.delete_ms,
+                "failed retained lookup exposes no partial result");
+        }
+        return result;
+    };
+    open();
+    {
+        Index index(store);
+        install(index, first);
+        install(index, other_zone);
+        install(index, other_variant);
+        auto original = ngx_http_cache_purge_test_raw(store,
+            "O"
+                + std::string(
+                    reinterpret_cast<const char *>(first.id.data()), 16));
+        raw_write(store, cf, "M:index", "6");
+        Index upgraded(store);
+        check(ngx_http_cache_purge_test_raw(store, "M:index") == "7"
+                  && ngx_http_cache_purge_test_raw(store,
+                         "O"
+                             + std::string(reinterpret_cast<const char *>(
+                                               first.id.data()),
+                                 16))
+                         == original,
+            "schema 6 upgrades without rewriting file records");
+        ngx_http_cache_purge_retention_t required{ 10, 500, 20, 700 };
+        keep(first, english, required);
+        ngx_http_cache_rocksdb_stats_t before{}, after{};
+        check(ngx_http_cache_rocksdb_stats(store, &before, &error) == 0,
+            "retention write statistics");
+        keep(first, english, required);
+        auto result = get(english, 200);
+        check(result.invalidate_ms == 10 && result.delete_ms == 20,
+            "retained independent modes");
+        get(german, 200, NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND);
+        get(english, 0, NGX_HTTP_CACHE_ROCKSDB_INVALID);
+        main[0] = 9;
+        get(english, 200, NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND);
+        main[0] = 1;
+        keep(first, english, required, NGX_HTTP_CACHE_ROCKSDB_CONFLICT, 1);
+        keep(first, english, { 10, 0, 0, 0 }, NGX_HTTP_CACHE_ROCKSDB_INVALID);
+        keep(first, english, { 10, 100, 0, 0 }, NGX_HTTP_CACHE_ROCKSDB_INVALID);
+        check(ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
+                  && before.writes == after.writes,
+            "reads, replay and rejected retention do not write WAL");
+        keep(other_zone, english, { 30, 400, 0, 0 });
+        result = get(english, 499);
+        check(result.invalidate_ms == 30 && result.delete_ms == 20,
+            "same representation across zones merges times and local windows");
+        result = get(english, 500);
+        check(result.invalidate_ms == 0 && result.delete_ms == 20,
+            "each mode expires independently");
+        keep(other_variant, german, { 40, 900, 0, 0 });
+        check(get(german, 200).invalidate_ms == 40,
+            "different Vary identity does not inherit another representation");
+        auto changed =
+            index.update_metadata(first.id, 2, "new proof", { "blue" });
+        keep(first, english, required, 0, changed.revision);
+        check(changed.revision == 3 && get(english, 200).invalidate_ms == 30,
+            "TAG replacement does not erase retained matched requirements");
+        for (auto file : { first, other_zone, other_variant }) {
+            auto current = index.get(file.id);
+            auto retired = index.retire(file.id, current.revision);
+            index.collect_file(file.id, retired.revision);
+        }
+        while (index.collect_keys(1)) {
+        }
+        check(!raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_URL).empty()
+                  && raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_TAG).empty(),
+            "history keeps URL aliases without retaining file TAG postings");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
+        "close retained database");
+    open();
+    {
+        Index index(store);
+        auto result = get(english, 499);
+        check(result.invalidate_ms == 30 && result.delete_ms == 20,
+            "retained identity survives last-file collection and restart");
+        size_t removed = 99;
+        check(ngx_http_cache_purge_index_expire_propagation(
+                  store, 600, 1, &removed, &error)
+                      == 0
+                  && removed == 0,
+            "expiry scan stops at first future deadline");
+        std::string damaged, saved;
+        for (const auto &key : raw_keys(store, cf)) {
+            if (key.size() == 81 && key[0] == 'q'
+                && static_cast<unsigned char>(key[33]) == 3)
+            {
+                damaged = key;
+                saved = ngx_http_cache_purge_test_raw(store, key);
+            }
+        }
+        check(!damaged.empty(), "select later expiry for rollback test");
+        raw_write(store, cf, damaged, "broken");
+        check(ngx_http_cache_purge_index_expire_propagation(
+                  store, 900, 3, &removed, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_CORRUPT
+                  && removed == 0,
+            "corruption rolls back the whole bounded expiry batch");
+        check(get(english, 200).invalidate_ms == 30,
+            "earlier retained record survives a failed batch");
+        raw_write(store, cf, damaged, saved);
+        check(ngx_http_cache_purge_index_expire_propagation(
+                  store, 700, 1, &removed, &error)
+                      == 0
+                  && removed == 1,
+            "one-item expiry removes only the due representation");
+        check(get(english, 700).invalidate_ms == 0,
+            "another expired membership cannot extend propagation");
+        check(ngx_http_cache_purge_index_expire_propagation(
+                  store, 700, 1, &removed, &error)
+                      == 0
+                  && removed == 1,
+            "remaining membership is collected in a separate bounded step");
+        get(english, 700, NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND);
+        check(
+            get(german, 700).invalidate_ms == 40 && index.collect_keys(1) == 0,
+            "another representation keeps the same key and aliases alive");
+        check(get(german, 900).invalidate_ms == 0,
+            "expired rows cannot propagate before physical GC");
+        check(ngx_http_cache_purge_index_expire_propagation(
+                  store, 900, 1, &removed, &error)
+                      == 0
+                  && removed == 1,
+            "last expiry releases the key for ordinary collection");
+        unsigned rounds = 0;
+        while (index.collect_keys(1)) {
+            check(++rounds < 100, "retained key collection remains bounded");
+        }
+        check(raw_keys(store, cf).size() == 3
+                  && raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_URL).empty()
+                  && raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_TAG).empty(),
+            "expiry releases every key, Vary value and identity association");
+        get(german, 901, NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND);
+        auto bounded = file(704, "/bounded-retention");
+        bounded.tags = { "retained-0" };
+        auto current = install(index, bounded);
+        for (unsigned n = 0; n < 65; n++) {
+            if (n) {
+                current = index.update_metadata(bounded.id, current.revision,
+                    "proof", { "retained-" + std::to_string(n) });
+            }
+            keep(bounded, english, { 50 + n, 1000, 0, 0 }, 0, current.revision);
+        }
+        ngx_http_cache_purge_fence_t limited{ 99, 99 };
+        check(ngx_http_cache_purge_index_get_propagation(store,
+                  ngx_http_cache_purge_native_bytes(bounded.key), main,
+                  ngx_http_cache_purge_native_bytes(bounded.vary), english, 200,
+                  &limited, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_LIMIT
+                  && !limited.invalidate_ms && !limited.delete_ms,
+            "membership limit rejects partial propagation output");
+        current = index.retire(bounded.id, current.revision);
+        index.collect_file(bounded.id, current.revision);
+        size_t total = 0;
+        do {
+            check(ngx_http_cache_purge_index_expire_propagation(
+                      store, 1000, 32, &removed, &error)
+                          == 0
+                      && removed <= 32,
+                "many memberships expire in bounded batches");
+            total += removed;
+        } while (removed);
+        check(
+            total == 65, "all historical TAG sets were independently retained");
+        while (index.collect_keys(1)) {
+        }
+        check(raw_keys(store, cf).size() == 3,
+            "large history releases every dictionary reference");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
+        "close expired database");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1387,6 +1600,7 @@ main(int argc, char **argv)
             std::string(path) + "-host-migration");
         ngx_http_cache_purge_test_validation_policy(
             std::string(path) + "-validation");
+        ngx_http_cache_purge_test_retention(std::string(path) + "-retention");
         std::cout << "PASS " << assertions << " index assertions; database "
                   << path << std::endl;
         return 0;

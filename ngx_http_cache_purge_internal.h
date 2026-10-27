@@ -909,6 +909,34 @@ int
 ngx_http_cache_purge_index_collect_keys(ngx_http_cache_rocksdb_t *store,
     size_t budget, size_t *removed, ngx_http_cache_rocksdb_error_t *error);
 
+typedef struct {
+    uint64_t  invalidate_ms, invalidate_until_ms;
+    uint64_t  delete_ms, delete_until_ms;
+} ngx_http_cache_purge_retention_t;
+
+/* Executor-only retention of already matched, activated local requirements.
+ * Identity is key/native main/Vary fields/native variant, independent of zone.
+ * Call before changing or collecting the exact indexed file. Immutable TAG
+ * sets keep namespace/TAG dictionary references and the key's aliases alive;
+ * identical memberships are deduplicated. File state and TAGs are unchanged.
+ * Per-mode maxima may conservatively retain a newer time until the longest
+ * matched local window. Reads never extend a deadline. The getter visits at
+ * most 64 memberships and returns LIMIT, never a partial answer, on overflow.
+ * Mutation integration, later-rule matching and paged queries are separate. */
+int ngx_http_cache_purge_index_keep_propagation(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file,
+    const unsigned char main[16], const unsigned char variant[16], uint64_t now,
+    const ngx_http_cache_purge_retention_t *retention,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_get_propagation(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_rocksdb_bytes_t key, const unsigned char main[16],
+    ngx_http_cache_rocksdb_bytes_t vary, const unsigned char variant[16],
+    uint64_t now, ngx_http_cache_purge_fence_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_expire_propagation(
+    ngx_http_cache_rocksdb_t *store, uint64_t now, size_t budget,
+    size_t *removed, ngx_http_cache_rocksdb_error_t *error);
+
 #ifdef __cplusplus
 }
 #endif
