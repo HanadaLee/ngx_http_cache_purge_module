@@ -13,7 +13,8 @@
 #include <thread>
 #include <vector>
 
-extern "C" int cache_purge_store_c_probe(ngx_http_cache_rocksdb_t *store);
+extern "C" int ngx_http_cache_purge_store_c_probe(
+    ngx_http_cache_rocksdb_t *store);
 static unsigned checks;
 static ngx_http_cache_rocksdb_error_t error;
 
@@ -198,7 +199,7 @@ main(int argc, char **argv)
         options.max_cursors = 2;
         auto *store = open(path, options);
         write(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, "C:abi", "C ABI");
-        require(cache_purge_store_c_probe(store) == 0, "C ABI probe");
+        require(ngx_http_cache_purge_store_c_probe(store) == 0, "C ABI probe");
         const std::string binary_key("K:a\0b\xff", 6), binary_value("v\0x", 3);
         write(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, binary_key, binary_value);
         require(get(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, binary_key)

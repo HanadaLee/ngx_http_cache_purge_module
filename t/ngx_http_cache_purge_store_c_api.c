@@ -3,7 +3,7 @@
 
 /* Compiled as C, so the test verifies the bridge's actual C ABI. */
 int
-cache_purge_store_c_probe(ngx_http_cache_rocksdb_t *store)
+ngx_http_cache_purge_store_c_probe(ngx_http_cache_rocksdb_t *store)
 {
     static const unsigned char      key[] = "C:abi";
     unsigned char                   value[16];
