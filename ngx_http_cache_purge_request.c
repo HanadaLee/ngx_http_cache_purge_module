@@ -32,7 +32,6 @@
 #include <ngx_config.h>
 #include "ngx_http_cache_purge.h"
 
-#if (NGX_HTTP_CACHE)
 
 struct ngx_http_cache_purge_fill_s {
     ngx_http_request_t   *request;
@@ -257,7 +256,6 @@ ngx_http_cache_purge_fill_complete(ngx_http_cache_purge_fill_t *f, ngx_int_t rc)
     ngx_http_cache_purge_fill_step(f, rc == NGX_AGAIN ? NGX_ERROR : rc);
 }
 
-#endif
 
 
 #if (NGX_HTTP_CACHE_PURGE_ROCKSDB)
@@ -3766,7 +3764,6 @@ ngx_http_cache_purge_capture_post(ngx_conf_t *cf)
 #endif /* NGX_HTTP_CACHE_PURGE_ROCKSDB */
 
 
-#if (NGX_HTTP_CACHE)
 
 #if (NGX_HTTP_FASTCGI || NGX_HTTP_PROXY || NGX_HTTP_SCGI || NGX_HTTP_UWSGI)
 static ngx_int_t ngx_http_cache_purge_defer(ngx_http_request_t *r);
@@ -4646,10 +4643,8 @@ ngx_http_uwsgi_cache_purge_handler(ngx_http_request_t *r)
 #endif
 
 
-#endif
 
 
-#if (NGX_HTTP_CACHE)
 
 typedef struct {
     ngx_uint_t  status;
@@ -5033,14 +5028,12 @@ ngx_http_cache_purge_send_result(ngx_http_request_t *r,
     return ngx_http_output_filter(r, &out);
 }
 
-#endif
 
 
 #if (NGX_RESTY_EXT && NGX_EXPR)
 #include <ngx_http_expr_module.h>
 #endif
 
-#if (NGX_HTTP_CACHE)
 /* -- bounded conditional REFRESH ---------------------------------------- */
 
 #if (NGX_HTTP_PROXY)
@@ -6080,7 +6073,4 @@ invalid:
                   &job->conf->refresh_location, &r->uri, reason);
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
 }
-#endif
-
-
 #endif

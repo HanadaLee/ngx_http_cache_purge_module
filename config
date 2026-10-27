@@ -2,6 +2,11 @@
 
 ngx_addon_name=ngx_http_cache_purge_module
 
+if [ "$HTTP" = NO ] || [ "$HTTP_CACHE" = NO ]; then
+    echo "ngx_http_cache_purge_module requires HTTP cache support"
+    exit 1
+fi
+
 # NGX_HAVE_OPENAT covers openat/fstatat only.  Probe the remaining operations
 # together; the module must not assume they exist on every Unix target.
 if [ "$NGX_PLATFORM" != win32 ]; then
@@ -48,8 +53,8 @@ CACHE_PURGE_DEPS="$ngx_addon_dir/ngx_http_cache_purge.h"
 CACHE_PURGE_LIBS=
 CACHE_ROCKSDB_LIBS=
 if [ -n "$CACHE_PURGE_ROCKSDB_LIB_DIR" ]; then
-    if [ "$NGX_PLATFORM" = win32 ] || [ "$HTTP_CACHE" = NO ] || [ "$HTTP" = NO ]; then
-        echo "cache purge persistent runtime requires Linux and HTTP cache support"
+    if [ "$NGX_PLATFORM" = win32 ]; then
+        echo "cache purge persistent runtime requires Linux"
         exit 1
     fi
     CACHE_ROCKSDB_LIBS="$CACHE_PURGE_ROCKSDB_LIB_DIR/libngx_http_cache_rocksdb.a"

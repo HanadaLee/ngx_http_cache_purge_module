@@ -38,7 +38,6 @@
 #endif
 
 
-#if (NGX_HTTP_CACHE)
 
 /* -- module commands ---------------------------------------------------- */
 
@@ -2036,28 +2035,8 @@ register_pool:
 }
 
 
-#else /* !NGX_HTTP_CACHE */
-
-static ngx_http_module_t  ngx_http_cache_purge_module_ctx = {
-    NULL, NULL, /* pre/postconfiguration  */
-    NULL, NULL, /* create/init main conf  */
-    NULL, NULL, /* create/merge srv conf  */
-    NULL, NULL  /* create/merge loc conf  */
-};
-
-ngx_module_t  ngx_http_cache_purge_module = {
-    NGX_MODULE_V1, &ngx_http_cache_purge_module_ctx,
-    NULL,          NGX_HTTP_MODULE,
-    NULL,          NULL,
-    NULL,          NULL,
-    NULL,          NULL,
-    NULL,          NGX_MODULE_V1_PADDING
-};
-
-#endif /* NGX_HTTP_CACHE */
 
 
-#if (NGX_HTTP_CACHE)
 
 extern ngx_module_t ngx_http_cache_purge_module;
 
@@ -2601,6 +2580,3 @@ ngx_http_cache_purge_generation_current(ngx_http_cache_purge_namespace_t *ns,
     ngx_shmtx_unlock(&slab->mutex);
     return matches ? NGX_OK : NGX_DECLINED;
 }
-
-
-#endif

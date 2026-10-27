@@ -77,7 +77,7 @@ for my $unit ($sources =~ /(ngx_http_cache_purge_\w+)\.c/g) {
     my $target = $1;
     make_path(dirname($target));
     run(shellwords($cc), @strict, @includes, '-c', "$module/$unit.c", '-o', $target);
-    for my $guards (['-DNGX_DEBUG=0'], ['-DNGX_HTTP_CACHE=0'],
+    for my $guards (['-DNGX_DEBUG=0'],
                     ['-DNGX_HTTP_PROXY=0'],
                     [map { "-DNGX_HTTP_$_=0" } qw(PROXY FASTCGI SCGI UWSGI)]) {
         run(shellwords($cc), @strict, @$guards, @includes,

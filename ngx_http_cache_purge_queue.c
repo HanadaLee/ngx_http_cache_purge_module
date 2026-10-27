@@ -31,7 +31,6 @@
 #include "ngx_http_cache_purge.h"
 #include <ngx_md5.h>
 
-#if (NGX_HTTP_CACHE)
 
 static ngx_http_cache_purge_stats_t *
 ngx_http_cache_purge_stats(ngx_http_cache_purge_path_t *path);
@@ -1354,10 +1353,8 @@ ngx_http_cache_purge_threaded(void)
 #endif
 }
 
-#endif
 
 
-#if (NGX_HTTP_CACHE)
 
 static void ngx_http_cache_purge_open_failed(ngx_log_t *log, u_char *name,
     const char *failed_op);
@@ -2091,6 +2088,3 @@ ngx_http_cache_purge_delete_file(ngx_http_cache_purge_walk_ctx_t *ctx,
         ctx->delete_errors++;
     }
 }
-
-
-#endif

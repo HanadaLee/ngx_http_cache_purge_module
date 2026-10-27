@@ -49,7 +49,6 @@
 #define NGX_HTTP_CACHE_PURGE_SHM_MIN_PAGES        8
 
 
-#if (NGX_HTTP_CACHE)
 #if (NGX_HTTP_CACHE_PURGE_ROCKSDB)
 #include <ngx_event_connect.h>
 #include "ngx_http_cache_purge_internal.h"
@@ -999,8 +998,6 @@ ngx_int_t ngx_http_uwsgi_cache_purge_handler(ngx_http_request_t *r);
 /* Copyright (C) Hanada */
 
 
-#if (NGX_HTTP_CACHE)
-
 #define NGX_HTTP_CACHE_PURGE_FILL_PREPARE  1
 #define NGX_HTTP_CACHE_PURGE_FILL_FINISH   2
 
@@ -1024,11 +1021,9 @@ ngx_int_t ngx_http_cache_purge_fill_arm(ngx_http_request_t *r,
 void      ngx_http_cache_purge_fill_complete(ngx_http_cache_purge_fill_t *fill,
     ngx_int_t result);
 
-#endif
 
 /* Use exported core layouts where available; keep old-ABI adapters together. */
 
-#if (NGX_HTTP_CACHE)
 #if (NGX_HTTP_FASTCGI)
 extern ngx_module_t ngx_http_fastcgi_module;
 
@@ -1306,7 +1301,5 @@ typedef struct {
 
 #endif
 
-#endif
 
-#endif /* NGX_HTTP_CACHE */
 #endif /* _NGX_HTTP_CACHE_PURGE_H_INCLUDED_ */

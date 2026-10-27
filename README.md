@@ -404,8 +404,10 @@ dynamic module last among them. Its admission filter must run before slice and
 other filters modify response state. Startup and `nginx -t` reject an unsafe
 filter order when `cache_purge_key` is configured.
 
-This requires Linux, HTTP cache support, and `master_process on`. The persistent
-runtime uses standard worker initialization, timers, and exit callbacks. It does
+The module requires HTTP cache support; configure rejects builds with HTTP or
+HTTP cache disabled. The persistent runtime also requires Linux and
+`master_process on`. It uses standard worker initialization, timers, and exit
+callbacks. It does
 not require privileged-agent support or an additional nginx core patch. Only
 worker 0 starts the component executor; all workers access it through bounded
 asynchronous IPC. The executor shares that worker's address space and failure

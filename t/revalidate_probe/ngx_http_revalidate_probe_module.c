@@ -43,7 +43,7 @@ static ngx_int_t
 ngx_http_revalidate_probe_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data)
 {
-#if (NGX_RESTY_EXT && NGX_HTTP_CACHE)
+#if (NGX_RESTY_EXT)
     ngx_str_t  value;
 
     if (r->cache != NULL
