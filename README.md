@@ -443,6 +443,43 @@ management location to expose the development HTTP API.
 
 ## Persistent management API
 
+The propagation configuration is being integrated with the L2 request/response
+path. It provides four independently inherited header-name directives with
+defaults `X-Cache-Purge-Time`, `X-Cache-Purge-Mode`, `X-Cache-Purge-Fence`, and
+`X-Cache-Purge-Ack`:
+
+```nginx
+cache_purge_propagation_time_header X-Cache-Purge-Time;
+cache_purge_propagation_mode_header X-Cache-Purge-Mode;
+cache_purge_propagation_fence_header X-Cache-Purge-Fence;
+cache_purge_propagation_ack_header X-Cache-Purge-Ack;
+```
+
+`cache_purge_ignore_propagation on|off;` configures whether L2 should ignore
+incoming propagation requirements; its default is `off`. With `NGX_EXPR`, it
+uses the expression module's native flag slots and `when` blocks:
+
+```nginx
+expr ignore_l1_purge = $arg_ignore_l1 1;
+when ignore_l1_purge {
+    cache_purge_ignore_propagation on;
+}
+```
+
+`when` is not a parameter of the directive. Expression candidates retain their
+normal ordering and inheritance: the first matching or unconditional candidate
+wins, and a child with only conditional candidates falls back to its parent.
+Without the expression module, ordinary `on`/`off` remains available.
+Header names must be distinct after inheritance, valid HTTP tokens, and
+compatible with nginx's underscore handling; standard protocol/cache headers
+cannot be reused as control headers. Capabilities exposes the effective names.
+
+These configuration and policy evaluation interfaces are implemented; L2 header
+transfer and acknowledgement enforcement remain unfinished and
+`proxy_propagation_ready` remains false. The planned protocol has no module-side
+authentication, signatures, or key management. An acknowledgement binds results
+to a request and does not authenticate a node.
+
 ```nginx
 location /__scm/cache/v2/ {
     allow 127.0.0.1;

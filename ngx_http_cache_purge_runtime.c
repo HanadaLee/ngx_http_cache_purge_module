@@ -1,5 +1,9 @@
 /* Copyright (C) Hanada */
 #include "ngx_http_cache_purge.h"
+
+#if (NGX_EXPR)
+#include <ngx_http_expr_module.h>
+#endif
 #include "ngx_http_cache_purge_internal.h"
 #include <sys/un.h>
 #include <openssl/sha.h>
@@ -1763,17 +1767,20 @@ char *
 ngx_http_cache_purge_api_header_conf(ngx_conf_t *cf, ngx_command_t *cmd,
     void *data)
 {
-    ngx_http_cache_purge_loc_conf_t  *conf = data;
-    ngx_str_t                        *value;
+    ngx_str_t                        *value, *slot;
     ngx_uint_t                        i, n;
     u_char                            ch;
     static const char *reserved[] = {
         "host", "content-length", "transfer-encoding", "connection",
         "authorization", "proxy-authorization", "content-type", "upgrade",
-        "te", "trailer", "expect"
+        "te", "trailer", "expect", "cookie", "set-cookie", "cache-control",
+        "etag", "last-modified", "expires", "range", "if-range",
+        "if-modified-since", "if-unmodified-since", "if-match", "if-none-match",
+        "vary", "accept-encoding"
     };
 
-    if (conf->tag_namespace_header.data != NULL) {
+    slot = (ngx_str_t *) ((u_char *) data + cmd->offset);
+    if (slot->data != NULL) {
         return "is duplicate";
     }
     value = cf->args->elts;
@@ -1800,8 +1807,21 @@ ngx_http_cache_purge_api_header_conf(ngx_conf_t *cf, ngx_command_t *cmd,
             return NGX_CONF_ERROR;
         }
     }
-    conf->tag_namespace_header = value[1];
+    *slot = value[1];
     return NGX_CONF_OK;
+}
+
+ngx_flag_t
+ngx_http_cache_purge_ignore_propagation(ngx_http_request_t *r)
+{
+    ngx_http_cache_purge_loc_conf_t  *conf;
+
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_module);
+#if (NGX_EXPR)
+    return ngx_http_get_expr_flag_value(r, conf->ignore_propagation);
+#else
+    return conf->ignore_propagation;
+#endif
 }
 
 char *
@@ -1810,10 +1830,59 @@ ngx_http_cache_purge_api_merge(ngx_conf_t *cf,
     ngx_http_cache_purge_loc_conf_t *conf)
 {
     ngx_http_core_loc_conf_t  *core;
+    ngx_http_core_srv_conf_t  *server;
+    ngx_str_t                *headers[5], *previous[5];
+    ngx_uint_t                i, j;
+    static const char *defaults[] = {
+        "X-Cache-Purge-Namespace", "X-Cache-Purge-Time", "X-Cache-Purge-Mode",
+        "X-Cache-Purge-Fence", "X-Cache-Purge-Ack"
+    };
 
-    ngx_conf_merge_str_value(conf->tag_namespace_header,
-                            prev->tag_namespace_header,
-                            "X-Cache-Purge-Namespace");
+#if (NGX_EXPR)
+    if (ngx_conf_merge_expr_flag_value(cf, &conf->ignore_propagation,
+                                       prev->ignore_propagation, 0) != NGX_OK)
+    {
+        return NGX_CONF_ERROR;
+    }
+#else
+    ngx_conf_merge_value(conf->ignore_propagation, prev->ignore_propagation, 0);
+#endif
+    headers[0] = &conf->tag_namespace_header;
+    previous[0] = &prev->tag_namespace_header;
+    for (i = 1; i < 5; i++) {
+        headers[i] = &conf->propagation_header[i - 1];
+        previous[i] = &prev->propagation_header[i - 1];
+    }
+    server = ngx_http_conf_get_module_srv_conf(cf, ngx_http_core_module);
+    for (i = 0; i < 5; i++) {
+        if (headers[i]->data == NULL) {
+            *headers[i] = *previous[i];
+        }
+        if (headers[i]->data == NULL) {
+            headers[i]->data = (u_char *) defaults[i];
+            headers[i]->len = ngx_strlen(defaults[i]);
+        }
+        if (!server->underscores_in_headers && server->ignore_invalid_headers
+            && ngx_strlchr(headers[i]->data,
+                           headers[i]->data + headers[i]->len, '_') != NULL)
+        {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "cache purge header %V would be ignored; enable "
+                "underscores_in_headers or choose another name", headers[i]);
+            return NGX_CONF_ERROR;
+        }
+        for (j = 0; j < i; j++) {
+            if (headers[i]->len == headers[j]->len
+                && ngx_strncasecmp(headers[i]->data, headers[j]->data,
+                                   headers[i]->len) == 0)
+            {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "cache purge control headers must have distinct names: "
+                    "%V", headers[i]);
+                return NGX_CONF_ERROR;
+            }
+        }
+    }
     core = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
     if (conf->api_prefix.data == NULL
         && core->handler == ngx_http_cache_purge_api_handler)
@@ -2647,6 +2716,8 @@ ngx_http_cache_purge_api_render(ngx_http_cache_purge_api_t *ctx,
     size_t                             size, count, i;
     static const char *types[] = {"key", "url", "prefix", "prefix",
                                   "host", "tag", "tag", "tag", "tag"};
+    static const char *roles[] = {"propagation_time", "propagation_mode",
+                                  "propagation_fence", "propagation_ack"};
 
     r = ctx->request;
     conf = ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_module);
@@ -2729,6 +2800,10 @@ ngx_http_cache_purge_api_render(ngx_http_cache_purge_api_t *ctx,
 #endif
             );
         p = ngx_http_cache_purge_api_quote(p, conf->tag_namespace_header);
+        for (i = 0; i < 4; i++) {
+            p = ngx_sprintf(p, ",\"%s\":", roles[i]);
+            p = ngx_http_cache_purge_api_quote(p, conf->propagation_header[i]);
+        }
         buffer->last = ngx_cpymem(p, "}}\n", 3);
         return ngx_http_cache_purge_api_send(r, status, buffer);
     }

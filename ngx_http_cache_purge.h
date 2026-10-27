@@ -731,6 +731,12 @@ typedef struct {
 #if (NGX_HTTP_CACHE_PURGE_ROCKSDB)
     ngx_str_t                          api_prefix;
     ngx_str_t                          tag_namespace_header;
+    ngx_str_t                          propagation_header[4];
+#if (NGX_EXPR)
+    ngx_array_t                       *ignore_propagation;
+#else
+    ngx_flag_t                         ignore_propagation;
+#endif
 #endif
 #if (NGX_HTTP_PROXY)
     ngx_flag_t  refresh;
@@ -759,6 +765,7 @@ char *ngx_http_cache_purge_api_merge(ngx_conf_t *cf,
     ngx_http_cache_purge_loc_conf_t *prev,
     ngx_http_cache_purge_loc_conf_t *conf);
 ngx_int_t ngx_http_cache_purge_api_handler(ngx_http_request_t *r);
+ngx_flag_t ngx_http_cache_purge_ignore_propagation(ngx_http_request_t *r);
 #endif
 
 typedef struct {

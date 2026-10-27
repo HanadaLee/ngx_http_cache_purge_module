@@ -33,6 +33,10 @@
 #include <ngx_http.h>
 #include "ngx_http_cache_purge.h"
 
+#if (NGX_HTTP_CACHE_PURGE_ROCKSDB && NGX_EXPR)
+#include <ngx_http_expr_module.h>
+#endif
+
 
 #if (NGX_HTTP_CACHE)
 
@@ -107,7 +111,47 @@ static ngx_command_t  ngx_http_cache_purge_module_commands[] = {
       NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF
       | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
       ngx_http_cache_purge_api_header_conf,
-      NGX_HTTP_LOC_CONF_OFFSET, 0, NULL },
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_purge_loc_conf_t, tag_namespace_header), NULL },
+
+    { ngx_string("cache_purge_propagation_time_header"),
+      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF
+      | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_http_cache_purge_api_header_conf, NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_purge_loc_conf_t, propagation_header[0]), NULL },
+
+    { ngx_string("cache_purge_propagation_mode_header"),
+      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF
+      | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_http_cache_purge_api_header_conf, NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_purge_loc_conf_t, propagation_header[1]), NULL },
+
+    { ngx_string("cache_purge_propagation_fence_header"),
+      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF
+      | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_http_cache_purge_api_header_conf, NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_purge_loc_conf_t, propagation_header[2]), NULL },
+
+    { ngx_string("cache_purge_propagation_ack_header"),
+      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF
+      | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_http_cache_purge_api_header_conf, NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_purge_loc_conf_t, propagation_header[3]), NULL },
+
+    { ngx_string("cache_purge_ignore_propagation"),
+      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF
+#if (NGX_EXPR)
+      | NGX_HTTP_MAIN_WHEN_CONF | NGX_HTTP_SRV_WHEN_CONF
+      | NGX_HTTP_LOC_WHEN_CONF
+#endif
+      | NGX_CONF_FLAG,
+#if (NGX_EXPR)
+      ngx_conf_set_conditional_flag_slot,
+#else
+      ngx_conf_set_flag_slot,
+#endif
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_purge_loc_conf_t, ignore_propagation), NULL },
 #endif
 
 #if !(NGX_HTTP_CACHE_PURGE_ROCKSDB)
@@ -1694,6 +1738,10 @@ ngx_http_cache_purge_create_loc_conf(ngx_conf_t *cf)
 
     conf->response_type = NGX_CONF_UNSET_UINT;
     conf->conf = NGX_CONF_UNSET_PTR;
+
+#if (NGX_HTTP_CACHE_PURGE_ROCKSDB && !(NGX_EXPR))
+    conf->ignore_propagation = NGX_CONF_UNSET;
+#endif
 
     return conf;
 }
