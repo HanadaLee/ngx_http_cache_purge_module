@@ -348,6 +348,7 @@ typedef struct {
     ngx_http_event_handler_pt       read_resume;
     ngx_int_t                    (*read_process_header)(ngx_http_request_t *);
     ngx_int_t                    (*read_reinit)(ngx_http_request_t *);
+    void (*error_finalize)(ngx_http_request_t *, ngx_int_t);
     ngx_http_cache_purge_redirect_t      *redirect;
     ngx_http_cache_purge_revalidation_t  *validation;
     ngx_event_t                           read_event;
@@ -379,6 +380,7 @@ typedef struct {
     unsigned  origin_valid : 1;
     unsigned  origin_registered : 1;
     unsigned  invalidation_retry : 1;
+    unsigned  error_held : 1;
 } ngx_http_cache_purge_capture_t;
 
 typedef struct {
@@ -410,6 +412,8 @@ static ngx_int_t ngx_http_cache_purge_read_request(
 static ngx_int_t ngx_http_cache_purge_read_process_header(
     ngx_http_request_t *r);
 static ngx_int_t ngx_http_cache_purge_read_reinit(ngx_http_request_t *r);
+static void ngx_http_cache_purge_error_finalize(ngx_http_request_t *r,
+    ngx_int_t rc);
 static ngx_int_t ngx_http_cache_purge_capture_allocate(
     ngx_http_cache_purge_capture_t *ctx, ngx_str_t *payload, size_t bytes);
 static void ngx_http_cache_purge_read_validation_reply(
@@ -581,6 +585,12 @@ static void
 ngx_http_cache_purge_capture_cleanup(void *data)
 {
     ngx_http_cache_purge_capture_t *ctx = data;
+    if (ctx->error_held) {
+        ctx->cache->updated = 0;
+        ctx->cache->error = 0;
+        ctx->error_held = 0;
+        ngx_http_file_cache_free(ctx->cache, NULL);
+    }
     if (ctx->call) {
         ngx_http_cache_purge_client_cancel(ctx->call);
     }
@@ -665,6 +675,13 @@ ngx_http_cache_purge_capture(ngx_http_request_t *r)
     ctx->failed = 1;
     cln->handler = ngx_http_cache_purge_capture_cleanup;
     ngx_http_set_ctx(r, ctx, ngx_http_cache_purge_index_module);
+    ctx->read_upstream = r->upstream;
+    ctx->read_process_header = r->upstream->process_header;
+    ctx->read_reinit = r->upstream->reinit_request;
+    ctx->error_finalize = r->upstream->finalize_request;
+    r->upstream->process_header = ngx_http_cache_purge_read_process_header;
+    r->upstream->reinit_request = ngx_http_cache_purge_read_reinit;
+    r->upstream->finalize_request = ngx_http_cache_purge_error_finalize;
 
 #if (NGX_HTTP_CACHE_KEY)
     if (main->snapshot) {
@@ -917,12 +934,6 @@ ngx_http_cache_purge_capture_guard_value(ngx_http_script_engine_t *engine)
                 rc = NGX_DECLINED;
             } else {
                 ctx->read_state = NGX_HTTP_CACHE_PURGE_READ_START;
-                ctx->read_upstream = r->upstream;
-                ctx->read_process_header = r->upstream->process_header;
-                ctx->read_reinit = r->upstream->reinit_request;
-                r->upstream->process_header =
-                    ngx_http_cache_purge_read_process_header;
-                r->upstream->reinit_request = ngx_http_cache_purge_read_reinit;
                 ctx->read_event.data = ctx;
                 ctx->read_event.handler = ngx_http_cache_purge_read_event;
                 ctx->read_event.log = r->connection->log;
@@ -1007,6 +1018,14 @@ ngx_http_cache_purge_capture_header(ngx_http_request_t *r)
     ngx_http_cache_purge_capture_conf_t  *conf;
     ngx_str_t                             value;
     ngx_int_t                             rc;
+    if (ctx && ctx->error_held && ctx->cache == r->cache
+        && ctx->read_upstream == r->upstream && r->upstream->cleanup != NULL)
+    {
+        /* Native interception did not consume this response. Its ordinary
+         * disk-cache path must retain the original cacheability decision. */
+        ctx->cache->updated = 0;
+        ctx->error_held = 0;
+    }
     if (ctx && !ctx->failed && ctx->cache == r->cache && r->cached
         && ctx->read_state == NGX_HTTP_CACHE_PURGE_READ_READY)
     {
@@ -1174,6 +1193,38 @@ failed:
     ngx_http_cache_purge_capture_release_publication(ctx);
 }
 
+static void
+ngx_http_cache_purge_error_finalize(ngx_http_request_t *r, ngx_int_t rc)
+{
+    ngx_pool_cleanup_t              *cleanup;
+    ngx_http_cache_purge_capture_t  *ctx;
+    ngx_http_upstream_t             *u;
+
+    u = r->upstream;
+    for (cleanup = r->pool->cleanup; cleanup; cleanup = cleanup->next) {
+        if (cleanup->handler != ngx_http_cache_purge_capture_cleanup) {
+            continue;
+        }
+        ctx = cleanup->data;
+        if (ctx->request != r || ctx->read_upstream != u) {
+            continue;
+        }
+        if (ctx->error_held) {
+            ctx->cache->updated = 0;
+            ctx->cache->error = 0;
+            ctx->error_held = 0;
+            u->cacheable = 0;
+        }
+        if (rc == NGX_HTTP_BAD_GATEWAY || rc == NGX_HTTP_GATEWAY_TIME_OUT) {
+            u->cacheable = 0;
+        }
+        ctx->error_finalize(r, rc);
+        return;
+    }
+    ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+                  "cache index lost error finalizer");
+}
+
 static ngx_int_t
 ngx_http_cache_purge_read_reinit(ngx_http_request_t *r)
 {
@@ -1183,6 +1234,11 @@ ngx_http_cache_purge_read_reinit(ngx_http_request_t *r)
     ctx = ngx_http_get_module_ctx(r, ngx_http_cache_purge_index_module);
     if (ctx == NULL || ctx->read_reinit == NULL) {
         return NGX_ERROR;
+    }
+    if (ctx->error_held) {
+        ctx->cache->updated = 0;
+        ctx->cache->error = 0;
+        ctx->error_held = 0;
     }
     if (ctx->cache == r->cache
         && ctx->read_state == NGX_HTTP_CACHE_PURGE_READ_READY
@@ -1219,6 +1275,17 @@ ngx_http_cache_purge_read_process_header(ngx_http_request_t *r)
     if (u->process_header != ngx_http_cache_purge_read_process_header) {
         ctx->read_process_header = u->process_header;
         u->process_header = ngx_http_cache_purge_read_process_header;
+    }
+    if (rc == NGX_OK && !r->cached && r->cache == ctx->cache
+        && !ctx->cache->updated && u->cacheable
+        && u->headers_in.status_n >= NGX_HTTP_SPECIAL_RESPONSE
+        && u->headers_in.status_n != NGX_HTTP_NOT_MODIFIED
+        && (u->conf->intercept_errors || u->conf->intercept_404))
+    {
+        /* Interception can free an error node before finalize_request. Defer
+         * that free without evaluating error_page/when a second time. */
+        ctx->cache->updated = 1;
+        ctx->error_held = 1;
     }
     if (rc != NGX_OK || !r->cached || u->headers_in.x_accel_redirect == NULL) {
         return rc;

@@ -99,6 +99,7 @@ class Origin(http.server.BaseHTTPRequestHandler):
         if path == '/negative-cache' and negative_outage:
             self.connection.shutdown(socket.SHUT_RDWR)
             return
+        if path == '/negative-timeout': time.sleep(.25)
         if path in origin_failures:
             self.send_response(500); self.send_header('Content-Length', '0'); self.end_headers(); return
         if path == '/no-store-stream':
@@ -129,12 +130,13 @@ class Origin(http.server.BaseHTTPRequestHandler):
             assert late_release.wait(15)
         if path == '/vary': body += self.headers.get('Accept-Language', '').encode()
         if path == '/large': body *= 40000
-        status, content_range = 200, None
+        status, content_range = (500 if path.startswith('/error-') else 200), None
+        if path in ('/error-disk-502', '/error-disk-504'): status = int(path[-3:])
         if path.startswith('/slice'):
             start, end = map(int, self.headers['Range'][6:].split('-')); end = min(end, len(body) - 1)
             content_range = f'bytes {start}-{end}/{len(body)}'; body = body[start:end + 1]; status = 206
         self.send_response(status)
-        self.send_header('Cache-Control', 'max-age=' + ('1' if path.startswith('/revalidate-') or path in ('/redirect-stale', '/redirect-revalidated') else '3600'))
+        self.send_header('Cache-Control', 'no-store' if path == '/error-no-store' else 'max-age=' + ('1' if path.startswith('/revalidate-') or path in ('/redirect-stale', '/redirect-revalidated') else '3600'))
         self.send_header('Accept-Ranges', 'bytes')
         self.send_header('ETag', '"capture-v1"')
         if path in redirects:
@@ -258,6 +260,40 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
       proxy_pass http://127.0.0.1:{origin.server_port};
   }}
   location = /negative-error {{ return 200 "negative-old"; }}
+  location = /negative-timeout {{
+      cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+      proxy_cache_valid 504 1h; error_page 504 = /negative-error;
+      proxy_read_timeout 50ms;
+      proxy_pass http://127.0.0.1:{origin.server_port};
+  }}
+  location = /error-no-store {{
+      cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+      proxy_intercept_errors on; error_page 404 = /negative-error;
+      proxy_cache_valid 500 1h;
+      proxy_pass http://127.0.0.1:{origin.server_port};
+  }}
+  location = /error-memory {{
+      cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+      proxy_intercept_errors on; error_page 500 = /negative-error;
+      proxy_cache_valid 500 1h;
+      proxy_pass http://127.0.0.1:{origin.server_port};
+  }}
+  location = /error-disk {{
+      cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+      proxy_cache_valid 500 1h;
+      proxy_pass http://127.0.0.1:{origin.server_port};
+  }}
+  location = /error-disk-unmatched {{
+      cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+      proxy_intercept_errors on; error_page 404 = /negative-error;
+      proxy_cache_valid 500 1h;
+      proxy_pass http://127.0.0.1:{origin.server_port};
+  }}
+  location /error-disk- {{
+      cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+      proxy_cache_valid 500 502 504 1h;
+      proxy_pass http://127.0.0.1:{origin.server_port};
+  }}
   location ~ ^/redirect-(cache|tag|unknown|named|stale|revalidated)$ {{
       cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
       proxy_ignore_headers X-Accel-Redirect;
@@ -271,6 +307,17 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
  }}
 }}
 '''
+if extension and a.expr:
+    error_when = f'''location /error-when/ {{
+      cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+      proxy_intercept_errors on;
+      expr intercept_error = $arg_intercept 1;
+      when intercept_error {{ error_page 500 = /negative-error; }}
+      proxy_cache_valid 500 1h;
+      proxy_pass http://127.0.0.1:{origin.server_port};
+    }}
+    '''
+    config = config.replace('location = /negative-error', error_when + 'location = /negative-error')
 (run / 'nginx.conf').write_text(config)
 if a.sanitize:
     suppression = run / 'leaks.supp'; suppression.write_text('leak:ngx_event_process_init\n')
@@ -831,14 +878,40 @@ try:
     assert get('/revalidate-covered')[1] == 'HIT' and calls.count('/revalidate-covered') == 3
     checks.append('ordinary 304 validation preserves prior durable coverage while its already-satisfied TAG FENCE remains active')
     assert get('/negative-cache') == (200, 'MISS', b'negative-old')
-    assert get('/negative-cache') == (200, 'HIT', b'negative-old')
-    assert calls.count('/negative-cache') == 1
+    assert get('/negative-cache') == (200, 'MISS', b'negative-old')
+    assert calls.count('/negative-cache') == 2
+    assert query('http://cache.test/negative-cache') == []
     negative_outage = False
     fence('read-negative', 1, 'http://cache.test/negative-cache')
     negative_result = get('/negative-cache')
     assert negative_result == (200, 'BYPASS', b'/negative-cache'), negative_result
-    assert calls.count('/negative-cache') == 2
-    checks.append('URL FENCE bypasses a memory-only cached upstream error before error_page can execute')
+    assert calls.count('/negative-cache') == 3
+    assert get('/negative-timeout') == (200, 'MISS', b'negative-old')
+    assert get('/negative-timeout') == (200, 'MISS', b'negative-old')
+    assert calls.count('/negative-timeout') == 2 and query('http://cache.test/negative-timeout') == []
+    checks.append('transport errors do not create memory-only cache entries, and URL FENCE still protects subsequent fills')
+    assert get('/error-memory') == (200, 'MISS', b'negative-old')
+    assert get('/error-memory') == (200, 'MISS', b'negative-old')
+    assert calls.count('/error-memory') == 2 and query('http://cache.test/error-memory') == []
+    checks.append('intercepted upstream errors never publish memory-only nodes even with cacheable response headers')
+    for uri, status in (('/error-disk', 500), ('/error-disk-unmatched', 500),
+                        ('/error-disk-502', 502), ('/error-disk-504', 504)):
+        assert get(uri) == (status, 'MISS', uri.encode())
+        ready_file(records(uri, 1)[0])
+        assert get(uri) == (status, 'HIT', uri.encode()) and calls.count(uri) == 1
+    assert get('/error-no-store') == (500, 'MISS', b'/error-no-store')
+    assert get('/error-no-store') == (500, 'MISS', b'/error-no-store')
+    assert query('http://cache.test/error-no-store') == []
+    if extension and a.expr:
+        assert get('/error-when/off?intercept=0') == (500, 'MISS', b'/error-when/off')
+        ready_file(records('/error-when/off', 1)[0])
+        assert get('/error-when/off?intercept=0') == (500, 'HIT', b'/error-when/off')
+        assert get('/error-when/on?intercept=1') == (200, 'MISS', b'negative-old')
+        assert get('/error-when/on?intercept=1') == (200, 'MISS', b'negative-old')
+        assert calls.count('/error-when/on') == 2 and query('http://cache.test/error-when/on') == []
+    checks.append('ordinary disk-backed errors remain indexed and reusable, including an unmatched error_page status')
+    error_cutoff = fence('error-writers-drained', 1, 'http://cache.test/never-error-request')
+    until(lambda: writers(error_cutoff) == 0)
     assert get('/redirect-cache') == (200, 'MISS', b'/redirect-cache')
     ready_file(records('/redirect-cache', 1)[0])
     policies['/redirect-tag'] = 'redirect-tag'

@@ -125,7 +125,13 @@ entity's watermark. The native physical-work coordinator does not yet invoke
 materialization: these write guards do not establish complete FENCE retirement.
 
 Known request selectors are also checked before native cache lookup. This covers
-memory-only cached upstream errors before `error_page` runs. Cached
+pre-existing memory-only upstream errors before `error_page` runs. Indexed
+requests no longer create these memory-only entries: transport 502/504 and
+intercepted errors are excluded, while ordinary disk-backed error responses keep
+their configured cache policy. Native `error_page` conditions are not evaluated
+again by the module. Existing negative nodes and unindexed writers sharing a zone
+still require migration/coverage validation; the early selector bypass remains.
+Cached
 `X-Accel-Redirect` responses wait for descriptor and TAG admission before selecting
 their target. The module composes the existing per-request upstream parsing and
 reinitialization callbacks, then uses native header-copy handlers and URI/named
