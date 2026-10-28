@@ -2,6 +2,8 @@
 """Real upstream cache fills through the key module, worker IPC and RocksDB."""
 import argparse
 import array
+import base64
+import calendar
 import concurrent.futures
 import hashlib
 import http.client
@@ -76,6 +78,7 @@ with tarfile.open(fileobj=io.BytesIO(archive)) as source:
         assert (build / member.name).read_bytes() == expected
 
 calls, policies = [], {}
+propagation_calls = []
 validation_tags = {'/revalidate-replace': 'new-tag', '/revalidate-clear': ''}
 conditional_paths = set()
 conditional_calls = []
@@ -98,6 +101,8 @@ class Origin(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split('?', 1)[0]
         calls.append(path)
+        if path.startswith('/propagation/'):
+            propagation_calls.append((path, {k.lower(): v for k, v in self.headers.items()}))
         if path == '/negative-cache' and negative_outage:
             self.connection.shutdown(socket.SHUT_RDWR)
             return
@@ -124,7 +129,8 @@ class Origin(http.server.BaseHTTPRequestHandler):
         if path == '/redirect-revalidated' and self.headers.get('If-None-Match') == '"capture-v1"':
             self.send_response(304); self.send_header('Cache-Control', 'max-age=60'); self.end_headers(); return
         if path == '/capacity': capacity_gate.wait(20)
-        body = path.encode() if not path.startswith('/slice') else slice_body
+        is_slice = path.startswith(('/slice', '/propagation/slice'))
+        body = path.encode() if not is_slice else slice_body
         body = fresh_bodies.get(path, body)
         if path == '/revalidate-race' and calls.count(path) >= 3:
             retry_waiting.set()
@@ -133,11 +139,12 @@ class Origin(http.server.BaseHTTPRequestHandler):
             body = b'old-late-entity'
             late_waiting.set()
             assert late_release.wait(15)
-        if path in ('/vary', '/revalidate-vary'): body += self.headers.get('Accept-Language', '').encode()
+        varying = path in ('/vary', '/revalidate-vary', '/propagation/vary')
+        if varying: body += self.headers.get('Accept-Language', '').encode()
         if path == '/large': body *= 40000
         status, content_range = (500 if path.startswith('/error-') else 200), None
         if path in ('/error-disk-502', '/error-disk-504'): status = int(path[-3:])
-        if path.startswith('/slice'):
+        if is_slice:
             start, end = map(int, self.headers['Range'][6:].split('-')); end = min(end, len(body) - 1)
             content_range = f'bytes {start}-{end}/{len(body)}'; body = body[start:end + 1]; status = 206
         self.send_response(status)
@@ -147,8 +154,9 @@ class Origin(http.server.BaseHTTPRequestHandler):
         if path in redirects:
             self.send_header('X-Accel-Redirect', redirects[path])
             self.send_header('X-Cached-Only', 'hidden-on-redirect')
-        self.send_header('Cache-Tag', policies.get(path, 'news, red, news'))
-        if path in ('/vary', '/revalidate-vary'): self.send_header('Vary', 'Accept-Language')
+        tag_identity = (path, self.headers.get('Accept-Language', '') if varying else self.headers.get('Range', ''))
+        self.send_header('Cache-Tag', policies.get(tag_identity, policies.get(path, 'news, red, news')))
+        if varying: self.send_header('Vary', 'Accept-Language')
         if content_range: self.send_header('Content-Range', content_range)
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
@@ -215,6 +223,15 @@ loads = ''.join(f'load_module {build}/objs/{name}.so;\n' for name in
 extension = any(line.split() == ['#define', 'NGX_RESTY_EXT', '1']
                 for line in (build / 'objs/ngx_auto_config.h').read_text().splitlines())
 slice_config = 'slice on; slice_size 1024;' if extension else 'slice 1024;'
+propagation_config = '''cache_key_namespace prop;
+  cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+  cache_purge_tag_namespace $cache_key_namespace;
+  cache_purge_propagation on;
+  proxy_set_header Host $host;
+  proxy_set_header X-Cache-Purge-Time $cache_purge_propagation_time;
+  proxy_set_header X-Cache-Purge-Mode $cache_purge_propagation_mode;
+  proxy_set_header X-Cache-Purge-Fence $cache_purge_propagation_fence;
+  proxy_set_header X-Cache-Purge-Namespace "";'''
 config = loads + f'''daemon off; master_process on; worker_processes {a.workers};
 pid {run}/pid; error_log {run}/error.log debug;
 thread_pool default threads=2;
@@ -242,6 +259,11 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
       cache_purge_tag_namespace_header X-Test-Purge-Scope; }}
   location /__denied/v2/ {{ cache_purge_api; proxy_cache off; deny all; }}
   location /__open/v2/ {{ cache_purge_api; proxy_cache off; }}
+  location /propagation/ {{ {propagation_config}
+      proxy_cache_revalidate on; proxy_pass http://127.0.0.1:{origin.server_port}; }}
+  location /propagation/slice {{ {propagation_config}
+      {slice_config} proxy_set_header Range $slice_range;
+      proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location / {{ cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
                 proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /large {{ cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
@@ -1617,6 +1639,94 @@ try:
         raise
     assert not held_path.exists()
     checks.append('HTTP TAG-group acceptance does not wait for a held file lease; disconnection and nginx restart preserve autonomous cleanup and the original effective time')
+
+    def propagation_headers(path, language=None, span=None):
+        return next(headers for uri, headers in reversed(propagation_calls)
+                    if uri == path and (language is None or headers.get('accept-language') == language)
+                    and (span is None or headers.get('range') == span))
+
+    def propagated(headers, expected=None):
+        names = {name for name in headers if name.startswith('x-cache-purge-')}
+        if expected is None:
+            assert not names, headers
+            return
+        assert names == {'x-cache-purge-time', 'x-cache-purge-mode', 'x-cache-purge-fence'}, headers
+        packet = base64.b64decode(headers['x-cache-purge-fence'], validate=True)
+        assert packet == b'NPF2' + struct.pack('>QQ', *expected), headers
+        assert headers['x-cache-purge-time'] == str(max(expected))
+        assert headers['x-cache-purge-mode'] == ('mixed' if all(expected) else 'invalidate' if expected[0] else 'delete')
+
+    def tag_push(name, tag, mode='delete'):
+        operation = api_input(name, {'type': 'tag', 'values': [tag]}, mode)
+        result = api('/__purge/v2/operations', operation,
+                     headers={'X-Cache-Purge-Namespace': 'prop'})
+        assert result[0] == 202 and result[2]['effective'], result
+        until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
+        return calendar.timegm(time.strptime(operation['event']['issued_at'], '%Y-%m-%dT%H:%M:%SZ')) * 1000
+
+    def prop_get(path, headers=None):
+        return get(path, {'Host': 'prop.test', **(headers or {})})
+
+    def prop_records(path, count):
+        found = until(lambda: (v if len(v := query('http://prop.test' + path)) == count
+                               and all(item[2] == 2 for item in v) else None))
+        return [record(item[0]) for item in found]
+
+    uri = '/propagation/vary'
+    policies[(uri, 'en')] = 'known-red'
+    policies[(uri, 'de')] = 'known-blue'
+    policies[(uri, 'fr')] = 'unknown-green'
+    for number, (suffix, language) in enumerate((('', 'en'), ('', 'de'), ('?z=b', 'en')), 1):
+        assert prop_get(uri + suffix, {'Accept-Language': language}) == (200, 'MISS', (uri + language).encode())
+        propagated(propagation_headers(uri, language))
+        prop_records(uri, number)
+    variants = prop_records(uri, 3)
+    removed = [item for item in variants if b'known-red' in item['tags']]
+    assert len(removed) == 2
+    deleted_at = tag_push('prop-known-red', 'known-red')
+    until(lambda: all(record(item['id'], optional=True) is None for item in removed))
+    assert prop_get(uri + '?bypass=1', {'Accept-Language': 'de'})[0] == 200
+    propagated(propagation_headers(uri, 'de'))
+    checks.append('TAG propagation selects the current native Vary representation and never borrows a different language across zones')
+    stop(process); process = start()
+    until(lambda: (run / 'index/component.sock').exists())
+    until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
+    assert prop_get(uri + '?z=b', {'Accept-Language': 'en'}) == (200, 'MISS', (uri + 'en').encode())
+    propagated(propagation_headers(uri, 'en'), (0, deleted_at))
+    checks.append('Delete retains known TAG associations through physical collection and full restart and emits only the fixed object timestamp')
+    assert prop_get(uri, {'Accept-Language': 'fr'})[0] == 200
+    propagated(propagation_headers(uri, 'fr'))
+    checks.append('a completely unknown variant proceeds upstream without TAG compensation or partial propagation headers')
+
+    uri = '/propagation/validate'
+    policies[uri] = 'validate-old'
+    conditional_paths.add(uri)
+    assert prop_get(uri) == (200, 'MISS', uri.encode())
+    original = prop_records(uri, 1)[0]
+    invalidated_at = tag_push('prop-validate', 'validate-old', 'invalidate')
+    validation_tags[uri] = 'validate-new'
+    response = prop_get(uri)
+    assert response == (200, 'REVALIDATED', uri.encode()), response
+    propagated(propagation_headers(uri), (invalidated_at, 0))
+    until(lambda: record(original['id'])['tags'] == [b'validate-new'])
+    assert prop_get(uri + '?bypass=1')[0] == 200
+    propagated(propagation_headers(uri), (invalidated_at, 0))
+    checks.append('Invalidate emits its requirement for 304 and preserves the previous TAG association after the response replaces TAGs')
+
+    uri = '/propagation/slice'
+    policies[(uri, 'bytes=0-1023')] = 'slice-first'
+    policies[(uri, 'bytes=1024-2047')] = 'slice-other'
+    policies[(uri, 'bytes=2048-3071')] = 'slice-other'
+    assert prop_get(uri)[2] == slice_body
+    sliced = prop_records(uri, 3)
+    first_slice = next(item for item in sliced if b'slice-first' in item['tags'])
+    deleted_at = tag_push('prop-slice', 'slice-first')
+    until(lambda: record(first_slice['id'], optional=True) is None)
+    assert prop_get(uri + '?bypass=1')[2] == slice_body
+    propagated(propagation_headers(uri, span='bytes=0-1023'), (0, deleted_at))
+    propagated(propagation_headers(uri, span='bytes=1024-2047'))
+    propagated(propagation_headers(uri, span='bytes=2048-3071'))
+    checks.append('known TAG propagation respects native slice identities instead of expanding a match to all files with the same key')
 finally:
     capacity_gate.set()
     validation_release.set()

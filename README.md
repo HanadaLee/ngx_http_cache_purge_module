@@ -421,9 +421,11 @@ On graceful reload, the old worker requests asynchronous executor shutdown so
 long-lived HTTP responses do not keep the database owner indefinitely. Its
 executor finishes the current operation and closes the DB before the replacement
 opens it. The old worker can continue sending its response and joins the stopped
-executor when it exits. The component C ABI is 7; rebuild its archives together
-with the addon. Upgrading from shared-control ABI 4 or earlier requires a full
-nginx restart; persisted cache files and indexes are retained.
+executor when it exits. The component C ABI is 10; rebuild its archives together
+with the addon. Upgrading from an earlier component ABI or shared-control ABI 4
+or earlier requires a full nginx restart; persisted cache files and indexes are
+retained. An old executor cannot serve the new object-query opcode during a
+mixed-version reload. nginx-ext ABI remains 1.
 Override `CACHE_PURGE_ROCKSDB_LIBS` to use
 a fixed RocksDB archive and its compression/runtime dependencies. The default
 links the system shared RocksDB library. Static archives linked into a dynamic
@@ -588,14 +590,26 @@ proxy request headers, preserving duplicate-header order and nginx's Accept-*
 normalization. Headers are neither logged nor persisted. A control publication
 change or expired snapshot discards the partial result and requires a retry.
 
-Full propagation remains unfinished: IPC scheduling and request-path
-integration are still pending. The intended
-TAG scope is known current or retained edge associations; completely unknown
-objects proceed upstream without TAG-specific retry or broader invalidation.
-Until the local lookup is connected,
-an unknown TAG candidate fails before upstream I/O; it is never sent as a matched
-object or delegated to L2. Uncached proxy routes and large local match sets also
-need integration. Capabilities reports the sender transport as
+Managed proxy-cache requests now resolve these associations asynchronously at
+the cache-entry gate. One IPC request holds its bounded input until completion,
+disconnect or the original deadline. The executor admits at most four object
+queries and advances eight steps per dispatch, allowing other peers to run.
+Workers retry transient failures within the existing three-second deadline;
+unresolved failures return 503 rather than treating missing results as empty.
+
+Known current or retained edge TAG associations supply the outgoing object's
+timestamps. Completely unknown objects proceed upstream without TAG-specific
+retry or broader invalidation. Other slices and Vary variants do not contribute
+their TAGs. Request headers are used only for local native Vary selection; TAGs
+are never forwarded to L2. Real HTTP tests cover cross-zone selection, retention
+through deletion and restart, 304 TAG replacement, and slice isolation.
+
+Full propagation remains unfinished. A new accepted operation between the gate
+and upstream request creation currently rejects sending; maintenance publication
+changes with the same ledger and operation sequence preserve the completed
+result. Older mutation/retention paths still have a 64-alias traversal bound.
+Uncached proxy routes, unsupported cache methods, complete tier integration,
+and loaded memory/latency acceptance remain open. Capabilities reports the sender transport as
 `filter` or `variables`, while `proxy_propagation_ready` remains false.
 The protocol has no module-side authentication, signatures, key management,
 or response verification exchange.

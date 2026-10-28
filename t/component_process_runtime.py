@@ -39,7 +39,7 @@ def wait_for(function, timeout=10):
 
 
 class Component:
-    def __init__(self, path, connections=8, timeout=3000, budget=1100000, payload=512 * 1024, shared=None, roots=None):
+    def __init__(self, path, connections=8, timeout=3000, budget=1100000, payload=512 * 1024, shared=None, roots=None, seed=False):
         self.path = path
         path.mkdir(exist_ok=True)
         self.stderr = (root / f'stderr-{len(processes)}.log').open('w')
@@ -50,6 +50,9 @@ class Component:
         env.pop('CACHE_PURGE_TEST_CACHE_ROOT', None)
         env.pop('CACHE_PURGE_TEST_TEMP_ROOT', None)
         env.pop('CACHE_PURGE_TEST_CACHE_ZONE', None)
+        env.pop('CACHE_PURGE_TEST_OBJECT_SEED', None)
+        if seed:
+            env['CACHE_PURGE_TEST_OBJECT_SEED'] = '1'
         if roots:
             env['CACHE_PURGE_TEST_CACHE_ROOT'], env['CACHE_PURGE_TEST_TEMP_ROOT'] = map(str, roots)
         self.process = subprocess.Popen(command, env=env,
@@ -1328,6 +1331,51 @@ try:
     assert struct.unpack('>QQQ', lp.call(31, identity(902) + struct.pack('>Q', 2) + string('') * 3))[:2] == (2000, 0)
     check(True, 'local propagation resolves persisted URL aliases and survives executor restart without index rebuilding')
     lp.close(); local.stop()
+
+    object_shared = root / 'object-query.shm'
+    objects = Component(root / 'object-query', shared=object_shared, seed=True)
+    objects.opened(); probe = Client(objects.path)
+    wait_for(lambda: struct.unpack('>IQ', probe.call(16))[0] == 6)
+    data = string('object-tag') + b'\x01' + struct.pack('>Q', 1000)
+    data += b'\x05' + string('red') + string('team') + string('object-ipc')
+    probe.call(14, data)
+    wait_for(lambda: struct.unpack('>IQ', probe.call(16))[0] == 6)
+    payload = b''.join(map(string, ('object-key', 'https://object.test/item', 'object.test', 'team')))
+    payload += b'\x01' + b'\0' * 15 + struct.pack('>I', 1)
+    payload += string('X-Query-Test') + string('retained until completion')
+    probe.call(32, b'', code=4)
+    probe.call(32, payload + b'bad', code=4)
+    for attempt in range(4):
+        pending = Client(objects.path)
+        pending.call(1)
+        pending.socket.sendall(pending.packet(32, payload))
+        probe.call(1)
+        assert not select.select([pending.socket], [], [], 0)[0]
+        if attempt % 2:
+            result = struct.unpack('>QQQ', pending.reply(32))
+            assert result[:2] == (1000, 0) and result[2]
+        pending.close()
+    check(True, 'OBJECT_PROPAGATION yields between alias pages, keeps its input live, and releases disconnected query snapshots')
+    result = struct.unpack('>QQQ', probe.call(32, payload))
+    assert result[:2] == (1000, 0) and result[2]
+    unknown = b''.join(map(string, ('unknown', 'https://unknown.test/item', 'unknown.test', 'team')))
+    unknown += b'\x01' + b'\0' * 15 + b'\0' * 4
+    assert struct.unpack('>QQQ', probe.call(32, unknown))[:2] == (0, 0)
+    check(True, 'OBJECT_PROPAGATION returns only complete object timestamps and distinguishes confirmed absence from malformed input')
+    pending = Client(objects.path)
+    pending.call(1)
+    pending.socket.sendall(pending.packet(32, payload))
+    probe.call(1)
+    assert not select.select([pending.socket], [], [], 0)[0]
+    objects.stop()
+    pending.close(); probe.close()
+    objects = Component(objects.path, shared=object_shared)
+    objects.opened(); probe = Client(objects.path)
+    wait_for(lambda: struct.unpack('>IQ', probe.call(16))[0] == 6)
+    result = struct.unpack('>QQQ', probe.call(32, payload))
+    assert result[:2] == (1000, 0) and result[2]
+    probe.close(); objects.stop()
+    check(True, 'executor shutdown closes pending object queries before their coordinator and restart preserves the indexed associations')
 
 finally:
     for component in processes:

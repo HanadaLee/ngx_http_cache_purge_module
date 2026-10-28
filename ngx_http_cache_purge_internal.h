@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define NGX_HTTP_CACHE_PURGE_COMPONENT_ABI 9
+#define NGX_HTTP_CACHE_PURGE_COMPONENT_ABI 10
 #define NGX_HTTP_CACHE_PURGE_PROTOCOL_VERSION 1
 #define NGX_HTTP_CACHE_PURGE_FRAME_SIZE 24
 
@@ -85,7 +85,10 @@ typedef enum {
     /* file ID[16], revision u64, current key/URL/host strings -> three u64:
      * Invalidate/Delete times and publication. Empty strings query only the
      * persisted associations. Use the executor's current time. */
-    NGX_HTTP_CACHE_PURGE_OP_FILE_PROPAGATION
+    NGX_HTTP_CACHE_PURGE_OP_FILE_PROPAGATION,
+    /* key/URL/host/namespace strings, main[16], encoded request headers ->
+     * Invalidate/Delete times and publication (three u64), asynchronously. */
+    NGX_HTTP_CACHE_PURGE_OP_OBJECT_PROPAGATION
 } ngx_http_cache_purge_opcode_e;
 
 #define NGX_HTTP_CACHE_PURGE_ROOT_CACHE 1
@@ -158,7 +161,7 @@ typedef struct {
 void ngx_http_cache_purge_component_options(
     ngx_http_cache_purge_component_options_t *options);
 /* Link-time header/archive compatibility marker. */
-uint32_t ngx_http_cache_purge_component_abi_9(void);
+uint32_t ngx_http_cache_purge_component_abi_10(void);
 
 /* Only start after fork in the selected nginx worker, never while parsing
  * configuration or in master. Copies its inputs and starts one executor thread.

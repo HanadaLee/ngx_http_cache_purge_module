@@ -21,6 +21,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#define NGX_HTTP_CACHE_PURGE_COMPONENT_PENDING  -1
+
 typedef struct {
     unsigned char  *data;
     size_t          len;
@@ -66,6 +68,7 @@ typedef struct {
     ngx_http_cache_purge_component_frame_t   request;
     int                                      parsed;
     uint64_t                                 deadline;
+    ngx_http_cache_purge_object_query_t     *object;
 } ngx_http_cache_purge_component_peer_t;
 
 struct ngx_http_cache_purge_component_s {
@@ -110,6 +113,7 @@ struct ngx_http_cache_purge_component_s {
     ngx_http_cache_purge_coordinator_t       *coordinator;
     ngx_http_cache_purge_operations_t         operations;
     size_t                                    next_peer;
+    size_t                                    object_queries;
     ngx_http_cache_purge_component_buffer_t   recovery_bookmark;
     uint64_t                                  recovery_at;
     int                                       native_migrated;
@@ -366,6 +370,10 @@ ngx_http_cache_purge_component_drop(ngx_http_cache_purge_component_t *c,
     p = &c->peers[i];
     if (p->fd < 0) {
         return;
+    }
+    if (p->object != NULL) {
+        (void) ngx_http_cache_purge_coordinator_object_close(&p->object, NULL);
+        c->object_queries--;
     }
     ngx_http_cache_purge_component_release(c, &p->input);
     ngx_http_cache_purge_component_release(c, &p->output);
@@ -952,6 +960,54 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
     rc = 0;
 
     switch (p->request.opcode) {
+    case NGX_HTTP_CACHE_PURGE_OP_OBJECT_PROPAGATION:
+        if (p->object == NULL) {
+            if (c->object_queries >= 4 || c->coordinator == NULL) {
+                rc = ngx_http_cache_purge_component_error(error,
+                    NGX_HTTP_CACHE_ROCKSDB_BUSY, "object query slots busy");
+                break;
+            }
+            memset(&propagation_request, 0, sizeof(propagation_request));
+            propagation_request.key =
+                ngx_http_cache_purge_component_string(&d, 32768);
+            propagation_request.url =
+                ngx_http_cache_purge_component_string(&d, 32768);
+            propagation_request.host =
+                ngx_http_cache_purge_component_string(&d, 32768);
+            propagation_request.tag_namespace =
+                ngx_http_cache_purge_component_string(&d, 32768);
+            ngx_http_cache_purge_component_id(&d, digest);
+            if (d.rc != 0) {
+                rc = d.rc;
+                break;
+            }
+            metadata.data = d.data + d.at;
+            metadata.len = d.len - d.at;
+            now = ngx_http_cache_purge_component_now(CLOCK_REALTIME);
+            rc = ngx_http_cache_purge_coordinator_object_open(c->coordinator,
+                &propagation_request, digest, metadata, now, &p->object, error);
+            if (rc != 0) {
+                break;
+            }
+            c->object_queries++;
+        }
+        rc = ngx_http_cache_purge_coordinator_object_step(p->object, 8,
+            &propagation, &publication, &done, error);
+        if (rc == 0 && !done) {
+            rc = NGX_HTTP_CACHE_PURGE_COMPONENT_PENDING;
+            break;
+        }
+        (void) ngx_http_cache_purge_coordinator_object_close(&p->object, NULL);
+        c->object_queries--;
+        if (rc == 0) {
+            ngx_http_cache_purge_component_put_integer(e,
+                propagation.invalidate_ms, 8);
+            ngx_http_cache_purge_component_put_integer(e,
+                propagation.delete_ms, 8);
+            ngx_http_cache_purge_component_put_integer(e, publication, 8);
+        }
+        break;
+
     case NGX_HTTP_CACHE_PURGE_OP_FILE_PROPAGATION:
         ngx_http_cache_purge_component_id(&d, expected[0].id);
         expected[0].revision = ngx_http_cache_purge_component_integer(&d, 8);
@@ -1672,8 +1728,14 @@ ngx_http_cache_purge_component_execute(ngx_http_cache_purge_component_t *c,
         ngx_http_cache_purge_component_buffer_free(&e.buffer);
         return e.rc;
     }
-    ngx_http_cache_purge_component_add64(&c->requests, 1);
+    if (p->object == NULL) {
+        ngx_http_cache_purge_component_add64(&c->requests, 1);
+    }
     rc = ngx_http_cache_purge_component_dispatch(c, store, p, &e, error);
+    if (rc == NGX_HTTP_CACHE_PURGE_COMPONENT_PENDING) {
+        ngx_http_cache_purge_component_buffer_free(&e.buffer);
+        return 0;
+    }
     code = (uint32_t) rc;
     if (rc != 0) {
         ngx_http_cache_purge_component_close(&p->output_lease);
@@ -3207,7 +3269,8 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
                 ngx_http_cache_purge_component_drop(c, i);
             }
         }
-        /* Queries close per dispatch; idle peers retain no DB snapshots. */
+        /* Pending object queries retain their input and snapshot only until
+         * completion, disconnect or the original request deadline. */
     }
     return 0;
 }
@@ -3258,14 +3321,14 @@ ngx_http_cache_purge_component_run(void *data)
     }
     ngx_http_cache_purge_component_store32(
         &c->state, NGX_HTTP_CACHE_PURGE_COMPONENT_STOPPING);
+    for (i = 0; i < c->options.max_connections; i++) {
+        ngx_http_cache_purge_component_drop(c, i);
+    }
     if (c->coordinator != NULL) {
         rc = ngx_http_cache_purge_coordinator_close(&c->coordinator, &error);
         if (rc != 0) {
             ngx_http_cache_purge_component_fail(c, &error);
         }
-    }
-    for (i = 0; i < c->options.max_connections; i++) {
-        ngx_http_cache_purge_component_drop(c, i);
     }
     /* Remove the rendezvous socket before releasing the database owner lock. */
     ngx_http_cache_purge_component_remove_socket(c);
@@ -3341,7 +3404,7 @@ ngx_http_cache_purge_component_options(
 }
 
 uint32_t
-ngx_http_cache_purge_component_abi_9(void)
+ngx_http_cache_purge_component_abi_10(void)
 {
     return NGX_HTTP_CACHE_PURGE_COMPONENT_ABI;
 }
@@ -6877,6 +6940,9 @@ ngx_http_cache_purge_coordinator_object_step(
         }
     }
     query->status = rc;
+    if (rc == 0) {
+        ngx_http_cache_purge_control_clear(error);
+    }
     if (rc == 0 && query->done) {
         *out = *fence;
         *publication = query->publication;

@@ -87,7 +87,7 @@ ngx_http_cache_purge_runtime_create(ngx_conf_t *cf)
     layout->vary_capacity = sizeof(((ngx_http_file_cache_header_t *) 0)->vary);
     layout->variant_offset = offsetof(ngx_http_file_cache_header_t, variant);
     if (rt->options.abi != NGX_HTTP_CACHE_PURGE_COMPONENT_ABI
-        || ngx_http_cache_purge_component_abi_9()
+        || ngx_http_cache_purge_component_abi_10()
                != NGX_HTTP_CACHE_PURGE_COMPONENT_ABI
         || ngx_array_init(&rt->roots, cf->pool, 2, sizeof(ngx_str_t)) != NGX_OK
         || ngx_array_init(&rt->file_roots, cf->pool, 8,
@@ -1855,6 +1855,34 @@ ngx_http_cache_purge_ignore_propagation(ngx_http_request_t *r)
     return ngx_http_get_expr_flag_value(r, conf->ignore_propagation);
 #else
     return conf->ignore_propagation;
+#endif
+}
+
+ngx_flag_t
+ngx_http_cache_purge_propagation_possible(ngx_http_request_t *r)
+{
+    ngx_http_cache_purge_loc_conf_t  *conf;
+#if (NGX_EXPR)
+    ngx_conf_expr_flag_ctx_t         *values;
+    ngx_uint_t                        i;
+#endif
+
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_module);
+#if (NGX_EXPR)
+    if (conf->propagation == NULL
+        || conf->propagation == NGX_CONF_UNSET_PTR)
+    {
+        return 0;
+    }
+    values = conf->propagation->elts;
+    for (i = 0; i < conf->propagation->nelts; i++) {
+        if (values[i].value == 1) {
+            return 1;
+        }
+    }
+    return 0;
+#else
+    return conf->propagation == 1;
 #endif
 }
 

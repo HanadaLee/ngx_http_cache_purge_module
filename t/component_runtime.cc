@@ -7,6 +7,61 @@
 #include <iostream>
 #include <thread>
 #include <cstring>
+#include <string>
+
+static int
+ngx_http_cache_purge_test_seed(const char *path)
+{
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    ngx_http_cache_rocksdb_error_t error{};
+    int rc = ngx_http_cache_rocksdb_open(path, &options, &store, &error);
+    if (rc != 0) {
+        return rc;
+    }
+    rc = ngx_http_cache_purge_index_init(store, &error);
+    auto bytes = [](const char *value) {
+        return ngx_http_cache_rocksdb_bytes_t{
+            reinterpret_cast<const unsigned char *>(value), std::strlen(value)
+        };
+    };
+    ngx_http_cache_purge_index_file_t file{};
+    file.id[15] = 1;
+    file.state = NGX_HTTP_CACHE_PURGE_INDEX_PREPARED;
+    file.key = bytes("object-key");
+    file.url = bytes("https://object.test/item");
+    file.host = bytes("object.test");
+    file.tag_namespace = bytes("team");
+    file.root = bytes("/unregistered-test-cache");
+    file.zone = bytes("test");
+    file.path = bytes("object");
+    file.tags[0] = bytes("red");
+    file.tag_count = 1;
+    unsigned char main[16] = { 1 }, variant[16] = {};
+    ngx_http_cache_purge_index_match_t prepared{};
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_index_prepare_native(
+            store, &file, nullptr, main, variant, &prepared, &error);
+    }
+    ngx_http_cache_purge_index_expected_t expected{};
+    std::memcpy(expected.id, file.id, 16);
+    expected.revision = 1;
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_index_apply(store,
+            NGX_HTTP_CACHE_PURGE_INDEX_COMMIT, &expected, 1, &prepared, &error);
+    }
+    for (unsigned i = 0; i < 2048 && rc == 0; i++) {
+        auto url = "https://object-alias.test/" + std::to_string(i);
+        rc = ngx_http_cache_purge_index_add_url(
+            store, file.key, bytes(url.c_str()), &error);
+    }
+    int closed = ngx_http_cache_rocksdb_close(&store, nullptr);
+    if (rc != 0) {
+        std::cerr << error.message << std::endl;
+    }
+    return rc != 0 ? rc : closed;
+}
 
 static int
 visit(void *data, const ngx_http_cache_purge_control_match_t *match)
@@ -108,6 +163,12 @@ main(int argc, char **argv)
                 return 4;
             }
             origin = true;
+        }
+    }
+    if (std::getenv("CACHE_PURGE_TEST_OBJECT_SEED")) {
+        int rc = ngx_http_cache_purge_test_seed(argv[1]);
+        if (rc != 0) {
+            return rc;
         }
     }
     int rc = ngx_http_cache_purge_component_start(

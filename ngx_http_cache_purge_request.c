@@ -385,6 +385,9 @@ typedef struct {
     ngx_http_cache_purge_propagation_t   *propagation;
     ngx_http_cache_purge_propagation_t   *propagation_shared;
     ngx_http_cache_purge_incoming_t      *incoming, *incoming_shared;
+    ngx_http_cache_purge_fence_t           local_fence;
+    ngx_http_cache_purge_watermark_t       local_watermark;
+    uint64_t                               local_publication;
     uint64_t                              incoming_invalidate, incoming_delete;
 #if (NGX_RESTY_EXT && NGX_HTTP_PROXY_FILTER)
     ngx_list_t                          *propagation_headers;
@@ -419,6 +422,9 @@ typedef struct {
     unsigned  read_ref : 1;
     unsigned  read_header_only : 1;
     unsigned  read_bypass : 1;
+    unsigned  local_started : 1;
+    unsigned  local_ready : 1;
+    unsigned  local_failed : 1;
     unsigned  incoming_error : 1;
     unsigned  incoming_retired : 1;
     unsigned  origin_valid : 1;
@@ -469,6 +475,8 @@ static void ngx_http_cache_purge_read_validation_reply(
     ngx_http_cache_purge_call_t *call, void *data,
     const ngx_http_cache_purge_reply_t *reply);
 static u_char *ngx_http_cache_purge_capture_string(u_char *p, ngx_str_t value);
+static u_char *ngx_http_cache_purge_capture_number(u_char *p, uint64_t value,
+    unsigned width);
 static uint64_t ngx_http_cache_purge_capture_read_number(u_char *p,
     unsigned width);
 static ngx_int_t  ngx_http_cache_purge_capture_step(ngx_http_request_t *,
@@ -740,29 +748,153 @@ ngx_http_cache_purge_propagation_cleanup(void *data)
     state->reserved = 0;
 }
 
-static int
-ngx_http_cache_purge_propagation_collect(void *data,
-    const ngx_http_cache_purge_control_match_t *match)
+static void
+ngx_http_cache_purge_propagation_reply(ngx_http_cache_purge_call_t *call,
+    void *data, const ngx_http_cache_purge_reply_t *reply)
 {
-    ngx_http_cache_purge_fence_t  *fence = data;
-    uint64_t                      *cutoff;
+    ngx_http_cache_purge_capture_t         *ctx = data;
+    ngx_http_cache_purge_control_reader_t *reader;
+    ngx_http_cache_purge_watermark_t       watermark;
+    ngx_http_cache_rocksdb_error_t         error;
+    uint64_t                               publication, current;
+    ngx_uint_t                             retry;
 
-    if (match->flags & NGX_HTTP_CACHE_PURGE_CONTROL_TAG_CANDIDATE) {
-        /* Resolve locally; a scope candidate is not a confirmed TAG match. */
-        return NGX_HTTP_CACHE_ROCKSDB_BUSY;
+    ctx->call = NULL;
+    retry = reply->transport != NGX_HTTP_CACHE_PURGE_CLIENT_OK
+            || reply->result == NGX_HTTP_CACHE_ROCKSDB_BUSY
+            || reply->result == NGX_HTTP_CACHE_ROCKSDB_LIMIT
+            || reply->result == NGX_HTTP_CACHE_ROCKSDB_EXPIRED;
+    if (reply->transport == NGX_HTTP_CACHE_PURGE_CLIENT_OK
+        && reply->result == 0 && reply->payload.len == 24)
+    {
+        publication = ngx_http_cache_purge_capture_read_number(
+            reply->payload.data + 16, 8);
+        if (publication != 0
+            && ngx_http_cache_purge_runtime_reader(ctx->request, &reader,
+                                                   &error) == 0
+            && ngx_http_cache_purge_control_watermark(reader, &watermark,
+                                                       &current, &error) == 0
+            && current == publication)
+        {
+            ctx->local_fence.invalidate_ms =
+                ngx_http_cache_purge_capture_read_number(
+                    reply->payload.data, 8);
+            ctx->local_fence.delete_ms =
+                ngx_http_cache_purge_capture_read_number(
+                    reply->payload.data + 8, 8);
+            ctx->local_publication = publication;
+            ctx->local_watermark = watermark;
+            ctx->local_ready = 1;
+            ngx_post_event(&ctx->read_event, &ngx_posted_events);
+            return;
+        }
+        retry = 1;
     }
-    cutoff = match->mode == NGX_HTTP_CACHE_PURGE_INVALIDATE
-             ? &fence->invalidate_ms : &fence->delete_ms;
-    if (match->issued_at_ms > *cutoff) {
-        *cutoff = match->issued_at_ms;
+    if (retry && !ctx->request->main->terminated
+        && (ngx_msec_int_t) (ctx->deadline - ngx_current_msec) > 10)
+    {
+        ngx_add_timer(&ctx->read_event, 10);
+        return;
     }
-    return 0;
+    ctx->local_failed = 1;
+    ngx_post_event(&ctx->read_event, &ngx_posted_events);
+}
+
+static ngx_int_t
+ngx_http_cache_purge_propagation_query(ngx_http_cache_purge_capture_t *ctx)
+{
+    ngx_http_request_t  *r;
+    ngx_list_part_t     *part;
+    ngx_table_elt_t     *headers;
+    ngx_str_t           payload, fields[4];
+    ngx_uint_t          i, count;
+    ngx_msec_t          timeout;
+    size_t              size;
+    u_char             *p;
+    ngx_int_t           rc;
+
+    r = ctx->request;
+    timeout = ctx->deadline - ngx_current_msec;
+    if (r->main->terminated || (ngx_msec_int_t) timeout <= 0
+        || ngx_http_cache_purge_runtime_client(r, &ctx->client) != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+    fields[0] = ctx->key;
+    fields[1] = ctx->url;
+    fields[2] = ctx->host;
+    fields[3] = ctx->namespace;
+    size = 36;
+    count = 0;
+    for (i = 0; i < 4; i++) {
+        if (fields[i].len > NGX_HTTP_CACHE_PURGE_CAPTURE_RECORD - size) {
+            return NGX_ERROR;
+        }
+        size += fields[i].len;
+    }
+    for (part = &r->headers_in.headers.part; part; part = part->next) {
+        headers = part->elts;
+        for (i = 0; i < part->nelts; i++) {
+            if (!headers[i].hash) {
+                continue;
+            }
+            if (size > NGX_HTTP_CACHE_PURGE_CAPTURE_RECORD - 8
+                || headers[i].key.len
+                   > NGX_HTTP_CACHE_PURGE_CAPTURE_RECORD - size - 8)
+            {
+                return NGX_ERROR;
+            }
+            size += 8 + headers[i].key.len;
+            if (headers[i].value.len
+                > NGX_HTTP_CACHE_PURGE_CAPTURE_RECORD - size)
+            {
+                return NGX_ERROR;
+            }
+            size += headers[i].value.len;
+            count++;
+        }
+    }
+    if (size > NGX_HTTP_CACHE_PURGE_CAPTURE_BYTES
+               - ngx_http_cache_purge_retained_bytes)
+    {
+        return NGX_BUSY;
+    }
+    payload.data = ngx_alloc(size, r->connection->log);
+    if (payload.data == NULL) {
+        return NGX_ERROR;
+    }
+    ngx_http_cache_purge_retained_bytes += size;
+    payload.len = size;
+    p = payload.data;
+    for (i = 0; i < 4; i++) {
+        p = ngx_http_cache_purge_capture_string(p, fields[i]);
+    }
+    p = ngx_cpymem(p, ctx->cache->main, 16);
+    p = ngx_http_cache_purge_capture_number(p, count, 4);
+    for (part = &r->headers_in.headers.part; part; part = part->next) {
+        headers = part->elts;
+        for (i = 0; i < part->nelts; i++) {
+            if (headers[i].hash) {
+                p = ngx_http_cache_purge_capture_string(p, headers[i].key);
+                p = ngx_http_cache_purge_capture_string(p, headers[i].value);
+            }
+        }
+    }
+    rc = NGX_ERROR;
+    if ((size_t) (p - payload.data) == size) {
+        rc = ngx_http_cache_purge_client_submit(ctx->client,
+            NGX_HTTP_CACHE_PURGE_OP_OBJECT_PROPAGATION, &payload, timeout,
+            ngx_http_cache_purge_propagation_reply, ctx, &ctx->call);
+    }
+    /* The IPC queue owns its copy; retries retain no request-pool payloads. */
+    ngx_free(payload.data);
+    ngx_http_cache_purge_retained_bytes -= size;
+    return rc;
 }
 
 static ngx_int_t
 ngx_http_cache_purge_propagation_snapshot(ngx_http_cache_purge_capture_t *ctx)
 {
-    ngx_http_cache_purge_control_context_t    context;
     ngx_http_cache_purge_control_reader_t    *reader;
     ngx_http_cache_purge_watermark_t          watermark;
     ngx_http_cache_rocksdb_error_t            error;
@@ -782,31 +914,24 @@ ngx_http_cache_purge_propagation_snapshot(ngx_http_cache_purge_capture_t *ctx)
     int                                       rc;
 
     r = ctx->request;
-    if (ctx->failed
+    if (ctx->failed || !ctx->local_ready
         || ngx_http_cache_purge_runtime_reader(r, &reader, &error) != 0)
     {
         return NGX_ERROR;
     }
-    ngx_memzero(&fence, sizeof(fence));
-    ngx_memzero(&context, sizeof(context));
-    context.key.data = ctx->key.data;
-    context.key.len = ctx->key.len;
-    context.url.data = ctx->url.data;
-    context.url.len = ctx->url.len;
-    context.host.data = ctx->host.data;
-    context.host.len = ctx->host.len;
-    context.tag_namespace.data = ctx->namespace.data;
-    context.tag_namespace.len = ctx->namespace.len;
-    context.proxy = 1;
-    context.now_ms = (uint64_t) ngx_time() * 1000;
+    fence = ctx->local_fence;
     result = NGX_ERROR;
-    /* No file metadata is retained here. Missing TAGs require scope candidates,
-     * not a claim that the current object has a known empty TAG set. */
-    rc = ngx_http_cache_purge_control_propagation(reader, &context, 0, 64,
-        NGX_HTTP_CACHE_PURGE_PROPAGATION_LINE,
-        ngx_http_cache_purge_propagation_collect, &fence, &watermark,
-        &publication, &error);
-    if (rc != 0) {
+    rc = ngx_http_cache_purge_control_watermark(reader, &watermark,
+                                                 &publication, &error);
+    /* Maintenance can republish the same accepted operations. Their original
+     * headers may outlive the local window; a new operation still requires a
+     * new lookup, as does a different ledger. */
+    if (rc != 0
+        || (publication != ctx->local_publication
+            && (watermark.sequence != ctx->local_watermark.sequence
+                || ngx_memcmp(watermark.ledger,
+                    ctx->local_watermark.ledger, 16) != 0)))
+    {
         goto done;
     }
     if (ctx->incoming) {
@@ -2842,6 +2967,27 @@ ngx_http_cache_purge_read_event(ngx_event_t *event)
     c = ctx->cache;
     connection = r->connection;
     if (ctx->read_state == NGX_HTTP_CACHE_PURGE_READ_START) {
+        if (!ctx->incoming_error && ctx->create_request
+            && ngx_http_cache_purge_propagation_possible(r)
+            && !ctx->local_ready && !ctx->local_failed)
+        {
+            if (!ctx->local_started) {
+                ctx->local_started = 1;
+                ctx->deadline = ngx_current_msec
+                                + NGX_HTTP_CACHE_PURGE_CAPTURE_TIMEOUT;
+            }
+            rc = ngx_http_cache_purge_propagation_query(ctx);
+            if (rc == NGX_OK) {
+                return;
+            }
+            if (rc == NGX_BUSY
+                && (ngx_msec_int_t) (ctx->deadline - ngx_current_msec) > 10)
+            {
+                ngx_add_timer(&ctx->read_event, 10);
+                return;
+            }
+            ctx->local_failed = 1;
+        }
         ctx->read_resume = r->write_event_handler;
         c->waiting = 0;
         ctx->read_state = NGX_HTTP_CACHE_PURGE_READ_READY;
@@ -2855,6 +3001,11 @@ ngx_http_cache_purge_read_event(ngx_event_t *event)
         }
         if (ctx->incoming_error) {
             ngx_http_finalize_request(r, NGX_HTTP_BAD_REQUEST);
+            ngx_http_run_posted_requests(connection);
+            return;
+        }
+        if (ctx->local_failed) {
+            ngx_http_finalize_request(r, NGX_HTTP_SERVICE_UNAVAILABLE);
             ngx_http_run_posted_requests(connection);
             return;
         }

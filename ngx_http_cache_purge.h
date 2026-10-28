@@ -776,6 +776,7 @@ char *ngx_http_cache_purge_api_merge(ngx_conf_t *cf,
 ngx_int_t ngx_http_cache_purge_api_handler(ngx_http_request_t *r);
 ngx_flag_t ngx_http_cache_purge_ignore_propagation(ngx_http_request_t *r);
 ngx_flag_t ngx_http_cache_purge_propagation_enabled(ngx_http_request_t *r);
+ngx_flag_t ngx_http_cache_purge_propagation_possible(ngx_http_request_t *r);
 #endif
 
 typedef struct {
