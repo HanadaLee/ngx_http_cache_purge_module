@@ -70,6 +70,20 @@ if a.sanitize:
 print('BUILD', root, flush=True)
 with (root / 'build.log').open('w') as log:
     subprocess.run(command, cwd=build, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
+    if a.sanitize:
+        # Native x86 MD5 intentionally reads unaligned words. Do not disable
+        # alignment checks for request code, the backend, or other core files.
+        makefile = build / 'objs/Makefile'
+        text = makefile.read_text()
+        begin = text.index('objs/src/core/ngx_md5.o:')
+        end = text.index('\n\n', begin)
+        rule = text[begin:end]
+        if '-fno-sanitize=alignment' not in rule:
+            assert '$(CC) -c $(CFLAGS)' in rule
+            rule = rule.replace('$(CC) -c $(CFLAGS)',
+                                '$(CC) -c $(CFLAGS) -fno-sanitize=alignment')
+            makefile.write_text(text[:begin] + rule + text[end:])
+            (build / 'objs/src/core/ngx_md5.o').unlink(missing_ok=True)
     subprocess.run(['make', '-j2'], cwd=build, stdout=log, stderr=subprocess.STDOUT, check=True)
 with tarfile.open(fileobj=io.BytesIO(archive)) as source:
     sources = [m for m in source if m.isfile() and m.name.startswith('src/')]
@@ -79,6 +93,7 @@ with tarfile.open(fileobj=io.BytesIO(archive)) as source:
 
 calls, policies = [], {}
 propagation_calls = []
+propagation_methods = []
 validation_tags = {'/revalidate-replace': 'new-tag', '/revalidate-clear': ''}
 conditional_paths = set()
 conditional_calls = []
@@ -107,6 +122,7 @@ class Origin(http.server.BaseHTTPRequestHandler):
             assert send_release.wait(15)
         if path.startswith('/propagation/'):
             propagation_calls.append((path, {k.lower(): v for k, v in self.headers.items()}))
+            propagation_methods.append((path, self.command))
         if path == '/negative-cache' and negative_outage:
             self.connection.shutdown(socket.SHUT_RDWR)
             return
@@ -143,7 +159,7 @@ class Origin(http.server.BaseHTTPRequestHandler):
             body = b'old-late-entity'
             late_waiting.set()
             assert late_release.wait(15)
-        varying = path in ('/vary', '/revalidate-vary', '/propagation/vary')
+        varying = path in ('/vary', '/revalidate-vary', '/propagation/vary', '/propagation/uncached-seed')
         if varying: body += self.headers.get('Accept-Language', '').encode()
         if path == '/large': body *= 40000
         status, content_range = (500 if path.startswith('/error-') else 200), None
@@ -166,6 +182,8 @@ class Origin(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         try: self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError): pass
+
+    do_POST = do_GET
 
 http.server.ThreadingHTTPServer.request_queue_size = 256
 origin = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Origin)
@@ -238,6 +256,13 @@ propagation_config = '''cache_key_namespace prop;
   proxy_set_header X-Cache-Purge-Namespace "";'''
 propagation_alias_config = propagation_config.replace(
     'cache_purge_url $cache_key_url;', 'cache_purge_url "$scheme://$host$uri";')
+propagation_off_config = propagation_config.replace('cache_purge_propagation on;',
+                                                    'cache_purge_propagation off;')
+propagation_manual_config = propagation_config.replace(
+    'cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;',
+    'cache_purge_key $uri; cache_purge_url "$scheme://$host$uri";').replace(
+    'cache_purge_tag_namespace $cache_key_namespace;', 'cache_purge_tag_namespace manual;').replace(
+    'cache_key_namespace prop;', '')
 
 dns_holds = {}
 class DNS(socketserver.BaseRequestHandler):
@@ -280,7 +305,7 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
  resolver 127.0.0.1:{dns_server.server_address[1]} ipv6=off;
  resolver_timeout 5s;
  map $arg_gate $send_host {{ default $arg_gate; "" 127.0.0.1; }}
- map $arg_z $zone {{ default a; b b; }}
+ map $arg_z $zone {{ default a; b b; off off; }}
  cache_key_namespace tenant; cache_key_uri $uri; cache_key_misc $arg_m; cache_key_range $slice_range;
  server {{ listen 127.0.0.1:{port};
   proxy_cache $zone; proxy_cache_key $cache_key_full;
@@ -301,6 +326,22 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
       proxy_cache_revalidate on; proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /propagation/send-race {{ {propagation_config}
       proxy_pass http://$send_host:{origin.server_port}; }}
+  location /propagation/uncached-vary {{ {propagation_config}
+      proxy_cache off; cache_key_uri /propagation/uncached-seed;
+      proxy_pass http://127.0.0.1:{origin.server_port}/propagation/uncached-seed; }}
+  location /propagation/uncached-slice {{ {propagation_config}
+      proxy_cache off; cache_key_uri /propagation/slice-uncached-seed;
+      {slice_config} proxy_set_header Range $slice_range;
+      proxy_pass http://127.0.0.1:{origin.server_port}/propagation/slice-uncached-seed; }}
+  location /propagation/uncached-origin {{ {propagation_off_config}
+      proxy_cache off; proxy_pass http://127.0.0.1:{origin.server_port}; }}
+  location /propagation/uncached-manual {{ {propagation_manual_config}
+      cache_key_namespace $arg_unused_namespace;
+      proxy_cache off; proxy_cache_key $uri;
+      proxy_pass http://127.0.0.1:{origin.server_port}; }}
+  location /propagation/uncached-ignore {{ {propagation_config}
+      cache_purge_ignore_propagation on;
+      proxy_cache off; proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /propagation/slice {{ {propagation_config}
       {slice_config} proxy_set_header Range $slice_range;
       proxy_pass http://127.0.0.1:{origin.server_port}; }}
@@ -1850,6 +1891,67 @@ try:
     assert prop_get(uri) == (200, 'HIT', b'send-new-entity')
     checks.append('a request sent before TAG acceptance can finish its response but cannot publish the old entity')
 
+    uri = '/propagation/uncached-seed'
+    policies[(uri, 'en')] = 'detached-red'
+    policies[(uri, 'de')] = 'detached-blue'
+    for number, language in enumerate(('en', 'de'), 1):
+        assert prop_get(uri, {'Accept-Language': language})[0] == 200
+        prop_records(uri, number)
+    initial = prop_records(uri, 2)
+    red = next(item for item in initial if b'detached-red' in item['tags'])
+    issued = tag_push('detached-red', 'detached-red')
+    until(lambda: record(red['id'], optional=True) is None)
+    remaining = query('http://prop.test' + uri)
+    for language, requirement in [('en', (0, issued)), ('de', None), ('fr', None)]:
+        response = prop_get('/propagation/uncached-vary', {'Accept-Language': language})
+        assert response == (200, None, (uri + language).encode()), response
+        propagated(propagation_headers(uri, language), requirement)
+        assert query('http://prop.test' + uri) == remaining
+    checks.append('proxy_cache off resolves current and retained Vary associations without borrowing unknown variants or publishing cache files')
+    response = get(uri, {'Host': 'prop.test', 'Accept-Language': 'en'}, method='POST')
+    assert response == (200, None, (uri + 'en').encode()), response
+    assert propagation_methods[-1] == (uri, 'POST')
+    propagated(propagation_headers(uri, 'en'), (0, issued))
+    response = prop_get(uri + '?z=off', {'Accept-Language': 'en'})
+    assert response == (200, None, (uri + 'en').encode()), response
+    propagated(propagation_headers(uri, 'en'), (0, issued))
+    assert query('http://prop.test' + uri) == remaining
+    checks.append('excluded POST methods and a runtime cache zone resolving to off retain propagation and do not create index records')
+
+    uri = '/propagation/slice-uncached-seed'
+    policies[(uri, 'bytes=0-1023')] = 'detached-slice-red'
+    assert prop_get(uri)[2] == slice_body
+    original = prop_records(uri, 3)
+    first = next(item for item in original if b'detached-slice-red' in item['tags'])
+    issued = tag_push('detached-slice', 'detached-slice-red')
+    until(lambda: record(first['id'], optional=True) is None)
+    response = prop_get('/propagation/uncached-slice')
+    assert response == (200, None, slice_body), response
+    propagated(propagation_headers(uri, span='bytes=0-1023'), (0, issued))
+    propagated(propagation_headers(uri, span='bytes=1024-2047'))
+    propagated(propagation_headers(uri, span='bytes=2048-3071'))
+    assert len(query('http://prop.test' + uri)) == 2
+    checks.append('uncached slice subrequests compute their own native main digest and propagate only the matching retained TAG')
+
+    incoming_time = int(time.time()) * 1000
+    incoming = {'X-Cache-Purge-Time': str(incoming_time), 'X-Cache-Purge-Mode': 'delete',
+                'X-Cache-Purge-Fence': base64.b64encode(b'NPF2' + struct.pack('>QQ', 0, incoming_time)).decode()}
+    assert prop_get('/propagation/uncached-vary', {**incoming, 'Accept-Language': 'fr'})[0] == 200
+    propagated(propagation_headers('/propagation/uncached-seed', 'fr'), (0, incoming_time))
+    assert prop_get('/propagation/uncached-origin', incoming)[0] == 200
+    propagated(propagation_headers('/propagation/uncached-origin'))
+    malformed = {**incoming, 'X-Cache-Purge-Fence': 'broken'}
+    assert prop_get('/propagation/uncached-ignore', malformed)[0] == 200
+    propagated(propagation_headers('/propagation/uncached-ignore'))
+    before = len(propagation_calls)
+    assert prop_get('/propagation/uncached-vary', malformed)[0] == 400
+    assert len(propagation_calls) == before
+    checks.append('uncached transit forwards valid requirements, strips them on the origin leg, honors ignore and rejects malformed input before dispatch')
+    response = prop_get('/propagation/uncached-manual', incoming)
+    assert response[0] == 200, response
+    propagated(propagation_headers('/propagation/uncached-manual'), (0, incoming_time))
+    checks.append('manual uncached key and selector expressions do not evaluate unused cache-key module components')
+
 finally:
     send_release.set()
     for hold in dns_holds.values(): hold[1].set()
@@ -1869,6 +1971,7 @@ result = {'root': str(root), 'run': str(run), 'nginx_revision': revision,
           'core_working_tree_files_match': len(sources) if a.core_working_tree else 0,
           'core_source_patch_sha256': hashlib.sha256(source_patch).hexdigest(),
           'dynamic': a.dynamic, 'sanitizer': a.sanitize, 'expr': bool(a.expr), 'extension': extension,
+          'sanitizer_exclusions': ['nonnull-attribute', 'alignment instrumentation for native ngx_md5.o only'] if a.sanitize else [],
           'workers': a.workers, 'checks': checks,
           'sources': {group: {str(p.relative_to(directory)): hashlib.sha256(p.read_bytes()).hexdigest() for p in directory.rglob('*') if p.is_file()}
                       for group, directory in [('addon', addon), ('key', key)]},

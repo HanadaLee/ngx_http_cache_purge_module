@@ -658,12 +658,29 @@ after request creation and verify refreshed headers and new cache publication.
 An origin response begun before acceptance can finish, but cannot publish an old
 reusable entity.
 
+Proxy locations configured with `cache_purge_key` also resolve propagation when
+`proxy_cache` is off, a variable zone resolves to off, or the method is excluded
+from caching. They use an explicit key capture and the native key builder to
+select current or retained slice/Vary associations, without opening cache files
+or publishing index records. Manual key expressions do not evaluate unused
+cache-key components. This path requires the current cache-key module when that
+module is used: its explicit capture API supports a zero field mask for lazy
+collection.
+
+A module-owned adapter at the existing post-create `proxy_bind` value boundary
+installs the output gate; no extra bind directive or core patch is required.
+It preserves the original binding expression and properties. Static binding
+addresses pass through native parsing. Incoming requirements can cross an
+uncached proxy hop; disabling propagation strips them on the origin leg.
+An ignored input does not contribute a requirement, and malformed accepted input
+is rejected before dispatch. No response acknowledgement is added.
+
 Full propagation remains unfinished. File validation, retention before mutation
 and retained-history expiry no longer have a fixed alias count limit.
-Per-step matching budgets and shared
-cursor capacity still require loaded performance and progress validation.
-Uncached proxy routes, unsupported cache methods, complete tier integration,
-and loaded memory/latency acceptance remain open. Capabilities reports the sender transport as
+Per-step matching budgets and shared cursor capacity still require loaded
+performance and progress validation. Final parent/origin selection timing,
+complete tier integration, and loaded memory/latency acceptance remain open.
+Capabilities reports the sender transport as
 `filter` or `variables`, while `proxy_propagation_ready` remains false.
 The protocol has no module-side authentication, signatures, key management,
 or response verification exchange.
