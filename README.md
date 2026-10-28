@@ -136,9 +136,11 @@ including old TAGs and watermark regression, before committing a replacement.
 Conflicting late candidates are retired without being stamped READY. This local
 watermark neither changes the cache key nor proves upstream CDN freshness.
 Current selectors use the file's proof for Invalidate and Delete; already-covered
-entities can HIT while their rules remain resident. An origin request
-started before a push may finish its response, but its old result must not become
-a reusable cache entry. Requests started after the push must avoid old entries.
+entities can HIT while their rules remain resident. An origin request started
+before a locally accepted push may finish its response, but its old result must
+not become a reusable local cache entry. Requests started after local acceptance
+must avoid entries invalidated by that operation. This guarantee does not extend
+to an in-flight fill on an upper tier that has not received the push.
 
 Each worker announces its oldest active origin boundary in its existing 64-byte
 shared reader slot. A request-local queue keeps registration and removal O(1),
@@ -542,6 +544,14 @@ cache header's second-resolution `date` with the push time rounded down to a
 second. Equal times are covered. No received requirement or extra timestamp is
 written to the index.
 
+Native `date` retains its response-processing semantics. An upper-tier request
+started before an L1 push can finish afterward and store an older entity with a
+later date if that tier has not received the push. The entity can then satisfy
+L1's propagated requirement and refill L1. This cross-tier in-flight boundary is
+accepted, along with the same-second boundary; `date` is not changed to request
+start time. Local publication checks still reject the original pre-push writer
+on a node that accepted the operation.
+
 An older object is revalidated for Invalidate or fetched unconditionally for
 Delete. An unmet incoming Delete suppresses conditional revalidation before an
 expired object goes upstream. Accepted incoming requirements join local outgoing
@@ -655,8 +665,8 @@ unresolved requirements cannot be sent as empty headers. Origin admission record
 the operation watermark immediately before the first send attempt, retaining the
 older writer pin until completion. DNS-gated HTTP tests accept real TAG operations
 after request creation and verify refreshed headers and new cache publication.
-An origin response begun before acceptance can finish, but cannot publish an old
-reusable entity.
+An origin response begun before local acceptance can finish, but its original
+local writer cannot publish an old reusable entity.
 
 Proxy locations configured with `cache_purge_key` also resolve propagation when
 `proxy_cache` is off, a variable zone resolves to off, or the method is excluded
@@ -678,8 +688,13 @@ is rejected before dispatch. No response acknowledgement is added.
 Full propagation remains unfinished. File validation, retention before mutation
 and retained-history expiry no longer have a fixed alias count limit.
 Per-step matching budgets and shared cursor capacity still require loaded
-performance and progress validation. Final parent/origin selection timing,
-complete tier integration, and loaded memory/latency acceptance remain open.
+performance and progress validation. Source tracing places the inspected
+Edgeresty parent/origin selection before native proxy content. A precontent
+probe and real three-tier HTTP/1 and HTTP/2 tests cover that timing, propagation,
+304, failed revalidation, an uncached middle tier, restart, and the accepted
+native-date in-flight boundary. They do not execute the complete production Lua
+deployment. Broader body/retry/cancellation and concurrency combinations, full
+deployment integration, and loaded memory/latency acceptance remain open.
 Capabilities reports the sender transport as
 `filter` or `variables`, while `proxy_propagation_ready` remains false.
 The protocol has no module-side authentication, signatures, key management,
