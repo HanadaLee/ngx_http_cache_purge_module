@@ -4093,6 +4093,7 @@ struct ngx_http_cache_purge_index_intern_s {
 struct ngx_http_cache_purge_index_tx_s {
     ngx_http_cache_purge_query_t         *context;
     size_t                                charged;
+    unsigned                              deferred;
     ngx_http_cache_purge_index_row_t     *buckets[NGX_HTTP_CACHE_PURGE_TX_HASH];
     ngx_http_cache_purge_index_intern_t  *interns[256];
 };
@@ -4381,8 +4382,13 @@ ngx_http_cache_purge_index_tx_commit(ngx_http_cache_purge_index_tx_t *tx)
                 }
             }
         }
-        q->status = ngx_http_cache_rocksdb_write(q->store, mutations, nm,
-                                                 conditions, nc, &q->error);
+        if (tx->deferred) {
+            q->status = ngx_http_cache_rocksdb_write_deferred(q->store,
+                mutations, nm, conditions, nc, &q->error);
+        } else {
+            q->status = ngx_http_cache_rocksdb_write(q->store, mutations, nm,
+                                                     conditions, nc, &q->error);
+        }
     }
     if (mutations != NULL) {
         q->bytes -= nm * sizeof(*mutations);
@@ -4914,6 +4920,9 @@ ngx_http_cache_purge_index_apply(ngx_http_cache_rocksdb_t *store,
     for (i = 0; i < count && tx->context->status == 0; i++) {
         ngx_http_cache_purge_index_apply_one(tx, action, &files[i], &result[i]);
     }
+    tx->deferred = action == NGX_HTTP_CACHE_PURGE_INDEX_COMMIT
+                   || action == NGX_HTTP_CACHE_PURGE_INDEX_COMMIT_PENDING
+                   || action == NGX_HTTP_CACHE_PURGE_INDEX_PUBLISH;
     ngx_http_cache_purge_index_tx_commit(tx);
     if (tx->context->status == 0) {
         memcpy(matches, result, count * sizeof(*matches));
@@ -6561,6 +6570,7 @@ ngx_http_cache_purge_index_prepare_batch(ngx_http_cache_rocksdb_t *store,
         ngx_http_cache_purge_index_prepare_one(tx, &fills[i].file,
                                                fills[i].previous, &result[i]);
     }
+    tx->deferred = 1;
     ngx_http_cache_purge_index_tx_commit(tx);
     if (q->status == 0) {
         memcpy(out, result, count * sizeof(*out));

@@ -142,6 +142,8 @@ struct ngx_http_cache_rocksdb_s {
     std::vector<ngx_http_cache_rocksdb_cursor_t *> cursors;
     uint64_t writes = 0;
     uint64_t conflicts = 0;
+    size_t pending_bytes = 0;
+    unsigned pending_writes = 0;
 
     ~ngx_http_cache_rocksdb_s()
     {
@@ -540,11 +542,16 @@ ngx_http_cache_rocksdb_close(
                 NGX_HTTP_CACHE_ROCKSDB_BUSY,
                 "close cache index cursors before the store");
         }
+        auto status = store->pending_writes ? store->db->SyncWAL() :
+                                              rocksdb::Status::OK();
         for (auto *&handle : store->cf) {
             store->db->DestroyColumnFamilyHandle(handle);
             handle = nullptr;
         }
-        auto status = store->db->Close();
+        auto closed = store->db->Close();
+        if (status.ok()) {
+            status = closed;
+        }
         delete store;
         *pointer = nullptr;
         return ngx_http_cache_rocksdb_result(status, error);
@@ -567,11 +574,11 @@ ngx_http_cache_rocksdb_get(ngx_http_cache_rocksdb_t *store,
     });
 }
 
-extern "C" int
-ngx_http_cache_rocksdb_write(ngx_http_cache_rocksdb_t *store,
+static int
+ngx_http_cache_rocksdb_write_internal(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_rocksdb_mutation_t *mutations, size_t count,
     const ngx_http_cache_rocksdb_condition_t *conditions,
-    size_t condition_count, ngx_http_cache_rocksdb_error_t *error)
+    size_t condition_count, int durable, ngx_http_cache_rocksdb_error_t *error)
 {
     return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
         int code = ngx_http_cache_rocksdb_check(store, error);
@@ -671,10 +678,59 @@ ngx_http_cache_rocksdb_write(ngx_http_cache_rocksdb_t *store,
             }
         }
         rocksdb::WriteOptions write;
-        write.sync = true;
+        size_t bytes = batch.GetDataSize();
+        write.sync =
+            durable || store->pending_writes >= 63
+            || bytes >= store->options.max_batch_bytes
+            || store->pending_bytes >= store->options.max_batch_bytes - bytes;
         auto status = store->db->Write(write, &batch);
         if (status.ok()) {
             ++store->writes;
+            if (write.sync) {
+                store->pending_bytes = 0;
+                store->pending_writes = 0;
+            } else {
+                store->pending_bytes += bytes;
+                store->pending_writes++;
+            }
+        }
+        return ngx_http_cache_rocksdb_result(status, error);
+    });
+}
+
+extern "C" int
+ngx_http_cache_rocksdb_write(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_rocksdb_mutation_t *mutations, size_t count,
+    const ngx_http_cache_rocksdb_condition_t *conditions,
+    size_t condition_count, ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_rocksdb_write_internal(
+        store, mutations, count, conditions, condition_count, 1, error);
+}
+
+extern "C" int
+ngx_http_cache_rocksdb_write_deferred(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_rocksdb_mutation_t *mutations, size_t count,
+    const ngx_http_cache_rocksdb_condition_t *conditions,
+    size_t condition_count, ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_rocksdb_write_internal(
+        store, mutations, count, conditions, condition_count, 0, error);
+}
+
+extern "C" int
+ngx_http_cache_rocksdb_sync(
+    ngx_http_cache_rocksdb_t *store, ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
+        int rc = ngx_http_cache_rocksdb_check(store, error);
+        if (rc != 0 || !store->pending_writes) {
+            return rc;
+        }
+        auto status = store->db->SyncWAL();
+        if (status.ok()) {
+            store->pending_bytes = 0;
+            store->pending_writes = 0;
         }
         return ngx_http_cache_rocksdb_result(status, error);
     });

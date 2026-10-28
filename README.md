@@ -11,6 +11,18 @@ implementation. Test-only C++ adapters and wire encoders live under `t/`.
 Production code is organized into 12 source/header files across the two modules;
 new behavior is added within these responsibility boundaries.
 
+New cache-file records use atomic WAL batches with deferred synchronization.
+The existing executor checks for pending WAL data every 100 ms; 64 batches or
+one configured maximum batch of accumulated WAL bytes force an earlier sync.
+A synchronous write and graceful close also flush preceding deferred records.
+No mutation queue or extra thread is added. Ordinary process restarts recover
+the WAL. Machine power loss may lose its unsynchronized cache-record suffix;
+files without a matching index identity refill instead of serving unverified
+data. The interval is an executor scheduling target, not a hard deadline.
+Purge acceptance, invalidation requirements, task checkpoints, retirement and
+in-place 304 validation still synchronize before acknowledgement. File and
+directory fsync ordering is retained.
+
 HTTP cache invalidation for nginx proxy, FastCGI, SCGI, and uWSGI caches.
 
 The module is undergoing a storage and lifecycle redesign. The default build
@@ -296,7 +308,7 @@ descriptor. The component validates configured cache roots/zones, the temporary
 path and inode, then persists an index intent and a matching file marker.
 Retries bind to the same physical temporary file. `FINISH_FILE` accepts the
 original prepared revision and a lease descriptor, verifies the final instance,
-and completes durable index/READY-marker publication after a same-filesystem
+and completes WAL-indexed/READY-marker publication after a same-filesystem
 rename. Retries recover interrupted publication without recreating an evicted
 file. Raw index mutations cannot bypass these checks for physical records.
 `ACQUIRE_PUBLICATION` also resolves the registered root and current file ID, so
@@ -323,7 +335,7 @@ node through cancellation and reload, and works on unmodified nginx without a
 custom store hook. FINISH verifies the actual final file because native update
 does not return a rename result. `t/native_fill_runtime.py` covers the native
 lifecycle separately. `t/capture_runtime.py` exercises real native fills through
-the companion key module, worker IPC, durable preparation, rename and READY
+the companion key module, worker IPC, WAL preparation, rename and READY
 publication. It also covers selected-descriptor admission, 304 commits,
 background invalidation, native-node cleanup and HTTP management requests.
 

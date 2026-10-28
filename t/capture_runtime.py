@@ -680,6 +680,26 @@ def prepared_replacement(item):
         os.close(lease)
 
 
+def missing_index_read():
+    assert get('/lost-index')[1] == 'MISS'
+    original = records('/lost-index', 1)[0]
+    path = ready_file(original)
+    marker = os.getxattr(path, 'user.ngx_cache_purge.id')
+    # Model a persisted replacement whose new ID was in the lost WAL tail.
+    # Its old catalogue record and the target path still exist.
+    missing = os.urandom(16)
+    assert record(missing, optional=True) is None
+    os.setxattr(path, 'user.ngx_cache_purge.id', marker[:8] + missing + marker[24:])
+    fresh_bodies['/lost-index'] = b'refilled-after-lost-index'
+    assert get('/lost-index') == (200, 'BYPASS', b'refilled-after-lost-index')
+    replacement = until(lambda: (item if (item := records('/lost-index', 1)[0])['id']
+                                != original['id'] else None))
+    ready_file(replacement)
+    assert get('/lost-index') == (200, 'HIT', b'refilled-after-lost-index')
+    assert calls.count('/lost-index') == 2
+    checks.append('a READY native file with a missing index ID refills instead of serving the old body or requiring a cache scan')
+
+
 def variant_hashes(item, language):
     value = origin_metadata(item)
     assert len(value) == 64
@@ -736,7 +756,7 @@ try:
     assert first['namespace'] == b'tenant' and set(first['tags']) == {b'news', b'red'}
     assert len(origin_metadata(first)) == 28
     assert get('/asset')[1] == 'HIT' and calls.count('/asset') == 1
-    checks.append('real upstream fill is durably indexed with the native key snapshot, scoped tags and READY marker')
+    checks.append('real upstream fill is WAL-indexed with the native key snapshot, scoped tags and READY marker')
     assert get('/asset', method='HEAD') == (200, 'HIT', b'')
     assert get('/asset', {'Range': 'bytes=1-3'}) == (206, 'HIT', b'ass')
     assert get('/asset', {'If-None-Match': '"capture-v1"'}) == (304, 'HIT', b'')
@@ -1101,6 +1121,7 @@ try:
     assert get('/unmarked')[1] == 'HIT' and calls.count('/unmarked') == 2
     assert retired(unmarked['id'])
     checks.append('a native HIT with no publication marker refills and replaces its old index instance before later reuse')
+    missing_index_read()
     assert get('/read-wait')[1] == 'MISS'
     with prepared_replacement(records('/read-wait', 1)[0]) as finish:
         with socket.create_connection(('127.0.0.1', port), timeout=5) as held:

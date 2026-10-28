@@ -129,6 +129,17 @@ int ngx_http_cache_rocksdb_write(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_rocksdb_condition_t *conditions,
     size_t condition_count, ngx_http_cache_rocksdb_error_t *error);
 
+/* Same atomic WAL batch, with durability deferred for recoverable cache rows.
+ * The owner must call sync periodically. A synchronous write also flushes all
+ * earlier deferred batches. No extra thread or retained mutation buffer. */
+int ngx_http_cache_rocksdb_write_deferred(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_rocksdb_mutation_t *mutations, size_t count,
+    const ngx_http_cache_rocksdb_condition_t *conditions,
+    size_t condition_count, ngx_http_cache_rocksdb_error_t *error);
+
+int ngx_http_cache_rocksdb_sync(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_rocksdb_error_t *error);
+
 /* Bytewise prefix scan, with an optional exclusive resume key in that prefix.
  * An empty prefix scans the whole CF, including the reserved schema marker.
  * No prefix truncation or fixed-length prefix extractor is used. next/get use

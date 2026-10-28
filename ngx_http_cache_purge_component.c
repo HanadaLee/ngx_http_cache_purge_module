@@ -3066,6 +3066,7 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
     size_t                                   step;
     size_t                                   start;
     uint64_t                                 expire_at;
+    uint64_t                                 sync_at;
     uint64_t                                 now;
     int                                      rc;
     int                                      progress;
@@ -3108,6 +3109,7 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
         return rc;
     }
     expire_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 1000;
+    sync_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 100;
     ngx_http_cache_purge_component_store32(&c->state,
                                            NGX_HTTP_CACHE_PURGE_COMPONENT_OPEN);
     while (!ngx_http_cache_purge_component_load32(&c->stopping)) {
@@ -3117,6 +3119,13 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
             return rc;
         }
         now = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC);
+        if (now >= sync_at) {
+            rc = ngx_http_cache_rocksdb_sync(store, error);
+            if (rc != 0) {
+                return rc;
+            }
+            sync_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 100;
+        }
         if (now >= c->recovery_at) {
             rc = ngx_http_cache_purge_component_recover(c, store, error);
             if (rc != 0) {
@@ -3169,9 +3178,14 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
                       || ngx_http_cache_purge_guard_pending(c->coordinator));
         timeout = 50;
         now = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC);
+        if (sync_at <= now) {
+            timeout = 0;
+        } else if (sync_at - now < 50) {
+            timeout = (int) (sync_at - now);
+        }
         if (c->recovery_at <= now) {
             timeout = 0;
-        } else if (c->recovery_at - now < 50) {
+        } else if (c->recovery_at - now < (uint64_t) timeout) {
             timeout = (int) (c->recovery_at - now);
         }
         if (c->work_at <= now) {

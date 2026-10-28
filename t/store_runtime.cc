@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -15,6 +16,8 @@
 
 extern "C" int ngx_http_cache_purge_store_c_probe(
     ngx_http_cache_rocksdb_t *store);
+extern "C" unsigned ngx_http_cache_purge_test_sync_count(void);
+extern "C" void ngx_http_cache_purge_test_sync_fail(unsigned fail);
 static unsigned checks;
 static ngx_http_cache_rocksdb_error_t error;
 
@@ -122,6 +125,81 @@ close(ngx_http_cache_rocksdb_t *&store)
 }
 
 static void
+ngx_http_cache_purge_test_deferred()
+{
+    char path[] = "/tmp/cache-purge-deferred-XXXXXX";
+    require(mkdtemp(path) != nullptr, "deferred test directory");
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    auto *store = open(path, options);
+    const std::string key = "deferred", value = "cache data";
+    std::array<ngx_http_cache_rocksdb_mutation_t, 3> batch;
+    for (unsigned i = 0; i < batch.size(); i++) {
+        batch[i] = put(static_cast<ngx_http_cache_rocksdb_cf_e>(i), key, value);
+    }
+    auto before = ngx_http_cache_purge_test_sync_count();
+    require(before != 0, "WAL sync interception observes initialization");
+    expect(ngx_http_cache_rocksdb_write_deferred(
+               store, batch.data(), batch.size(), nullptr, 0, &error),
+        NGX_HTTP_CACHE_ROCKSDB_OK, "defer cross-CF durability");
+    require(ngx_http_cache_purge_test_sync_count() == before,
+        "deferred write does not sync WAL immediately");
+    for (unsigned i = 0; i < batch.size(); i++) {
+        require(get(store, static_cast<ngx_http_cache_rocksdb_cf_e>(i), key)
+                    == value,
+            "deferred cross-CF rows are immediately queryable");
+    }
+    expect(ngx_http_cache_rocksdb_sync(store, &error), 0, "flush deferred WAL");
+    require(ngx_http_cache_purge_test_sync_count() == before + 1,
+        "one barrier syncs the deferred batch");
+    expect(ngx_http_cache_rocksdb_sync(store, &error), 0, "idle WAL barrier");
+    require(ngx_http_cache_purge_test_sync_count() == before + 1,
+        "idle barriers do not issue sync calls");
+    before = ngx_http_cache_purge_test_sync_count();
+    for (unsigned i = 0; i < 64; i++) {
+        expect(ngx_http_cache_rocksdb_write_deferred(
+                   store, batch.data(), batch.size(), nullptr, 0, &error),
+            0, "bounded WAL group");
+        require(ngx_http_cache_purge_test_sync_count() == before + (i == 63),
+            "the sixty-fourth deferred write forces a barrier");
+    }
+    before = ngx_http_cache_purge_test_sync_count();
+    expect(ngx_http_cache_rocksdb_write_deferred(
+               store, batch.data(), batch.size(), nullptr, 0, &error),
+        0, "cache before control");
+    write(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, "control", "durable");
+    require(ngx_http_cache_purge_test_sync_count() == before + 1,
+        "ordinary control write still syncs WAL immediately");
+    expect(ngx_http_cache_rocksdb_sync(store, &error), 0, "control barrier");
+    require(ngx_http_cache_purge_test_sync_count() == before + 1,
+        "control durability also covers preceding cache batches");
+    expect(ngx_http_cache_rocksdb_write_deferred(
+               store, batch.data(), batch.size(), nullptr, 0, &error),
+        0, "defer before close");
+    before = ngx_http_cache_purge_test_sync_count();
+    close(store);
+    require(ngx_http_cache_purge_test_sync_count() > before,
+        "graceful close syncs outstanding cache batches");
+    store = open(path, options);
+    require(get(store, NGX_HTTP_CACHE_ROCKSDB_TAG, key) == value,
+        "closed deferred batch survives reopening");
+    expect(ngx_http_cache_rocksdb_write_deferred(
+               store, batch.data(), batch.size(), nullptr, 0, &error),
+        0, "defer before sync failure");
+    ngx_http_cache_purge_test_sync_fail(1);
+    expect(ngx_http_cache_rocksdb_sync(store, &error),
+        NGX_HTTP_CACHE_ROCKSDB_IO, "WAL synchronization failure is reported");
+    ngx_http_cache_purge_test_sync_fail(0);
+    expect(ngx_http_cache_rocksdb_sync(store, &error),
+        NGX_HTTP_CACHE_ROCKSDB_IO,
+        "a failed WAL cannot silently clear its pending durability");
+    expect(ngx_http_cache_rocksdb_close(&store, &error),
+        NGX_HTTP_CACHE_ROCKSDB_IO,
+        "close reports the failed durability barrier");
+    require(store == nullptr, "failed close still consumes the store");
+}
+
+static void
 schema_change(const char *path, const std::string &value)
 {
     rocksdb::Options options;
@@ -166,7 +244,9 @@ main(int argc, char **argv)
             if (mode == "--hold") {
                 std::cout << "READY" << std::endl;
                 std::getchar();
-            } else if (mode == "--crash-write") {
+            } else if (mode == "--crash-write" || mode == "--deferred-write"
+                       || mode == "--deferred-barrier")
+            {
                 const std::string key = "Z:committed",
                                   value = "cross-CF durable";
                 std::array<ngx_http_cache_rocksdb_mutation_t, 3> entries;
@@ -175,17 +255,55 @@ main(int argc, char **argv)
                         put(static_cast<ngx_http_cache_rocksdb_cf_e>(i), key,
                             value);
                 }
-                expect(ngx_http_cache_rocksdb_write(store, entries.data(),
-                           entries.size(), nullptr, 0, &error),
-                    NGX_HTTP_CACHE_ROCKSDB_OK, "cross-CF write");
+                int rc =
+                    mode == "--crash-write" ?
+                        ngx_http_cache_rocksdb_write(store, entries.data(),
+                            entries.size(), nullptr, 0, &error) :
+                        ngx_http_cache_rocksdb_write_deferred(store,
+                            entries.data(), entries.size(), nullptr, 0, &error);
+                expect(rc, NGX_HTTP_CACHE_ROCKSDB_OK, "cross-CF write");
+                if (mode == "--deferred-barrier") {
+                    write(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, "B:accepted",
+                        "durable barrier");
+                    for (const auto &entry :
+                        std::filesystem::directory_iterator(argv[2]))
+                    {
+                        if (entry.path().extension() == ".log") {
+                            std::cout << "WAL " << entry.path().string() << ' '
+                                      << entry.file_size() << std::endl;
+                        }
+                    }
+                    const std::string tail = "Z:tail";
+                    for (unsigned i = 0; i < entries.size(); i++) {
+                        entries[i] =
+                            put(static_cast<ngx_http_cache_rocksdb_cf_e>(i),
+                                tail, value);
+                    }
+                    expect(
+                        ngx_http_cache_rocksdb_write_deferred(store,
+                            entries.data(), entries.size(), nullptr, 0, &error),
+                        0, "unsynchronized tail after barrier");
+                }
                 _exit(0);
-            } else if (mode == "--recover") {
+            } else if (mode == "--recover" || mode == "--recover-barrier") {
                 for (unsigned i = 0; i != 3; ++i) {
                     require(
                         get(store, static_cast<ngx_http_cache_rocksdb_cf_e>(i),
                             "Z:committed")
                             == "cross-CF durable",
                         "recover batch");
+                    if (mode == "--recover-barrier") {
+                        missing(store,
+                            static_cast<ngx_http_cache_rocksdb_cf_e>(i),
+                            "Z:tail");
+                    }
+                }
+                if (mode == "--recover-barrier") {
+                    require(
+                        get(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, "B:accepted")
+                            == "durable barrier",
+                        "a later lost cache tail preserves the control "
+                        "barrier");
                 }
             } else {
                 throw std::runtime_error("unknown mode");
@@ -194,6 +312,7 @@ main(int argc, char **argv)
             return 0;
         }
 
+        ngx_http_cache_purge_test_deferred();
         char path[] = "/tmp/cache-purge-store-test-XXXXXX";
         require(mkdtemp(path) != nullptr, "create test directory");
         options.max_cursors = 2;
