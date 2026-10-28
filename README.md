@@ -640,11 +640,27 @@ their TAGs. Request headers are used only for local native Vary selection; TAGs
 are never forwarded to L2. Real HTTP tests cover cross-zone selection, retention
 through deletion and restart, 304 TAG replacement, and slice isolation.
 
-Full propagation remains unfinished. A new accepted operation between the gate
-and upstream request creation currently rejects sending; maintenance publication
-changes with the same ledger and operation sequence preserve the completed
-result. File validation, retention before mutation and retained-history expiry
-no longer have a fixed alias count limit. Per-step matching budgets and shared
+Before the first upstream send, managed proxy requests check the accepted
+operation sequence again. A newer operation causes a bounded asynchronous object
+query through the existing upstream output filter. The module refreshes only its
+control headers in the unsent HTTP/1 or HTTP/2 request and resumes native output;
+this does not require a new nginx core hook. Unchanged sequences take the direct
+path. Maintenance publication changes with the same ledger and operation sequence
+preserve the completed result. Existing request bodies and native retry behavior
+remain owned by nginx.
+
+Send refresh shares the 64-waiter and 2 MiB propagation budgets, with a separate
+three-second phase deadline. Timeout and cancellation release the waiting state;
+unresolved requirements cannot be sent as empty headers. Origin admission records
+the operation watermark immediately before the first send attempt, retaining the
+older writer pin until completion. DNS-gated HTTP tests accept real TAG operations
+after request creation and verify refreshed headers and new cache publication.
+An origin response begun before acceptance can finish, but cannot publish an old
+reusable entity.
+
+Full propagation remains unfinished. File validation, retention before mutation
+and retained-history expiry no longer have a fixed alias count limit.
+Per-step matching budgets and shared
 cursor capacity still require loaded performance and progress validation.
 Uncached proxy routes, unsupported cache methods, complete tier integration,
 and loaded memory/latency acceptance remain open. Capabilities reports the sender transport as

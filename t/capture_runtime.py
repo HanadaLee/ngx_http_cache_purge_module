@@ -86,6 +86,7 @@ conditional_policies = {}
 validation_waiting, validation_release = threading.Event(), threading.Event()
 invalidate_waiting, invalidate_release = threading.Event(), threading.Event()
 late_waiting, late_release = threading.Event(), threading.Event()
+send_waiting, send_release = threading.Event(), threading.Event()
 retry_waiting, retry_release = threading.Event(), threading.Event()
 stream_waiting, stream_release = threading.Event(), threading.Event()
 fresh_bodies = {}
@@ -101,6 +102,9 @@ class Origin(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split('?', 1)[0]
         calls.append(path)
+        if path == '/propagation/send-inflight' and calls.count(path) == 1:
+            send_waiting.set()
+            assert send_release.wait(15)
         if path.startswith('/propagation/'):
             propagation_calls.append((path, {k.lower(): v for k, v in self.headers.items()}))
         if path == '/negative-cache' and negative_outage:
@@ -234,6 +238,35 @@ propagation_config = '''cache_key_namespace prop;
   proxy_set_header X-Cache-Purge-Namespace "";'''
 propagation_alias_config = propagation_config.replace(
     'cache_purge_url $cache_key_url;', 'cache_purge_url "$scheme://$host$uri";')
+
+dns_holds = {}
+class DNS(socketserver.BaseRequestHandler):
+    def handle(self):
+        packet, sock = self.request
+        at = 12
+        names = []
+        while packet[at]:
+            length = packet[at]
+            names.append(packet[at+1:at+1+length].decode())
+            at += 1 + length
+        at += 1
+        question = packet[12:at+4]
+        name = '.'.join(names)
+        hold = dns_holds.get(name)
+        if hold:
+            hold[0].set()
+            if not hold[1].wait(10):
+                return
+        if packet[at:at+2] != b'\x00\x01':
+            return
+        answer = (packet[:2] + b'\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00'
+                  + question + b'\xc0\x0c\x00\x01\x00\x01'
+                  + struct.pack('>IH', 1, 4) + socket.inet_aton('127.0.0.1'))
+        sock.sendto(answer, self.client_address)
+dns_server = socketserver.ThreadingUDPServer(('127.0.0.1', 0), DNS)
+dns_server.daemon_threads = True
+threading.Thread(target=dns_server.serve_forever, daemon=True).start()
+
 config = loads + f'''daemon off; master_process on; worker_processes {a.workers};
 pid {run}/pid; error_log {run}/error.log debug;
 thread_pool default threads=2;
@@ -244,6 +277,9 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
  proxy_cache_path {run}/cache-a levels=1:2 keys_zone=a:1m;
  proxy_cache_path {run}/cache-b levels=1:2 keys_zone=b:1m;
  {' '.join(gateway_paths)}
+ resolver 127.0.0.1:{dns_server.server_address[1]} ipv6=off;
+ resolver_timeout 5s;
+ map $arg_gate $send_host {{ default $arg_gate; "" 127.0.0.1; }}
  map $arg_z $zone {{ default a; b b; }}
  cache_key_namespace tenant; cache_key_uri $uri; cache_key_misc $arg_m; cache_key_range $slice_range;
  server {{ listen 127.0.0.1:{port};
@@ -263,6 +299,8 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
   location /__open/v2/ {{ cache_purge_api; proxy_cache off; }}
   location /propagation/ {{ {propagation_config}
       proxy_cache_revalidate on; proxy_pass http://127.0.0.1:{origin.server_port}; }}
+  location /propagation/send-race {{ {propagation_config}
+      proxy_pass http://$send_host:{origin.server_port}; }}
   location /propagation/slice {{ {propagation_config}
       {slice_config} proxy_set_header Range $slice_range;
       proxy_pass http://127.0.0.1:{origin.server_port}; }}
@@ -505,14 +543,15 @@ def fence(name, kind, value, scope='', mode=2, submit=False, activate=True):
     previous = struct.unpack('>IQ', rpc(16))[1]
     payload = (string(name) + bytes([mode]) + struct.pack('>Q', int(time.time() * 1000))
                + bytes([kind]) + string(value) + string(scope) + string('read-test'))
-    receipt = rpc(27 if submit else 14, payload)
+    # Acceptance is idempotent. Keep its input frozen while publication is busy.
+    receipt = until(lambda: rpc(27 if submit else 14, payload, codes=(0, 6)))
     assert receipt[len(payload) + 40] == 1
     until(lambda: (state := struct.unpack('>IQ', rpc(16)))[0] == 6 and state[1] != previous)
     if activate and not submit:
         # Ordinary request checks use effective rules with a fixed propagation
         # deadline. Only recovery fixtures deliberately leave them PREPARING.
         previous = struct.unpack('>IQ', rpc(16))[1]
-        active = rpc(26, string(name))
+        active = until(lambda: rpc(26, string(name), codes=(0, 6)))
         assert active[len(payload) + 40] >= 2
         until(lambda: (state := struct.unpack('>IQ', rpc(16)))[0] == 6 and state[1] != previous)
     if submit:
@@ -1761,7 +1800,60 @@ try:
     until(lambda: record(current['id'])['tags'] == [b'alias-new'])
     assert prop_get(alias_uri) == (200, 'HIT', alias_uri.encode())
     checks.append('Invalidate on one of 97 persisted aliases validates the selected file with 304, replaces TAGs and later HITs without a fixed alias limit')
+    for number, overlap in enumerate((False, True)):
+        uri = '/propagation/send-race-' + str(number)
+        tag = 'send-race-tag-' + str(number)
+        policies[uri] = tag
+        assert prop_get(uri) == (200, 'MISS', uri.encode())
+        prop_records(uri, 1)
+        invalidated = tag_push('send-invalidate-' + str(number), tag,
+                               'invalidate') if overlap else 0
+        host = 'held-' + str(number) + '.send.test'
+        arrived, release = threading.Event(), threading.Event()
+        dns_holds[host] = arrived, release
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(prop_get, uri + '?bypass=1&gate=' + host)
+            try:
+                assert arrived.wait(5), 'proxy did not reach DNS after create_request'
+                deleted = tag_push('send-delete-' + str(number), tag)
+                policies[uri] = 'send-new-' + str(number)
+            finally:
+                release.set()
+            response = future.result(timeout=12)
+        assert response == (200, 'BYPASS', uri.encode()), response
+        propagated(propagation_headers(uri), (invalidated, deleted))
+        latest = prop_records(uri, 1)[0]
+        assert latest['tags'] == [('send-new-' + str(number)).encode()], latest
+        checks.append('real TAG acceptance during DNS wait refreshes ' +
+                      ('an existing Invalidate header to mixed' if overlap else 'an empty header set to Delete') +
+                      ' before the first send, then admits the new response')
+
+    uri = '/propagation/send-inflight'
+    policies[uri] = 'send-inflight-tag'
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(prop_get, uri)
+        try:
+            assert send_waiting.wait(5), 'request did not reach the upstream'
+            tag_push('send-inflight', 'send-inflight-tag')
+            operation = api('/__purge/v2/operations/send-inflight')[2]
+        finally:
+            send_release.set()
+        response = future.result(timeout=12)
+    assert response == (200, 'MISS', uri.encode()), response
+    until(lambda: writers(int(operation['sequence'])) == 0)
+    assert not any(item[2] == 2 for item in query('http://prop.test' + uri))
+    fresh_bodies[uri] = b'send-new-entity'
+    response = prop_get(uri)
+    assert response[0] == 200 and response[1] in ('MISS', 'BYPASS'), response
+    assert response[2] == b'send-new-entity' and calls.count(uri) == 2, response
+    prop_records(uri, 1)
+    assert prop_get(uri) == (200, 'HIT', b'send-new-entity')
+    checks.append('a request sent before TAG acceptance can finish its response but cannot publish the old entity')
+
 finally:
+    send_release.set()
+    for hold in dns_holds.values(): hold[1].set()
+    dns_server.shutdown(); dns_server.server_close()
     capacity_gate.set()
     validation_release.set()
     late_release.set()

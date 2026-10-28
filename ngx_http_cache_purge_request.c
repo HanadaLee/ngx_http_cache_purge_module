@@ -352,6 +352,17 @@ typedef struct {
 } ngx_http_cache_purge_propagation_t;
 
 typedef struct {
+    ngx_buf_t     original;
+    ngx_chain_t  *pending;
+    ngx_chain_t **last;
+    ngx_buf_t    *body;
+    u_char       *data;
+    size_t        capacity, reserved, links;
+    unsigned      held : 1;
+    unsigned      changed : 1;
+} ngx_http_cache_purge_send_t;
+
+typedef struct {
     /* The pool cleanup uses this first member's shared budget accounting. */
     ngx_http_cache_purge_propagation_t  allocation;
     ngx_http_cache_purge_fence_t        fence;
@@ -385,6 +396,10 @@ typedef struct {
     ngx_http_cache_purge_revalidation_t  *validation;
     ngx_http_cache_purge_propagation_t   *propagation;
     ngx_http_cache_purge_propagation_t   *propagation_shared;
+    ngx_http_cache_purge_send_t          *send;
+    ngx_output_chain_filter_pt           send_next;
+    void                                *send_data;
+    ngx_buf_t                           *send_header;
     ngx_http_cache_purge_incoming_t      *incoming, *incoming_shared;
     ngx_http_cache_purge_fence_t           local_fence;
     ngx_http_cache_purge_watermark_t       local_watermark;
@@ -432,6 +447,7 @@ typedef struct {
     unsigned  origin_registered : 1;
     unsigned  invalidation_retry : 1;
     unsigned  error_held : 1;
+    unsigned  send_started : 1;
 } ngx_http_cache_purge_capture_t;
 
 typedef struct {
@@ -494,6 +510,12 @@ static ngx_int_t ngx_http_cache_purge_capture_post(ngx_conf_t *cf);
 static ngx_int_t ngx_http_cache_purge_capture_header(ngx_http_request_t *r);
 static ngx_int_t ngx_http_cache_purge_propagation_variables(ngx_conf_t *cf);
 static ngx_int_t ngx_http_cache_purge_propagation_create(ngx_http_request_t *r);
+static ngx_int_t ngx_http_cache_purge_send_output(void *data, ngx_chain_t *in);
+static void ngx_http_cache_purge_send_event(ngx_event_t *event);
+static void ngx_http_cache_purge_send_cancel(
+    ngx_http_cache_purge_capture_t *ctx);
+static void ngx_http_cache_purge_send_clear(
+    ngx_http_cache_purge_capture_t *ctx);
 static ngx_int_t ngx_http_cache_purge_incoming_parse(
     ngx_http_cache_purge_capture_t *ctx);
 static ngx_uint_t ngx_http_cache_purge_incoming_mode(
@@ -797,6 +819,9 @@ ngx_http_cache_purge_propagation_reply(ngx_http_cache_purge_call_t *call,
         ngx_add_timer(&ctx->read_event, 10);
         return;
     }
+    ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
+                  "cache purge object query failed: transport:%ui result:%i",
+                  (ngx_uint_t) reply->transport, (ngx_int_t) reply->result);
     ctx->local_failed = 1;
     ngx_post_event(&ctx->read_event, &ngx_posted_events);
 }
@@ -927,13 +952,15 @@ ngx_http_cache_purge_propagation_snapshot(ngx_http_cache_purge_capture_t *ctx)
     /* Maintenance can republish the same accepted operations. Their original
      * headers may outlive the local window; a new operation still requires a
      * new lookup, as does a different ledger. */
-    if (rc != 0
-        || (publication != ctx->local_publication
-            && (watermark.sequence != ctx->local_watermark.sequence
-                || ngx_memcmp(watermark.ledger,
-                    ctx->local_watermark.ledger, 16) != 0)))
+    if (rc != 0) {
+        return NGX_AGAIN;
+    }
+    if (publication != ctx->local_publication
+        && (watermark.sequence != ctx->local_watermark.sequence
+            || ngx_memcmp(watermark.ledger,
+                           ctx->local_watermark.ledger, 16) != 0))
     {
-        goto done;
+        return NGX_AGAIN;
     }
     if (ctx->incoming) {
         fence.invalidate_ms = ngx_max(fence.invalidate_ms,
@@ -1073,6 +1100,716 @@ ngx_http_cache_purge_propagation_role(ngx_http_cache_purge_loc_conf_t *conf,
         }
     }
     return NGX_DECLINED;
+}
+
+static ngx_chain_t *
+ngx_http_cache_purge_send_link(ngx_http_cache_purge_capture_t *ctx,
+    ngx_buf_t *buffer)
+{
+    ngx_chain_t                  *link;
+    ngx_http_cache_purge_send_t  *send;
+
+    send = ctx->send;
+    if (send->links > NGX_HTTP_CACHE_PURGE_CAPTURE_RECORD - sizeof(*link)
+        || sizeof(*link) > NGX_HTTP_CACHE_PURGE_CAPTURE_BYTES
+                           - ngx_http_cache_purge_propagation_bytes)
+    {
+        return NULL;
+    }
+    link = ngx_alloc(sizeof(*link), ctx->request->connection->log);
+    if (link == NULL) {
+        return NULL;
+    }
+    link->buf = buffer;
+    link->next = NULL;
+    send->links += sizeof(*link);
+    send->reserved += sizeof(*link);
+    ngx_http_cache_purge_propagation_bytes += sizeof(*link);
+    return link;
+}
+
+static void
+ngx_http_cache_purge_send_clear(ngx_http_cache_purge_capture_t *ctx)
+{
+    ngx_chain_t                  *link;
+    ngx_http_cache_purge_send_t  *send;
+
+    send = ctx->send;
+    if (send == NULL) {
+        return;
+    }
+    while (send->pending) {
+        link = send->pending;
+        send->pending = link->next;
+        ngx_free(link);
+        send->reserved -= sizeof(*link);
+        send->links -= sizeof(*link);
+        ngx_http_cache_purge_propagation_bytes -= sizeof(*link);
+    }
+    send->last = &send->pending;
+}
+
+static void
+ngx_http_cache_purge_send_release(ngx_http_cache_purge_capture_t *ctx)
+{
+    if (ctx->send->held) {
+        ctx->send->held = 0;
+        ctx->request->main->count--;
+        ctx->request->main->blocked--;
+        ngx_http_cache_purge_read_count--;
+    }
+}
+
+static void
+ngx_http_cache_purge_send_cancel(ngx_http_cache_purge_capture_t *ctx)
+{
+    ngx_http_cache_purge_send_t  *send;
+
+    send = ctx->send;
+    if (send == NULL) {
+        return;
+    }
+    if (send->held) {
+        if (ctx->call) {
+            ngx_http_cache_purge_client_cancel(ctx->call);
+            ctx->call = NULL;
+        }
+        if (ctx->read_event.timer_set) {
+            ngx_del_timer(&ctx->read_event);
+        }
+        if (ctx->read_event.posted) {
+            ngx_delete_posted_event(&ctx->read_event);
+        }
+        ngx_http_cache_purge_send_release(ctx);
+        ctx->read_event.handler = ngx_http_cache_purge_read_event;
+    }
+    ngx_http_cache_purge_send_clear(ctx);
+    ngx_http_cache_purge_propagation_bytes -= send->reserved;
+    ngx_free(send->data);
+    ngx_free(send);
+    ctx->send = NULL;
+}
+
+static ngx_int_t
+ngx_http_cache_purge_send_grant(ngx_http_cache_purge_capture_t *ctx)
+{
+    ngx_http_cache_purge_control_reader_t  *reader;
+    ngx_http_cache_purge_watermark_t        watermark;
+    ngx_http_cache_rocksdb_error_t          error;
+    uint64_t                                publication;
+
+    if (!ctx->local_ready) {
+        return NGX_AGAIN;
+    }
+    if (ctx->failed || !ctx->origin_registered) {
+        ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
+                      "cache purge send admission unavailable: "
+                      "failed:%ui origin:%ui", (ngx_uint_t) ctx->failed,
+                      (ngx_uint_t) ctx->origin_registered);
+        return NGX_ERROR;
+    }
+    if (ngx_http_cache_purge_runtime_reader(ctx->request, &reader, &error)
+        != 0) {
+        ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
+                      "cache purge send reader unavailable: %s",
+                      error.message);
+        return NGX_ERROR;
+    }
+    if (ngx_http_cache_purge_control_watermark(reader, &watermark,
+                                               &publication, &error) != 0)
+    {
+        return NGX_AGAIN;
+    }
+    if (watermark.sequence != ctx->local_watermark.sequence
+        || ngx_memcmp(watermark.ledger, ctx->local_watermark.ledger, 16) != 0)
+    {
+        return NGX_AGAIN;
+    }
+    if (ngx_memcmp(ctx->origin.ledger, watermark.ledger, 16) != 0) {
+        ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
+                      "cache purge send ledger changed");
+        return NGX_ERROR;
+    }
+    if (ngx_http_cache_purge_control_guard_begin(reader, publication, &error)
+        != 0)
+    {
+        return NGX_AGAIN;
+    }
+    /* Admission precedes the first send attempt, not cache lookup. Keep the
+     * older writer pin for retention, but timestamp this origin at admission.
+     * No IPC, allocation or network I/O occurs while the guard is held. */
+    ctx->origin = watermark;
+    ctx->origin_publication = publication;
+    ctx->send_started = 1;
+    if (ngx_http_cache_purge_control_guard_end(reader, &error) != 0) {
+        ctx->send_started = 0;
+        ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
+                      "cache purge send admission release failed: %s",
+                      error.message);
+        return NGX_ERROR;
+    }
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_cache_purge_send_buffer(ngx_http_cache_purge_capture_t *ctx,
+    size_t length)
+{
+    ngx_http_cache_purge_send_t  *send;
+    size_t                        capacity, size;
+
+    send = ctx->send;
+    if (length > NGX_HTTP_CACHE_PURGE_CAPTURE_RECORD) {
+        return NGX_ERROR;
+    }
+    capacity = length + 1024;
+    if (send->data) {
+        return capacity <= send->capacity ? NGX_OK : NGX_ERROR;
+    }
+    size = capacity * 2;
+    if (size > NGX_HTTP_CACHE_PURGE_CAPTURE_BYTES
+               - ngx_http_cache_purge_propagation_bytes) {
+        return NGX_ERROR;
+    }
+    send->data = ngx_alloc(size, ctx->request->connection->log);
+    if (send->data == NULL) {
+        return NGX_ERROR;
+    }
+    send->capacity = capacity;
+    send->reserved += size;
+    ngx_http_cache_purge_propagation_bytes += size;
+    return NGX_OK;
+}
+
+#if (NGX_HTTP_V2)
+static ngx_int_t ngx_http_cache_purge_send_h2(
+    ngx_http_cache_purge_capture_t *ctx);
+#endif
+
+static ngx_int_t
+ngx_http_cache_purge_send_headers(ngx_http_cache_purge_capture_t *ctx)
+{
+    ngx_http_request_t               *r;
+    ngx_buf_t                        *b, *body;
+    ngx_chain_t                      *native, *pending;
+    ngx_str_t                         name;
+    ngx_http_cache_purge_loc_conf_t  *conf;
+    u_char                           *p, *line, *end, *colon, *out, *last,
+                                     *header_end;
+    size_t                            capacity;
+    ngx_uint_t                        i, keep, first;
+    ngx_int_t                         role;
+
+    r = ctx->request;
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_module);
+    if (ctx->send->pending == NULL
+        || ctx->send->pending->buf != ctx->send_header)
+    {
+        return NGX_ERROR;
+    }
+    b = ctx->send->pending->buf;
+    *b = ctx->send->original;
+    if (!ngx_buf_in_memory(b)) {
+        return NGX_ERROR;
+    }
+
+#if (NGX_HTTP_V2)
+    if (b->last - b->pos >= 24
+        && ngx_memcmp(b->pos, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 24) == 0)
+    {
+        return ngx_http_cache_purge_send_h2(ctx);
+    }
+#endif
+
+    header_end = NULL;
+    for (p = b->pos; (size_t) (b->last - p) >= 4
+         && (size_t) (p - b->pos) <= NGX_HTTP_CACHE_PURGE_CAPTURE_RECORD; p++)
+    {
+        if (ngx_memcmp(p, CRLF CRLF, 4) == 0) {
+            header_end = p + 4;
+            break;
+        }
+    }
+    if (header_end == NULL || header_end - b->pos > 131072) {
+        return NGX_ERROR;
+    }
+
+    if (ngx_http_cache_purge_send_buffer(ctx, header_end - b->pos) != NGX_OK) {
+        return NGX_ERROR;
+    }
+    capacity = ctx->send->capacity;
+    out = ctx->send->data;
+    last = out;
+    p = b->pos;
+    first = 1;
+    while (p < header_end - 2) {
+        line = p;
+        end = ngx_strlchr(p, header_end, LF);
+        if (end == NULL || end == line || end[-1] != CR) {
+            return NGX_ERROR;
+        }
+        p = end + 1;
+        keep = 1;
+        if (!first) {
+            colon = ngx_strlchr(line, end, ':');
+            if (colon == NULL) {
+                return NGX_ERROR;
+            }
+            name.data = line;
+            name.len = colon - line;
+            role = ngx_http_cache_purge_propagation_role(conf, name);
+            keep = role == NGX_DECLINED;
+
+        }
+        if (keep) {
+            last = ngx_cpymem(last, line, p - line);
+        }
+        first = 0;
+    }
+    if (ctx->propagation) {
+        for (i = 0; i < 3; i++) {
+            last = ngx_cpymem(last, conf->propagation_header[i].data,
+                              conf->propagation_header[i].len);
+            *last++ = ':';
+            *last++ = ' ';
+            last = ngx_cpymem(last, ctx->propagation->value[i].data,
+                              ctx->propagation->value[i].len);
+            last = ngx_cpymem(last, CRLF, 2);
+        }
+    }
+    last = ngx_cpymem(last, CRLF, 2);
+
+    if (header_end != b->last) {
+        if (r->request_body_no_buffering) {
+            return NGX_ERROR;
+        }
+        if (ctx->send->body == NULL) {
+            body = ngx_alloc_buf(r->pool);
+            native = ngx_alloc_chain_link(r->pool);
+            if (body == NULL || native == NULL) {
+                return NGX_ERROR;
+            }
+            pending = ngx_http_cache_purge_send_link(ctx, body);
+            if (pending == NULL) {
+                return NGX_ERROR;
+            }
+            *body = *b;
+            body->start = body->pos = header_end;
+            native->buf = pending->buf = body;
+            native->next = ctx->read_upstream->request_bufs->next;
+            ctx->read_upstream->request_bufs->next = native;
+            pending->next = ctx->send->pending->next;
+            if (ctx->send->last == &ctx->send->pending->next) {
+                ctx->send->last = &pending->next;
+            }
+            ctx->send->pending->next = pending;
+            ctx->send->body = body;
+        }
+        b->last_buf = 0;
+        b->last_in_chain = 0;
+        b->flush = 0;
+    }
+
+    b->start = b->pos = out;
+    b->last = last;
+    b->end = out + capacity;
+    b->temporary = 1;
+    b->memory = 0;
+    return NGX_OK;
+}
+
+
+#if (NGX_HTTP_V2)
+static ngx_int_t
+ngx_http_cache_purge_send_integer(u_char **cursor, u_char *end, size_t mask,
+    size_t *value)
+{
+    u_char     *p, ch;
+    size_t      n;
+    ngx_uint_t  shift;
+
+    p = *cursor;
+    if (p == end) {
+        return NGX_ERROR;
+    }
+    n = *p++ & mask;
+    if (n == mask) {
+        shift = 0;
+        do {
+            if (p == end || shift > 14) {
+                return NGX_ERROR;
+            }
+            ch = *p++;
+            n += (size_t) (ch & 127) << shift;
+            shift += 7;
+            if (n > 131072) {
+                return NGX_ERROR;
+            }
+        } while (ch & 128);
+    }
+    *cursor = p;
+    *value = n;
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_cache_purge_send_string(u_char **cursor, u_char *end)
+{
+    size_t  length;
+
+    if (ngx_http_cache_purge_send_integer(cursor, end, 127, &length) != NGX_OK
+        || length > (size_t) (end - *cursor))
+    {
+        return NGX_ERROR;
+    }
+    *cursor += length;
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_cache_purge_send_h2(ngx_http_cache_purge_capture_t *ctx)
+{
+    ngx_http_request_t               *r;
+    ngx_buf_t                        *b;
+    ngx_str_t                        *name, keys[4];
+    ngx_http_cache_purge_loc_conf_t  *conf;
+    u_char                           *p, *frame, *flat, *end, *field, *start,
+                                     *out, *encoded;
+    u_char                            first[9], names[4][132], scratch[128], ch;
+    size_t                            prefix, length, size, names_len[4], index,
+                                      capacity;
+    ngx_uint_t                        i, remove, finished, count;
+
+    r = ctx->request;
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_module);
+    for (i = 0; i < 3; i++) {
+        keys[i] = conf->propagation_header[i];
+    }
+    keys[3] = conf->tag_namespace_header;
+    b = ctx->send_header;
+    if (ngx_http_cache_purge_send_buffer(ctx, b->last - b->pos) != NGX_OK) {
+        return NGX_ERROR;
+    }
+    p = b->pos + 24;
+    while (b->last - p >= 9 && p[3] != NGX_HTTP_V2_HEADERS_FRAME) {
+        length = ((size_t) p[0] << 16) | ((size_t) p[1] << 8) | p[2];
+        if ((p[3] != NGX_HTTP_V2_SETTINGS_FRAME
+             && p[3] != NGX_HTTP_V2_WINDOW_UPDATE_FRAME)
+            || p[5] || p[6] || p[7] || p[8]
+            || length > (size_t) (b->last - p - 9))
+        {
+            return NGX_ERROR;
+        }
+        p += 9 + length;
+    }
+    if (b->last - p < 9 || p[4] & ~(NGX_HTTP_V2_END_STREAM_FLAG
+                                   | NGX_HTTP_V2_END_HEADERS_FLAG))
+    {
+        return NGX_ERROR;
+    }
+    prefix = p - b->pos;
+    ngx_memcpy(first, p, 9);
+    flat = ctx->send->data;
+    end = flat;
+    count = 0;
+    do {
+        if (b->last - p < 9) {
+            return NGX_ERROR;
+        }
+        length = ((size_t) p[0] << 16) | ((size_t) p[1] << 8) | p[2];
+        if (length > (size_t) (b->last - p - 9)
+            || ngx_memcmp(p + 5, first + 5, 4) != 0
+            || (count && (p[3] != NGX_HTTP_V2_CONTINUATION_FRAME
+                         || p[4] & ~NGX_HTTP_V2_END_HEADERS_FLAG)))
+        {
+            return NGX_ERROR;
+        }
+        finished = p[4] & NGX_HTTP_V2_END_HEADERS_FLAG;
+        end = ngx_cpymem(end, p + 9, length);
+        p += 9 + length;
+        count++;
+    } while (!finished);
+    if (p != b->last) {
+        return NGX_ERROR;
+    }
+
+    for (i = 0; i < 4; i++) {
+        names_len[i] = ngx_http_v2_write_name(names[i], keys[i].data,
+                                             keys[i].len, scratch) - names[i];
+    }
+    p = out = flat;
+    while (p < end) {
+        field = p;
+        ch = *p;
+        remove = 0;
+        if (ch & 128) {
+            if (ngx_http_cache_purge_send_integer(&p, end, 127, &index)
+                != NGX_OK || index == 0 || index > 61)
+            {
+                return NGX_ERROR;
+            }
+            name = ngx_http_v2_get_static_name(index);
+            remove = ngx_http_cache_purge_propagation_role(conf, *name)
+                     != NGX_DECLINED;
+
+        } else if ((ch & 224) == 32) {
+            if (ngx_http_cache_purge_send_integer(&p, end, 31, &index)
+                != NGX_OK)
+            {
+                return NGX_ERROR;
+            }
+
+        } else {
+            if (ngx_http_cache_purge_send_integer(&p, end,
+                                                  ch & 64 ? 63 : 15, &index)
+                != NGX_OK || index > 61)
+            {
+                return NGX_ERROR;
+            }
+            if (index == 0) {
+                start = p;
+                if (ngx_http_cache_purge_send_string(&p, end) != NGX_OK) {
+                    return NGX_ERROR;
+                }
+                for (i = 0; i < 4; i++) {
+                    if ((size_t) (p - start) == names_len[i]
+                        && ngx_memcmp(start, names[i], names_len[i]) == 0)
+                    {
+                        remove = 1;
+                        break;
+                    }
+                }
+
+            } else {
+                name = ngx_http_v2_get_static_name(index);
+                for (i = 0; i < 4; i++) {
+                    if (name->len == keys[i].len
+                        && ngx_strncasecmp(name->data, keys[i].data,
+                                           name->len) == 0)
+                    {
+                        remove = 1;
+                        break;
+                    }
+                }
+            }
+            if (ngx_http_cache_purge_send_string(&p, end) != NGX_OK
+                || (remove && (ch & 64)))
+            {
+                /* Dropping an indexed insertion would change later indexes. */
+                return NGX_ERROR;
+            }
+        }
+        if (!remove) {
+            ngx_memmove(out, field, p - field);
+            out += p - field;
+        }
+    }
+    if (ctx->propagation) {
+        for (i = 0; i < 3; i++) {
+            *out++ = 0;
+            out = ngx_cpymem(out, names[i], names_len[i]);
+            out = ngx_http_v2_write_value(out, ctx->propagation->value[i].data,
+                         ctx->propagation->value[i].len, scratch);
+        }
+    }
+    size = out - flat;
+    capacity = prefix + size + 9 * ((size + 16383) / 16384);
+    if (capacity > ctx->send->capacity || size == 0) {
+        return NGX_ERROR;
+    }
+    encoded = ctx->send->data + ctx->send->capacity;
+    out = ngx_cpymem(encoded, b->pos, prefix);
+    p = flat;
+    count = 0;
+    while (size) {
+        length = ngx_min(size, 16384);
+        frame = out;
+        out = ngx_cpymem(out, first, 9);
+        frame[0] = (u_char) (length >> 16);
+        frame[1] = (u_char) (length >> 8);
+        frame[2] = (u_char) length;
+        frame[3] = count ? NGX_HTTP_V2_CONTINUATION_FRAME
+                         : NGX_HTTP_V2_HEADERS_FRAME;
+        frame[4] = count ? 0 : first[4] & NGX_HTTP_V2_END_STREAM_FLAG;
+        if (length == size) {
+            frame[4] |= NGX_HTTP_V2_END_HEADERS_FLAG;
+        }
+        out = ngx_cpymem(out, p, length);
+        p += length;
+        size -= length;
+        count++;
+    }
+    b->start = b->pos = encoded;
+    b->last = out;
+    b->end = encoded + capacity;
+    b->memory = 0;
+    b->temporary = 1;
+    return NGX_OK;
+}
+
+
+#endif
+
+static ngx_int_t
+ngx_http_cache_purge_send_output(void *data, ngx_chain_t *in)
+{
+    ngx_http_cache_purge_capture_t  *ctx = data;
+
+    ngx_http_request_t           *r;
+    ngx_http_cache_purge_send_t  *send;
+    ngx_chain_t                  *link;
+    ngx_int_t                     rc;
+
+    r = ctx->request;
+    if (ctx->send_started) {
+        return ctx->send_next(ctx->send_data, in);
+    }
+    send = ctx->send;
+    if (send == NULL) {
+        rc = ngx_http_cache_purge_send_grant(ctx);
+        if (rc == NGX_OK) {
+            return ctx->send_next(ctx->send_data, in);
+        }
+        if (rc == NGX_ERROR
+            || sizeof(*send) > NGX_HTTP_CACHE_PURGE_CAPTURE_BYTES
+                              - ngx_http_cache_purge_propagation_bytes)
+        {
+            return NGX_HTTP_SERVICE_UNAVAILABLE;
+        }
+        send = ngx_alloc(sizeof(*send), r->connection->log);
+        if (send == NULL) {
+            return NGX_HTTP_SERVICE_UNAVAILABLE;
+        }
+        ngx_memzero(send, sizeof(*send));
+        send->original = *ctx->send_header;
+        send->last = &send->pending;
+        send->reserved = sizeof(*send);
+        ngx_http_cache_purge_propagation_bytes += sizeof(*send);
+        ctx->send = send;
+        ctx->deadline = ngx_current_msec + NGX_HTTP_CACHE_PURGE_CAPTURE_TIMEOUT;
+    }
+    while (in) {
+        link = ngx_http_cache_purge_send_link(ctx, in->buf);
+        if (link == NULL) {
+            return NGX_HTTP_SERVICE_UNAVAILABLE;
+        }
+        *send->last = link;
+        send->last = &link->next;
+        in = in->next;
+    }
+    if (ctx->local_failed) {
+        return NGX_HTTP_SERVICE_UNAVAILABLE;
+    }
+    if (ctx->local_ready && send->changed) {
+        rc = ngx_http_cache_purge_send_grant(ctx);
+        if (rc == NGX_OK) {
+            rc = ctx->send_next(ctx->send_data, send->pending);
+            ngx_http_cache_purge_send_clear(ctx);
+            return rc;
+        }
+        if (rc == NGX_ERROR) {
+            return NGX_HTTP_SERVICE_UNAVAILABLE;
+        }
+    }
+    if (!send->held) {
+        if (r->main->count == 65535
+            || r->main->blocked >= NGX_HTTP_MAX_BLOCKED
+            || ngx_http_cache_purge_read_count
+               >= NGX_HTTP_CACHE_PURGE_CAPTURE_COUNT)
+        {
+            return NGX_HTTP_SERVICE_UNAVAILABLE;
+        }
+        send->held = 1;
+        send->changed = 0;
+        ctx->local_ready = 0;
+        r->main->count++;
+        r->main->blocked++;
+        ngx_http_cache_purge_read_count++;
+        ctx->read_event.handler = ngx_http_cache_purge_send_event;
+        ngx_post_event(&ctx->read_event, &ngx_posted_events);
+    }
+    return NGX_AGAIN;
+}
+
+static void
+ngx_http_cache_purge_send_event(ngx_event_t *event)
+{
+    ngx_http_cache_purge_capture_t  *ctx;
+    ngx_http_request_t              *r;
+    ngx_http_upstream_t             *u;
+    ngx_connection_t                *connection;
+    ngx_int_t                        rc, headers;
+
+    ctx = event->data;
+    r = ctx->request;
+    u = ctx->read_upstream;
+    connection = r->connection;
+    if (r->main->terminated) {
+        ngx_http_cache_purge_send_cancel(ctx);
+        connection->write->handler(connection->write);
+        return;
+    }
+    if (r->upstream != u) {
+        ngx_http_cache_purge_send_cancel(ctx);
+        return;
+    }
+    if (connection->error || u->peer.connection == NULL) {
+        if (u->cleanup && *u->cleanup) {
+            /* Keep the async reference until the upstream finalizer runs. */
+            (*u->cleanup)(r);
+        } else {
+            ngx_http_cache_purge_send_cancel(ctx);
+        }
+        return;
+    }
+    if (ctx->call) {
+        return;
+    }
+    if ((ngx_msec_int_t) (ctx->deadline - ngx_current_msec) <= 0) {
+        ctx->local_failed = 1;
+    }
+    if (!ctx->local_ready && !ctx->local_failed) {
+        rc = ngx_http_cache_purge_propagation_query(ctx);
+        if (rc == NGX_OK) {
+            return;
+        }
+        if (rc == NGX_BUSY
+            && (ngx_msec_int_t) (ctx->deadline - ngx_current_msec) > 10)
+        {
+            ngx_add_timer(&ctx->read_event, 10);
+            return;
+        }
+        ngx_log_error(NGX_LOG_WARN, connection->log, 0,
+                      "cache purge send query submission failed: %i", rc);
+        ctx->local_failed = 1;
+    }
+    if (ctx->local_ready && !ctx->local_failed) {
+        ctx->propagation = NULL;
+        rc = ngx_http_cache_purge_propagation_snapshot(ctx);
+        if (rc == NGX_AGAIN
+            && (ngx_msec_int_t) (ctx->deadline - ngx_current_msec) > 10)
+        {
+            ctx->local_ready = 0;
+            ngx_add_timer(&ctx->read_event, 10);
+            return;
+        }
+        headers = rc == NGX_OK ? ngx_http_cache_purge_send_headers(ctx)
+                              : NGX_ERROR;
+        if (rc != NGX_OK || headers != NGX_OK) {
+            ngx_log_error(NGX_LOG_WARN, connection->log, 0,
+                          "cache purge send refresh failed: "
+                          "snapshot:%i headers:%i", rc, headers);
+            ctx->local_failed = 1;
+        } else {
+            ctx->send->changed = 1;
+        }
+    }
+    ngx_http_cache_purge_send_release(ctx);
+    ctx->read_event.handler = ngx_http_cache_purge_read_event;
+    u->write_event_handler(r, u);
+    ngx_http_run_posted_requests(connection);
 }
 
 static ngx_int_t
@@ -1376,6 +2113,12 @@ ngx_http_cache_purge_propagation_create(ngx_http_request_t *r)
     {
         return NGX_ERROR;
     }
+    if (r->upstream->output.output_filter == ngx_http_cache_purge_send_output) {
+        r->upstream->output.output_filter = ctx->send_next;
+        r->upstream->output.filter_ctx = ctx->send_data;
+    }
+    ngx_http_cache_purge_send_cancel(ctx);
+    ctx->send_started = 0;
     ctx->propagation = NULL;
     ngx_http_cache_purge_incoming_cutoffs(ctx);
     if (ctx->cache->file.fd != NGX_INVALID_FILE) {
@@ -1413,7 +2156,11 @@ ngx_http_cache_purge_propagation_create(ngx_http_request_t *r)
     }
 #endif
     if (enabled) {
-        if (ngx_http_cache_purge_propagation_snapshot(ctx) != NGX_OK) {
+        rc = ngx_http_cache_purge_propagation_snapshot(ctx);
+        if (rc == NGX_AGAIN) {
+            ctx->local_ready = 0;
+        }
+        if (rc != NGX_OK && rc != NGX_AGAIN) {
             ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                 "cache purge propagation snapshot unavailable or over budget");
             return NGX_ERROR;
@@ -1431,6 +2178,20 @@ ngx_http_cache_purge_propagation_create(ngx_http_request_t *r)
         return NGX_ERROR;
     }
 #endif
+    if (rc == NGX_OK && enabled) {
+        if (r->upstream->request_bufs == NULL) {
+            return NGX_ERROR;
+        }
+        ctx->send_header = r->upstream->request_bufs->buf;
+        ctx->send_next = r->upstream->output.output_filter;
+        ctx->send_data = r->upstream->output.filter_ctx;
+        if (ctx->send_next == NULL) {
+            ctx->send_next = ngx_chain_writer;
+            ctx->send_data = &r->upstream->writer;
+        }
+        r->upstream->output.output_filter = ngx_http_cache_purge_send_output;
+        r->upstream->output.filter_ctx = ctx;
+    }
     return rc;
 }
 
@@ -1592,6 +2353,7 @@ static void
 ngx_http_cache_purge_capture_cleanup(void *data)
 {
     ngx_http_cache_purge_capture_t *ctx = data;
+    ngx_http_cache_purge_send_cancel(ctx);
     if (ctx->error_held) {
         ctx->cache->updated = 0;
         ctx->cache->error = 0;
@@ -1854,6 +2616,8 @@ ngx_http_cache_purge_capture_origin(ngx_http_cache_purge_capture_t *ctx)
     ngx_http_cache_purge_control_reader_t  *reader;
     ngx_http_cache_rocksdb_error_t          error;
     ngx_http_cache_purge_capture_t         *last;
+    ngx_http_cache_purge_watermark_t        origin;
+    uint64_t                                publication;
     ngx_int_t                               announced;
 
     ctx->origin_valid = 0;
@@ -1881,23 +2645,27 @@ ngx_http_cache_purge_capture_origin(ngx_http_cache_purge_capture_t *ctx)
         }
         announced = 1;
     }
-    if (ngx_http_cache_purge_control_watermark(reader, &ctx->origin,
-            &ctx->origin_publication, &error) != 0)
+    /* A failed read clears its outputs. Keep an existing registration intact
+     * until its replacement has been validated. */
+    if (ngx_http_cache_purge_control_watermark(reader, &origin,
+                                                &publication, &error) != 0)
     {
         goto failed;
     }
     if (!ngx_queue_empty(&ngx_http_cache_purge_origins)) {
         last = ngx_queue_data(ngx_queue_last(&ngx_http_cache_purge_origins),
                              ngx_http_cache_purge_capture_t, origin_queue);
-        if (ngx_memcmp(ctx->origin.ledger, ngx_http_cache_purge_origin_ledger,
+        if (ngx_memcmp(origin.ledger, ngx_http_cache_purge_origin_ledger,
                        16) != 0
-            || ctx->origin.sequence < last->writer_sequence)
+            || origin.sequence < last->writer_sequence)
         {
             goto failed;
         }
     } else {
-        ngx_memcpy(ngx_http_cache_purge_origin_ledger, ctx->origin.ledger, 16);
+        ngx_memcpy(ngx_http_cache_purge_origin_ledger, origin.ledger, 16);
     }
+    ctx->origin = origin;
+    ctx->origin_publication = publication;
     if (!ctx->origin_registered) {
         ctx->origin_reader = reader;
         ctx->writer_sequence = ctx->origin.sequence;
@@ -2244,6 +3012,7 @@ ngx_http_cache_purge_error_finalize(ngx_http_request_t *r, ngx_int_t rc)
         if (ctx->request != r || ctx->read_upstream != u) {
             continue;
         }
+        ngx_http_cache_purge_send_cancel(ctx);
         if (ctx->error_held) {
             ctx->cache->updated = 0;
             ctx->cache->error = 0;
@@ -2270,6 +3039,7 @@ ngx_http_cache_purge_read_reinit(ngx_http_request_t *r)
     if (ctx == NULL || ctx->read_reinit == NULL) {
         return NGX_ERROR;
     }
+    ngx_http_cache_purge_send_clear(ctx);
     if (ctx->error_held) {
         ctx->cache->updated = 0;
         ctx->cache->error = 0;
