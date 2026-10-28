@@ -2274,7 +2274,7 @@ ngx_http_cache_purge_component_checkpoint(ngx_http_cache_purge_component_t *c,
         point.next_run_ms = next;
         point.last_error.data = (const unsigned char *) message;
         point.last_error.len = strlen(message);
-        rc = ngx_http_cache_purge_operations_checkpoint(&c->operations,
+        rc = ngx_http_cache_purge_operations_checkpoint_deferred(&c->operations,
             op->input.id, op->revision, &point, &updated, error);
         if (rc == 0) {
             rc = ngx_http_cache_purge_coordinator_checkpoint_pin(c->coordinator,
@@ -2928,6 +2928,9 @@ ngx_http_cache_purge_component_work(ngx_http_cache_purge_component_t *c,
         if (rc == 0) {
             /* Collection acknowledgements must not keep postponing tasks. */
             c->work_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC);
+            if (c->cleanup_operation.len != 0) {
+                c->collect_at = c->work_at;
+            }
         }
         return rc;
     }
@@ -3070,6 +3073,8 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
     uint64_t                                 now;
     int                                      rc;
     int                                      progress;
+    int                                      acknowledged;
+    int                                      collected;
     int                                      ready;
     int                                      complete;
     int                                      pending;
@@ -3132,15 +3137,31 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
                 return rc;
             }
         }
-        if (now >= c->work_at
-            || ngx_http_cache_purge_component_load32(&c->cleanup_state) == 2)
+        acknowledged =
+            ngx_http_cache_purge_component_load32(&c->cleanup_state) == 2;
+        collected = 0;
+        /*
+         * Alternate users of the single native cleanup slot. After a task
+         * acknowledgement, let collection try first; after collection, let
+         * task progress run. The acknowledgement itself consumes this turn.
+         */
+        if (!acknowledged && c->cleanup_operation.len != 0
+            && now >= c->collect_at)
+        {
+            rc = ngx_http_cache_purge_component_collect(c, error);
+            if (rc != 0) {
+                return rc;
+            }
+            collected = 1;
+        }
+        if (now >= c->work_at || acknowledged)
         {
             rc = ngx_http_cache_purge_component_work(c, error);
             if (rc != 0) {
                 return rc;
             }
         }
-        if (now >= c->collect_at) {
+        if (!acknowledged && !collected && now >= c->collect_at) {
             rc = ngx_http_cache_purge_component_collect(c, error);
             if (rc != 0) {
                 return rc;

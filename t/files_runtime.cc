@@ -922,6 +922,7 @@ background_delete(const std::string &mode, const std::string &path)
                 id(1));
         } else {
             check(mode == "--background-seed"
+                      || mode == "--background-seed-many"
                       || mode == "--background-seed-invalidate",
                 "background fixture mode");
             create(
@@ -931,6 +932,13 @@ background_delete(const std::string &mode, const std::string &path)
             create(
                 4, "cache", "outside", "https://example.test/outside", 0, {});
             create(6, "cache-b", "other", "https://example.test/other", 0, {});
+            if (mode == "--background-seed-many") {
+                for (unsigned n = 10; n < 50; n++) {
+                    auto name = "bulk-" + std::to_string(n);
+                    auto url = "https://example.test/work/zz-" + name;
+                    create(n, "cache", name.c_str(), url.c_str(), 0, {});
+                }
+            }
             for (const std::string name : { "background", "independent" }) {
                 std::string value = name == "background" ?
                                         "https://example.test/work/" :

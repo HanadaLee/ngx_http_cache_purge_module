@@ -1270,10 +1270,9 @@ try:
             assert value[0] == 200 and value[2] == b'/after-capacity', value
             assert value[1] in ('MISS', 'HIT', 'BYPASS'), value
             matches = query('http://cache.test/after-capacity')
-            return matches if matches and all(item[2] == 2 for item in matches) and pending() == 0 else None
+            return matches if value[1] == 'HIT' and matches and all(item[2] == 2 for item in matches) and pending() == 0 else None
         until(recovered, timeout=10)
         ready_file(records('/after-capacity', 1)[0])
-        assert get('/after-capacity')[1] == 'HIT'
         checks.append('publication pressure preserves ordinary HITs and response bodies; subsequent fills recover')
     until(lambda: pending() == 0)
     before = {x[0] for x in query('http://cache.test/asset')}

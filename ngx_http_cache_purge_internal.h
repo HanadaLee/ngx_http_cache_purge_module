@@ -630,6 +630,15 @@ int ngx_http_cache_purge_operations_checkpoint(
     uint64_t revision, const ngx_http_cache_purge_checkpoint_t *point,
     ngx_http_cache_purge_operation_t *out,
     ngx_http_cache_rocksdb_error_t *error);
+
+/* Executor progress may replay after power loss. WAL order places the
+ * reserved instance before retirement; materialize synchronizes all earlier
+ * progress before removing FENCE or reporting completion. */
+int ngx_http_cache_purge_operations_checkpoint_deferred(
+    ngx_http_cache_purge_operations_t *ops, ngx_http_cache_rocksdb_bytes_t id,
+    uint64_t revision, const ngx_http_cache_purge_checkpoint_t *point,
+    ngx_http_cache_purge_operation_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
 /* The caller must prove global old-origin quiescence and physical completion.
  * Advances the durable write floor atomically with FENCE removal.
  */

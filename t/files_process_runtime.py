@@ -141,7 +141,8 @@ def background_delete(cut):
     validation_case = cut.startswith('validation-')
     checks.append(subprocess.check_output(
         [str(a.binary), '--validate-race-intent' if validation_case else
-         '--background-seed-invalidate' if cut == 'invalidate' else '--background-seed', str(root)], text=True, timeout=30).strip())
+         '--background-seed-invalidate' if cut == 'invalidate' else
+         '--background-seed-many' if cut == 'native-many' else '--background-seed', str(root)], text=True, timeout=30).strip())
     first = root / ('cache/file' if validation_case else 'cache/a/first')
     offset = int.from_bytes(hashlib.sha256(str(first).encode()).digest()[16:24], 'big') & 0x3fffffffffffffff
     lease = os.open(root / 'db/file.leases', os.O_RDWR | os.O_CLOEXEC)
@@ -155,7 +156,7 @@ def background_delete(cut):
     if cut == 'invalidate':
         environment.update(CACHE_PURGE_TEST_HOLD_ORIGIN='1',
                            CACHE_PURGE_TEST_MATCH_URL='https://example.test/work/first')
-    if cut == 'native':
+    if cut.startswith('native'):
         environment['CACHE_PURGE_TEST_NATIVE_ROOT'] = '1'
     if validation_case:
         environment.pop('CACHE_PURGE_TEST_SECOND_ROOT')
@@ -272,7 +273,7 @@ def background_delete(cut):
                 assert tagged('red') == tagged('blue') == tagged('green') == 0
             old.close()
             stop()
-        elif cut == 'native':
+        elif cut.startswith('native'):
             def native():
                 process.stdin.write('n\n'); process.stdin.flush()
                 assert select.select([process.stdout], [], [], 8)[0]
@@ -321,16 +322,22 @@ def background_delete(cut):
             completed = 0
             seen = {}
             restarted_collection = False
+            task_streak = 0
+            expected_paths = {'a/first': 1, 'a/second': 2, 'a/other': 6}
+            if cut == 'native-many':
+                expected_paths.update({f'a/bulk-{n}': n for n in range(10, 50)})
             while True:
                 request = until(lambda: native() or
                                 ('done' if operation()['stage'] == operation('independent')['stage'] == 4
                                  and rpc(10, b'\0' * 4 + b'\x01')[0] == 0 else None))
                 if request == 'done': break
-                assert int(request[3]) > 0 and request[5] in ('a/first', 'a/second', 'a/other')
-                number = {'a/first': 1, 'a/second': 2, 'a/other': 6}[request[5]]
+                assert int(request[3]) > 0 and request[5] in expected_paths
+                number = expected_paths[request[5]]
                 raw = rpc(2, number.to_bytes(16, 'big'))
                 rpc(7, b'\x01' + number.to_bytes(16, 'big') + raw[1:9], code=4)
                 if seen.get(request[5], 0) == 1 and not restarted_collection:
+                    if cut == 'native-many':
+                        assert len(seen) <= 8, ('collection starved behind task removals', len(seen))
                     # The task checkpoint has released this ID; the retired
                     # queue alone must recover an unacknowledged GC removal.
                     assert raw[0] == 3
@@ -339,11 +346,14 @@ def background_delete(cut):
                     assert rpc(2, number.to_bytes(16, 'big'))[0] == 3
                     restarted_collection = True
                     continue
+                task_streak = 0 if seen.get(request[5], 0) else task_streak + 1
+                if cut == 'native-many':
+                    assert task_streak <= 8, ('collection starved behind task removals', task_streak, seen)
                 seen[request[5]] = seen.get(request[5], 0) + 1
                 ack('y')
                 completed += 1
-                assert completed <= 6
-            assert completed == 6 and set(seen.values()) == {2} and restarted_collection, seen
+                assert completed <= len(expected_paths) * 2
+            assert completed == len(expected_paths) * 2 and set(seen.values()) == {2} and restarted_collection, seen
             assert not first.exists() and not (root / 'cache-b/a/second').exists()
             assert (root / 'cache/a/fresh').exists()
             stop()
@@ -451,12 +461,13 @@ def background_delete(cut):
     diagnostics = (root / 'component.log').read_text()
     assert not any(word in diagnostics for word in ('AddressSanitizer', 'LeakSanitizer', 'runtime error:')), diagnostics
     checks.append('304 recovery retains old TAG membership, rechecks old/new rules before header mutation and atomically publishes new TAGs: ' + cut if validation_case else
+                  'native cleanup alternates task removal and collection without draining a 43-file task first' if cut == 'native-many' else
                   'native cleanup notification survives owner death, rejects stale replies, retries busy consumers and preserves durable per-file progress' if cut == 'native' else
                   'background Invalidate waits for origins and durable intents, resumes after owner death, retires FENCE while retaining PROPAGATE and rejects delayed old writes' if cut == 'invalidate' else
                   'background Delete survives ' + cut + ' restart, handles both zones, preserves new entities and retires the FENCE')
 
 if a.component:
-    for cut in ('lease', 'retired', 'replaced', 'invalidate', 'native'):
+    for cut in ('lease', 'retired', 'replaced', 'invalidate', 'native', 'native-many'):
         background_delete(cut)
     for cut in ('validation-old-invalidate', 'validation-new-invalidate',
                 'validation-old-delete', 'validation-new-delete',

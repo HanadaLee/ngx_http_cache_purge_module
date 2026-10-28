@@ -2,8 +2,10 @@
 #include <unistd.h>
 #include <iostream>
 #include <algorithm>
+#include <filesystem>
 
 using namespace ngx_http_cache_purge;
+extern "C" unsigned ngx_http_cache_purge_test_sync_count(void);
 static unsigned assertions;
 static void
 check(bool value, const char *message)
@@ -84,6 +86,154 @@ raw_write(ngx_http_cache_rocksdb_t *store, const std::string &key,
     check(ngx_http_cache_rocksdb_write(store, &mutation, 1, nullptr, 0, &error)
               == 0,
         "raw corruption fixture");
+}
+
+static Operation
+ngx_http_cache_purge_test_checkpoint(
+    Operations &ops, const Operation &op, const OperationCheckpoint &point)
+{
+    ngx_http_cache_purge_checkpoint_t raw{ point.id, bytes(point.bookmark),
+        point.scan_done, point.next_run_ms, point.visits_delta, point.pending,
+        point.failed, bytes(point.last_error) };
+    ngx_http_cache_purge_operation_t output{};
+    ngx_http_cache_rocksdb_error_t error{};
+    int rc = ngx_http_cache_purge_operations_checkpoint_deferred(
+        ops.native(), bytes(op.input.id), op.revision, &raw, &output, &error);
+    auto result =
+        rc == 0 ? ngx_http_cache_purge_cpp_operation(output) : Operation{};
+    ngx_http_cache_purge_operation_free(&output);
+    check(rc == 0, error.message);
+    return result;
+}
+
+static void
+ngx_http_cache_purge_test_checkpoint_sync()
+{
+    char path[] = "/tmp/cache-purge-checkpoint-sync-XXXXXX";
+    check(mkdtemp(path) != nullptr, "checkpoint sync directory");
+    auto *store = open(path);
+    {
+        Index index(store);
+        Operations ops(store);
+        auto before = ngx_http_cache_purge_test_sync_count();
+        auto op = ops.accept(input("sync"), 1000);
+        check(ngx_http_cache_purge_test_sync_count() > before,
+            "acceptance synchronizes immediately");
+        before = ngx_http_cache_purge_test_sync_count();
+        op = ops.activate("sync", op.revision, 1100);
+        check(ngx_http_cache_purge_test_sync_count() > before,
+            "activation synchronizes immediately");
+        before = ngx_http_cache_purge_test_sync_count();
+        auto pending = point(1, false, 1);
+        op = ngx_http_cache_purge_test_checkpoint(ops, op, pending);
+        check(ngx_http_cache_purge_test_sync_count() == before,
+            "executor progress shares a later WAL barrier");
+        auto replay = ops.checkpoint("sync", op.revision, pending);
+        check(replay.visits == op.visits
+                  && ngx_http_cache_purge_test_sync_count() == before + 1,
+            "synchronous replay flushes deferred progress without duplicating "
+            "it");
+        before = ngx_http_cache_purge_test_sync_count();
+        op = ngx_http_cache_purge_test_checkpoint(ops, op, point(2, true));
+        check(ngx_http_cache_purge_test_sync_count() == before,
+            "scan completion alone is not a durable completion receipt");
+        op = ops.materialize("sync", op.revision, op.sequence);
+        check(op.stage == OperationStage::materialized
+                  && ngx_http_cache_purge_test_sync_count() == before + 1,
+            "materialization flushes progress before FENCE retirement");
+    }
+    close(store);
+}
+
+static void
+ngx_http_cache_purge_test_wal_boundary(const char *path)
+{
+    for (const auto &entry : std::filesystem::directory_iterator(path)) {
+        if (entry.path().extension() == ".log") {
+            std::cout << "WAL " << entry.path().string() << ' '
+                      << entry.file_size() << std::endl;
+        }
+    }
+}
+
+static void
+ngx_http_cache_purge_test_checkpoint_loss(
+    const char *path, unsigned phase, bool recover)
+{
+    check(phase < 3, "valid checkpoint rollback phase");
+    auto *store = open(path);
+    Index index(store);
+    Operations ops(store);
+    File file;
+    file.id[15] = 1;
+    file.key = "progress";
+    file.url = "https://example.test/progress";
+    file.host = "example.test";
+    file.tag_namespace = "team";
+    file.root = "/cache/a";
+    file.zone = "a";
+    file.path = "0/00/progress";
+    file.tags = { "photo" };
+    if (!recover) {
+        index.prepare(file);
+        index.commit(file.id, 1);
+        auto op = ops.accept(input("progress"), 1000);
+        op = ops.activate("progress", op.revision, 1100);
+        if (phase == 0) {
+            ngx_http_cache_purge_test_wal_boundary(path);
+        }
+        op = ngx_http_cache_purge_test_checkpoint(ops, op, point(1, false, 1));
+        if (phase != 0) {
+            index.retire(file.id, 2);
+            if (phase == 1) {
+                ngx_http_cache_purge_test_wal_boundary(path);
+            }
+            op = ngx_http_cache_purge_test_checkpoint(
+                ops, op, point(2, phase == 2));
+            if (phase == 2) {
+                ops.materialize("progress", op.revision, op.sequence);
+                ngx_http_cache_purge_test_wal_boundary(path);
+                ngx_http_cache_rocksdb_mutation_t tail{
+                    NGX_HTTP_CACHE_ROCKSDB_DEFAULT, NGX_HTTP_CACHE_ROCKSDB_PUT,
+                    bytes("Z:tail"), bytes("cache data")
+                };
+                ngx_http_cache_rocksdb_error_t error{};
+                check(ngx_http_cache_rocksdb_write_deferred(
+                          store, &tail, 1, nullptr, 0, &error)
+                          == 0,
+                    "write disposable WAL tail");
+            }
+        }
+        _exit(0);
+    }
+    auto op = ops.get("progress");
+    auto saved = index.get(file.id);
+    check(op.accepted_at_ms == 1000 && op.effective_at_ms == 1100,
+        "progress loss preserves durable acceptance and activation");
+    if (phase == 0) {
+        check(op.checkpoint_id == 0 && op.pending == 0
+                  && saved.state == FileState::committed,
+            "lost reservation leaves the instance available for enumeration");
+    } else if (phase == 1) {
+        check(op.checkpoint_id == 1 && op.pending == 1
+                  && saved.state == FileState::retired,
+            "retirement barrier preserves the exact pending reservation");
+    } else {
+        check(op.checkpoint_id == 2 && op.pending == 0 && op.scan_done
+                  && op.stage == OperationStage::materialized
+                  && ops.usage().retired_sequence == op.sequence,
+            "durable completion preserves prior progress and the write floor");
+    }
+    if (phase != 2) {
+        check(op.stage == OperationStage::active && !op.scan_done
+                  && ops.usage().retired_sequence == 0,
+            "incomplete replay keeps FENCE and does not advance the write "
+            "floor");
+        fails(NGX_HTTP_CACHE_ROCKSDB_BUSY,
+            [&] { ops.materialize("progress", op.revision, op.sequence); });
+    }
+    close(store);
+    std::cout << "PASS checkpoint WAL rollback phase " << phase << std::endl;
 }
 
 static void
@@ -484,6 +634,15 @@ int
 main(int argc, char **argv)
 {
     try {
+        if (argc == 4
+            && (std::string(argv[1]) == "--crash-progress"
+                || std::string(argv[1]) == "--recover-progress"))
+        {
+            ngx_http_cache_purge_test_checkpoint_loss(argv[2],
+                static_cast<unsigned>(std::strtoul(argv[3], nullptr, 10)),
+                std::string(argv[1]) == "--recover-progress");
+            return 0;
+        }
         if (argc == 4 && std::string(argv[1]) == "--retire-fixture") {
             /*
              * Offline fixture only: no claim of physical work or native
@@ -807,6 +966,7 @@ main(int argc, char **argv)
         ngx_http_cache_purge_test_submission();
         ngx_http_cache_purge_test_requirements();
         ngx_http_cache_purge_test_tag_groups();
+        ngx_http_cache_purge_test_checkpoint_sync();
         std::cout << "PASS " << assertions << " operation assertions; database "
                   << path << std::endl;
         return 0;

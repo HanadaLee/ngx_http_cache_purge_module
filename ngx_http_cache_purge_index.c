@@ -85,6 +85,7 @@ typedef struct {
     ngx_http_cache_purge_op_block_t  *blocks;
     ngx_http_cache_rocksdb_error_t    error;
     int                               status;
+    int                               deferred;
     size_t                            bytes;
     size_t                            count;
     ngx_http_cache_purge_op_row_t     rows[NGX_HTTP_CACHE_PURGE_OP_ROWS];
@@ -849,8 +850,13 @@ ngx_http_cache_purge_op_commit(ngx_http_cache_purge_op_tx_t *tx)
             mutations[nm++].value = row->after.bytes;
         }
     }
-    tx->status = ngx_http_cache_rocksdb_write(tx->store, mutations, nm,
-                                              conditions, nc, &tx->error);
+    if (tx->deferred) {
+        tx->status = ngx_http_cache_rocksdb_write_deferred(tx->store,
+            mutations, nm, conditions, nc, &tx->error);
+    } else {
+        tx->status = ngx_http_cache_rocksdb_write(tx->store, mutations, nm,
+                                                  conditions, nc, &tx->error);
+    }
 }
 
 static int
@@ -1926,11 +1932,11 @@ ngx_http_cache_purge_op_digest(ngx_http_cache_purge_op_tx_t *tx,
     }
 }
 
-int
-ngx_http_cache_purge_operations_checkpoint(
+static int
+ngx_http_cache_purge_operations_checkpoint_internal(
     ngx_http_cache_purge_operations_t *ops, ngx_http_cache_rocksdb_bytes_t id,
     uint64_t revision, const ngx_http_cache_purge_checkpoint_t *point,
-    ngx_http_cache_purge_operation_t *out,
+    ngx_http_cache_purge_operation_t *out, int deferred,
     ngx_http_cache_rocksdb_error_t *error)
 {
     ngx_http_cache_purge_op_tx_t     tx;
@@ -1962,6 +1968,9 @@ ngx_http_cache_purge_operations_checkpoint(
             before.digest_len == 32 && memcmp(before.digest, digest, 32) == 0,
             NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
             "checkpoint ID reused with different progress");
+        if (tx.status == 0 && !deferred) {
+            tx.status = ngx_http_cache_rocksdb_sync(ops->store, &tx.error);
+        }
         ngx_http_cache_purge_op_clone(&tx, &before.op, out);
         return ngx_http_cache_purge_op_result(&tx, out, error);
     }
@@ -1996,7 +2005,30 @@ ngx_http_cache_purge_operations_checkpoint(
     if (after.op.scan_done) {
         after.op.stage = NGX_HTTP_CACHE_PURGE_DRAINING;
     }
+    tx.deferred = deferred;
     return ngx_http_cache_purge_op_update(&tx, &before, &after, out, error);
+}
+
+int
+ngx_http_cache_purge_operations_checkpoint(
+    ngx_http_cache_purge_operations_t *ops, ngx_http_cache_rocksdb_bytes_t id,
+    uint64_t revision, const ngx_http_cache_purge_checkpoint_t *point,
+    ngx_http_cache_purge_operation_t *out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_purge_operations_checkpoint_internal(ops, id,
+        revision, point, out, 0, error);
+}
+
+int
+ngx_http_cache_purge_operations_checkpoint_deferred(
+    ngx_http_cache_purge_operations_t *ops, ngx_http_cache_rocksdb_bytes_t id,
+    uint64_t revision, const ngx_http_cache_purge_checkpoint_t *point,
+    ngx_http_cache_purge_operation_t *out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_purge_operations_checkpoint_internal(ops, id,
+        revision, point, out, 1, error);
 }
 
 int

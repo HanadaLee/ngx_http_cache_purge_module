@@ -19,9 +19,14 @@ No mutation queue or extra thread is added. Ordinary process restarts recover
 the WAL. Machine power loss may lose its unsynchronized cache-record suffix;
 files without a matching index identity refill instead of serving unverified
 data. The interval is an executor scheduling target, not a hard deadline.
-Purge acceptance, invalidation requirements, task checkpoints, retirement and
-in-place 304 validation still synchronize before acknowledgement. File and
-directory fsync ordering is retained.
+Purge acceptance, invalidation requirements, final task completion, retirement
+and in-place 304 validation synchronize before acknowledgement. The executor's
+intermediate checkpoints share the bounded WAL sync group: retirement flushes
+its preceding instance reservation, and completion flushes all prior progress
+before removing FENCE. Power loss can replay intermediate work, but cannot lose
+an accepted task or turn incomplete work into a completed receipt. The explicit
+checkpoint API remains synchronous, including replay of a deferred checkpoint.
+File and directory fsync ordering is retained.
 
 HTTP cache invalidation for nginx proxy, FastCGI, SCGI, and uWSGI caches.
 
@@ -59,8 +64,9 @@ remain retryable without stopping the database owner. Retired records remain for
 subsequent task and native-node cleanup. The executor now advances persisted
 active Delete tasks automatically, one checkpoint or file attempt per event-loop
 pass. It records the selected instance before retirement can remove it from
-enumeration, then resumes that exact instance after a crash. Busy leases and
-per-file failures retain a durable retry; other tasks and IPC continue. Full
+enumeration. Retirement makes that reservation durable in the same WAL barrier;
+if an earlier reservation is lost, the instance remains enumerable. Busy leases
+and per-file failures retain replayable work; other tasks and IPC continue. Full
 entities fetched after the operation are preserved, including replacements.
 
 For native nginx roots, background Delete now hands node accounting back to the
@@ -70,6 +76,11 @@ The event handler uses a try-lock and bounded tree lookup, without database or
 filesystem I/O. It preserves replacements, retries nodes still in use or being
 loaded/deleted, and subtracts the old node's block count once. Task progress is
 not acknowledged before this step; a crash resumes the persisted file identity.
+Task removal and retired-record collection take turns using that slot. A task
+acknowledgement makes collection eligible immediately; a collection
+acknowledgement gives task progress the next turn. Acknowledgement handling does
+not immediately reuse the slot, so neither stream repeatedly postpones the other
+under sustained cleanup.
 Graceful executor shutdown releases the pending lease before DB ownership moves
 to a new worker. No nginx request or cache-node pointers cross into the database
 thread.
