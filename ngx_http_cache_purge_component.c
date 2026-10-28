@@ -7150,6 +7150,10 @@ ngx_http_cache_purge_coordinator_object_step(
             break;
         }
     }
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_index_representations_yield(query->catalog,
+            error);
+    }
     query->status = rc;
     if (rc == 0) {
         ngx_http_cache_purge_control_clear(error);

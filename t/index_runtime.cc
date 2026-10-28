@@ -1207,6 +1207,16 @@ ngx_http_cache_purge_test_representations(const std::string &path)
                     && query == nullptr,
                 "release representation snapshot");
         };
+        auto pause = [&] {
+            check(
+                ngx_http_cache_purge_index_representations_yield(query, &error)
+                    == 0,
+                "release representation traversal cursors");
+            ngx_http_cache_rocksdb_stats_t usage{};
+            check(ngx_http_cache_rocksdb_stats(store, &usage, &error) == 0
+                      && usage.cursor_handles <= 1,
+                "paused catalog retains at most one snapshot anchor");
+        };
         auto aliases = [&](uint32_t kind) {
             check(ngx_http_cache_purge_index_representations_aliases(
                       query, kind, &error)
@@ -1215,6 +1225,7 @@ ngx_http_cache_purge_test_representations(const std::string &path)
             std::set<std::string> values;
             ngx_http_cache_rocksdb_bytes_t value{};
             int rc;
+            pause();
             while ((rc = ngx_http_cache_purge_index_representations_alias_next(
                         query, &value, &error))
                    == 0)
@@ -1222,6 +1233,7 @@ ngx_http_cache_purge_test_representations(const std::string &path)
                 check(
                     values.insert(ngx_http_cache_purge_cpp_bytes(value)).second,
                     "alias pass emits each stored relationship once");
+                pause();
             }
             check(rc == NGX_HTTP_CACHE_ROCKSDB_DONE && value.len == 0,
                 "alias pass completes without a fixed total-count cap");
@@ -1236,11 +1248,13 @@ ngx_http_cache_purge_test_representations(const std::string &path)
                       query, variant, &error)
                       == 0,
                 "select the native variant in the catalog snapshot");
+            pause();
             unsigned count = 0, steps = 0;
             for (;;) {
                 ngx_http_cache_purge_retained_context_t context{};
                 int rc = ngx_http_cache_purge_index_representations_member(
                     query, 1, &context, &error);
+                pause();
                 check(++steps < 20, "membership advances within each budget");
                 if (rc == NGX_HTTP_CACHE_ROCKSDB_DONE) {
                     break;
@@ -1288,6 +1302,7 @@ ngx_http_cache_purge_test_representations(const std::string &path)
                     values.insert(ngx_http_cache_purge_cpp_bytes(vary)).second,
                     "one result per definition across variants and zones");
                 auto definition = ngx_http_cache_purge_cpp_bytes(vary);
+                pause();
                 unsigned selected = definition.empty()      ? 1001 :
                                     definition == "Cookie"  ? 1003 :
                                     definition == "X-Later" ? 1211 :
@@ -1308,9 +1323,9 @@ ngx_http_cache_purge_test_representations(const std::string &path)
             "catalog statistics");
         open();
         check(ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
-                  && after.active_cursors == before.active_cursors + 2
-                  && after.cursor_handles == before.cursor_handles + 2,
-            "catalog holds only two bounded snapshot cursors");
+                  && after.active_cursors == before.active_cursors + 1
+                  && after.cursor_handles == before.cursor_handles + 1,
+            "catalog opens one bounded snapshot anchor");
         check(read()
                   == std::set<std::string>({ "", "Accept-Language", "Cookie" }),
             "catalog merges retained-only fields and excludes other slices");
@@ -1319,7 +1334,7 @@ ngx_http_cache_purge_test_representations(const std::string &path)
                   && before.writes == after.writes
                   && before.active_cursors == after.active_cursors
                   && before.cursor_handles == after.cursor_handles,
-            "catalog is read-only and releases both handles");
+            "catalog is read-only and releases every handle");
         open();
         insert(1211, "X-Later", false);
         index.add_url(first.key, "https://alias.test/later");

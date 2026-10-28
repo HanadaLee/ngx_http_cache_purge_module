@@ -860,6 +860,11 @@ int ngx_http_cache_purge_index_representations_next(
     ngx_http_cache_purge_representation_query_t *query,
     ngx_http_cache_rocksdb_bytes_t *vary,
     ngx_http_cache_rocksdb_error_t *error);
+/* Release traversal cursors between batches, retaining one snapshot anchor.
+ * Resume uses that exact snapshot/deadline and preserves borrowed fields. */
+int ngx_http_cache_purge_index_representations_yield(
+    ngx_http_cache_purge_representation_query_t *query,
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_representations_close(
     ngx_http_cache_purge_representation_query_t **query,
     ngx_http_cache_rocksdb_error_t *error);

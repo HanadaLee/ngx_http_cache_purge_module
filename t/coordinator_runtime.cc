@@ -241,6 +241,56 @@ ngx_http_cache_purge_test_object_propagation()
         result = query(red_headers, 2100);
         check(result.invalidate_ms == 1800 && result.delete_ms == 1500,
             "paged host TAG and URL aliases both participate");
+        {
+            ngx_http_cache_purge_object_query_t *pending[4]{};
+            for (auto &entry : pending) {
+                check(ngx_http_cache_purge_coordinator_object_open(
+                          coordinator.native(), &request, main,
+                          ngx_http_cache_purge_native_bytes(red_headers), 2100,
+                          &entry, &error)
+                          == 0,
+                    "open four interleaved object queries");
+            }
+            unsigned remaining = 4, rounds = 0;
+            while (remaining) {
+                check(++rounds < 1000,
+                    "concurrent objects make progress within their budget");
+                for (auto &entry : pending) {
+                    if (entry == nullptr) {
+                        continue;
+                    }
+                    ngx_http_cache_purge_fence_t fence{};
+                    uint64_t version = 0;
+                    int complete = 0;
+                    check(ngx_http_cache_purge_coordinator_object_step(
+                              entry, 8, &fence, &version, &complete, &error)
+                              == 0,
+                        "four objects share the default eight cursor slots");
+                    if (complete) {
+                        check(fence.invalidate_ms == 1800
+                                  && fence.delete_ms == 1500
+                                  && version == coordinator.publication(),
+                            "concurrent object retains exact requirements");
+                        check(ngx_http_cache_purge_coordinator_object_close(
+                                  &entry, &error)
+                                  == 0,
+                            "release completed interleaved object");
+                        remaining--;
+                    }
+                }
+                ngx_http_cache_rocksdb_stats_t usage{};
+                check(ngx_http_cache_rocksdb_stats(store, &usage, &error) == 0
+                          && usage.cursor_handles == remaining
+                          && usage.active_cursors == remaining,
+                    "pending objects retain one cursor per snapshot");
+                auto background = index.query(
+                    { SelectorKind::namespace_tag, "red", "tenant" });
+                Match matched{};
+                check(background->next(matched) && matched.id == red.id
+                          && !background->next(matched),
+                    "TAG enumeration advances between object query batches");
+            }
+        }
         unsigned char other_main[16] = { 2 };
         result = query(red_headers, 2100, other_main);
         check(result.invalidate_ms == 1800 && result.delete_ms == 0,

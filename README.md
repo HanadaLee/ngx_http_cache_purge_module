@@ -625,6 +625,11 @@ Managed proxy-cache requests now resolve these associations asynchronously at
 the cache-entry gate. One IPC request holds its bounded input until completion,
 disconnect or the original deadline. The executor admits at most four object
 queries and advances eight steps per dispatch, allowing other peers to run.
+Between batches each object retains one snapshot cursor and releases its
+traversal cursors. Resumption seeks past the last returned row using the same
+snapshot and deadline. Four interleaved objects therefore leave room for
+background TAG enumeration within the default eight-cursor budget, without
+raising the handle limit or loading all associations into memory.
 Workers retry transient failures within the existing three-second deadline;
 unresolved failures return 503 rather than treating missing results as empty.
 

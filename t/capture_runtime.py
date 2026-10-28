@@ -1740,7 +1740,9 @@ try:
     original = prop_records(uri, 1)[0]
     for number in range(96):
         alias_uri = '/propagation/aliases/observed-' + str(number)
-        assert prop_get(alias_uri) == (200, 'HIT', uri.encode())
+        response = prop_get(alias_uri)
+        assert response == (200, 'HIT', uri.encode()), (alias_uri, response)
+        prop_records(alias_uri, 1)
     deleted_at = tag_push('prop-many-aliases', 'many-aliases')
     until(lambda: record(original['id'], optional=True) is None)
     policies[alias_uri] = 'alias-old'
