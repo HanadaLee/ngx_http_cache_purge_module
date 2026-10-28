@@ -6292,8 +6292,7 @@ ngx_http_cache_purge_coordinator_keep_file(
     ngx_http_cache_purge_index_file_t           file;
     ngx_http_cache_purge_propagation_context_t  p;
     ngx_http_cache_purge_retention_t            keep;
-    unsigned char                               main[16], variant[16], digit;
-    size_t                                      i;
+    unsigned char                               main[16], variant[16];
     int                                         rc;
 
     if (expected == NULL || now == 0) {
@@ -6344,36 +6343,9 @@ ngx_http_cache_purge_coordinator_keep_file(
     if (rc != 0) {
         goto done;
     }
-    if (file.vary.len) {
-        rc = ngx_http_cache_purge_publication_variant(file.metadata, main,
-            variant, error);
-        if (rc != 0) {
-            goto done;
-        }
-    } else {
-        if (file.path.len < 32
-            || (file.path.len > 32
-                && file.path.data[file.path.len - 33] != '/'))
-        {
-            rc = ngx_http_cache_purge_control_error(error,
-                NGX_HTTP_CACHE_ROCKSDB_INVALID, "cache hash is absent");
-            goto done;
-        }
-        memset(main, 0, sizeof(main));
-        memset(variant, 0, sizeof(variant));
-        for (i = 0; i < 32; i++) {
-            digit = file.path.data[file.path.len - 32 + i];
-            if (digit >= '0' && digit <= '9') {
-                digit -= '0';
-            } else if (digit >= 'a' && digit <= 'f') {
-                digit = (unsigned char) (digit - 'a' + 10);
-            } else {
-                rc = ngx_http_cache_purge_control_error(error,
-                    NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid cache hash");
-                goto done;
-            }
-            main[i / 2] = (unsigned char) ((main[i / 2] << 4) | digit);
-        }
+    rc = ngx_http_cache_purge_publication_native(&file, main, variant, error);
+    if (rc != 0) {
+        goto done;
     }
     rc = ngx_http_cache_purge_index_keep_propagation(c->operations.store,
         expected, main, variant, now, &keep, error);

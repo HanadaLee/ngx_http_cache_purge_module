@@ -796,6 +796,18 @@ int ngx_http_cache_purge_index_prepare(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_file_t *file,
     const unsigned char previous[16], ngx_http_cache_purge_index_match_t *out,
     ngx_http_cache_rocksdb_error_t *error);
+/* The proxy representation posting and preparation intent share one commit.
+ * PREPARED/RETIRED postings do not authorize reuse of a cached entity. */
+int ngx_http_cache_purge_index_prepare_native(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_file_t *file,
+    const unsigned char previous[16], const unsigned char main[16],
+    const unsigned char variant[16], ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+/* Backfill at an exact revision; a repeated binding does not write WAL. */
+int ngx_http_cache_purge_index_bind_native(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file,
+    const unsigned char main[16], const unsigned char variant[16],
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_prepare_batch(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_fill_t *files, size_t count,
     ngx_http_cache_purge_index_match_t *out,
@@ -1064,6 +1076,10 @@ int ngx_http_cache_purge_publication_watermarks(
 int ngx_http_cache_purge_publication_variant(
     ngx_http_cache_rocksdb_bytes_t metadata, unsigned char main[16],
     unsigned char variant[16], ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_publication_native(
+    const ngx_http_cache_purge_index_file_t *file,
+    unsigned char main[16], unsigned char variant[16],
+    ngx_http_cache_rocksdb_error_t *error);
 
 typedef struct {
     ngx_http_cache_rocksdb_bytes_t  root;

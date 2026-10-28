@@ -1381,6 +1381,55 @@ ngx_http_cache_purge_publication_variant(
 }
 
 int
+ngx_http_cache_purge_publication_native(
+    const ngx_http_cache_purge_index_file_t *file,
+    unsigned char main[16], unsigned char variant[16],
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    unsigned char  digest[16], digit;
+    size_t         i;
+
+    if (main != NULL) {
+        memset(main, 0, 16);
+    }
+    if (variant != NULL) {
+        memset(variant, 0, 16);
+    }
+    if (file == NULL || main == NULL || variant == NULL
+        || !ngx_http_cache_purge_publication_valid(file->path, 32768))
+    {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid native identity input");
+    }
+    if (file->vary.len) {
+        return ngx_http_cache_purge_publication_variant(file->metadata,
+            main, variant, error);
+    }
+    if (file->path.len < 32
+        || (file->path.len > 32
+            && file->path.data[file->path.len - 33] != '/'))
+    {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "native cache hash is absent");
+    }
+    memset(digest, 0, sizeof(digest));
+    for (i = 0; i < 32; i++) {
+        digit = file->path.data[file->path.len - 32 + i];
+        if (digit >= '0' && digit <= '9') {
+            digit -= '0';
+        } else if (digit >= 'a' && digit <= 'f') {
+            digit = (unsigned char) (digit - 'a' + 10);
+        } else {
+            return ngx_http_cache_purge_result(error,
+                NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid native cache hash");
+        }
+        digest[i / 2] = (unsigned char) ((digest[i / 2] << 4) | digit);
+    }
+    memcpy(main, digest, 16);
+    return ngx_http_cache_purge_result(error, 0, "");
+}
+
+int
 ngx_http_cache_purge_publication_watermark(
     ngx_http_cache_rocksdb_bytes_t metadata,
     ngx_http_cache_purge_watermark_t *watermark,
@@ -1619,6 +1668,7 @@ ngx_http_cache_purge_publications_prepare(
     ngx_http_cache_rocksdb_bytes_t address, temp_address, relative, prefix;
     struct stat                    received, named, existing, after;
     unsigned char                  digest[16], *proof, *next;
+    unsigned char                  main[16], variant[16];
     uint64_t                       offset;
     size_t                         i, pass, longest, size;
     int                            rc, flags, named_fd, current_fd;
@@ -1826,8 +1876,17 @@ ngx_http_cache_purge_publications_prepare(
     /*
      * Persist intent before writing the marker; errors never authorize rename.
      */
-    rc = ngx_http_cache_purge_index_prepare(store, &file, fill->previous,
-                                            &match, error);
+    if (target->configured.kind == NGX_HTTP_CACHE_PURGE_ROOT_PROXY) {
+        rc = ngx_http_cache_purge_publication_native(&file, main, variant,
+            error);
+        if (rc == 0) {
+            rc = ngx_http_cache_purge_index_prepare_native(store, &file,
+                fill->previous, main, variant, &match, error);
+        }
+    } else {
+        rc = ngx_http_cache_purge_index_prepare(store, &file, fill->previous,
+            &match, error);
+    }
     if (rc != 0) {
         goto done;
     }

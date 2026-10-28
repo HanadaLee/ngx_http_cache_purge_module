@@ -418,7 +418,7 @@ ngx_http_cache_purge_test_host_migration(const std::string &path)
         raw_write(store, cf, damaged, "broken object");
         fails(
             NGX_HTTP_CACHE_ROCKSDB_CORRUPT, [&] { Index interrupted(store); });
-        check(ngx_http_cache_purge_test_raw(store, "M:index") == "7"
+        check(ngx_http_cache_purge_test_raw(store, "M:index") == "8"
                   && ngx_http_cache_purge_test_raw(store, "M:host-cursor")
                          == "O"
                                 + std::string(reinterpret_cast<const char *>(
@@ -463,8 +463,9 @@ ngx_http_cache_purge_test_host_migration(const std::string &path)
         }
         while (index.collect_keys(2)) {
         }
-        check(
-            raw_keys(store, cf).size() == 3 && raw_keys(store, tag_cf).empty(),
+        check(raw_keys(store, cf).size() == 4 && raw_keys(store, tag_cf).empty()
+                  && ngx_http_cache_purge_test_raw(store, "M:native-cursor")
+                         == "O",
             "migrated dictionary references remain balanced after GC");
     }
     check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
@@ -950,6 +951,115 @@ ngx_http_cache_purge_test_tag_groups()
 }
 
 static void
+ngx_http_cache_purge_test_native_bindings(const std::string &path)
+{
+    check(mkdir(path.c_str(), 0700) == 0, "native binding directory");
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    ngx_http_cache_rocksdb_error_t error{};
+    check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
+              == 0,
+        error.message);
+    {
+        Index index(store);
+        auto source = file(801, "/native-binding");
+        auto other = file(802, "/native-binding", "", "b.test", "/cache/b");
+        unsigned char main[16] = { 1 }, variant[16] = { 2 };
+        ngx_http_cache_purge_index_match_t prepared{};
+        ngx_http_cache_rocksdb_stats_t before{}, after{};
+        auto prepare = [&](const File &file, int expected = 0) {
+            auto raw = ngx_http_cache_purge_native_file(file);
+            check(ngx_http_cache_purge_index_prepare_native(
+                      store, &raw, nullptr, main, variant, &prepared, &error)
+                      == expected,
+                error.message);
+        };
+        check(ngx_http_cache_rocksdb_stats(store, &before, &error) == 0,
+            "native preparation write count");
+        prepare(source);
+        check(prepared.state == 1 && prepared.revision == 1,
+            "native binding is prepared with its file intent");
+        check(ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
+                  && after.writes == before.writes + 1,
+            "binding and file preparation use one WAL write");
+        before = after;
+        prepare(source);
+        main[0] = 3;
+        prepare(source, NGX_HTTP_CACHE_ROCKSDB_CONFLICT);
+        main[0] = 1;
+        check(ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
+                  && after.writes == before.writes,
+            "binding replay and rejected identity do not write");
+        prepare(other);
+        index.commit(source.id, 1);
+        index.commit(other.id, 1);
+        std::vector<std::string> postings;
+        auto cf = NGX_HTTP_CACHE_ROCKSDB_DEFAULT;
+        for (const auto &key : raw_keys(store, cf)) {
+            if (key[0] == 'n') {
+                postings.push_back(key);
+                check(key.size() == 65 && key[9] == 1 && key[33] == 2,
+                    "native posting carries main and Vary identity");
+            }
+        }
+        check(postings.size() == 2
+                  && postings[0].substr(0, 49) == postings[1].substr(0, 49),
+            "same representation covers distinct zone files");
+        auto expected = ngx_http_cache_purge_native_expected(source.id, 2);
+        variant[0] = 4;
+        check(ngx_http_cache_purge_index_bind_native(
+                  store, &expected, main, variant, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "published native identity cannot be rebound");
+        variant[0] = 2;
+        auto updated = index.update_metadata(source.id, 2, "304", { "new" });
+        auto retired = index.retire(source.id, updated.revision);
+        std::string reverse =
+            "j"
+            + std::string(reinterpret_cast<const char *>(source.id.data()), 16);
+        auto saved = ngx_http_cache_purge_test_raw(store, reverse);
+        check(saved.size() == 32, "reverse native binding has fixed size");
+        raw_write(store, cf, reverse, "bad");
+        expected =
+            ngx_http_cache_purge_native_expected(source.id, retired.revision);
+        check(ngx_http_cache_purge_index_collect(store, &expected, 1, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+            "corrupt reverse binding prevents partial collection");
+        check(index.get(source.id).revision == retired.revision,
+            "failed native collection leaves its file intact");
+        raw_write(store, cf, reverse, saved);
+        index.collect_file(source.id, retired.revision);
+        retired = index.retire(other.id, 2);
+        index.collect_file(other.id, retired.revision);
+        auto legacy = file(803, "/native-backfill");
+        auto committed = install(index, legacy);
+        expected =
+            ngx_http_cache_purge_native_expected(legacy.id, committed.revision);
+        check(ngx_http_cache_purge_index_bind_native(
+                  store, &expected, main, variant, &error)
+                  == 0,
+            "backfill an exact existing file revision");
+        check(ngx_http_cache_rocksdb_stats(store, &before, &error) == 0,
+            "backfill replay statistics");
+        check(ngx_http_cache_purge_index_bind_native(
+                  store, &expected, main, variant, &error)
+                      == 0
+                  && ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
+                  && before.writes == after.writes,
+            "backfill replay performs no WAL write");
+        retired = index.retire(legacy.id, committed.revision);
+        index.collect_file(legacy.id, retired.revision);
+        while (index.collect_keys(8)) {
+        }
+        check(raw_keys(store, cf).size() == 3,
+            "collection releases native postings and reverse bindings");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
+        "native binding database close");
+}
+
+static void
 ngx_http_cache_purge_test_retention(const std::string &path)
 {
     check(mkdir(path.c_str(), 0700) == 0, "retention directory");
@@ -1004,7 +1114,7 @@ ngx_http_cache_purge_test_retention(const std::string &path)
                     reinterpret_cast<const char *>(first.id.data()), 16));
         raw_write(store, cf, "M:index", "6");
         Index upgraded(store);
-        check(ngx_http_cache_purge_test_raw(store, "M:index") == "7"
+        check(ngx_http_cache_purge_test_raw(store, "M:index") == "8"
                   && ngx_http_cache_purge_test_raw(store,
                          "O"
                              + std::string(reinterpret_cast<const char *>(
@@ -1118,7 +1228,7 @@ ngx_http_cache_purge_test_retention(const std::string &path)
         while (index.collect_keys(1)) {
             check(++rounds < 100, "retained key collection remains bounded");
         }
-        check(raw_keys(store, cf).size() == 3
+        check(raw_keys(store, cf).size() == 4
                   && raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_URL).empty()
                   && raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_TAG).empty(),
             "expiry releases every key, Vary value and identity association");
@@ -1196,7 +1306,7 @@ ngx_http_cache_purge_test_retention(const std::string &path)
             total == 66, "all historical TAG sets were independently retained");
         while (index.collect_keys(1)) {
         }
-        check(raw_keys(store, cf).size() == 3,
+        check(raw_keys(store, cf).size() == 4,
             "large history releases every dictionary reference");
         ngx_http_cache_rocksdb_stats_t before{}, after{};
         check(ngx_http_cache_rocksdb_stats(store, &before, &error) == 0,
@@ -1313,6 +1423,8 @@ main(int argc, char **argv)
         char path[] = "/tmp/cache-purge-index-test-XXXXXX";
         check(mkdtemp(path) != nullptr, "test directory");
         ngx_http_cache_purge_test_tag_groups();
+        ngx_http_cache_purge_test_native_bindings(
+            std::string(path) + "-native");
         ngx_http_cache_rocksdb_options_t options;
         ngx_http_cache_rocksdb_options(&options);
         options.cursor_lifetime_ms = 5000;
@@ -1727,7 +1839,9 @@ main(int argc, char **argv)
             check(raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_TAG).empty(),
                 "TAG CF reclaimed");
             auto keys = raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT);
-            check(keys.size() == 3
+            check(keys.size() == 4
+                      && ngx_http_cache_purge_test_raw(store, "M:native-cursor")
+                             == "O"
                       && std::find(keys.begin(), keys.end(), "M:index")
                              != keys.end()
                       && std::find(keys.begin(), keys.end(), "M:next")
