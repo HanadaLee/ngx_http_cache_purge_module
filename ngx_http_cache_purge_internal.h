@@ -1010,6 +1010,15 @@ int ngx_http_cache_purge_index_representations_member(
     ngx_http_cache_purge_representation_query_t *query, size_t budget,
     ngx_http_cache_purge_retained_context_t *context,
     ngx_http_cache_rocksdb_error_t *error);
+/* Incremental URL/HOST aliases from the same snapshot, without a total-count
+ * cap. Opening resets that alias pass; next returns one borrowed value/DONE. */
+int ngx_http_cache_purge_index_representations_aliases(
+    ngx_http_cache_purge_representation_query_t *query, uint32_t kind,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_representations_alias_next(
+    ngx_http_cache_purge_representation_query_t *query,
+    ngx_http_cache_rocksdb_bytes_t *value,
+    ngx_http_cache_rocksdb_error_t *error);
 
 typedef struct ngx_http_cache_purge_retained_query_s
     ngx_http_cache_purge_retained_query_t;
@@ -1099,6 +1108,29 @@ int ngx_http_cache_purge_coordinator_history_step(
     ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_coordinator_history_close(
     ngx_http_cache_purge_history_query_t **query,
+    ngx_http_cache_rocksdb_error_t *error);
+
+typedef struct ngx_http_cache_purge_object_query_s
+    ngx_http_cache_purge_object_query_t;
+
+/* Borrow request fields and a bounded HTTP header snapshot until close.
+ * Headers encode u32 count, then name/value pairs as u32-length byte strings,
+ * in native request-list order, excluding entries whose nginx hash is zero.
+ * Steps visit a bounded number of definitions/members/aliases. Only a complete
+ * unchanged-publication result is exposed; errors require closing/restarting.
+ */
+int ngx_http_cache_purge_coordinator_object_open(
+    ngx_http_cache_purge_coordinator_t *coordinator,
+    const ngx_http_cache_purge_control_context_t *request,
+    const unsigned char main[16], ngx_http_cache_rocksdb_bytes_t headers,
+    uint64_t now, ngx_http_cache_purge_object_query_t **query,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_coordinator_object_step(
+    ngx_http_cache_purge_object_query_t *query, size_t budget,
+    ngx_http_cache_purge_fence_t *out, uint64_t *publication, int *done,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_coordinator_object_close(
+    ngx_http_cache_purge_object_query_t **query,
     ngx_http_cache_rocksdb_error_t *error);
 
 #ifdef __cplusplus

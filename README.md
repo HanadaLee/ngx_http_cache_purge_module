@@ -582,7 +582,13 @@ the same snapshot. Definition scans seek past whole variant groups. Unfinished
 migration and expired or corrupt snapshots return errors rather than a false
 empty result; uncommitted file postings do not supply TAG memberships.
 
-Full propagation remains unfinished: representation selection and request-path
+The coordinator can aggregate these memberships and paged URL/host aliases in
+bounded steps. It selects native Vary hashes from a transient snapshot of the
+proxy request headers, preserving duplicate-header order and nginx's Accept-*
+normalization. Headers are neither logged nor persisted. A control publication
+change or expired snapshot discards the partial result and requires a retry.
+
+Full propagation remains unfinished: IPC scheduling and request-path
 integration are still pending. The intended
 TAG scope is known current or retained edge associations; completely unknown
 objects proceed upstream without TAG-specific retry or broader invalidation.

@@ -4,6 +4,7 @@
 
 #include "ngx_http_cache_purge_internal.h"
 
+#include <openssl/evp.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -6451,6 +6452,459 @@ ngx_http_cache_purge_coordinator_expire_propagation(
         c->operations.store, now, budget,
         c->count ? ngx_http_cache_purge_component_retention_guard : NULL,
         c, processed, error);
+}
+
+struct ngx_http_cache_purge_object_query_s {
+    ngx_http_cache_purge_coordinator_t          *coordinator;
+    ngx_http_cache_purge_representation_query_t *catalog;
+    ngx_http_cache_purge_control_context_t       request;
+    ngx_http_cache_purge_propagation_context_t   match;
+    ngx_http_cache_rocksdb_bytes_t               headers;
+    ngx_http_cache_rocksdb_bytes_t               tags[64];
+    unsigned char                                main[16];
+    uint64_t                                     now, publication;
+    uint32_t                                     header_count;
+    unsigned                                     phase;
+    int                                          done, status;
+};
+
+static unsigned char
+ngx_http_cache_purge_variant_lower(unsigned char ch)
+{
+    return ch >= 'A' && ch <= 'Z' ? (unsigned char) (ch | 0x20) : ch;
+}
+
+static int
+ngx_http_cache_purge_variant_equal(ngx_http_cache_rocksdb_bytes_t a,
+    ngx_http_cache_rocksdb_bytes_t b)
+{
+    size_t  i;
+
+    if (a.len != b.len) {
+        return 0;
+    }
+    for (i = 0; i < a.len; i++) {
+        if (ngx_http_cache_purge_variant_lower(a.data[i]) != b.data[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Mirrors ngx_http_file_cache_vary(), including duplicate header order and
+ * its space/comma normalization for the three Accept-* header fields. */
+static int
+ngx_http_cache_purge_object_variant(ngx_http_cache_purge_object_query_t *query,
+    ngx_http_cache_rocksdb_bytes_t vary, unsigned char variant[16],
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_component_decoder_t  d;
+    ngx_http_cache_rocksdb_bytes_t            name, key, value;
+    EVP_MD_CTX                               *md;
+    unsigned char                             lowered[255], digest[16];
+    size_t                                    i, at, start, pos, token;
+    uint32_t                                  h;
+    unsigned                                  size;
+    int                                       multiple, normalize, rc;
+
+    memset(variant, 0, 16);
+    if (vary.len == 0) {
+        return 0;
+    }
+    if (vary.len > sizeof(lowered)) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "native Vary exceeds header limit");
+    }
+    for (i = 0; i < vary.len; i++) {
+        lowered[i] = ngx_http_cache_purge_variant_lower(vary.data[i]);
+    }
+    md = EVP_MD_CTX_new();
+    if (md == NULL) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "variant digest allocation failed");
+    }
+    rc = NGX_HTTP_CACHE_ROCKSDB_IO;
+    if (EVP_DigestInit_ex(md, EVP_md5(), NULL) != 1
+        || EVP_DigestUpdate(md, query->main, 16) != 1)
+    {
+        goto done;
+    }
+    at = 0;
+    while (at < vary.len) {
+        while (at < vary.len && (lowered[at] == ' ' || lowered[at] == ',')) {
+            at++;
+        }
+        start = at;
+        while (at < vary.len && lowered[at] != ',' && lowered[at] != ' ') {
+            at++;
+        }
+        name.data = lowered + start;
+        name.len = at - start;
+        if (!name.len) {
+            break;
+        }
+        if (EVP_DigestUpdate(md, name.data, name.len) != 1
+            || EVP_DigestUpdate(md, ":", 1) != 1)
+        {
+            goto done;
+        }
+        normalize = (name.len == 14
+                     && memcmp(name.data, "accept-charset", 14) == 0)
+                    || (name.len == 15
+                        && (memcmp(name.data, "accept-encoding", 15) == 0
+                            || memcmp(name.data, "accept-language", 15) == 0));
+        multiple = 0;
+        memset(&d, 0, sizeof(d));
+        d.data = query->headers.data;
+        d.len = query->headers.len;
+        d.at = 4;
+        d.error = error;
+        for (h = 0; h < query->header_count; h++) {
+            key = ngx_http_cache_purge_component_string(&d, 524288);
+            value = ngx_http_cache_purge_component_string(&d, 524288);
+            if (d.rc != 0) {
+                rc = d.rc;
+                goto done;
+            }
+            if (!ngx_http_cache_purge_variant_equal(key, name)) {
+                continue;
+            }
+            if (!normalize) {
+                if ((multiple && EVP_DigestUpdate(md, ",", 1) != 1)
+                    || EVP_DigestUpdate(md, value.data, value.len) != 1)
+                {
+                    goto done;
+                }
+                multiple = 1;
+                continue;
+            }
+            pos = 0;
+            while (pos < value.len) {
+                while (pos < value.len
+                       && (value.data[pos] == ' ' || value.data[pos] == ','))
+                {
+                    pos++;
+                }
+                token = pos;
+                while (pos < value.len && value.data[pos] != ','
+                       && value.data[pos] != ' ')
+                {
+                    pos++;
+                }
+                if (pos == token) {
+                    break;
+                }
+                if ((multiple && EVP_DigestUpdate(md, ",", 1) != 1)
+                    || EVP_DigestUpdate(md, value.data + token, pos - token)
+                       != 1)
+                {
+                    goto done;
+                }
+                multiple = 1;
+            }
+        }
+        if (EVP_DigestUpdate(md, "\r\n", 2) != 1) {
+            goto done;
+        }
+    }
+    if (EVP_DigestFinal_ex(md, digest, &size) == 1 && size == 16) {
+        memcpy(variant, digest, 16);
+        rc = 0;
+    }
+
+done:
+    EVP_MD_CTX_free(md);
+    return ngx_http_cache_purge_control_error(error, rc,
+        rc == 0 ? "" : "native variant digest failed");
+}
+
+static int
+ngx_http_cache_purge_object_lookup(ngx_http_cache_purge_object_query_t *query,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_watermark_t  watermark;
+    uint64_t                          publication;
+    int                               rc;
+
+    query->match.remaining = NGX_HTTP_CACHE_PURGE_CONTROL_MAX;
+    rc = ngx_http_cache_purge_control_propagation(
+        query->coordinator->validation_reader, &query->match.context, 1,
+        NGX_HTTP_CACHE_PURGE_CONTROL_MAX, NGX_HTTP_CACHE_PURGE_CONTROL_BYTES,
+        ngx_http_cache_purge_component_propagation_match, &query->match,
+        &watermark, &publication, error);
+    if (rc == 0 && publication != query->publication) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_BUSY, "object control publication changed");
+    }
+    return rc;
+}
+
+int
+ngx_http_cache_purge_coordinator_object_open(
+    ngx_http_cache_purge_coordinator_t *c,
+    const ngx_http_cache_purge_control_context_t *request,
+    const unsigned char main[16], ngx_http_cache_rocksdb_bytes_t headers,
+    uint64_t now, ngx_http_cache_purge_object_query_t **out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_object_query_t      *query;
+    ngx_http_cache_purge_component_decoder_t  d;
+    uint32_t                                  count, i;
+    int                                       rc;
+
+    if (out != NULL) {
+        *out = NULL;
+    }
+    if (out == NULL || request == NULL || main == NULL || !now
+        || !request->key.len || !request->url.len || !request->host.len
+        || !ngx_http_cache_purge_control_bytes_valid(request->key, 32768)
+        || !ngx_http_cache_purge_control_bytes_valid(request->url, 32768)
+        || !ngx_http_cache_purge_control_bytes_valid(request->host, 32768)
+        || !ngx_http_cache_purge_control_bytes_valid(
+            request->tag_namespace, 32768)
+        || !ngx_http_cache_purge_control_bytes_valid(headers, 524288)
+        || headers.len < 4)
+    {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid object propagation input");
+    }
+    rc = ngx_http_cache_purge_control_coordinator_owner(c, error);
+    if (rc != 0) {
+        return rc;
+    }
+    if (c->state != NGX_HTTP_CACHE_PURGE_COORD_READY) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_BUSY, "object query awaits publication");
+    }
+    memset(&d, 0, sizeof(d));
+    d.data = headers.data;
+    d.len = headers.len;
+    d.error = error;
+    count = (uint32_t) ngx_http_cache_purge_component_integer(&d, 4);
+    if (count > (headers.len - 4) / 8) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid object header count");
+    }
+    for (i = 0; i < count && d.rc == 0; i++) {
+        (void) ngx_http_cache_purge_component_string(&d, 524288);
+        (void) ngx_http_cache_purge_component_string(&d, 524288);
+    }
+    rc = ngx_http_cache_purge_component_end(&d);
+    if (rc != 0) {
+        return rc;
+    }
+    if (c->validation_reader == NULL) {
+        rc = ngx_http_cache_purge_control_reader_open(c->shared,
+            c->shared_bytes, &c->validation_reader, error);
+        if (rc != 0) {
+            return rc;
+        }
+    }
+    query = calloc(1, sizeof(*query));
+    if (query == NULL) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "object query allocation failed");
+    }
+    rc = ngx_http_cache_purge_index_representations_open(c->operations.store,
+        request->key, main, &query->catalog, error);
+    if (rc != 0) {
+        free(query);
+        return rc;
+    }
+    query->coordinator = c;
+    query->request = *request;
+    query->request.tags = NULL;
+    query->request.tag_count = 0;
+    query->request.proxy = 1;
+    query->request.now_ms = now;
+    query->match.coordinator = c;
+    query->match.context = query->request;
+    query->headers = headers;
+    query->header_count = count;
+    memcpy(query->main, main, 16);
+    query->now = now;
+    query->publication = c->publication;
+    *out = query;
+    return 0;
+}
+
+int
+ngx_http_cache_purge_coordinator_object_step(
+    ngx_http_cache_purge_object_query_t *query, size_t budget,
+    ngx_http_cache_purge_fence_t *out, uint64_t *publication, int *done,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_coordinator_t      *c;
+    ngx_http_cache_purge_control_context_t  *context;
+    ngx_http_cache_purge_retained_context_t  member;
+    ngx_http_cache_purge_fence_t            *fence;
+    ngx_http_cache_rocksdb_bytes_t           value;
+    unsigned char                            variant[16];
+    size_t                                   i;
+    int                                      rc;
+    static const ngx_http_cache_rocksdb_bytes_t empty = { NULL, 0 };
+
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (publication != NULL) {
+        *publication = 0;
+    }
+    if (done != NULL) {
+        *done = 0;
+    }
+    if (query == NULL || out == NULL || publication == NULL || done == NULL
+        || !budget || budget > 32)
+    {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid object propagation step");
+    }
+    c = query->coordinator;
+    rc = ngx_http_cache_purge_control_coordinator_owner(c, error);
+    if (rc != 0) {
+        return rc;
+    }
+    if (query->status != 0) {
+        return ngx_http_cache_purge_control_error(error, query->status,
+            "object query must be restarted");
+    }
+    if (c->state != NGX_HTTP_CACHE_PURGE_COORD_READY
+        || c->publication != query->publication)
+    {
+        query->status = NGX_HTTP_CACHE_ROCKSDB_BUSY;
+        return ngx_http_cache_purge_control_error(error, query->status,
+            "object query publication changed");
+    }
+    context = &query->match.context;
+    fence = &query->match.fence;
+    rc = 0;
+    for (i = 0; i < budget && !query->done && rc == 0; i++) {
+        switch (query->phase) {
+        case 0:
+            /* Identity-only rules first. TAGs come from actual memberships. */
+            rc = ngx_http_cache_purge_object_lookup(query, error);
+            if (rc == 0) {
+                rc = ngx_http_cache_purge_index_representations_aliases(
+                    query->catalog, NGX_HTTP_CACHE_PURGE_HOST, error);
+            }
+            context->key = context->url = context->tag_namespace = empty;
+            query->phase = 1;
+            break;
+        case 1:
+        case 2:
+        case 5:
+            rc = ngx_http_cache_purge_index_representations_alias_next(
+                query->catalog, &value, error);
+            if (rc == NGX_HTTP_CACHE_ROCKSDB_DONE) {
+                rc = 0;
+                if (query->phase == 1) {
+                    context->host = empty;
+                    rc = ngx_http_cache_purge_index_representations_aliases(
+                        query->catalog, NGX_HTTP_CACHE_PURGE_URL, error);
+                    query->phase = 2;
+                } else {
+                    query->phase = query->phase == 2 ? 3 : 4;
+                }
+                break;
+            }
+            if (rc == 0) {
+                if (query->phase == 2) {
+                    context->url = value;
+                } else {
+                    context->host = value;
+                }
+                rc = ngx_http_cache_purge_object_lookup(query, error);
+            }
+            break;
+        case 3:
+            rc = ngx_http_cache_purge_index_representations_next(
+                query->catalog, &value, error);
+            if (rc == NGX_HTTP_CACHE_ROCKSDB_DONE) {
+                query->done = 1;
+                rc = 0;
+                break;
+            }
+            if (rc == 0) {
+                rc = ngx_http_cache_purge_object_variant(query, value,
+                    variant, error);
+            }
+            if (rc == 0) {
+                rc = ngx_http_cache_purge_index_representations_select(
+                    query->catalog, variant, error);
+                query->phase = 4;
+            }
+            break;
+        case 4:
+            rc = ngx_http_cache_purge_index_representations_member(
+                query->catalog, 1, &member, error);
+            if (rc == NGX_HTTP_CACHE_ROCKSDB_BUSY) {
+                rc = 0;
+                break;
+            }
+            if (rc == NGX_HTTP_CACHE_ROCKSDB_DONE) {
+                query->phase = 3;
+                rc = 0;
+                break;
+            }
+            if (rc != 0) {
+                break;
+            }
+            *context = query->request;
+            context->key = member.key;
+            context->tag_namespace = member.tag_namespace;
+            memcpy(query->tags, member.tags,
+                member.tag_count * sizeof(member.tags[0]));
+            context->tags = query->tags;
+            context->tag_count = member.tag_count;
+            if (query->now < member.times.invalidate_until_ms
+                && member.times.invalidate_ms > fence->invalidate_ms)
+            {
+                fence->invalidate_ms = member.times.invalidate_ms;
+            }
+            if (query->now < member.times.delete_until_ms
+                && member.times.delete_ms > fence->delete_ms)
+            {
+                fence->delete_ms = member.times.delete_ms;
+            }
+            rc = ngx_http_cache_purge_object_lookup(query, error);
+            context->key = context->url = context->tag_namespace = empty;
+            if (rc == 0) {
+                rc = ngx_http_cache_purge_index_representations_aliases(
+                    query->catalog, NGX_HTTP_CACHE_PURGE_HOST, error);
+                query->phase = 5;
+            }
+            break;
+        }
+    }
+    query->status = rc;
+    if (rc == 0 && query->done) {
+        *out = *fence;
+        *publication = query->publication;
+        *done = 1;
+    }
+    return rc;
+}
+
+int
+ngx_http_cache_purge_coordinator_object_close(
+    ngx_http_cache_purge_object_query_t **out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_object_query_t  *query;
+    int                                   rc;
+
+    if (out == NULL || *out == NULL) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "null object query");
+    }
+    query = *out;
+    rc = ngx_http_cache_purge_index_representations_close(&query->catalog,
+        error);
+    if (rc == 0) {
+        free(query);
+        *out = NULL;
+    }
+    return rc;
 }
 
 struct ngx_http_cache_purge_history_query_s {

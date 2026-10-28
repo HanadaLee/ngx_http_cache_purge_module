@@ -1,4 +1,5 @@
 #include "ngx_http_cache_purge_test.hpp"
+#include <openssl/evp.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <iostream>
@@ -65,6 +66,257 @@ lookup(ngx_http_cache_purge_control_reader_t *reader, uint64_t *out,
     out[0] = out[1] = 0;
     return ngx_http_cache_purge_control_match(
         reader, &context, 64, 65536, visit, out, &version, &error);
+}
+
+static void
+ngx_http_cache_purge_test_object_propagation()
+{
+    char path[] = "/tmp/ncp-object-propagation-XXXXXX";
+    check(mkdtemp(path) != nullptr, "object propagation directory");
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    check(ngx_http_cache_rocksdb_open(path, &options, &store, &error) == 0,
+        error.message);
+    size_t size = ngx_http_cache_purge_control_size(262144, 8);
+    void *shared = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    check(shared != MAP_FAILED
+              && ngx_http_cache_purge_control_init(
+                     shared, size, 262144, 8, &error)
+                     == 0,
+        "object propagation shared region");
+    {
+        Index index(store);
+        Operations operations(store);
+        Coordinator coordinator(operations, shared, size);
+        ready(coordinator);
+        unsigned char main[16] = { 1 }, red_variant[16], blue_variant[16];
+        auto hash = [&](const std::string &language, unsigned char *out) {
+            std::string data(reinterpret_cast<char *>(main), 16);
+            data += "accept-charset:UTF-8,ISO-8859-1\r\n"
+                    "accept-encoding:gzip,br\r\naccept-language:";
+            data += language;
+            data += "\r\ncookie:a=1;  b=2,c=3\r\nx-empty:,\r\n";
+            unsigned length;
+            check(EVP_Digest(data.data(), data.size(), out, &length, EVP_md5(),
+                      nullptr)
+                          == 1
+                      && length == 16,
+                "independent expected native Vary input");
+        };
+        hash("en,fr,de", red_variant);
+        hash("de", blue_variant);
+        File red;
+        red.id[15] = 1;
+        red.key = "object-key";
+        red.url = "https://cache.test/item";
+        red.host = "cache.test";
+        red.tag_namespace = "tenant";
+        red.root = "/cache";
+        red.zone = "a";
+        red.path = "red";
+        red.tags = { "red" };
+        red.vary = " Accept-Charset, Accept-Encoding, Accept-Language, Cookie, "
+                   "X-Empty ";
+        File blue = red;
+        blue.id[15] = 2;
+        blue.path = "blue";
+        blue.tags = { "blue" };
+        for (const auto &file : { red, blue }) {
+            ngx_http_cache_purge_index_match_t prepared{};
+            auto raw = ngx_http_cache_purge_native_file(file);
+            check(
+                ngx_http_cache_purge_index_prepare_native(store, &raw, nullptr,
+                    main, file.id == red.id ? red_variant : blue_variant,
+                    &prepared, &error)
+                    == 0,
+                error.message);
+            index.commit(file.id, prepared.revision);
+        }
+        auto encode = [](bool english) {
+            std::vector<std::pair<std::string, std::string>> fields{
+                { "Accept-Charset", " UTF-8 ,ISO-8859-1" },
+                { "accept-Encoding", " gzip,  br " },
+                { "Accept-Language", english ? " en, fr  " : "" },
+                { "accept-language", "de" }, { "Cookie", "a=1;  b=2" },
+                { "cookie", "c=3" }, { "X-Empty", "" }, { "x-empty", "" },
+                { "X-Unrelated", "not indexed" }
+            };
+            std::string out;
+            auto number = [&](uint32_t n) {
+                for (int i = 3; i >= 0; i--) {
+                    out += static_cast<char>(n >> (8 * i));
+                }
+            };
+            number(fields.size());
+            for (const auto &field : fields) {
+                number(field.first.size());
+                out += field.first;
+                number(field.second.size());
+                out += field.second;
+            }
+            return out;
+        };
+        auto red_headers = encode(true), blue_headers = encode(false);
+        const std::string other_namespace = "other";
+        const std::string unknown_key = "never-indexed";
+        ngx_http_cache_purge_control_context_t request{};
+        request.key = ngx_http_cache_purge_native_bytes(red.key);
+        request.url = ngx_http_cache_purge_native_bytes(red.url);
+        request.host = ngx_http_cache_purge_native_bytes(red.host);
+        request.tag_namespace =
+            ngx_http_cache_purge_native_bytes(other_namespace);
+        auto query = [&](const std::string &headers, uint64_t now,
+                         const unsigned char *identity = nullptr) {
+            ngx_http_cache_purge_object_query_t *q = nullptr;
+            check(
+                ngx_http_cache_purge_coordinator_object_open(
+                    coordinator.native(), &request, identity ? identity : main,
+                    ngx_http_cache_purge_native_bytes(headers), now, &q, &error)
+                    == 0,
+                error.message);
+            ngx_http_cache_purge_fence_t result{};
+            uint64_t publication = 0;
+            int done = 0;
+            unsigned steps = 0;
+            while (!done) {
+                check(ngx_http_cache_purge_coordinator_object_step(
+                          q, 1, &result, &publication, &done, &error)
+                          == 0,
+                    error.message);
+                check(++steps < 1000, "object query makes bounded progress");
+                check(done
+                          || (!result.invalidate_ms && !result.delete_ms
+                              && !publication),
+                    "object query publishes no partial requirement");
+            }
+            check(publication == coordinator.publication(),
+                "object query retains its exact publication");
+            check(
+                ngx_http_cache_purge_coordinator_object_close(&q, &error) == 0,
+                "close object query");
+            return result;
+        };
+        auto add = [&](const std::string &name, Selector selector,
+                       PurgeMode mode, uint64_t issued) {
+            OperationInput input{ name, selector, mode, issued,
+                "object-query" };
+            auto op = coordinator.accept(input, 2000, 120000);
+            ready(coordinator);
+            operations.activate(op.input.id, op.revision, 2000);
+            coordinator.refresh();
+            ready(coordinator);
+        };
+        add("red", { SelectorKind::namespace_tag, "red", "tenant" },
+            PurgeMode::invalidate, 1000);
+        add("blue", { SelectorKind::namespace_tag, "blue", "tenant" },
+            PurgeMode::remove, 2000);
+        add("wrong", { SelectorKind::namespace_tag, "red", "other" },
+            PurgeMode::remove, 9000);
+        auto result = query(red_headers, 2100);
+        check(result.invalidate_ms == 1000 && result.delete_ms == 0,
+            "native normalization selects red without caller-namespace "
+            "pollution");
+        result = query(blue_headers, 2100);
+        check(result.invalidate_ms == 0 && result.delete_ms == 2000,
+            "other Vary representation has independent TAG requirements");
+        result = query(std::string(4, '\0'), 2100);
+        check(result.invalidate_ms == 0 && result.delete_ms == 0,
+            "unknown Vary has no TAG compensation");
+        for (unsigned i = 0; i < 90; i++) {
+            auto host = "alias-" + std::to_string(i) + ".test";
+            check(ngx_http_cache_purge_index_observe(store, request.key,
+                      ngx_http_cache_purge_native_bytes(
+                          "https://" + host + "/item"),
+                      ngx_http_cache_purge_native_bytes(host), &error)
+                      == 0,
+                "object aliases beyond the old fixed limit");
+        }
+        add("alias-red", { SelectorKind::host_tag, "red", "alias-89.test" },
+            PurgeMode::remove, 1500);
+        add("alias-url",
+            { SelectorKind::url, "https://alias-88.test/item", "" },
+            PurgeMode::invalidate, 1800);
+        result = query(red_headers, 2100);
+        check(result.invalidate_ms == 1800 && result.delete_ms == 1500,
+            "paged host TAG and URL aliases both participate");
+        unsigned char other_main[16] = { 2 };
+        result = query(red_headers, 2100, other_main);
+        check(result.invalidate_ms == 1800 && result.delete_ms == 0,
+            "unknown slice inherits identity rules but not another slice's "
+            "TAGs");
+        auto expected = ngx_http_cache_purge_native_expected(red.id, 2);
+        ngx_http_cache_purge_retention_t retained{ 1000, 10000, 1500, 10000 };
+        check(ngx_http_cache_purge_index_keep_propagation(
+                  store, &expected, main, red_variant, 2100, &retained, &error)
+                  == 0,
+            "retain selected representation before its file is removed");
+        auto retired = index.retire(red.id, 2);
+        index.collect_file(red.id, retired.revision);
+        add("later-red", { SelectorKind::namespace_tag, "red", "tenant" },
+            PurgeMode::invalidate, 2500);
+        result = query(red_headers, 3000);
+        check(result.invalidate_ms == 2500 && result.delete_ms == 1500,
+            "deleted known representation matches later local TAG rules");
+        result = query(red_headers, 123000);
+        check(result.invalidate_ms == 0 && result.delete_ms == 0,
+            "expired outgoing windows do not emit requirements");
+        request.key = ngx_http_cache_purge_native_bytes(unknown_key);
+        result = query(red_headers, 3000);
+        check(result.invalidate_ms == 0 && result.delete_ms == 0,
+            "confirmed unknown key proceeds without TAG compensation");
+        ngx_http_cache_purge_object_query_t *q = nullptr;
+        std::string malformed = red_headers + "trailing";
+        check(ngx_http_cache_purge_coordinator_object_open(coordinator.native(),
+                  &request, main, ngx_http_cache_purge_native_bytes(malformed),
+                  3000, &q, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_INVALID
+                  && !q,
+            "malformed header snapshot never starts a query");
+        request.key = ngx_http_cache_purge_native_bytes(red.key);
+        check(
+            ngx_http_cache_purge_coordinator_object_open(coordinator.native(),
+                &request, main, ngx_http_cache_purge_native_bytes(red_headers),
+                3000, &q, &error)
+                == 0,
+            "open publication race query");
+        uint64_t publication = 99;
+        int done = 99;
+        check(ngx_http_cache_purge_coordinator_object_step(
+                  q, 1, &result, &publication, &done, &error)
+                      == 0
+                  && !done && !publication,
+            "start object query before control change");
+        add("racing", { SelectorKind::namespace_tag, "red", "tenant" },
+            PurgeMode::remove, 3000);
+        check(ngx_http_cache_purge_coordinator_object_step(
+                  q, 1, &result, &publication, &done, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_BUSY
+                  && !done && !publication && !result.invalidate_ms
+                  && !result.delete_ms,
+            "changed control image discards all partial requirements");
+        check(ngx_http_cache_purge_coordinator_object_close(&q, &error) == 0,
+            "close raced object query");
+        check(
+            ngx_http_cache_purge_coordinator_object_open(coordinator.native(),
+                &request, main, ngx_http_cache_purge_native_bytes(red_headers),
+                3000, &q, &error)
+                == 0,
+            "open expiring object query");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        check(ngx_http_cache_purge_coordinator_object_step(
+                  q, 1, &result, &publication, &done, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_EXPIRED
+                  && !done && !publication && !result.invalidate_ms
+                  && !result.delete_ms,
+            "expired snapshot never becomes a successful empty object result");
+        check(ngx_http_cache_purge_coordinator_object_close(&q, &error) == 0,
+            "close expired object query");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
+        "close object propagation database");
+    munmap(shared, size);
 }
 
 static void
@@ -482,6 +734,7 @@ main(int argc, char **argv)
     try {
         if (argc == 1) {
             ngx_http_cache_purge_test_file_propagation();
+            ngx_http_cache_purge_test_object_propagation();
             ngx_http_cache_purge_test_retention();
         }
         char temporary[] = "/tmp/ncp-coordinator-XXXXXX";

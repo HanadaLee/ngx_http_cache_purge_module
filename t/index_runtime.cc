@@ -1015,6 +1015,8 @@ ngx_http_cache_purge_test_native_migration(const std::string &path)
         raw_write(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, "M:index", "8");
         Index upgraded(store);
         check(!ready(files[0]), "unfinished migration is not an empty catalog");
+        check(ready(file(999, "/never-indexed")),
+            "migration does not block a key absent from the persistent index");
         int done = 99;
         check(ngx_http_cache_purge_index_migrate_native(
                   store, 1, resolve, &resolution, &done, &error)
@@ -1125,7 +1127,7 @@ ngx_http_cache_purge_test_representations(const std::string &path)
     check(mkdir(path.c_str(), 0700) == 0, "representation directory");
     ngx_http_cache_rocksdb_options_t options;
     ngx_http_cache_rocksdb_options(&options);
-    options.cursor_lifetime_ms = 300;
+    options.cursor_lifetime_ms = 1000;
     ngx_http_cache_rocksdb_t *store = nullptr;
     ngx_http_cache_rocksdb_error_t error{};
     check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
@@ -1186,6 +1188,9 @@ ngx_http_cache_purge_test_representations(const std::string &path)
                 "pending members share a selected representation");
         }
         ngx_http_cache_purge_representation_query_t *query = nullptr;
+        for (unsigned i = 0; i < 90; i++) {
+            index.add_url(first.key, "https://alias.test/" + std::to_string(i));
+        }
         auto open = [&](int expected = 0) {
             check(ngx_http_cache_purge_index_representations_open(store,
                       ngx_http_cache_purge_native_bytes(first.key), main,
@@ -1201,6 +1206,26 @@ ngx_http_cache_purge_test_representations(const std::string &path)
                         == 0
                     && query == nullptr,
                 "release representation snapshot");
+        };
+        auto aliases = [&](uint32_t kind) {
+            check(ngx_http_cache_purge_index_representations_aliases(
+                      query, kind, &error)
+                      == 0,
+                "open incremental alias pass");
+            std::set<std::string> values;
+            ngx_http_cache_rocksdb_bytes_t value{};
+            int rc;
+            while ((rc = ngx_http_cache_purge_index_representations_alias_next(
+                        query, &value, &error))
+                   == 0)
+            {
+                check(
+                    values.insert(ngx_http_cache_purge_cpp_bytes(value)).second,
+                    "alias pass emits each stored relationship once");
+            }
+            check(rc == NGX_HTTP_CACHE_ROCKSDB_DONE && value.len == 0,
+                "alias pass completes without a fixed total-count cap");
+            return values;
         };
         std::string expected_tag = "photo";
         auto members = [&](unsigned selected) {
@@ -1241,6 +1266,12 @@ ngx_http_cache_purge_test_representations(const std::string &path)
                 check(context.times.invalidate_ms
                           == (selected == 1003 || selected == 1004 ? 10 : 0),
                     "historical requirements survive selected file removal");
+                auto before = ngx_http_cache_purge_cpp_bytes(context.key);
+                check(aliases(NGX_HTTP_CACHE_PURGE_URL).size() >= 91
+                          && !aliases(NGX_HTTP_CACHE_PURGE_HOST).empty(),
+                    "selected membership can match arbitrarily paged aliases");
+                check(ngx_http_cache_purge_cpp_bytes(context.key) == before,
+                    "alias dictionary reads preserve borrowed membership");
                 count++;
             }
             return count;
@@ -1291,6 +1322,11 @@ ngx_http_cache_purge_test_representations(const std::string &path)
             "catalog is read-only and releases both handles");
         open();
         insert(1211, "X-Later", false);
+        index.add_url(first.key, "https://alias.test/later");
+        check(
+            aliases(NGX_HTTP_CACHE_PURGE_URL).count("https://alias.test/later")
+                == 0,
+            "alias pass shares the opening representation snapshot");
         index.update_metadata(id(1002), 2, "later", { "new-later" });
         check(read()
                   == std::set<std::string>({ "", "Accept-Language", "Cookie" }),
@@ -1298,6 +1334,10 @@ ngx_http_cache_purge_test_representations(const std::string &path)
         close();
         expected_tag = "new-later";
         open();
+        check(
+            aliases(NGX_HTTP_CACHE_PURGE_URL).count("https://alias.test/later")
+                == 1,
+            "a new alias pass sees later relationships after reopening");
         check(read().count("X-Later") == 1,
             "new catalog observes later Vary definitions");
         close();
@@ -1344,7 +1384,7 @@ ngx_http_cache_purge_test_representations(const std::string &path)
         close();
         raw_write(store, cf, reverse, binding);
         open();
-        std::this_thread::sleep_for(std::chrono::milliseconds(350));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
         ngx_http_cache_rocksdb_bytes_t vary{};
         check(ngx_http_cache_purge_index_representations_next(
                   query, &vary, &error)
@@ -1358,6 +1398,8 @@ ngx_http_cache_purge_test_representations(const std::string &path)
         close();
         first.key = "unknown-key";
         open();
+        check(aliases(NGX_HTTP_CACHE_PURGE_URL).empty(),
+            "absent key has no alias cursor or relationships");
         check(read().empty(), "confirmed absent key has no definitions");
         close();
     }

@@ -6068,13 +6068,19 @@ ngx_http_cache_purge_index_native_ready(ngx_http_cache_rocksdb_t *store,
         return NGX_HTTP_CACHE_ROCKSDB_LIMIT;
     }
     q = tx->context;
+    id = ngx_http_cache_purge_index_dict_find(tx, key);
+    if (!id) {
+        if (q->status == 0) {
+            *ready = 1;
+        }
+        return ngx_http_cache_purge_index_tx_end(tx, error);
+    }
     cursor = ngx_http_cache_purge_index_tx_get(tx,
         NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
         ngx_http_cache_purge_op_literal("M:native-cursor"));
     if (cursor.exists || q->status != 0) {
         return ngx_http_cache_purge_index_tx_end(tx, error);
     }
-    id = ngx_http_cache_purge_index_dict_find(tx, key);
     if (id != 0) {
         ngx_http_cache_purge_index_cursor_open(q, &q->outer,
             NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
@@ -7701,11 +7707,13 @@ struct ngx_http_cache_purge_retained_query_s {
 };
 
 struct ngx_http_cache_purge_representation_query_s {
-    ngx_http_cache_purge_query_t  *query;
-    uint64_t                       native_id, retained_id, selected;
-    int                            started;
-    unsigned                       phase;
-    unsigned char                  member_prefix[49];
+    ngx_http_cache_purge_query_t        *query;
+    uint64_t                             native_id, retained_id, selected;
+    int                                  started;
+    unsigned                             phase;
+    unsigned char                        member_prefix[49];
+    ngx_http_cache_purge_index_cursor_t  aliases;
+    int                                  alias_started, alias_done;
 };
 
 static int
@@ -8272,6 +8280,17 @@ ngx_http_cache_purge_index_representations_close(
             NGX_HTTP_CACHE_ROCKSDB_INVALID, "null representation iterator");
     }
     r = *out;
+    rc = ngx_http_cache_purge_index_cursor_close(r->query, &r->aliases);
+    if (rc != 0) {
+        if (error != NULL) {
+            *error = r->query->error;
+        }
+        return rc;
+    }
+    r->query->bytes -= r->aliases.key.capacity + r->aliases.value.capacity;
+    free(r->aliases.key.data);
+    free(r->aliases.value.data);
+    memset(&r->aliases, 0, sizeof(r->aliases));
     rc = ngx_http_cache_purge_query_close(&r->query, error);
     if (rc == 0) {
         free(r);
@@ -8431,6 +8450,87 @@ ngx_http_cache_purge_index_representations_member(
     return ngx_http_cache_purge_index_error(error,
         r->phase == 3 ? NGX_HTTP_CACHE_ROCKSDB_DONE
                       : NGX_HTTP_CACHE_ROCKSDB_BUSY, "");
+}
+
+int
+ngx_http_cache_purge_index_representations_aliases(
+    ngx_http_cache_purge_representation_query_t *r, uint32_t kind,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_query_t   *q;
+    ngx_http_cache_rocksdb_bytes_t  prefix;
+    unsigned char                   raw[9];
+
+    if (r == NULL || (kind != NGX_HTTP_CACHE_PURGE_URL
+                     && kind != NGX_HTTP_CACHE_PURGE_HOST))
+    {
+        return ngx_http_cache_purge_index_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid representation aliases");
+    }
+    q = r->query;
+    ngx_http_cache_purge_index_cursor_close(q, &r->aliases);
+    r->alias_started = 1;
+    r->alias_done = q->prefix.len == 0;
+    if (q->status == 0 && !r->alias_done) {
+        memcpy(raw, q->prefix.data, sizeof(raw));
+        raw[0] = kind == NGX_HTTP_CACHE_PURGE_URL ? 'a' : 'b';
+        prefix.data = raw;
+        prefix.len = sizeof(raw);
+        ngx_http_cache_purge_index_cursor_open(q, &r->aliases,
+            NGX_HTTP_CACHE_ROCKSDB_DEFAULT, prefix,
+            ngx_http_cache_purge_op_empty, q->outer.handle);
+    }
+    if (error != NULL) {
+        *error = q->error;
+    }
+    return q->status;
+}
+
+int
+ngx_http_cache_purge_index_representations_alias_next(
+    ngx_http_cache_purge_representation_query_t *r,
+    ngx_http_cache_rocksdb_bytes_t *value,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_query_t   *q;
+    ngx_http_cache_rocksdb_bytes_t  number;
+
+    if (value != NULL) {
+        *value = ngx_http_cache_purge_op_empty;
+    }
+    if (r == NULL || value == NULL || !r->alias_started) {
+        return ngx_http_cache_purge_index_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "alias pass is not open");
+    }
+    q = r->query;
+    if (q->status == 0 && !r->alias_done) {
+        if (!ngx_http_cache_purge_index_cursor_next(q, &r->aliases)) {
+            r->alias_done = 1;
+            (void) ngx_http_cache_purge_index_cursor_close(q, &r->aliases);
+        } else if (ngx_http_cache_purge_index_require(q,
+                       r->aliases.key.len == 17 && r->aliases.value.len == 0,
+                       NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                       "invalid representation alias"))
+        {
+            number.data = r->aliases.key.data + 9;
+            number.len = 8;
+            ngx_http_cache_purge_index_require(q,
+                ngx_http_cache_purge_index_value(q, r->aliases.handle,
+                    ngx_http_cache_purge_index_integer(q, number), 0),
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "missing representation alias");
+            if (q->status == 0) {
+                *value = ngx_http_cache_purge_index_bytes(&q->lookup);
+            }
+        }
+    }
+    if (q->status != 0) {
+        if (error != NULL) {
+            *error = q->error;
+        }
+        return q->status;
+    }
+    return ngx_http_cache_purge_index_error(error,
+        r->alias_done ? NGX_HTTP_CACHE_ROCKSDB_DONE : 0, "");
 }
 
 int
