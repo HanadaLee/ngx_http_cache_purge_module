@@ -416,7 +416,7 @@ typedef struct {
 #endif
     ngx_event_t                           read_event;
     ngx_event_t                           publication_retry;
-    ngx_str_t                             acquire_payload;
+    ngx_str_t                             publication_payload;
     ngx_pool_t                           *publication_pool;
     ngx_temp_file_t                      *temporary;
 
@@ -4307,17 +4307,33 @@ ngx_http_cache_purge_capture_retry(ngx_event_t *event)
 
     timeout = ngx_http_cache_purge_capture_remaining(ctx);
     if (timeout == 0 || ctx->request->main->terminated) {
-        ngx_http_cache_purge_fill_complete(ctx->fill, NGX_DECLINED);
+        goto failed;
+    }
+    if (ctx->rpc == NGX_HTTP_CACHE_PURGE_RPC_FINISH) {
+        rc = ngx_http_cache_purge_client_finish_file(ctx->client,
+            &ctx->publication_payload, ctx->lease, timeout,
+            ngx_http_cache_purge_capture_reply, ctx, &ctx->call);
+    } else {
+        rc = ngx_http_cache_purge_client_submit(
+            ctx->client, NGX_HTTP_CACHE_PURGE_OP_ACQUIRE_PUBLICATION,
+            &ctx->publication_payload, timeout,
+            ngx_http_cache_purge_capture_reply, ctx, &ctx->call);
+    }
+    if (rc == NGX_OK) {
         return;
     }
-    rc = ngx_http_cache_purge_client_submit(ctx->client,
-        NGX_HTTP_CACHE_PURGE_OP_ACQUIRE_PUBLICATION, &ctx->acquire_payload,
-        timeout, ngx_http_cache_purge_capture_reply, ctx, &ctx->call);
     if (rc == NGX_BUSY && timeout > 10) {
         ngx_add_timer(event, 10);
-    } else if (rc != NGX_OK) {
-        ngx_http_cache_purge_fill_complete(ctx->fill, NGX_DECLINED);
+        return;
     }
+
+failed:
+
+    if (ctx->rpc == NGX_HTTP_CACHE_PURGE_RPC_FINISH) {
+        ngx_http_cache_purge_capture_release_publication(ctx);
+        ngx_http_cache_purge_capture_origin_release(ctx);
+    }
+    ngx_http_cache_purge_fill_complete(ctx->fill, NGX_DECLINED);
 }
 
 static ngx_int_t
@@ -4347,11 +4363,16 @@ ngx_http_cache_purge_capture_step(ngx_http_request_t *r,
         }
         p = ngx_cpymem(payload.data, ctx->id, 16);
         ngx_http_cache_purge_capture_number(p, ctx->revision, 8);
+        ctx->publication_payload = payload;
         ctx->rpc = NGX_HTTP_CACHE_PURGE_RPC_FINISH;
         rc = ngx_http_cache_purge_client_finish_file(
             ctx->client, &payload, ctx->lease, timeout,
             ngx_http_cache_purge_capture_reply, ctx, &ctx->call);
         if (rc == NGX_OK) {
+            return NGX_AGAIN;
+        }
+        if (rc == NGX_BUSY && timeout > 10 && !r->main->terminated) {
+            ngx_add_timer(&ctx->publication_retry, 10);
             return NGX_AGAIN;
         }
         ngx_http_cache_purge_capture_release_publication(ctx);
@@ -4408,7 +4429,7 @@ ngx_http_cache_purge_capture_step(ngx_http_request_t *r,
     p = ngx_http_cache_purge_capture_string(payload.data, root);
     p = ngx_http_cache_purge_capture_string(p, ctx->zone);
     ngx_http_cache_purge_capture_string(p, name);
-    ctx->acquire_payload = payload;
+    ctx->publication_payload = payload;
     ctx->publication_retry.data = ctx;
     ctx->publication_retry.handler = ngx_http_cache_purge_capture_retry;
     ctx->publication_retry.log = r->connection->log;
@@ -4430,7 +4451,8 @@ ngx_http_cache_purge_capture_reply(ngx_http_cache_purge_call_t *call,
     ngx_str_t                        root;
     size_t                           length;
     ctx->call = NULL;
-    if (stage == NGX_HTTP_CACHE_PURGE_RPC_ACQUIRE
+    if ((stage == NGX_HTTP_CACHE_PURGE_RPC_ACQUIRE
+         || stage == NGX_HTTP_CACHE_PURGE_RPC_FINISH)
         && reply->transport == NGX_HTTP_CACHE_PURGE_CLIENT_OK
         && reply->result == NGX_HTTP_CACHE_ROCKSDB_BUSY
         && !ctx->request->main->terminated

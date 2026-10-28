@@ -310,7 +310,10 @@ Retries bind to the same physical temporary file. `FINISH_FILE` accepts the
 original prepared revision and a lease descriptor, verifies the final instance,
 and completes WAL-indexed/READY-marker publication after a same-filesystem
 rename. Retries recover interrupted publication without recreating an evicted
-file. Raw index mutations cannot bypass these checks for physical records.
+file. A busy FINISH keeps its lease and retries within the original publication
+deadline, including when an alias guard needs more batches. Cancellation and
+deadline expiry release the retained resources for background recovery.
+Raw index mutations cannot bypass these checks for physical records.
 `ACQUIRE_PUBLICATION` also resolves the registered root and current file ID, so
 the native fill consumer can replace an indexed instance safely. Cross-filesystem
 copy verification remains unfinished. Added database, marker, and fsync work

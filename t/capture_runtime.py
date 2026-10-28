@@ -102,6 +102,7 @@ conditional_policies = {}
 validation_waiting, validation_release = threading.Event(), threading.Event()
 invalidate_waiting, invalidate_release = threading.Event(), threading.Event()
 late_waiting, late_release = threading.Event(), threading.Event()
+finish_waiting, finish_release = threading.Event(), threading.Event()
 send_waiting, send_release = threading.Event(), threading.Event()
 retry_waiting, retry_release = threading.Event(), threading.Event()
 stream_waiting, stream_release = threading.Event(), threading.Event()
@@ -160,6 +161,10 @@ class Origin(http.server.BaseHTTPRequestHandler):
             body = b'old-late-entity'
             late_waiting.set()
             assert late_release.wait(15)
+        if path == '/alias/finish-wait' and calls.count(path) == 1:
+            body = b'finish-retry-entity'
+            finish_waiting.set()
+            assert finish_release.wait(15)
         varying = path in ('/vary', '/revalidate-vary', '/propagation/vary', '/propagation/uncached-seed')
         if varying: body += self.headers.get('Accept-Language', '').encode()
         if path == '/large': body *= 40000
@@ -700,6 +705,29 @@ def missing_index_read():
     checks.append('a READY native file with a missing index ID refills instead of serving the old body or requiring a cache scan')
 
 
+def finish_busy_retries():
+    suffix = '?m=finish-retry'
+    assert get('/alias/finish-0' + suffix) == (200, 'MISS', b'/alias/finish-0')
+    original = records('/alias/finish-0', 1)[0]
+    for number in range(1, 65):
+        assert get('/alias/finish-' + str(number) + suffix) == (200, 'HIT', b'/alias/finish-0')
+    before = (run / 'error.log').read_text().count('publication stage 2 failed:')
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        held = pool.submit(get, '/alias/finish-wait' + suffix + '&bypass=1')
+        try:
+            assert finish_waiting.wait(5)
+            fence('finish-busy-unrelated', 1, 'http://cache.test/unrelated-finish')
+        finally:
+            finish_release.set()
+        assert held.result(timeout=10) == (200, 'BYPASS', b'finish-retry-entity')
+    ready_file(records('/alias/finish-wait', 1)[0])
+    assert records('/alias/finish-wait', 1)[0]['id'] != original['id']
+    assert get('/alias/finish-wait' + suffix) == (200, 'HIT', b'finish-retry-entity')
+    assert calls.count('/alias/finish-wait') == 1
+    assert (run / 'error.log').read_text().count('publication stage 2 failed:') == before
+    checks.append('FINISH retries a real paged alias guard after an unrelated push without dropping its lease or refetching the entity')
+
+
 def variant_hashes(item, language):
     value = origin_metadata(item)
     assert len(value) == 64
@@ -771,6 +799,7 @@ try:
     assert head_reply == (200, 'HIT', b'head-bypass-replacement'), head_reply
     assert calls.count('/head-fill') == 2
     checks.append('cache-entry waits preserve HEAD-to-GET conversion on MISS and BYPASS and publish the replacement entity')
+    finish_busy_retries()
     assert get('/remove-native')[1] == 'MISS'
     assert get('/remove-native?z=b')[1] == 'MISS'
     removed_instances = records('/remove-native', 2)
@@ -2011,6 +2040,7 @@ try:
     checks.append('manual uncached key and selector expressions do not evaluate unused cache-key module components')
 
 finally:
+    finish_release.set()
     send_release.set()
     for hold in dns_holds.values(): hold[1].set()
     dns_server.shutdown(); dns_server.server_close()
