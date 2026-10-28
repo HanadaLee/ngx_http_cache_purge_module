@@ -7212,6 +7212,11 @@ typedef struct {
     size_t                             count;
 } ngx_http_cache_purge_retained_t;
 
+struct ngx_http_cache_purge_retained_query_s {
+    ngx_http_cache_purge_query_t  *query;
+    uint64_t                       key_id;
+};
+
 static int
 ngx_http_cache_purge_index_retention_valid(
     const ngx_http_cache_purge_retention_t *r)
@@ -7553,16 +7558,15 @@ ngx_http_cache_purge_index_get_propagation(ngx_http_cache_rocksdb_t *store,
 
 static int
 ngx_http_cache_purge_index_retention_context(
-    ngx_http_cache_purge_index_tx_t *tx, uint64_t key,
+    ngx_http_cache_purge_query_t *q, ngx_http_cache_rocksdb_cursor_t *view,
+    uint64_t key,
     const ngx_http_cache_purge_retained_t *retained,
     ngx_http_cache_purge_retained_context_t *out)
 {
-    ngx_http_cache_purge_query_t    *q;
     ngx_http_cache_rocksdb_bytes_t  value, fields[66];
     size_t                          offsets[66], i;
     uint64_t                        id;
 
-    q = tx->context;
     memset(out, 0, sizeof(*out));
     /* Dictionary reconstruction uses scratch for every component read. Keep
      * the borrowed callback fields in a separate, reusable buffer. */
@@ -7570,7 +7574,13 @@ ngx_http_cache_purge_index_retention_context(
     for (i = 0; i < retained->count + 2 && q->status == 0; i++) {
         id = i == 0 ? key : i == 1 ? retained->tag_namespace
                                    : retained->tags[i - 2];
-        value = ngx_http_cache_purge_index_dict_text(tx, id);
+        if (!ngx_http_cache_purge_index_require(q,
+                ngx_http_cache_purge_index_value(q, view, id, 0),
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "missing retained identity"))
+        {
+            return 0;
+        }
+        value = ngx_http_cache_purge_index_bytes(&q->lookup);
         if (!ngx_http_cache_purge_index_require(q,
                 value.len <= 131072 - q->current_outer.len,
                 NGX_HTTP_CACHE_ROCKSDB_LIMIT, "retained identity is too large"))
@@ -7594,6 +7604,194 @@ ngx_http_cache_purge_index_retention_context(
     memcpy(out->tags, fields + 2, retained->count * sizeof(fields[0]));
     out->times = retained->times;
     return 1;
+}
+
+int
+ngx_http_cache_purge_index_propagation_open(
+    ngx_http_cache_rocksdb_t *store, ngx_http_cache_rocksdb_bytes_t key,
+    const unsigned char main[16], ngx_http_cache_rocksdb_bytes_t vary,
+    const unsigned char variant[16],
+    ngx_http_cache_purge_retained_query_t **out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_retained_query_t  *r;
+    ngx_http_cache_purge_query_t           *q;
+    uint64_t                                vary_id;
+    int                                     rc;
+
+    if (out != NULL) {
+        *out = NULL;
+    }
+    if (store == NULL || out == NULL || main == NULL || variant == NULL
+        || !key.len || !ngx_http_cache_purge_op_bytes_valid(key, 32768)
+        || !ngx_http_cache_purge_op_bytes_valid(vary, 32768))
+    {
+        return ngx_http_cache_purge_index_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid retained iterator");
+    }
+    r = calloc(1, sizeof(*r));
+    q = calloc(1, sizeof(*q));
+    if (r == NULL || q == NULL) {
+        free(r);
+        free(q);
+        return ngx_http_cache_purge_index_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+            "retained iterator allocation failed");
+    }
+    r->query = q;
+    q->store = store;
+    q->bytes = sizeof(*q) + sizeof(*r);
+    r->key_id = ngx_http_cache_purge_index_find(q, key);
+    vary_id = ngx_http_cache_purge_index_find(q, vary);
+    if (ngx_http_cache_purge_index_require(q, r->key_id && vary_id,
+            NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND, "propagation identity is absent"))
+    {
+        ngx_http_cache_purge_index_cursor_open(q, &q->outer,
+            NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+            ngx_http_cache_purge_index_retention_key(q, r->key_id, main,
+                vary_id, variant), ngx_http_cache_purge_op_empty, NULL);
+    }
+    rc = q->status;
+    if (rc != 0) {
+        if (error != NULL) {
+            *error = q->error;
+        }
+        (void) ngx_http_cache_purge_index_propagation_close(&r, NULL);
+        return rc;
+    }
+    *out = r;
+    return ngx_http_cache_purge_index_error(error, 0, "");
+}
+
+int
+ngx_http_cache_purge_index_propagation_next(
+    ngx_http_cache_purge_retained_query_t *r,
+    ngx_http_cache_purge_retained_context_t *out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_query_t     *q;
+    ngx_http_cache_purge_retained_t   retained;
+
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (r == NULL || out == NULL) {
+        return ngx_http_cache_purge_index_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid retained iterator output");
+    }
+    q = r->query;
+    if (!q->empty && q->status == 0) {
+        if (!ngx_http_cache_purge_index_cursor_next(q, &q->outer)) {
+            q->empty = 1;
+        } else if (ngx_http_cache_purge_index_retention_check(q,
+                       ngx_http_cache_purge_index_bytes(&q->outer.key),
+                       ngx_http_cache_purge_index_bytes(&q->outer.value))
+                   && ngx_http_cache_purge_index_retention_decode(q,
+                       ngx_http_cache_purge_index_bytes(&q->outer.value),
+                       &retained))
+        {
+            (void) ngx_http_cache_purge_index_retention_context(q,
+                q->outer.handle, r->key_id, &retained, out);
+        }
+    }
+    if (q->status != 0) {
+        memset(out, 0, sizeof(*out));
+        if (error != NULL) {
+            *error = q->error;
+        }
+        return q->status;
+    }
+    return ngx_http_cache_purge_index_error(error,
+        q->empty ? NGX_HTTP_CACHE_ROCKSDB_DONE : 0, "");
+}
+
+int
+ngx_http_cache_purge_index_propagation_aliases(
+    ngx_http_cache_purge_retained_query_t *r, uint32_t kind,
+    size_t max_values, size_t max_bytes,
+    ngx_http_cache_purge_index_visit_pt visit, void *data,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_query_t   *q;
+    ngx_http_cache_rocksdb_bytes_t  number, value;
+    ngx_http_cache_rocksdb_error_t  failure;
+    size_t                           count, bytes;
+    unsigned char                    prefix;
+    int                              rc;
+
+    if (r == NULL || visit == NULL || !max_values || max_values > 256
+        || !max_bytes || max_bytes > 1048576
+        || (kind != NGX_HTTP_CACHE_PURGE_URL
+            && kind != NGX_HTTP_CACHE_PURGE_HOST))
+    {
+        return ngx_http_cache_purge_index_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid history alias query");
+    }
+    q = r->query;
+    prefix = kind == NGX_HTTP_CACHE_PURGE_URL ? 'a' : 'b';
+    ngx_http_cache_purge_index_cursor_open(q, &q->links,
+        NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+        ngx_http_cache_purge_index_row_key(q, prefix, r->key_id),
+        ngx_http_cache_purge_op_empty, q->outer.handle);
+    count = 0;
+    bytes = 0;
+    while (ngx_http_cache_purge_index_cursor_next(q, &q->links)) {
+        if (!ngx_http_cache_purge_index_require(q,
+                q->links.key.len == 17 && q->links.value.len == 0,
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid history alias"))
+        {
+            break;
+        }
+        number.data = q->links.key.data + 9;
+        number.len = 8;
+        if (!ngx_http_cache_purge_index_value(q, q->links.handle,
+                ngx_http_cache_purge_index_integer(q, number), 0))
+        {
+            ngx_http_cache_purge_index_fail(q,
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "missing history alias value");
+            break;
+        }
+        value = ngx_http_cache_purge_index_bytes(&q->lookup);
+        if (!ngx_http_cache_purge_index_require(q,
+                count < max_values && value.len <= max_bytes - bytes,
+                NGX_HTTP_CACHE_ROCKSDB_LIMIT, "history alias budget exhausted"))
+        {
+            break;
+        }
+        count++;
+        bytes += value.len;
+        memset(&failure, 0, sizeof(failure));
+        rc = visit(data, value, &failure);
+        if (rc != 0) {
+            ngx_http_cache_purge_index_fail(q, rc,
+                failure.message[0] ? failure.message
+                                   : "history alias visitor failed");
+            break;
+        }
+    }
+    (void) ngx_http_cache_purge_index_cursor_close(q, &q->links);
+    if (error != NULL) {
+        *error = q->error;
+    }
+    return q->status;
+}
+
+int
+ngx_http_cache_purge_index_propagation_close(
+    ngx_http_cache_purge_retained_query_t **query,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    int  rc;
+
+    if (query == NULL || *query == NULL) {
+        return ngx_http_cache_purge_index_error(error, 0, "");
+    }
+    rc = ngx_http_cache_purge_query_close(&(*query)->query, error);
+    if (rc == 0) {
+        free(*query);
+        *query = NULL;
+    }
+    return rc;
 }
 
 int
@@ -7668,7 +7866,7 @@ ngx_http_cache_purge_index_expire_propagation_checked(
             break;
         }
         if (guard != NULL) {
-            if (!ngx_http_cache_purge_index_retention_context(tx, key_id,
+            if (!ngx_http_cache_purge_index_retention_context(q, NULL, key_id,
                     &retained, &context))
             {
                 break;

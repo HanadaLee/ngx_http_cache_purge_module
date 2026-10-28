@@ -6046,6 +6046,7 @@ ngx_http_cache_purge_control_coordinator_owner(
 
 typedef struct {
     ngx_http_cache_purge_coordinator_t     *coordinator;
+    ngx_http_cache_purge_retained_query_t  *history;
     ngx_http_cache_purge_control_context_t  context;
     ngx_http_cache_purge_fence_t            fence;
     ngx_http_cache_purge_fence_t            until;
@@ -6160,15 +6161,26 @@ ngx_http_cache_purge_component_propagation_resolve(
     p->context.url = empty;
     p->context.host = empty;
     p->context.tag_namespace = empty;
-    rc = ngx_http_cache_purge_index_visit_key_hosts(c->operations.store,
-        key, 64, 65536, ngx_http_cache_purge_component_propagation_host,
-        p, error);
+    if (p->history != NULL) {
+        rc = ngx_http_cache_purge_index_propagation_aliases(p->history,
+            NGX_HTTP_CACHE_PURGE_HOST, 64, 65536,
+            ngx_http_cache_purge_component_propagation_host, p, error);
+    } else {
+        rc = ngx_http_cache_purge_index_visit_key_hosts(c->operations.store,
+            key, 64, 65536, ngx_http_cache_purge_component_propagation_host,
+            p, error);
+    }
     if (rc != 0) {
         return rc;
     }
     p->context.host = empty;
     p->context.tags = NULL;
     p->context.tag_count = 0;
+    if (p->history != NULL) {
+        return ngx_http_cache_purge_index_propagation_aliases(p->history,
+            NGX_HTTP_CACHE_PURGE_URL, 64, 65536,
+            ngx_http_cache_purge_component_propagation_url, p, error);
+    }
     return ngx_http_cache_purge_index_visit_key_urls(c->operations.store,
         key, 64, 65536, ngx_http_cache_purge_component_propagation_url,
         p, error);
@@ -6414,6 +6426,172 @@ ngx_http_cache_purge_coordinator_expire_propagation(
         c->operations.store, now, budget,
         c->count ? ngx_http_cache_purge_component_retention_guard : NULL,
         c, processed, error);
+}
+
+struct ngx_http_cache_purge_history_query_s {
+    ngx_http_cache_purge_coordinator_t    *coordinator;
+    ngx_http_cache_purge_retained_query_t *history;
+    ngx_http_cache_purge_fence_t           result;
+    uint64_t                               now, publication;
+    int                                    found, done, status;
+};
+
+int
+ngx_http_cache_purge_coordinator_history_open(
+    ngx_http_cache_purge_coordinator_t *c,
+    ngx_http_cache_rocksdb_bytes_t key, const unsigned char main[16],
+    ngx_http_cache_rocksdb_bytes_t vary, const unsigned char variant[16],
+    uint64_t now, ngx_http_cache_purge_history_query_t **out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_history_query_t  *query;
+    int                                    rc;
+
+    if (out != NULL) {
+        *out = NULL;
+    }
+    if (out == NULL || now == 0) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid historical query");
+    }
+    rc = ngx_http_cache_purge_control_coordinator_owner(c, error);
+    if (rc != 0) {
+        return rc;
+    }
+    if (c->state != NGX_HTTP_CACHE_PURGE_COORD_READY) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_BUSY, "history awaits control publication");
+    }
+    query = calloc(1, sizeof(*query));
+    if (query == NULL) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "history query allocation failed");
+    }
+    rc = ngx_http_cache_purge_index_propagation_open(c->operations.store,
+        key, main, vary, variant, &query->history, error);
+    if (rc != 0) {
+        free(query);
+        return rc;
+    }
+    query->coordinator = c;
+    query->publication = c->publication;
+    query->now = now;
+    *out = query;
+    return 0;
+}
+
+int
+ngx_http_cache_purge_coordinator_history_step(
+    ngx_http_cache_purge_history_query_t *query, size_t budget,
+    ngx_http_cache_purge_fence_t *out, uint64_t *publication, int *done,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_retained_context_t     snapshot;
+    ngx_http_cache_purge_propagation_context_t  p;
+    ngx_http_cache_purge_coordinator_t         *c;
+    size_t                                      i;
+    int                                         rc;
+
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (publication != NULL) {
+        *publication = 0;
+    }
+    if (done != NULL) {
+        *done = 0;
+    }
+    if (query == NULL || out == NULL || publication == NULL || done == NULL
+        || budget == 0 || budget > 32)
+    {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid historical query step");
+    }
+    c = query->coordinator;
+    rc = ngx_http_cache_purge_control_coordinator_owner(c, error);
+    if (rc != 0) {
+        return rc;
+    }
+    if (query->status != 0) {
+        return ngx_http_cache_purge_control_error(error, query->status,
+            "historical query must be restarted");
+    }
+    if (c->state != NGX_HTTP_CACHE_PURGE_COORD_READY
+        || c->publication != query->publication)
+    {
+        query->status = NGX_HTTP_CACHE_ROCKSDB_BUSY;
+        return ngx_http_cache_purge_control_error(error, query->status,
+            "historical query control publication changed");
+    }
+    for (i = 0; i < budget && !query->done; i++) {
+        rc = ngx_http_cache_purge_index_propagation_next(query->history,
+            &snapshot, error);
+        if (rc == NGX_HTTP_CACHE_ROCKSDB_DONE) {
+            query->done = 1;
+            break;
+        }
+        if (rc != 0) {
+            query->status = rc;
+            return rc;
+        }
+        query->found = 1;
+        memset(&p, 0, sizeof(p));
+        p.coordinator = c;
+        p.history = query->history;
+        p.context.key = snapshot.key;
+        p.context.tag_namespace = snapshot.tag_namespace;
+        p.context.tags = snapshot.tags;
+        p.context.tag_count = snapshot.tag_count;
+        p.context.now_ms = query->now;
+        p.context.proxy = 1;
+        if (query->now < snapshot.times.invalidate_until_ms) {
+            p.fence.invalidate_ms = snapshot.times.invalidate_ms;
+        }
+        if (query->now < snapshot.times.delete_until_ms) {
+            p.fence.delete_ms = snapshot.times.delete_ms;
+        }
+        rc = ngx_http_cache_purge_component_propagation_resolve(&p, error);
+        if (rc != 0) {
+            query->status = rc;
+            return rc;
+        }
+        if (p.fence.invalidate_ms > query->result.invalidate_ms) {
+            query->result.invalidate_ms = p.fence.invalidate_ms;
+        }
+        if (p.fence.delete_ms > query->result.delete_ms) {
+            query->result.delete_ms = p.fence.delete_ms;
+        }
+    }
+    if (query->done) {
+        if (!query->found) {
+            query->status = NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND;
+            return ngx_http_cache_purge_control_error(error, query->status,
+                "historical membership is absent");
+        }
+        *out = query->result;
+        *publication = query->publication;
+        *done = 1;
+    }
+    return ngx_http_cache_purge_control_error(error, 0, "");
+}
+
+int
+ngx_http_cache_purge_coordinator_history_close(
+    ngx_http_cache_purge_history_query_t **query,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    int  rc;
+
+    if (query == NULL || *query == NULL) {
+        return ngx_http_cache_purge_control_error(error, 0, "");
+    }
+    rc = ngx_http_cache_purge_index_propagation_close(&(*query)->history,
+        error);
+    if (rc == 0) {
+        free(*query);
+        *query = NULL;
+    }
+    return rc;
 }
 
 typedef struct {

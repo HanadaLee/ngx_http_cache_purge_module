@@ -955,6 +955,7 @@ ngx_http_cache_purge_test_retention(const std::string &path)
     check(mkdir(path.c_str(), 0700) == 0, "retention directory");
     ngx_http_cache_rocksdb_options_t options;
     ngx_http_cache_rocksdb_options(&options);
+    options.cursor_lifetime_ms = 5000;
     ngx_http_cache_rocksdb_t *store = nullptr;
     ngx_http_cache_rocksdb_error_t error{};
     const auto cf = NGX_HTTP_CACHE_ROCKSDB_DEFAULT;
@@ -1140,6 +1141,46 @@ ngx_http_cache_purge_test_retention(const std::string &path)
                       == NGX_HTTP_CACHE_ROCKSDB_LIMIT
                   && !limited.invalidate_ms && !limited.delete_ms,
             "membership limit rejects partial propagation output");
+        ngx_http_cache_purge_retained_query_t *history = nullptr;
+        auto history_open = [&](const File &file, int code = 0) {
+            check(ngx_http_cache_purge_index_propagation_open(store,
+                      ngx_http_cache_purge_native_bytes(file.key), main,
+                      ngx_http_cache_purge_native_bytes(file.vary), english,
+                      &history, &error)
+                      == code,
+                error.message);
+        };
+        ngx_http_cache_purge_retained_context_t context{};
+        check(ngx_http_cache_purge_index_propagation_next(
+                  nullptr, &context, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_INVALID,
+            "history iterator rejects missing handle");
+        auto missing = bounded;
+        missing.key = "unrecorded";
+        history_open(missing, NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND);
+        check(history == nullptr, "failed history open clears its output");
+        main[0] = 9;
+        history_open(bounded);
+        check(ngx_http_cache_purge_index_propagation_next(
+                  history, &context, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_DONE
+                  && !context.key.len && !context.tag_count,
+            "different native main has no historical membership");
+        check(
+            ngx_http_cache_purge_index_propagation_close(&history, &error) == 0,
+            "close empty history");
+        main[0] = 1;
+        history_open(bounded);
+        check(ngx_http_cache_purge_index_propagation_next(
+                  history, &context, &error)
+                      == 0
+                  && context.tag_count == 1,
+            "read one historical membership");
+        std::set<std::string> historical_tags;
+        historical_tags.insert(ngx_http_cache_purge_cpp_bytes(context.tags[0]));
+        current = index.update_metadata(bounded.id, current.revision,
+            "after snapshot", { "retained-after-snapshot" });
+        keep(bounded, english, { 999, 1000, 0, 0 }, 0, current.revision);
         current = index.retire(bounded.id, current.revision);
         index.collect_file(bounded.id, current.revision);
         size_t total = 0;
@@ -1152,14 +1193,114 @@ ngx_http_cache_purge_test_retention(const std::string &path)
             total += removed;
         } while (removed);
         check(
-            total == 65, "all historical TAG sets were independently retained");
+            total == 66, "all historical TAG sets were independently retained");
         while (index.collect_keys(1)) {
         }
         check(raw_keys(store, cf).size() == 3,
             "large history releases every dictionary reference");
+        ngx_http_cache_rocksdb_stats_t before{}, after{};
+        check(ngx_http_cache_rocksdb_stats(store, &before, &error) == 0,
+            "history iterator statistics");
+        unsigned steps = 1;
+        int rc;
+        while ((rc = ngx_http_cache_purge_index_propagation_next(
+                    history, &context, &error))
+               == 0)
+        {
+            check(++steps <= 65 && context.tag_count == 1
+                      && ngx_http_cache_purge_cpp_bytes(context.key)
+                             == bounded.key
+                      && ngx_http_cache_purge_cpp_bytes(context.tag_namespace)
+                             == bounded.tag_namespace,
+                "history dictionaries share the original snapshot");
+            historical_tags.insert(
+                ngx_http_cache_purge_cpp_bytes(context.tags[0]));
+            check(context.times.invalidate_ms >= 50
+                      && context.times.invalidate_ms <= 114
+                      && context.times.invalidate_until_ms == 1000,
+                "history excludes memberships inserted after open");
+        }
+        check(rc == NGX_HTTP_CACHE_ROCKSDB_DONE && steps == 65
+                  && historical_tags.size() == 65 && !context.key.len
+                  && !context.tag_count,
+            "incremental history exceeds 64 sets without truncating");
+        check(ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
+                  && before.writes == after.writes,
+            "incremental history reads never write WAL");
+        check(
+            ngx_http_cache_purge_index_propagation_close(&history, &error) == 0
+                && history == nullptr,
+            "history iterator releases its snapshot");
+        check(ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
+                  && !after.active_cursors && !after.cursor_handles,
+            "history close leaves no cursor resources");
+        history_open(bounded, NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND);
+        current = install(index, bounded);
+        keep(bounded, english, { 200, 2000, 0, 0 }, 0, current.revision);
+        std::vector<ngx_http_cache_purge_retained_query_t *> held;
+        for (unsigned i = 0; i < options.max_cursors; i++) {
+            history_open(bounded);
+            held.push_back(history);
+        }
+        history_open(bounded, NGX_HTTP_CACHE_ROCKSDB_LIMIT);
+        check(history == nullptr, "cursor capacity applies to history scans");
+        for (auto &cursor : held) {
+            check(ngx_http_cache_purge_index_propagation_close(&cursor, &error)
+                      == 0,
+                "release bounded history cursor slot");
+        }
+        history_open(bounded);
+        std::string row;
+        for (const auto &key : raw_keys(store, cf)) {
+            if (key.size() == 81 && key[0] == 'q') {
+                row = key;
+            }
+        }
+        check(!row.empty(), "history row for corruption check");
+        saved = ngx_http_cache_purge_test_raw(store, row);
+        raw_write(store, cf, row, "corrupt");
+        check(ngx_http_cache_purge_index_propagation_next(
+                  history, &context, &error)
+                      == 0
+                  && context.times.invalidate_ms == 200,
+            "already-open snapshot does not observe later row corruption");
+        check(
+            ngx_http_cache_purge_index_propagation_close(&history, &error) == 0,
+            "close original snapshot");
+        history_open(bounded);
+        check(ngx_http_cache_purge_index_propagation_next(
+                  history, &context, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_CORRUPT
+                  && !context.key.len && !context.tag_count
+                  && !context.times.invalidate_ms,
+            "corrupt history exposes no borrowed partial identity");
+        check(
+            ngx_http_cache_purge_index_propagation_close(&history, &error) == 0,
+            "close failed history");
+        raw_write(store, cf, row, saved);
     }
     check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
         "close expired database");
+    options.cursor_lifetime_ms = 20;
+    open();
+    auto bounded = file(704, "/bounded-retention");
+    ngx_http_cache_purge_retained_query_t *history = nullptr;
+    ngx_http_cache_purge_retained_context_t context{};
+    check(ngx_http_cache_purge_index_propagation_open(store,
+              ngx_http_cache_purge_native_bytes(bounded.key), main,
+              ngx_http_cache_purge_native_bytes(bounded.vary), english,
+              &history, &error)
+              == 0,
+        "open short-lived history snapshot");
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    check(ngx_http_cache_purge_index_propagation_next(history, &context, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_EXPIRED
+              && !context.key.len && !context.tag_count,
+        "expired history cannot claim an empty complete result");
+    check(ngx_http_cache_purge_index_propagation_close(&history, &error) == 0,
+        "expired snapshot still requires and permits close");
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
+        "expired history releases database ownership");
 }
 
 int

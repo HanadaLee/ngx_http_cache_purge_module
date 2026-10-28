@@ -923,12 +923,15 @@ typedef struct {
     uint64_t  delete_ms, delete_until_ms;
 } ngx_http_cache_purge_retention_t;
 
-/* Borrowed only during a synchronous retention callback. */
+/* Borrowed during a callback or until the next iterator step/close. */
 typedef struct {
     ngx_http_cache_rocksdb_bytes_t  key, tag_namespace, tags[64];
     size_t                           tag_count;
     ngx_http_cache_purge_retention_t times;
 } ngx_http_cache_purge_retained_context_t;
+
+typedef struct ngx_http_cache_purge_retained_query_s
+    ngx_http_cache_purge_retained_query_t;
 
 typedef int (*ngx_http_cache_purge_retention_guard_pt)(void *data,
     const ngx_http_cache_purge_retained_context_t *snapshot, uint64_t now,
@@ -943,7 +946,7 @@ typedef int (*ngx_http_cache_purge_retention_guard_pt)(void *data,
  * Per-mode maxima may conservatively retain a newer time until the longest
  * matched local window. Reads never extend a deadline. The getter visits at
  * most 64 memberships and returns LIMIT, never a partial answer, on overflow.
- * Mutation integration, later-rule matching and paged queries are separate. */
+ * The iterator supports larger sets without accumulating them in memory. */
 int ngx_http_cache_purge_index_keep_propagation(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_expected_t *file,
     const unsigned char main[16], const unsigned char variant[16], uint64_t now,
@@ -953,6 +956,31 @@ int ngx_http_cache_purge_index_get_propagation(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_bytes_t key, const unsigned char main[16],
     ngx_http_cache_rocksdb_bytes_t vary, const unsigned char variant[16],
     uint64_t now, ngx_http_cache_purge_fence_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+/* One bounded-lifetime snapshot, including dictionary reads. Each next call
+ * returns one immutable membership, even if its stored window has expired:
+ * the caller must also match later local rules before deciding it is unused.
+ * DONE is complete enumeration; EXPIRED/error requires discarding any partial
+ * aggregate. Close on every outcome. No pointer may cross executor ownership.
+ */
+int ngx_http_cache_purge_index_propagation_open(
+    ngx_http_cache_rocksdb_t *store, ngx_http_cache_rocksdb_bytes_t key,
+    const unsigned char main[16], ngx_http_cache_rocksdb_bytes_t vary,
+    const unsigned char variant[16],
+    ngx_http_cache_purge_retained_query_t **out,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_propagation_next(
+    ngx_http_cache_purge_retained_query_t *query,
+    ngx_http_cache_purge_retained_context_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+/* URL or HOST aliases from the same snapshot as the memberships. */
+int ngx_http_cache_purge_index_propagation_aliases(
+    ngx_http_cache_purge_retained_query_t *query, uint32_t kind,
+    size_t max_values, size_t max_bytes,
+    ngx_http_cache_purge_index_visit_pt visit, void *data,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_propagation_close(
+    ngx_http_cache_purge_retained_query_t **query,
     ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_expire_propagation(
     ngx_http_cache_rocksdb_t *store, uint64_t now, size_t budget,
@@ -970,6 +998,27 @@ int ngx_http_cache_purge_coordinator_keep_file(
 int ngx_http_cache_purge_coordinator_expire_propagation(
     ngx_http_cache_purge_coordinator_t *coordinator, uint64_t now,
     size_t budget, size_t *processed, ngx_http_cache_rocksdb_error_t *error);
+
+typedef struct ngx_http_cache_purge_history_query_s
+    ngx_http_cache_purge_history_query_t;
+
+/* Executor-owned, read-only aggregation of stored times and current rules.
+ * A step visits at most budget memberships (1-32); outputs stay zero until
+ * done. A changed control publication requires close/restart, as does an
+ * expired database snapshot. The coordinator must outlive its queries. */
+int ngx_http_cache_purge_coordinator_history_open(
+    ngx_http_cache_purge_coordinator_t *coordinator,
+    ngx_http_cache_rocksdb_bytes_t key, const unsigned char main[16],
+    ngx_http_cache_rocksdb_bytes_t vary, const unsigned char variant[16],
+    uint64_t now, ngx_http_cache_purge_history_query_t **query,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_coordinator_history_step(
+    ngx_http_cache_purge_history_query_t *query, size_t budget,
+    ngx_http_cache_purge_fence_t *out, uint64_t *publication, int *done,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_coordinator_history_close(
+    ngx_http_cache_purge_history_query_t **query,
+    ngx_http_cache_rocksdb_error_t *error);
 
 #ifdef __cplusplus
 }

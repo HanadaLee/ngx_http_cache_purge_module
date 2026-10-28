@@ -333,6 +333,37 @@ ngx_http_cache_purge_test_retention()
             coordinator.refresh();
             ready(coordinator);
         };
+        ngx_http_cache_purge_history_query_t *history = nullptr;
+        auto history_open = [&](uint64_t now) {
+            check(ngx_http_cache_purge_coordinator_history_open(
+                      coordinator.native(),
+                      ngx_http_cache_purge_native_bytes(file.key), main,
+                      ngx_http_cache_purge_native_bytes(file.vary), variant,
+                      now, &history, &error)
+                      == 0,
+                error.message);
+        };
+        auto history_result = [&] {
+            ngx_http_cache_purge_fence_t result{ 99, 99 };
+            uint64_t publication = 99;
+            int done = 99;
+            check(ngx_http_cache_purge_coordinator_history_step(
+                      history, 1, &result, &publication, &done, &error)
+                          == 0
+                      && !done && !publication && !result.invalidate_ms
+                      && !result.delete_ms,
+                "partial history step does not publish an aggregate");
+            check(ngx_http_cache_purge_coordinator_history_step(
+                      history, 1, &result, &publication, &done, &error)
+                          == 0
+                      && done && publication == coordinator.publication(),
+                "history completion carries the matching publication");
+            check(
+                ngx_http_cache_purge_coordinator_history_close(&history, &error)
+                    == 0,
+                "close completed history query");
+            return result;
+        };
         auto first =
             accept("first", { SelectorKind::namespace_tag, "red", "tenant" },
                 PurgeMode::invalidate, 10, 100, 50);
@@ -374,6 +405,26 @@ ngx_http_cache_purge_test_retention()
         check(get(149).invalidate_ms == 10,
             "failed expiry retains the original snapshot");
         activate(second, 140);
+        history_open(151);
+        auto immediate = history_result();
+        check(!immediate.invalidate_ms && immediate.delete_ms == 20,
+            "a new TAG rule matches stored history immediately before GC "
+            "renews its expired original window");
+        history_open(151);
+        coordinator.refresh();
+        ready(coordinator);
+        ngx_http_cache_purge_fence_t stale{ 99, 99 };
+        uint64_t publication = 99;
+        int done = 99;
+        check(ngx_http_cache_purge_coordinator_history_step(
+                  history, 1, &stale, &publication, &done, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_BUSY
+                  && !stale.invalidate_ms && !stale.delete_ms && !publication
+                  && !done,
+            "a replaced control image rejects the history aggregate");
+        check(ngx_http_cache_purge_coordinator_history_close(&history, &error)
+                  == 0,
+            "close history after publication change");
         check(ngx_http_cache_purge_coordinator_expire_propagation(
                   coordinator.native(), 151, 8, &processed, &error)
                       == 0
@@ -390,6 +441,14 @@ ngx_http_cache_purge_test_retention()
             accept("host", { SelectorKind::host_tag, "red", "alias.test" },
                 PurgeMode::invalidate, 30, 220, 100);
         activate(host, 220);
+        auto alias = accept("alias",
+            { SelectorKind::url_prefix, "https://alias.test/", "" },
+            PurgeMode::remove, 40, 220, 10);
+        activate(alias, 220);
+        history_open(221);
+        auto alias_result = history_result();
+        check(alias_result.invalidate_ms == 30 && alias_result.delete_ms == 40,
+            "retained URL aliases participate in new prefix rules before GC");
         check(ngx_http_cache_purge_coordinator_expire_propagation(
                   coordinator.native(), 241, 8, &processed, &error)
                       == 0
@@ -399,6 +458,7 @@ ngx_http_cache_purge_test_retention()
         check(result.invalidate_ms == 30 && !result.delete_ms,
             "history renewal uses retained TAGs and persistent host aliases "
             "with namespace isolation");
+        history_open(241);
         check(ngx_http_cache_purge_coordinator_expire_propagation(
                   coordinator.native(), 321, 8, &processed, &error)
                       == 0
@@ -407,6 +467,10 @@ ngx_http_cache_purge_test_retention()
         get(321, NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND);
         while (index.collect_keys(1)) {
         }
+        auto historical = history_result();
+        check(historical.invalidate_ms == 30 && !historical.delete_ms,
+            "history TAGs and host aliases remain in one snapshot while "
+            "live GC releases their dictionaries");
     }
     check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
     munmap(shared, size);
