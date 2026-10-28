@@ -111,6 +111,7 @@ struct ngx_http_cache_purge_component_s {
     size_t                                    next_peer;
     ngx_http_cache_purge_component_buffer_t   recovery_bookmark;
     uint64_t                                  recovery_at;
+    int                                       native_migrated;
     unsigned char                             work_after[17];
     size_t                                    work_after_len;
     uint64_t                                  work_at;
@@ -2052,6 +2053,24 @@ ngx_http_cache_purge_component_recover(ngx_http_cache_purge_component_t *c,
     bookmark.data = c->recovery_bookmark.data;
     bookmark.len = c->recovery_bookmark.len;
     c->recovery_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 1000;
+
+    if (!c->native_migrated) {
+        rc = ngx_http_cache_purge_publications_migrate_native(c->publications,
+            store, 8, &c->native_migrated, error);
+        if (rc == NGX_HTTP_CACHE_ROCKSDB_LIMIT
+            || rc == NGX_HTTP_CACHE_ROCKSDB_EXPIRED)
+        {
+            rc = ngx_http_cache_purge_publications_migrate_native(
+                c->publications, store, 1, &c->native_migrated, error);
+        }
+        if (rc != 0) {
+            goto done;
+        }
+        if (!c->native_migrated) {
+            c->recovery_at =
+                ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 10;
+        }
+    }
 
     rc = ngx_http_cache_purge_query_open(store, NULL,
                                          NGX_HTTP_CACHE_PURGE_QUERY_PENDING,
@@ -6343,7 +6362,12 @@ ngx_http_cache_purge_coordinator_keep_file(
     if (rc != 0) {
         goto done;
     }
-    rc = ngx_http_cache_purge_publication_native(&file, main, variant, error);
+    rc = ngx_http_cache_purge_index_native_identity(c->operations.store,
+        expected, main, variant, error);
+    if (rc == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) {
+        rc = ngx_http_cache_purge_publication_native(&file, main, variant,
+            error);
+    }
     if (rc != 0) {
         goto done;
     }

@@ -808,6 +808,26 @@ int ngx_http_cache_purge_index_bind_native(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_expected_t *file,
     const unsigned char main[16], const unsigned char variant[16],
     ngx_http_cache_rocksdb_error_t *error);
+enum {
+    NGX_HTTP_CACHE_PURGE_NATIVE_SKIP = 0,
+    NGX_HTTP_CACHE_PURGE_NATIVE_BIND,
+    NGX_HTTP_CACHE_PURGE_NATIVE_MISSING
+};
+typedef int (*ngx_http_cache_purge_native_resolver_pt)(void *data,
+    const ngx_http_cache_purge_index_file_t *file, unsigned char main[16],
+    unsigned char variant[16], unsigned *state,
+    ngx_http_cache_rocksdb_error_t *error);
+/* Read-only resolver; cursor advancement and bindings commit atomically. */
+int ngx_http_cache_purge_index_migrate_native(ngx_http_cache_rocksdb_t *store,
+    size_t budget, ngx_http_cache_purge_native_resolver_pt resolver, void *data,
+    int *done, ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_native_ready(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_rocksdb_bytes_t key, int *ready,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_native_identity(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file,
+    unsigned char main[16], unsigned char variant[16],
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_prepare_batch(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_fill_t *files, size_t count,
     ngx_http_cache_purge_index_match_t *out,
@@ -1079,6 +1099,10 @@ int ngx_http_cache_purge_publication_variant(
 int ngx_http_cache_purge_publication_native(
     const ngx_http_cache_purge_index_file_t *file,
     unsigned char main[16], unsigned char variant[16],
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_publications_migrate_native(
+    ngx_http_cache_purge_publications_t *publications,
+    ngx_http_cache_rocksdb_t *store, size_t budget, int *done,
     ngx_http_cache_rocksdb_error_t *error);
 
 typedef struct {

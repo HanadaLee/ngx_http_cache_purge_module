@@ -215,10 +215,13 @@ The existing worker executor resumes the bounded scan from durable checkpoints.
 Admission checks that requirement even when no resident rule remains; successful
 conditional validation satisfies it without replacing the entity. Requirements
 are monotonic within one ledger and are collected with their retired file.
-Index schema 7 upgrades schemas 1/2/3/4/5/6 from existing index records; upgrades
-from 4/5/6 only change the schema marker and add no full scan. Older readers reject
-it instead of ignoring deferred Delete, staged TAG changes or retained key
-references. Pending NFV1 plans cannot recover their removed old TAG membership
+Index schema 9 upgrades existing index records without rebuilding cache files.
+The worker executor backfills native proxy representation bindings in bounded
+batches, retaining a durable cursor across restarts. Completed migrations do not
+rescan the index. Unresolved legacy identities remain explicitly marked by key;
+they must not be mistaken for uncached objects. Older readers reject the schema
+instead of ignoring required relationships. Pending NFV1 plans cannot recover
+their removed old TAG membership
 and are conservatively discarded; completed NFR1 receipts and unrelated cache
 files remain valid. NFV2 plans retain
 the 16 KiB metadata limit; oversized proposed TAG/header combinations are rejected
@@ -559,13 +562,18 @@ Vary files retain the native main and variant hashes in their publication
 metadata, including across conditional revalidation. Ordinary files keep the
 original metadata size.
 
-The index also provides sparse retention of resolved object times, local
-deadlines and immutable TAG memberships, with bounded lookup and expiry. These
-records keep key aliases alive after the last file is collected. Automatic
-mutation capture, later-rule matching and request-path use remain unfinished.
+Proxy mutations preserve resolved object times, local deadlines and immutable
+TAG memberships before replacement, TAG changes or collection. These records
+keep key aliases alive after the last file is collected. Incremental snapshot
+queries match later local rules against retained memberships without loading all
+metadata into memory. Native representation bindings also preserve access to
+secondary Vary files after their main file is removed.
 
-Full propagation remains unfinished: this query still needs request-path
-integration and retained associations after deletion. Until that is connected,
+Full propagation remains unfinished: representation selection, legacy Vary
+identity repair and request-path integration are still pending. The intended
+TAG scope is known current or retained edge associations; completely unknown
+objects proceed upstream without TAG-specific retry or broader invalidation.
+Until the local lookup is connected,
 an unknown TAG candidate fails before upstream I/O; it is never sent as a matched
 object or delegated to L2. Uncached proxy routes and large local match sets also
 need integration. Capabilities reports the sender transport as

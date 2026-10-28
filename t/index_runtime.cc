@@ -418,7 +418,7 @@ ngx_http_cache_purge_test_host_migration(const std::string &path)
         raw_write(store, cf, damaged, "broken object");
         fails(
             NGX_HTTP_CACHE_ROCKSDB_CORRUPT, [&] { Index interrupted(store); });
-        check(ngx_http_cache_purge_test_raw(store, "M:index") == "8"
+        check(ngx_http_cache_purge_test_raw(store, "M:index") == "9"
                   && ngx_http_cache_purge_test_raw(store, "M:host-cursor")
                          == "O"
                                 + std::string(reinterpret_cast<const char *>(
@@ -951,6 +951,151 @@ ngx_http_cache_purge_test_tag_groups()
 }
 
 static void
+ngx_http_cache_purge_test_native_migration(const std::string &path)
+{
+    check(mkdir(path.c_str(), 0700) == 0, "native migration directory");
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    ngx_http_cache_rocksdb_error_t error{};
+    std::vector<File> files;
+    auto open = [&] {
+        check(
+            ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
+                == 0,
+            error.message);
+    };
+    struct Resolution {
+        unsigned calls = 0;
+        bool fail = true;
+    } resolution;
+    auto resolve = [](void *data, const ngx_http_cache_purge_index_file_t *f,
+                       unsigned char *main, unsigned char *variant,
+                       unsigned *state,
+                       ngx_http_cache_rocksdb_error_t *) -> int {
+        auto &r = *static_cast<Resolution *>(data);
+        r.calls++;
+        auto metadata = ngx_http_cache_purge_cpp_bytes(f->metadata);
+        if (metadata == "failure" && r.fail) {
+            return NGX_HTTP_CACHE_ROCKSDB_IO;
+        }
+        *state = metadata == "skip"    ? NGX_HTTP_CACHE_PURGE_NATIVE_SKIP :
+                 metadata == "missing" ? NGX_HTTP_CACHE_PURGE_NATIVE_MISSING :
+                                         NGX_HTTP_CACHE_PURGE_NATIVE_BIND;
+        std::memcpy(main, f->id, 16);
+        std::memset(variant, 0, 16);
+        return 0;
+    };
+    auto ready = [&](const File &file) {
+        int available = 99;
+        check(
+            ngx_http_cache_purge_index_native_ready(store,
+                ngx_http_cache_purge_native_bytes(file.key), &available, &error)
+                == 0,
+            error.message);
+        return available != 0;
+    };
+    open();
+    std::string cursor;
+    {
+        Index index(store);
+        for (unsigned i = 0; i < 5; i++) {
+            auto f = file(901 + i, "/migration-" + std::to_string(i));
+            f.metadata = i == 1 || i == 4 ? "missing" :
+                         i == 2           ? "skip" :
+                         i == 3           ? "failure" :
+                                            "known";
+            install(index, f);
+            files.push_back(f);
+        }
+        raw_write(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, "M:index", "8");
+        Index upgraded(store);
+        check(!ready(files[0]), "unfinished migration is not an empty catalog");
+        int done = 99;
+        check(ngx_http_cache_purge_index_migrate_native(
+                  store, 1, resolve, &resolution, &done, &error)
+                      == 0
+                  && !done && resolution.calls == 1,
+            "migration limits each committed batch");
+        cursor = ngx_http_cache_purge_test_raw(store, "M:native-cursor");
+        check(cursor
+                  == "O"
+                         + std::string(
+                             reinterpret_cast<const char *>(files[0].id.data()),
+                             16),
+            "migration records its last committed object");
+        check(ngx_http_cache_purge_index_migrate_native(
+                  store, 32, resolve, &resolution, &done, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_IO
+                  && !done
+                  && ngx_http_cache_purge_test_raw(store, "M:native-cursor")
+                         == cursor,
+            "resolver failure rolls back bindings and the migration cursor");
+        for (const auto &key : raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT))
+        {
+            check(key[0] != 'z', "failed batch creates no unresolved markers");
+        }
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
+        "close partially migrated database");
+    open();
+    {
+        Index index(store);
+        check(ngx_http_cache_purge_test_raw(store, "M:native-cursor") == cursor,
+            "restart resumes rather than resetting native migration");
+        resolution.fail = false;
+        int done = 0;
+        unsigned steps = 0;
+        while (!done) {
+            check(ngx_http_cache_purge_index_migrate_native(
+                      store, 1, resolve, &resolution, &done, &error)
+                          == 0
+                      && ++steps <= 4,
+                error.message);
+        }
+        check(ready(files[0]) && !ready(files[1]) && ready(files[2])
+                  && ready(files[3]) && !ready(files[4]),
+            "unresolved old identities block only their key after the scan");
+        unsigned char main[16], variant[16];
+        auto expected = ngx_http_cache_purge_native_expected(files[3].id, 2);
+        check(ngx_http_cache_purge_index_native_identity(
+                  store, &expected, main, variant, &error)
+                      == 0
+                  && std::memcmp(main, files[3].id.data(), 16) == 0,
+            "backfilled identity is available at its exact revision");
+        ngx_http_cache_rocksdb_stats_t before{}, after{};
+        check(ngx_http_cache_rocksdb_stats(store, &before, &error) == 0,
+            "completed migration statistics");
+        unsigned calls = resolution.calls;
+        check(ngx_http_cache_purge_index_migrate_native(
+                  store, 8, resolve, &resolution, &done, &error)
+                      == 0
+                  && done && calls == resolution.calls
+                  && ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
+                  && before.writes == after.writes,
+            "completed migration does not scan or write on another call");
+        expected = ngx_http_cache_purge_native_expected(files[1].id, 2);
+        std::memcpy(main, files[1].id.data(), 16);
+        check(ngx_http_cache_purge_index_bind_native(
+                  store, &expected, main, variant, &error)
+                      == 0
+                  && ready(files[1]),
+            "resolved native identity atomically removes the missing marker");
+        for (const auto &f : files) {
+            auto retired = index.retire(f.id, 2);
+            index.collect_file(f.id, retired.revision);
+        }
+        while (index.collect_keys(8)) {
+        }
+        check(raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT).size() == 3
+                  && ready(files[4]),
+            "collection releases unresolved markers and key references");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
+        "close migrated database");
+}
+
+static void
 ngx_http_cache_purge_test_native_bindings(const std::string &path)
 {
     check(mkdir(path.c_str(), 0700) == 0, "native binding directory");
@@ -1114,7 +1259,7 @@ ngx_http_cache_purge_test_retention(const std::string &path)
                     reinterpret_cast<const char *>(first.id.data()), 16));
         raw_write(store, cf, "M:index", "6");
         Index upgraded(store);
-        check(ngx_http_cache_purge_test_raw(store, "M:index") == "8"
+        check(ngx_http_cache_purge_test_raw(store, "M:index") == "9"
                   && ngx_http_cache_purge_test_raw(store,
                          "O"
                              + std::string(reinterpret_cast<const char *>(
@@ -1423,6 +1568,8 @@ main(int argc, char **argv)
         char path[] = "/tmp/cache-purge-index-test-XXXXXX";
         check(mkdtemp(path) != nullptr, "test directory");
         ngx_http_cache_purge_test_tag_groups();
+        ngx_http_cache_purge_test_native_migration(
+            std::string(path) + "-migration");
         ngx_http_cache_purge_test_native_bindings(
             std::string(path) + "-native");
         ngx_http_cache_rocksdb_options_t options;

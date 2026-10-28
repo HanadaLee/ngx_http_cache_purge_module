@@ -1448,6 +1448,59 @@ ngx_http_cache_purge_publication_watermark(
 }
 
 static int
+ngx_http_cache_purge_publication_resolve_native(void *data,
+    const ngx_http_cache_purge_index_file_t *file, unsigned char main[16],
+    unsigned char variant[16], unsigned *state,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_publications_t     *p;
+    ngx_http_cache_purge_publication_root_t *root;
+    int                                      rc;
+
+    p = data;
+    *state = NGX_HTTP_CACHE_PURGE_NATIVE_MISSING;
+    root = ngx_http_cache_purge_publication_find(p, file->root, file->zone, 1);
+    if (root == NULL) {
+        return 0;
+    }
+    if (root->configured.kind != NGX_HTTP_CACHE_PURGE_ROOT_PROXY
+        || (file->state == NGX_HTTP_CACHE_PURGE_INDEX_RETIRED
+            && file->revision == 2))
+    {
+        *state = NGX_HTTP_CACHE_PURGE_NATIVE_SKIP;
+        return 0;
+    }
+    rc = ngx_http_cache_purge_publication_native(file, main, variant, error);
+    if (rc == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND
+        || rc == NGX_HTTP_CACHE_ROCKSDB_INVALID)
+    {
+        return ngx_http_cache_purge_result(error, 0, "");
+    }
+    if (rc == 0) {
+        *state = NGX_HTTP_CACHE_PURGE_NATIVE_BIND;
+    }
+    return rc;
+}
+
+int
+ngx_http_cache_purge_publications_migrate_native(
+    ngx_http_cache_purge_publications_t *p, ngx_http_cache_rocksdb_t *store,
+    size_t budget, int *done, ngx_http_cache_rocksdb_error_t *error)
+{
+    int  rc;
+
+    if (done != NULL) {
+        *done = 0;
+    }
+    rc = ngx_http_cache_purge_publication_owner(p, error);
+    if (rc != 0) {
+        return rc;
+    }
+    return ngx_http_cache_purge_index_migrate_native(store, budget,
+        ngx_http_cache_purge_publication_resolve_native, p, done, error);
+}
+
+static int
 ngx_http_cache_purge_publication_same(
     const ngx_http_cache_purge_publication_proof_t *proof,
     const struct stat *st)

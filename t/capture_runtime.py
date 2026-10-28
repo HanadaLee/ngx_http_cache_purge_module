@@ -1351,11 +1351,13 @@ try:
     assert get('/negative-cache') == (200, 'BYPASS', b'/negative-cache')
     checks.append('disabling indexing by reload is rejected and the existing workers continue enforcing resident Delete FENCEs')
     (run / 'nginx.conf').write_text(config)
-    status, headers, caps = api('/__purge/v2/capabilities')
+    status, headers, caps = until(lambda: (reply if
+        (reply := api('/__purge/v2/capabilities'))[0] == 200 and reply[2]['ready']
+        else None))
     assert status == 200 and headers['Cache-Control'] == 'no-store' and caps['ready'], (status, caps)
     assert caps['authentication'] == 'nginx-configuration' and 'signed_events' not in caps
     assert caps['propagation_timeout_ms'] == '120000'
-    assert caps['index_schema'] == 8
+    assert caps['index_schema'] == 9
     assert caps['control_headers']['tag_namespace'] == 'X-Cache-Purge-Namespace'
     assert caps['index_id'] == ledger.hex() and caps['max_tags'] == 64
     assert caps['invalidate_stale_policy'] == ('forbid' if extension else 'native')
