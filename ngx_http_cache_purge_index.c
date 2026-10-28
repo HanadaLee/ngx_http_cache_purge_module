@@ -2939,11 +2939,13 @@ static uint64_t
 ngx_http_cache_purge_index_find(ngx_http_cache_purge_query_t *q,
     ngx_http_cache_rocksdb_bytes_t text)
 {
-    unsigned char                        prefix[33];
-    ngx_http_cache_rocksdb_bytes_t       range, number;
+    unsigned char                         prefix[33];
+    ngx_http_cache_rocksdb_bytes_t        range, number;
+    ngx_http_cache_rocksdb_error_t        error;
     ngx_http_cache_purge_index_cursor_t  *cursor;
     uint64_t                              id;
     unsigned                              candidates;
+    int                                   rc;
 
     prefix[0] = 'S';
     if (!ngx_http_cache_purge_index_require(
@@ -2955,9 +2957,19 @@ ngx_http_cache_purge_index_find(ngx_http_cache_purge_query_t *q,
     range.data = prefix;
     range.len = sizeof(prefix);
     cursor = &q->files;
-    ngx_http_cache_purge_index_cursor_open(
-        q, cursor, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, range,
-        ngx_http_cache_purge_op_empty, NULL);
+    ngx_http_cache_purge_index_cursor_close(q, cursor);
+    if (q->status != 0) {
+        return 0;
+    }
+
+    /* Digest probes inspect at most 16 candidates; bulk cursors stay cold. */
+    rc = ngx_http_cache_rocksdb_cursor_open_cached(q->store,
+        NGX_HTTP_CACHE_ROCKSDB_DEFAULT, range, ngx_http_cache_purge_op_empty,
+        &cursor->handle, &error);
+    if (rc != 0) {
+        ngx_http_cache_purge_index_fail(q, rc, error.message);
+        return 0;
+    }
     id = 0;
     candidates = 0;
     while (ngx_http_cache_purge_index_cursor_next(q, cursor)) {

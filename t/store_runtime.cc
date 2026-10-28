@@ -83,11 +83,13 @@ missing(ngx_http_cache_rocksdb_t *store, ngx_http_cache_rocksdb_cf_e cf,
 }
 static std::vector<std::string>
 scan(ngx_http_cache_rocksdb_t *store, ngx_http_cache_rocksdb_cf_e cf,
-    const std::string &prefix, const std::string &after = "")
+    const std::string &prefix, const std::string &after = "",
+    bool cached = false)
 {
     ngx_http_cache_rocksdb_cursor_t *cursor = nullptr;
-    expect(ngx_http_cache_rocksdb_cursor_open(
-               store, cf, bytes(prefix), bytes(after), &cursor, &error),
+    auto open_cursor = cached ? ngx_http_cache_rocksdb_cursor_open_cached :
+                                ngx_http_cache_rocksdb_cursor_open;
+    expect(open_cursor(store, cf, bytes(prefix), bytes(after), &cursor, &error),
         NGX_HTTP_CACHE_ROCKSDB_OK, "open cursor");
     std::vector<unsigned char> key_data(65536), value_data(4096);
     ngx_http_cache_rocksdb_buffer_t key{ key_data.data(), key_data.size(), 0 };
@@ -122,6 +124,64 @@ close(ngx_http_cache_rocksdb_t *&store)
     expect(ngx_http_cache_rocksdb_close(&store, &error),
         NGX_HTTP_CACHE_ROCKSDB_OK, "close");
     require(store == nullptr, "store handle consumed");
+}
+
+static void
+ngx_http_cache_purge_test_cached_cursor(ngx_http_cache_rocksdb_t *store)
+{
+    const std::string prefix("cached\0", 7),
+        first = prefix + "a", last = prefix + "b", outside = "cached!";
+    write(store, NGX_HTTP_CACHE_ROCKSDB_URL, first, "first");
+    write(store, NGX_HTTP_CACHE_ROCKSDB_URL, last, "old");
+    write(store, NGX_HTTP_CACHE_ROCKSDB_URL, outside, "outside");
+    require(scan(store, NGX_HTTP_CACHE_ROCKSDB_URL, prefix, first, true)
+                == std::vector<std::string>{ last },
+        "cached binary prefix with exclusive resume");
+    ngx_http_cache_rocksdb_cursor_t *parent = nullptr, *child = nullptr,
+                                    *extra = nullptr;
+    expect(ngx_http_cache_rocksdb_cursor_open_cached(store,
+               NGX_HTTP_CACHE_ROCKSDB_URL, bytes(prefix), bytes(outside),
+               &parent, &error),
+        NGX_HTTP_CACHE_ROCKSDB_INVALID, "cached resume rejects another range");
+    require(!parent, "invalid cached range leaves no handle");
+    expect(ngx_http_cache_rocksdb_cursor_open_cached(store,
+               NGX_HTTP_CACHE_ROCKSDB_URL, bytes(prefix), bytes(first), &parent,
+               &error),
+        NGX_HTTP_CACHE_ROCKSDB_OK, "cached snapshot");
+    write(store, NGX_HTTP_CACHE_ROCKSDB_URL, last, "new");
+    ngx_http_cache_rocksdb_buffer_t key{ nullptr, 0, 0 },
+        value{ nullptr, 0, 0 };
+    expect(ngx_http_cache_rocksdb_cursor_next(parent, &key, &value, &error),
+        NGX_HTTP_CACHE_ROCKSDB_BUFFER, "cached short buffer");
+    require(key.length == last.size() && value.length == 3,
+        "cached required buffer sizes");
+    std::array<unsigned char, 64> k{}, v{};
+    key = { k.data(), k.size(), 0 };
+    value = { v.data(), v.size(), 0 };
+    expect(ngx_http_cache_rocksdb_cursor_next(parent, &key, &value, &error),
+        NGX_HTTP_CACHE_ROCKSDB_OK, "cached retry does not consume row");
+    require(
+        std::string(reinterpret_cast<char *>(key.data), key.length) == last
+            && std::string(reinterpret_cast<char *>(value.data), value.length)
+                   == "old",
+        "cached read preserves pre-write snapshot");
+    expect(ngx_http_cache_rocksdb_cursor_next(parent, &key, &value, &error),
+        NGX_HTTP_CACHE_ROCKSDB_DONE, "cached upper bound excludes neighbor");
+    expect(
+        ngx_http_cache_rocksdb_cursor_fork(parent, NGX_HTTP_CACHE_ROCKSDB_URL,
+            bytes(prefix), bytes(""), &child, &error),
+        NGX_HTTP_CACHE_ROCKSDB_OK, "bulk child from cached parent");
+    expect(ngx_http_cache_rocksdb_cursor_open_cached(store,
+               NGX_HTTP_CACHE_ROCKSDB_URL, bytes(prefix), bytes(""), &extra,
+               &error),
+        NGX_HTTP_CACHE_ROCKSDB_LIMIT, "cached cursors share the handle budget");
+    require(!extra, "saturated cached open leaves no handle");
+    expect(ngx_http_cache_rocksdb_cursor_close(&parent, &error),
+        NGX_HTTP_CACHE_ROCKSDB_OK, "close cached parent");
+    require(get(store, NGX_HTTP_CACHE_ROCKSDB_URL, last, child) == "old",
+        "bulk child retains cached parent's snapshot");
+    expect(ngx_http_cache_rocksdb_cursor_close(&child, &error),
+        NGX_HTTP_CACHE_ROCKSDB_OK, "close cached child");
 }
 
 static void
@@ -317,6 +377,7 @@ main(int argc, char **argv)
         require(mkdtemp(path) != nullptr, "create test directory");
         options.max_cursors = 2;
         auto *store = open(path, options);
+        ngx_http_cache_purge_test_cached_cursor(store);
         write(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, "C:abi", "C ABI");
         require(ngx_http_cache_purge_store_c_probe(store) == 0, "C ABI probe");
         const std::string binary_key("K:a\0b\xff", 6), binary_value("v\0x", 3);
@@ -443,6 +504,9 @@ main(int argc, char **argv)
         require(scan(store, NGX_HTTP_CACHE_ROCKSDB_URL, high)
                     == std::vector<std::string>{ high, high + "a" },
             "all-FF prefix without successor");
+        require(scan(store, NGX_HTTP_CACHE_ROCKSDB_URL, high, "", true)
+                    == std::vector<std::string>{ high, high + "a" },
+            "cached all-FF prefix without successor");
         const std::string scope1("T:ns1\0tag\0", 10),
             scope2("T:ns2\0tag\0", 10);
         write(store, NGX_HTTP_CACHE_ROCKSDB_TAG, scope1 + "1", "a");
@@ -555,7 +619,7 @@ main(int argc, char **argv)
         store = open(path, options);
         require(get(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, key) == "later",
             "reopen persistent data");
-        expect(ngx_http_cache_rocksdb_cursor_open(store,
+        expect(ngx_http_cache_rocksdb_cursor_open_cached(store,
                    NGX_HTTP_CACHE_ROCKSDB_URL, bytes(prefix), bytes(""),
                    &cursor, &error),
             NGX_HTTP_CACHE_ROCKSDB_OK, "expiring cursor");

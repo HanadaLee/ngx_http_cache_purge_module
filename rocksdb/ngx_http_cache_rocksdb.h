@@ -149,6 +149,14 @@ int ngx_http_cache_rocksdb_cursor_open(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_bytes_t after,
     ngx_http_cache_rocksdb_cursor_t **cursor,
     ngx_http_cache_rocksdb_error_t *error);
+/* Same bounds, snapshot, deadline and handle budget, but read blocks may enter
+ * the existing shared cache. Use only for short probes; bulk scans use open.
+ * Forks always keep the bulk no-fill policy, including from a cached parent. */
+int ngx_http_cache_rocksdb_cursor_open_cached(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_rocksdb_cf_e cf, ngx_http_cache_rocksdb_bytes_t prefix,
+    ngx_http_cache_rocksdb_bytes_t after,
+    ngx_http_cache_rocksdb_cursor_t **cursor,
+    ngx_http_cache_rocksdb_error_t *error);
 /* Open a related range using the parent's exact snapshot and deadline. A child
  * remains valid after its parent closes, until that shared deadline expires.
  * Every cursor consumes one bounded slot and must be closed, even on EXPIRED.

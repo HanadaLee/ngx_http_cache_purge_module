@@ -739,7 +739,7 @@ ngx_http_cache_rocksdb_sync(
 static int
 open_cursor(ngx_http_cache_rocksdb_t *store, ngx_http_cache_rocksdb_cf_e cf,
     ngx_http_cache_rocksdb_bytes_t prefix, ngx_http_cache_rocksdb_bytes_t after,
-    std::shared_ptr<ngx_http_cache_rocksdb_snapshot_s> view,
+    bool fill_cache, std::shared_ptr<ngx_http_cache_rocksdb_snapshot_s> view,
     ngx_http_cache_rocksdb_cursor_t **output,
     ngx_http_cache_rocksdb_error_t *error)
 {
@@ -794,7 +794,7 @@ open_cursor(ngx_http_cache_rocksdb_t *store, ngx_http_cache_rocksdb_cf_e cf,
     cursor->view = std::move(view);
     rocksdb::ReadOptions read;
     read.snapshot = cursor->view->snapshot;
-    read.fill_cache = false;
+    read.fill_cache = fill_cache;
     read.total_order_seek = true;
     if (!cursor->upper.empty()) {
         read.iterate_upper_bound = &cursor->bound;
@@ -826,7 +826,24 @@ ngx_http_cache_rocksdb_cursor_open(ngx_http_cache_rocksdb_t *store,
         *output = nullptr;
     }
     return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
-        return open_cursor(store, cf, prefix, after, nullptr, output, error);
+        return open_cursor(
+            store, cf, prefix, after, false, nullptr, output, error);
+    });
+}
+
+extern "C" int
+ngx_http_cache_rocksdb_cursor_open_cached(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_rocksdb_cf_e cf, ngx_http_cache_rocksdb_bytes_t prefix,
+    ngx_http_cache_rocksdb_bytes_t after,
+    ngx_http_cache_rocksdb_cursor_t **output,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    if (output) {
+        *output = nullptr;
+    }
+    return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
+        return open_cursor(
+            store, cf, prefix, after, true, nullptr, output, error);
     });
 }
 
@@ -845,8 +862,8 @@ ngx_http_cache_rocksdb_cursor_fork(ngx_http_cache_rocksdb_cursor_t *parent,
         if (code != NGX_HTTP_CACHE_ROCKSDB_OK) {
             return code;
         }
-        return open_cursor(
-            parent->store, cf, prefix, after, parent->view, output, error);
+        return open_cursor(parent->store, cf, prefix, after, false,
+            parent->view, output, error);
     });
 }
 

@@ -32,6 +32,13 @@ preparation API. Native representation bindings and their file intent remain in
 the same atomic batch. Tests count actual WAL sync calls through these entry
 points and verify process recovery and loss of an unsynchronized WAL suffix.
 
+Bounded dictionary digest probes can fill the existing shared RocksDB block
+cache. Bulk prefix scans and forked cursors retain their no-fill policy, so
+enumerating a purge does not populate the cache with the scanned range. Both
+cursor APIs share the same snapshot deadlines, handle limits and memory budget.
+Exact URL/key selectors already use direct lookups; this optimization targets
+value interning and native representation or association queries.
+
 HTTP cache invalidation for nginx proxy, FastCGI, SCGI, and uWSGI caches.
 
 The module is undergoing a storage and lifecycle redesign. The default build
