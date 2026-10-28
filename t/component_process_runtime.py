@@ -1299,50 +1299,6 @@ try:
     os.close(lease)
     check(True, 'physical removal accepts validation receipts and collected PREPARED-marker instances stay absent')
     v.close(); validating.stop()
-    propagation_shared = root / 'local-propagation.shm'
-    local = Component(root / 'local-propagation', shared=propagation_shared)
-    local.opened(); lp = Client(local.path)
-    wait_for(lambda: struct.unpack('>IQ', lp.call(16))[0] == 6)
-    lp.call(3, b'\x02' + record(901, uri='/local-propagation', tags=('red',))
-            + record(902, uri='/local-propagation', tags=('blue',)))
-    lp.call(4, batch([(901, 1), (902, 1)]))
-    lp.call(31, b'', code=4)
-    lp.call(31, identity(901) + struct.pack('>Q', 1) + string('') * 3, code=7)
-    lp.call(31, identity(999) + struct.pack('>Q', 2) + string('') * 3, code=1)
-    selected_before = lp.call(2, identity(901))
-    data = string('local-tag') + b'\x01' + struct.pack('>Q', 1000)
-    data += b'\x05' + string('red') + string('team') + string('local-test')
-    lp.call(14, data)
-    wait_for(lambda: struct.unpack('>IQ', lp.call(16))[0] == 6)
-    first = struct.unpack('>QQQ', lp.call(31, identity(901) + struct.pack('>Q', 2) + string('') * 3))
-    other = struct.unpack('>QQQ', lp.call(31, identity(902) + struct.pack('>Q', 2) + string('') * 3))
-    assert first[:2] == (1000, 0) and other[:2] == (0, 0) and first[2] and other[2]
-    assert lp.call(2, identity(901)) == selected_before
-    check(True, 'FILE_PROPAGATION returns fixed object cutoffs for indexed TAG membership, rejects stale identities and does not rewrite file metadata')
-    logical = 'team\x1fhttps\x1fa.test\x1f/local-propagation\x1f'
-    alias = 'https://alias.test/local-propagation'
-    data = string('local-alias') + b'\x01' + struct.pack('>Q', 2000)
-    data += b'\x01' + string(alias) + string('') + string('local-test')
-    lp.call(14, data)
-    wait_for(lambda: struct.unpack('>IQ', lp.call(16))[0] == 6)
-    selected = identity(902) + struct.pack('>Q', 2)
-    assert struct.unpack('>QQQ', lp.call(31, selected + string('') * 3))[:2] == (0, 0)
-    current = string(logical) + string(alias) + string('alias.test')
-    assert struct.unpack('>QQQ', lp.call(31, selected + current))[:2] == (2000, 0)
-    assert struct.unpack('>QQQ', lp.call(31, selected + string('') * 3))[:2] == (0, 0)
-    lp.call(31, selected + string('wrong') + string(alias) + string('alias.test'), code=7)
-    lp.call(31, selected + string('') + string(alias) + string('alias.test'), code=4)
-    lp.call(12, string(logical) + string(alias))
-    assert struct.unpack('>QQQ', lp.call(31, identity(902) + struct.pack('>Q', 2) + string('') * 3))[:2] == (2000, 0)
-    lp.close(); local.stop()
-    local = Component(local.path, shared=propagation_shared)
-    local.opened(); lp = Client(local.path)
-    wait_for(lambda: struct.unpack('>IQ', lp.call(16))[0] == 6)
-    assert struct.unpack('>QQQ', lp.call(31, identity(901) + struct.pack('>Q', 2) + string('') * 3))[:2] == (2000, 0)
-    assert struct.unpack('>QQQ', lp.call(31, identity(902) + struct.pack('>Q', 2) + string('') * 3))[:2] == (2000, 0)
-    check(True, 'local propagation resolves persisted URL aliases and survives executor restart without index rebuilding')
-    lp.close(); local.stop()
-
     object_shared = root / 'object-query.shm'
     objects = Component(root / 'object-query', shared=object_shared, seed=True)
     objects.opened(); probe = Client(objects.path)
@@ -1354,6 +1310,9 @@ try:
     payload = b''.join(map(string, ('object-key', 'https://object.test/item', 'object.test', 'team')))
     payload += b'\x01' + b'\0' * 15 + struct.pack('>I', 1)
     payload += string('X-Query-Test') + string('retained until completion')
+    probe.call(31, b'', code=4)
+    probe.call(31, identity(1) + struct.pack('>Q', 2) + string('') * 3, code=4)
+    check(True, 'retired opcode 31 is rejected and cannot be reinterpreted as the request propagation query')
     probe.call(32, b'', code=4)
     probe.call(32, payload + b'bad', code=4)
     for attempt in range(4):
@@ -1367,8 +1326,13 @@ try:
             assert result[:2] == (1000, 0) and result[2]
         pending.close()
     check(True, 'OBJECT_PROPAGATION yields between alias pages, keeps its input live, and releases disconnected query snapshots')
+    indexed_before = probe.call(2, identity(1))
+    writes_before = struct.unpack('>9Q', probe.call(1))[1]
     result = struct.unpack('>QQQ', probe.call(32, payload))
     assert result[:2] == (1000, 0) and result[2]
+    assert probe.call(2, identity(1)) == indexed_before
+    assert struct.unpack('>9Q', probe.call(1))[1] == writes_before
+    check(True, 'the request object query resolves native indexed TAGs without changing file metadata or writing WAL')
     unknown = b''.join(map(string, ('unknown', 'https://unknown.test/item', 'unknown.test', 'team')))
     unknown += b'\x01' + b'\0' * 15 + b'\0' * 4
     assert struct.unpack('>QQQ', probe.call(32, unknown))[:2] == (0, 0)

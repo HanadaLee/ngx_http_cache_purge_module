@@ -320,7 +320,7 @@ ngx_http_cache_purge_test_object_propagation()
 }
 
 static void
-ngx_http_cache_purge_test_file_propagation()
+ngx_http_cache_purge_test_propagation_policy()
 {
     char path[] = "/tmp/ncp-file-propagation-XXXXXX";
     check(mkdtemp(path) != nullptr, "file propagation directory");
@@ -355,35 +355,80 @@ ngx_http_cache_purge_test_file_propagation()
         blue.id[15] = 2;
         blue.path = "blue";
         blue.tags = { "blue" };
+        unsigned char main[16] = { 1 };
         for (const auto &file : { red, blue }) {
-            auto prepared = index.prepare(file);
+            std::string hash_input(reinterpret_cast<char *>(main), 16);
+            hash_input += "accept-language:" + file.path + "\r\n";
+            unsigned char variant[16];
+            unsigned length;
+            check(EVP_Digest(hash_input.data(), hash_input.size(), variant,
+                      &length, EVP_md5(), nullptr)
+                          == 1
+                      && length == 16,
+                "policy fixture native Vary identity");
+            auto raw = ngx_http_cache_purge_native_file(file);
+            ngx_http_cache_purge_index_match_t prepared{};
+            check(ngx_http_cache_purge_index_prepare_native(
+                      store, &raw, nullptr, main, variant, &prepared, &error)
+                      == 0,
+                error.message);
             index.commit(file.id, prepared.revision);
         }
         Coordinator coordinator(operations, shared, size);
-        auto query =
-            [&](const File &file, uint64_t now, int code = 0,
-                uint64_t revision = 2,
-                const ngx_http_cache_purge_control_context_t *observed =
-                    nullptr) {
-                auto expected =
-                    ngx_http_cache_purge_native_expected(file.id, revision);
-                ngx_http_cache_purge_fence_t result{ 99, 99 };
-                uint64_t publication = 99;
-                int rc = ngx_http_cache_purge_coordinator_file_propagation(
-                    coordinator.native(), &expected, observed, now, &result,
-                    &publication, &error);
-                check(rc == code, error.message);
-                if (rc) {
-                    check(result.invalidate_ms == 0 && result.delete_ms == 0
-                              && publication == 0,
-                        "failed local query exposes no partial cutoffs");
-                } else {
-                    check(
-                        publication == coordinator.publication() && publication,
-                        "file propagation returns its control publication");
+        auto query = [&](const File &file, uint64_t now, int code = 0,
+                         const ngx_http_cache_purge_control_context_t
+                             *observed = nullptr) {
+            ngx_http_cache_purge_control_context_t request{};
+            request.key = ngx_http_cache_purge_native_bytes(file.key);
+            request.url = ngx_http_cache_purge_native_bytes(file.url);
+            request.host = ngx_http_cache_purge_native_bytes(file.host);
+            request.tag_namespace =
+                ngx_http_cache_purge_native_bytes(file.tag_namespace);
+            if (observed) {
+                request.key = observed->key;
+                request.url = observed->url;
+                request.host = observed->host;
+            }
+            std::string headers;
+            auto number = [&](uint32_t value) {
+                for (int n = 3; n >= 0; n--) {
+                    headers += static_cast<char>(value >> (n * 8));
                 }
-                return result;
             };
+            number(1);
+            number(15);
+            headers += "Accept-Language";
+            number(file.path.size());
+            headers += file.path;
+            ngx_http_cache_purge_fence_t result{};
+            uint64_t publication = 0;
+            ngx_http_cache_purge_object_query_t *q = nullptr;
+            int rc = ngx_http_cache_purge_coordinator_object_open(
+                coordinator.native(), &request, main,
+                ngx_http_cache_purge_native_bytes(headers), now, &q, &error);
+            int done = 0;
+            unsigned steps = 0;
+            while (rc == 0 && !done) {
+                rc = ngx_http_cache_purge_coordinator_object_step(
+                    q, 8, &result, &publication, &done, &error);
+                check(++steps < 1000, "policy query makes bounded progress");
+            }
+            check(rc == code, error.message);
+            if (q) {
+                check(ngx_http_cache_purge_coordinator_object_close(&q, &error)
+                          == 0,
+                    "close policy object query");
+            }
+            if (rc) {
+                check(result.invalidate_ms == 0 && result.delete_ms == 0
+                          && publication == 0,
+                    "failed local query exposes no partial cutoffs");
+            } else {
+                check(publication == coordinator.publication() && publication,
+                    "object propagation returns its control publication");
+            }
+            return result;
+        };
         query(red, 2000, NGX_HTTP_CACHE_ROCKSDB_BUSY);
         ready(coordinator);
         auto result = query(red, 2000);
@@ -441,19 +486,20 @@ ngx_http_cache_purge_test_file_propagation()
         result = query(blue, 2000);
         check(result.invalidate_ms == 1300 && result.delete_ms == 2000,
             "host TAG checks alias scope and this file's actual TAGs");
-        result = query(red, 2000, 0, 2, &observed);
+        result = query(red, 2000, 0, &observed);
         check(result.invalidate_ms == 2300 && result.delete_ms == 2200,
             "new request identities match before their aliases are persisted");
-        result = query(blue, 2000, 0, 2, &observed);
+        result = query(blue, 2000, 0, &observed);
         check(result.invalidate_ms == 2300 && result.delete_ms == 2000,
             "current host TAG still uses the selected file's membership");
         auto wrong = observed;
         const std::string wrong_key = "other-key";
         wrong.key = ngx_http_cache_purge_native_bytes(wrong_key);
-        query(red, 2000, NGX_HTTP_CACHE_ROCKSDB_CONFLICT, 2, &wrong);
+        check(query(red, 2000, 0, &wrong).delete_ms == 0,
+            "unknown key cannot borrow indexed TAG memberships");
         wrong = observed;
         wrong.host = { nullptr, 10 };
-        query(red, 2000, NGX_HTTP_CACHE_ROCKSDB_INVALID, 2, &wrong);
+        query(red, 2000, NGX_HTTP_CACHE_ROCKSDB_INVALID, &wrong);
         check(ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
                   && before.writes == after.writes,
             "local propagation queries perform no WAL writes");
@@ -480,35 +526,15 @@ ngx_http_cache_purge_test_file_propagation()
         result = query(red, 3099);
         check(result.invalidate_ms == 1300,
             "file propagation is independent of local FENCE retirement");
-        query(red, 3001, NGX_HTTP_CACHE_ROCKSDB_CONFLICT, 1);
-        File missing = red;
-        missing.id[15] = 99;
-        query(missing, 3001, NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND);
         query(red, 0, NGX_HTTP_CACHE_ROCKSDB_INVALID);
         index.retire(blue.id, 2);
-        query(blue, 3001, NGX_HTTP_CACHE_ROCKSDB_CONFLICT, 3);
+        check(query(blue, 3001).delete_ms == 2000,
+            "retired committed files retain known membership until collection");
         for (unsigned n = 0; n < 63; n++) {
             index.add_url(red.key, "https://many.test/" + std::to_string(n));
         }
-        query(red, 3001, NGX_HTTP_CACHE_ROCKSDB_LIMIT);
-        File bounded = red;
-        bounded.id[15] = 3;
-        bounded.key = "budget-key";
-        bounded.path = "budget";
-        bounded.tags.clear();
-        auto prepared = index.prepare(bounded);
-        index.commit(bounded.id, prepared.revision);
-        for (unsigned n = 0; n < 62; n++) {
-            index.add_url(
-                bounded.key, "https://budget.test/" + std::to_string(n));
-        }
-        for (unsigned n = 0; n < 20; n++) {
-            add("all-" + std::to_string(n),
-                { SelectorKind::url_prefix, "", "" }, PurgeMode::invalidate,
-                n + 1);
-        }
-        query(bounded, 3001, NGX_HTTP_CACHE_ROCKSDB_LIMIT);
-        query(red, 3001, NGX_HTTP_CACHE_ROCKSDB_CONFLICT, 1);
+        check(query(red, 3001).invalidate_ms == 1300,
+            "paged request query exceeds the retired diagnostic alias limit");
     }
     check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
     munmap(shared, size);
@@ -585,13 +611,19 @@ ngx_http_cache_purge_test_retention()
             coordinator.refresh();
             ready(coordinator);
         };
-        ngx_http_cache_purge_history_query_t *history = nullptr;
+        ngx_http_cache_purge_object_query_t *history = nullptr;
+        ngx_http_cache_purge_control_context_t history_request{};
+        history_request.key = ngx_http_cache_purge_native_bytes(file.key);
+        history_request.url = ngx_http_cache_purge_native_bytes(file.url);
+        history_request.host = ngx_http_cache_purge_native_bytes(file.host);
+        history_request.tag_namespace =
+            ngx_http_cache_purge_native_bytes(file.tag_namespace);
+        const std::string empty_headers(4, '\0');
         auto history_open = [&](uint64_t now) {
-            check(ngx_http_cache_purge_coordinator_history_open(
-                      coordinator.native(),
-                      ngx_http_cache_purge_native_bytes(file.key), main,
-                      ngx_http_cache_purge_native_bytes(file.vary), variant,
-                      now, &history, &error)
+            check(ngx_http_cache_purge_coordinator_object_open(
+                      coordinator.native(), &history_request, main,
+                      ngx_http_cache_purge_native_bytes(empty_headers), now,
+                      &history, &error)
                       == 0,
                 error.message);
         };
@@ -599,19 +631,24 @@ ngx_http_cache_purge_test_retention()
             ngx_http_cache_purge_fence_t result{ 99, 99 };
             uint64_t publication = 99;
             int done = 99;
-            check(ngx_http_cache_purge_coordinator_history_step(
+            check(ngx_http_cache_purge_coordinator_object_step(
                       history, 1, &result, &publication, &done, &error)
                           == 0
                       && !done && !publication && !result.invalidate_ms
                       && !result.delete_ms,
                 "partial history step does not publish an aggregate");
-            check(ngx_http_cache_purge_coordinator_history_step(
-                      history, 1, &result, &publication, &done, &error)
-                          == 0
-                      && done && publication == coordinator.publication(),
+            unsigned steps = 0;
+            while (!done) {
+                check(ngx_http_cache_purge_coordinator_object_step(
+                          history, 1, &result, &publication, &done, &error)
+                          == 0,
+                    error.message);
+                check(++steps < 100, "historical object query makes progress");
+            }
+            check(publication == coordinator.publication(),
                 "history completion carries the matching publication");
             check(
-                ngx_http_cache_purge_coordinator_history_close(&history, &error)
+                ngx_http_cache_purge_coordinator_object_close(&history, &error)
                     == 0,
                 "close completed history query");
             return result;
@@ -668,13 +705,13 @@ ngx_http_cache_purge_test_retention()
         ngx_http_cache_purge_fence_t stale{ 99, 99 };
         uint64_t publication = 99;
         int done = 99;
-        check(ngx_http_cache_purge_coordinator_history_step(
+        check(ngx_http_cache_purge_coordinator_object_step(
                   history, 1, &stale, &publication, &done, &error)
                       == NGX_HTTP_CACHE_ROCKSDB_BUSY
                   && !stale.invalidate_ms && !stale.delete_ms && !publication
                   && !done,
             "a replaced control image rejects the history aggregate");
-        check(ngx_http_cache_purge_coordinator_history_close(&history, &error)
+        check(ngx_http_cache_purge_coordinator_object_close(&history, &error)
                   == 0,
             "close history after publication change");
         check(ngx_http_cache_purge_coordinator_expire_propagation(
@@ -1057,7 +1094,7 @@ main(int argc, char **argv)
 {
     try {
         if (argc == 1) {
-            ngx_http_cache_purge_test_file_propagation();
+            ngx_http_cache_purge_test_propagation_policy();
             ngx_http_cache_purge_test_object_propagation();
             ngx_http_cache_purge_test_retention();
             ngx_http_cache_purge_test_keep_pages();

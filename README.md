@@ -555,10 +555,11 @@ replacement or a successfully revalidated instance. Submission is bounded to
 32 jobs and 256 KiB per worker, with a five-second retry deadline. Once retired,
 normal persistent collection continues across executor restarts.
 
-The executor has a bounded, read-only file propagation query. It checks the
-selected committed file's revision and actual TAGs, visits its key's persisted
-URL and business-host aliases, and returns the two object times with a control
-publication stamp. It never exports TAG candidates or grants cache admission.
+The executor resolves propagation through the asynchronous request object
+query, using native representation identity and current or retained membership.
+The earlier file-only and history-only coordinator queries have been removed.
+Their internal IPC opcode 31 is retired and rejected; opcode 32 remains the
+request object query. Propagation results never grant cache admission.
 
 Vary files retain the native main and variant hashes in their publication
 metadata, including across conditional revalidation. Ordinary files keep the
@@ -618,8 +619,7 @@ between alias batches. Before collection it matches later local rules against
 the retained namespace/TAG membership and all persisted aliases. Each completed
 membership commits independently, so a later pending scan cannot roll back its
 progress. Completed scans wake collection immediately; waiting does not extend
-the original propagation deadlines. Diagnostic propagation visitors still need
-this paging integration.
+the original propagation deadlines.
 
 Managed proxy-cache requests now resolve these associations asynchronously at
 the cache-entry gate. One IPC request holds its bounded input until completion,
@@ -638,9 +638,9 @@ through deletion and restart, 304 TAG replacement, and slice isolation.
 Full propagation remains unfinished. A new accepted operation between the gate
 and upstream request creation currently rejects sending; maintenance publication
 changes with the same ledger and operation sequence preserve the completed
-result. Diagnostic propagation visitors still have a 64-alias traversal bound.
-File validation, retention before mutation and retained-history expiry no longer
-have that count limit.
+result. File validation, retention before mutation and retained-history expiry
+no longer have a fixed alias count limit. Per-step matching budgets and shared
+cursor capacity still require loaded performance and progress validation.
 Uncached proxy routes, unsupported cache methods, complete tier integration,
 and loaded memory/latency acceptance remain open. Capabilities reports the sender transport as
 `filter` or `variables`, while `proxy_propagation_ready` remains false.

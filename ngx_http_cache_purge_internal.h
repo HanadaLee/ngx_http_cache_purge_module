@@ -82,13 +82,10 @@ typedef enum {
     /* root/zone/path/native header prefix, one selected FD -> retired match.
      * No push identity/time is stored. The existing collector deletes it. */
     NGX_HTTP_CACHE_PURGE_OP_RETIRE_SELECTED,
-    /* file ID[16], revision u64, current key/URL/host strings -> three u64:
-     * Invalidate/Delete times and publication. Empty strings query only the
-     * persisted associations. Use the executor's current time. */
-    NGX_HTTP_CACHE_PURGE_OP_FILE_PROPAGATION,
-    /* key/URL/host/namespace strings, main[16], encoded request headers ->
+    /* Opcode 31 is retired and must not be reused.
+     * key/URL/host/namespace strings, main[16], encoded request headers ->
      * Invalidate/Delete times and publication (three u64), asynchronously. */
-    NGX_HTTP_CACHE_PURGE_OP_OBJECT_PROPAGATION
+    NGX_HTTP_CACHE_PURGE_OP_OBJECT_PROPAGATION = 32
 } ngx_http_cache_purge_opcode_e;
 
 #define NGX_HTTP_CACHE_PURGE_ROOT_CACHE 1
@@ -875,20 +872,6 @@ int ngx_http_cache_purge_index_get_file(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_error_t *error);
 void
 ngx_http_cache_purge_index_file_free(ngx_http_cache_purge_index_file_t *file);
-/* Executor-only snapshot for a committed file at its exact revision. Match
- * actual file TAGs and the key's persisted URL/host aliases. Optional request
- * fields must identify the same key; match their URL/host without writing new
- * associations. Only key/URL/host are read from request. No admission or
- * file-write permission is implied. Errors
- * clear both outputs. Asynchronous consumers must recheck the publication and
- * selected instance. Request routing and retired-object retention are separate.
- */
-int ngx_http_cache_purge_coordinator_file_propagation(
-    ngx_http_cache_purge_coordinator_t *coordinator,
-    const ngx_http_cache_purge_index_expected_t *file,
-    const ngx_http_cache_purge_control_context_t *request, uint64_t now,
-    ngx_http_cache_purge_fence_t *out, uint64_t *publication,
-    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_current(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_bytes_t root, ngx_http_cache_rocksdb_bytes_t path,
     ngx_http_cache_purge_index_match_t *out,
@@ -1013,14 +996,6 @@ int ngx_http_cache_purge_index_aliases_close(
     ngx_http_cache_purge_alias_query_t **query,
     ngx_http_cache_rocksdb_error_t *error);
 
-int ngx_http_cache_purge_index_visit_key_urls(ngx_http_cache_rocksdb_t *store,
-    ngx_http_cache_rocksdb_bytes_t key, size_t max_values, size_t max_bytes,
-    ngx_http_cache_purge_index_visit_pt visit, void *data,
-    ngx_http_cache_rocksdb_error_t *error);
-int ngx_http_cache_purge_index_visit_key_hosts(ngx_http_cache_rocksdb_t *store,
-    ngx_http_cache_rocksdb_bytes_t key, size_t max_values, size_t max_bytes,
-    ngx_http_cache_purge_index_visit_pt visit, void *data,
-    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_collect(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_expected_t *files, size_t count,
     ngx_http_cache_rocksdb_error_t *error);
@@ -1106,12 +1081,6 @@ int ngx_http_cache_purge_index_propagation_next(
     ngx_http_cache_purge_retained_query_t *query,
     ngx_http_cache_purge_retained_context_t *out,
     ngx_http_cache_rocksdb_error_t *error);
-/* URL or HOST aliases from the same snapshot as the memberships. */
-int ngx_http_cache_purge_index_propagation_aliases(
-    ngx_http_cache_purge_retained_query_t *query, uint32_t kind,
-    size_t max_values, size_t max_bytes,
-    ngx_http_cache_purge_index_visit_pt visit, void *data,
-    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_propagation_close(
     ngx_http_cache_purge_retained_query_t **query,
     ngx_http_cache_rocksdb_error_t *error);
@@ -1134,27 +1103,6 @@ int ngx_http_cache_purge_coordinator_keep_file(
 int ngx_http_cache_purge_coordinator_expire_propagation(
     ngx_http_cache_purge_coordinator_t *coordinator, uint64_t now,
     size_t budget, size_t *processed, ngx_http_cache_rocksdb_error_t *error);
-
-typedef struct ngx_http_cache_purge_history_query_s
-    ngx_http_cache_purge_history_query_t;
-
-/* Executor-owned, read-only aggregation of stored times and current rules.
- * A step visits at most budget memberships (1-32); outputs stay zero until
- * done. A changed control publication requires close/restart, as does an
- * expired database snapshot. The coordinator must outlive its queries. */
-int ngx_http_cache_purge_coordinator_history_open(
-    ngx_http_cache_purge_coordinator_t *coordinator,
-    ngx_http_cache_rocksdb_bytes_t key, const unsigned char main[16],
-    ngx_http_cache_rocksdb_bytes_t vary, const unsigned char variant[16],
-    uint64_t now, ngx_http_cache_purge_history_query_t **query,
-    ngx_http_cache_rocksdb_error_t *error);
-int ngx_http_cache_purge_coordinator_history_step(
-    ngx_http_cache_purge_history_query_t *query, size_t budget,
-    ngx_http_cache_purge_fence_t *out, uint64_t *publication, int *done,
-    ngx_http_cache_rocksdb_error_t *error);
-int ngx_http_cache_purge_coordinator_history_close(
-    ngx_http_cache_purge_history_query_t **query,
-    ngx_http_cache_rocksdb_error_t *error);
 
 typedef struct ngx_http_cache_purge_object_query_s
     ngx_http_cache_purge_object_query_t;
