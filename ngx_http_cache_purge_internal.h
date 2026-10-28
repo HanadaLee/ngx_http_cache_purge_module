@@ -91,6 +91,7 @@ typedef enum {
 #define NGX_HTTP_CACHE_PURGE_ROOT_CACHE 1
 #define NGX_HTTP_CACHE_PURGE_ROOT_TEMP  2
 #define NGX_HTTP_CACHE_PURGE_ROOT_NATIVE 3
+#define NGX_HTTP_CACHE_PURGE_ROOT_PROXY 4
 typedef struct {
     ngx_http_cache_rocksdb_bytes_t path, zone;
     uint32_t                       kind;
@@ -902,6 +903,14 @@ int ngx_http_cache_purge_index_visit_hosts(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_expected_t *file, size_t max_hosts,
     size_t max_bytes, ngx_http_cache_purge_index_visit_pt visit, void *data,
     ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_visit_key_urls(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_rocksdb_bytes_t key, size_t max_values, size_t max_bytes,
+    ngx_http_cache_purge_index_visit_pt visit, void *data,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_visit_key_hosts(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_rocksdb_bytes_t key, size_t max_values, size_t max_bytes,
+    ngx_http_cache_purge_index_visit_pt visit, void *data,
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_collect(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_expected_t *files, size_t count,
     ngx_http_cache_rocksdb_error_t *error);
@@ -913,6 +922,18 @@ typedef struct {
     uint64_t  invalidate_ms, invalidate_until_ms;
     uint64_t  delete_ms, delete_until_ms;
 } ngx_http_cache_purge_retention_t;
+
+/* Borrowed only during a synchronous retention callback. */
+typedef struct {
+    ngx_http_cache_rocksdb_bytes_t  key, tag_namespace, tags[64];
+    size_t                           tag_count;
+    ngx_http_cache_purge_retention_t times;
+} ngx_http_cache_purge_retained_context_t;
+
+typedef int (*ngx_http_cache_purge_retention_guard_pt)(void *data,
+    const ngx_http_cache_purge_retained_context_t *snapshot, uint64_t now,
+    ngx_http_cache_purge_retention_t *keep,
+    ngx_http_cache_rocksdb_error_t *error);
 
 /* Executor-only retention of already matched, activated local requirements.
  * Identity is key/native main/Vary fields/native variant, independent of zone.
@@ -936,6 +957,19 @@ int ngx_http_cache_purge_index_get_propagation(ngx_http_cache_rocksdb_t *store,
 int ngx_http_cache_purge_index_expire_propagation(
     ngx_http_cache_rocksdb_t *store, uint64_t now, size_t budget,
     size_t *removed, ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_expire_propagation_checked(
+    ngx_http_cache_rocksdb_t *store, uint64_t now, size_t budget,
+    ngx_http_cache_purge_retention_guard_pt guard, void *data,
+    size_t *removed, ngx_http_cache_rocksdb_error_t *error);
+/* The checked expiry count includes renewed as well as removed snapshots.
+ * Its guard is read-only and returns the current local requirements. */
+int ngx_http_cache_purge_coordinator_keep_file(
+    ngx_http_cache_purge_coordinator_t *coordinator,
+    const ngx_http_cache_purge_index_expected_t *file, uint64_t now,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_coordinator_expire_propagation(
+    ngx_http_cache_purge_coordinator_t *coordinator, uint64_t now,
+    size_t budget, size_t *processed, ngx_http_cache_rocksdb_error_t *error);
 
 #ifdef __cplusplus
 }
@@ -1071,6 +1105,14 @@ int ngx_http_cache_purge_publications_remove(
     const ngx_http_cache_purge_index_expected_t *file,
     int anchor_fd, int lease_fd, uint32_t peer_uid, uint32_t *outcome,
     ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_publications_remove_checked(
+    ngx_http_cache_purge_publications_t *publications,
+    ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file,
+    int anchor_fd, int lease_fd, uint32_t peer_uid,
+    ngx_http_cache_purge_publication_guard_pt guard, void *data,
+    uint32_t *outcome, ngx_http_cache_purge_index_match_t *out,
     ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_publication_inode(
     ngx_http_cache_rocksdb_bytes_t metadata, uint64_t *inode,

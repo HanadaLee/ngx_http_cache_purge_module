@@ -463,16 +463,30 @@ def record(ident, optional=False):
 def retired(ident):
     item = record(ident, optional=True)
     return item is None or item['state'] == 3
+
+def deleted_response(path, body, headers=None):
+    reply = get(path, headers)
+    # An effective Delete can reach the request gate or remove the old file
+    # first. Both paths must fetch the expected entity, never reuse stale data.
+    assert reply[0] == 200 and reply[1] in ('BYPASS', 'MISS') and reply[2] == body, reply
+    return reply
 def pending():
     return rpc(9, string('') + bytes([32]))[0]
 
-def fence(name, kind, value, scope='', mode=2, submit=False):
+def fence(name, kind, value, scope='', mode=2, submit=False, activate=True):
     previous = struct.unpack('>IQ', rpc(16))[1]
     payload = (string(name) + bytes([mode]) + struct.pack('>Q', int(time.time() * 1000))
                + bytes([kind]) + string(value) + string(scope) + string('read-test'))
     receipt = rpc(27 if submit else 14, payload)
     assert receipt[len(payload) + 40] == 1
     until(lambda: (state := struct.unpack('>IQ', rpc(16)))[0] == 6 and state[1] != previous)
+    if activate and not submit:
+        # Ordinary request checks use effective rules with a fixed propagation
+        # deadline. Only recovery fixtures deliberately leave them PREPARING.
+        previous = struct.unpack('>IQ', rpc(16))[1]
+        active = rpc(26, string(name))
+        assert active[len(payload) + 40] >= 2
+        until(lambda: (state := struct.unpack('>IQ', rpc(16)))[0] == 6 and state[1] != previous)
     if submit:
         until(lambda: rpc(15, string(name))[len(payload) + 40] >= 2
               and struct.unpack('>IQ16sQQQQI', rpc(28))[0] == 6)
@@ -616,7 +630,7 @@ try:
     for target in materialized_targets: assert get(target)[1] == 'MISS'
     materialized = records(materialized_uri, 2) + records(materialized_failure, 1)
     materialized_contents = {str(ready_file(item)): ready_file(item).read_bytes() for item in materialized}
-    fence('background-invalidate', 3, 'http://cache.test/invalidate/materialized/', mode=1)
+    fence('background-invalidate', 3, 'http://cache.test/invalidate/materialized/', mode=1, activate=False)
     stop(process)
     subprocess.run([str(a.libraries / 'cache_purge_files_test'),
                     '--activate-background', str(run / 'index'), 'background-invalidate'],
@@ -682,8 +696,8 @@ try:
         else:
             body = ('fresh-host-' + str(number)).encode()
             fresh_bodies[uri] = body
-            assert get(uri, {'Host': first_host}) == (200, 'BYPASS', body)
-            assert get(uri + '?z=b', {'Host': second_host}) == (200, 'BYPASS', body)
+            deleted_response(uri, body, {'Host': first_host})
+            deleted_response(uri + '?z=b', body, {'Host': second_host})
             until(lambda: {item['id'] for item in records(uri, 2)}.isdisjoint(original_ids))
             assert uri not in conditional_calls
         assert get(uri, {'Host': alias_host}) == (200, 'HIT', body)
@@ -701,7 +715,7 @@ try:
         name = 'retired-late-host-' + str(number)
         assert not query(late_host, kind=4)
         fence(name, kind, late_host if kind == 4 else tag,
-              scope='' if kind == 4 else late_host, mode=mode)
+              scope='' if kind == 4 else late_host, mode=mode, activate=False)
         late_host_cases.append((name, mode, uri, first_host, late_host, kind, original_ids))
 
     late_alias_cases = []
@@ -715,7 +729,7 @@ try:
         name = 'retired-late-alias-' + str(number)
         value = 'http://cache.test' + (target_uri if kind == 1 else target_uri.rsplit('/', 1)[0] + '/')
         assert not query('http://cache.test' + target_uri)
-        fence(name, kind, value, mode=mode)
+        fence(name, kind, value, mode=mode, activate=False)
         late_alias_cases.append((name, mode, source_uri, target_uri, suffix, original_ids))
     stop(process)
     for name, *_ in late_alias_cases + late_host_cases:
@@ -811,7 +825,7 @@ try:
     checks.append('native HITs register distinct observed URL aliases for one key without issuing extra origin requests')
     fence('read-discovered-alias', 1, 'http://cache.test/alias/two')
     fresh_bodies['/alias/one'] = b'fresh-alias-entity'
-    assert get('/alias/one') == (200, 'BYPASS', b'fresh-alias-entity')
+    deleted_response('/alias/one', b'fresh-alias-entity')
     old_alias = alias['id']
     alias = until(lambda: (item if (item := records('/alias/one', 1)[0])['id'] != old_alias else None))
     ready_file(alias)
@@ -820,7 +834,7 @@ try:
     checks.append('a URL FENCE on a persisted third-party alias invalidates another request URL while a post-push entity can HIT under that FENCE')
     fence('read-discovered-alias-prefix', 3, 'http://cache.test/alias/tw')
     fresh_bodies['/alias/one'] = b'prefix-fresh-alias'
-    assert get('/alias/one') == (200, 'BYPASS', b'prefix-fresh-alias')
+    deleted_response('/alias/one', b'prefix-fresh-alias')
     old_alias = alias['id']
     alias = until(lambda: (item if (item := records('/alias/one', 1)[0])['id'] != old_alias else None))
     ready_file(alias)
@@ -874,7 +888,7 @@ try:
     checks.append('TAG Invalidate forces conditional origin validation; durable 304 retains the entity and full-origin proof, then permits HIT under the live FENCE')
     fence('delete-after-invalidate-304', 5, 'invalidate-304', 'tenant', mode=2)
     fresh_bodies['/invalidate/304'] = b'new-full-entity'
-    assert get('/invalidate/304') == (200, 'BYPASS', b'new-full-entity')
+    deleted_response('/invalidate/304', b'new-full-entity')
     until(lambda: records('/invalidate/304', 1)[0]['id'] != invalidated['id'])
     assert conditional_calls.count('/invalidate/304') == 1
     assert get('/invalidate/304') == (200, 'HIT', b'new-full-entity')
@@ -1193,22 +1207,22 @@ try:
     assert get('/fenced-url?z=b')[1] == 'MISS'; records('/fenced-url', 2)
     assert get('/fenced-url')[1] == 'HIT'
     url_cutoff = fence('read-url', 1, 'http://cache.test/fenced-url')
-    assert get('/fenced-url') == (200, 'BYPASS', b'/fenced-url')
-    assert get('/fenced-url?z=b') == (200, 'BYPASS', b'/fenced-url')
+    deleted_response('/fenced-url', b'/fenced-url')
+    deleted_response('/fenced-url?z=b', b'/fenced-url')
     until(lambda: all(watermark(item)[1] >= url_cutoff for item in records('/fenced-url', 2)))
     assert get('/fenced-url')[1] == get('/fenced-url?z=b')[1] == 'HIT'
     assert get('/asset')[1] == 'HIT'
     checks.append('native read admission checks the published URL FENCE across both zones while unrelated cached files remain HITs')
     assert get('/fenced-prefix/a')[1] == 'MISS'; records('/fenced-prefix/a', 1)
     prefix_cutoff = fence('read-prefix', 3, 'http://cache.test/fenced-prefix/')
-    assert get('/fenced-prefix/a')[1] == 'BYPASS'
+    deleted_response('/fenced-prefix/a', b'/fenced-prefix/a')
     until(lambda: watermark(records('/fenced-prefix/a', 1)[0])[1] >= prefix_cutoff)
     assert get('/fenced-prefix/a')[1] == 'HIT'
     checks.append('native read admission applies bytewise prefix FENCEs to cached files')
     assert get('/fenced-key')[1] == 'MISS'
     fenced_key = records('/fenced-key', 1)[0]['key']
     key_cutoff = fence('read-key', 0, fenced_key)
-    assert get('/fenced-key')[1] == 'BYPASS'
+    deleted_response('/fenced-key', b'/fenced-key')
     until(lambda: watermark(records('/fenced-key', 1)[0])[1] >= key_cutoff)
     assert get('/fenced-key')[1] == 'HIT'
     checks.append('native read admission applies exact base-key FENCEs')
@@ -1217,7 +1231,7 @@ try:
     fence('read-wrong-tag', 5, 'only-this-tag', 'other-tenant')
     assert get('/fenced-tag')[1] == 'HIT'
     tag_cutoff = fence('read-tag', 5, 'only-this-tag', 'tenant')
-    assert get('/fenced-tag')[1] == 'BYPASS'
+    deleted_response('/fenced-tag', b'/fenced-tag')
     until(lambda: watermark(records('/fenced-tag', 1)[0])[1] >= tag_cutoff)
     assert get('/fenced-tag')[1] == 'HIT' and calls.count('/fenced-tag') == 2
     assert get('/asset')[1] == 'HIT'
@@ -1226,7 +1240,7 @@ try:
     assert get('/revalidate-covered')[1] == 'MISS'
     original = records('/revalidate-covered', 1)[0]
     fence('covered-tag-rule', 5, 'covered-tag', 'tenant')
-    assert get('/revalidate-covered')[1] == 'BYPASS'
+    deleted_response('/revalidate-covered', b'/revalidate-covered')
     current = until(lambda: (item if (item := records('/revalidate-covered', 1)[0])['id'] != original['id'] else None))
     covered = watermark(current)
     time.sleep(2.1)
@@ -1308,13 +1322,12 @@ try:
     checks.append('an unmarked cached redirect cannot select its old target before descriptor inspection')
     redirects['/redirect-tag'] = '/redirect-new'
     fence('read-redirect-tag', 5, 'redirect-tag', 'tenant')
-    assert get('/redirect-tag') == (200, 'BYPASS', b'redirect-new')
+    deleted_response('/redirect-tag', b'redirect-new')
     assert calls.count('/redirect-tag') == 2
     checks.append('scoped TAG FENCE matches persisted metadata before a cached redirect executes')
     redirects['/redirect-cache'] = '/redirect-new'
     fence('read-redirect', 1, 'http://cache.test/redirect-cache')
-    redirect_result = get('/redirect-cache')
-    assert redirect_result == (200, 'BYPASS', b'redirect-new'), redirect_result
+    deleted_response('/redirect-cache', b'redirect-new')
     assert calls.count('/redirect-cache') == 2
     checks.append('URL FENCE bypasses a cached X-Accel-Redirect before it selects the old target')
     uri = '/invalidate/host'
@@ -1328,8 +1341,8 @@ try:
     assert get(uri) == (200, 'HIT', uri.encode())
     checks.append('current host Invalidate conditionally validates without replacing the entity or repeatedly bypassing its covered file')
     fence('read-host', 4, 'cache.test')
-    assert get('/asset')[1] == 'BYPASS'
-    checks.append('native read admission applies host FENCEs; receipts still remain PREPARING pending complete protocol coverage')
+    deleted_response('/asset', b'/asset')
+    checks.append('native read admission applies effective host FENCEs before background file processing')
     marker = 'enabling/disabling cache_purge_key indexing requires a full restart'
     rejected = (run / 'error.log').read_text().count(marker)
     (run / 'nginx.conf').write_text(legacy_config)

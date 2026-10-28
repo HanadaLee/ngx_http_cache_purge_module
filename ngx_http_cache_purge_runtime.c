@@ -417,6 +417,9 @@ ngx_http_cache_purge_runtime_post(ngx_conf_t *cf)
                 registered->path.data = caches[j]->path->name.data;
                 registered->path.len = caches[j]->path->name.len;
                 registered->kind = NGX_HTTP_CACHE_PURGE_ROOT_NATIVE;
+                if (ngx_strcmp(command->name.data, "proxy_cache_path") == 0) {
+                    registered->kind = NGX_HTTP_CACHE_PURGE_ROOT_PROXY;
+                }
                 registered->zone.data = caches[j]->shm_zone->shm.name.data;
                 registered->zone.len = caches[j]->shm_zone->shm.name.len;
                 native = ngx_array_push(&rt->native);

@@ -262,12 +262,163 @@ ngx_http_cache_purge_test_file_propagation()
     munmap(shared, size);
 }
 
+static void
+ngx_http_cache_purge_test_retention()
+{
+    char path[] = "/tmp/ncp-automatic-retention-XXXXXX";
+    check(mkdtemp(path) != nullptr, "retention coordinator directory");
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    check(ngx_http_cache_rocksdb_open(path, &options, &store, &error) == 0,
+        error.message);
+    size_t size = ngx_http_cache_purge_control_size(262144, 8);
+    void *shared = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    check(shared != MAP_FAILED
+              && ngx_http_cache_purge_control_init(
+                     shared, size, 262144, 8, &error)
+                     == 0,
+        "retention coordinator shared region");
+    {
+        Index index(store);
+        Operations operations(store);
+        File file;
+        file.id[15] = 1;
+        file.key = "tenant\037https\037cache.test\037/object\037";
+        file.url = "https://cache.test/object";
+        file.host = "cache.test";
+        file.tag_namespace = "tenant";
+        file.structured_key = true;
+        file.structured_url = true;
+        file.components = { "tenant", "https", "cache.test", "/object", "",
+            "" };
+        file.tags = { "red" };
+        file.root = "/cache";
+        file.zone = "cache";
+        file.path = std::string(31, '0') + '1';
+        auto prepared = index.prepare(file);
+        index.commit(file.id, prepared.revision);
+        check(ngx_http_cache_purge_index_observe(store,
+                  ngx_http_cache_purge_native_bytes(file.key),
+                  ngx_http_cache_purge_native_bytes("https://alias.test/item"),
+                  ngx_http_cache_purge_native_bytes("alias.test"), &error)
+                  == 0,
+            "retention source has historical URL and host aliases");
+        Coordinator coordinator(operations, shared, size);
+        ready(coordinator);
+        unsigned char main[16] = {}, variant[16] = {};
+        main[15] = 1;
+        auto expected = ngx_http_cache_purge_native_expected(file.id, 2);
+        auto get = [&](uint64_t now, int code = 0) {
+            ngx_http_cache_purge_fence_t result{};
+            check(ngx_http_cache_purge_index_get_propagation(store,
+                      ngx_http_cache_purge_native_bytes(file.key), main,
+                      ngx_http_cache_purge_native_bytes(file.vary), variant,
+                      now, &result, &error)
+                      == code,
+                error.message);
+            return result;
+        };
+        auto accept = [&](const std::string &name, Selector selector,
+                          PurgeMode mode, uint64_t issued, uint64_t now,
+                          uint32_t window) {
+            OperationInput input{ name, selector, mode, issued, "retention" };
+            auto op = coordinator.accept(input, now, window);
+            ready(coordinator);
+            return op;
+        };
+        auto activate = [&](const Operation &op, uint64_t now) {
+            operations.activate(op.input.id, op.revision, now);
+            coordinator.refresh();
+            ready(coordinator);
+        };
+        auto first =
+            accept("first", { SelectorKind::namespace_tag, "red", "tenant" },
+                PurgeMode::invalidate, 10, 100, 50);
+        check(ngx_http_cache_purge_coordinator_keep_file(
+                  coordinator.native(), &expected, 100, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_BUSY,
+            "PREPARING cannot invent a persistent local deadline");
+        get(100, NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND);
+        activate(first, 100);
+        check(ngx_http_cache_purge_coordinator_keep_file(
+                  coordinator.native(), &expected, 110, &error)
+                  == 0,
+            error.message);
+        check(get(110).invalidate_ms == 10, "file TAG match is retained");
+        ngx_http_cache_rocksdb_stats_t before{}, after{};
+        check(ngx_http_cache_rocksdb_stats(store, &before, &error) == 0,
+            "retention statistics");
+        check(ngx_http_cache_purge_coordinator_keep_file(
+                  coordinator.native(), &expected, 111, &error)
+                  == 0,
+            error.message);
+        check(ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
+                  && before.writes == after.writes,
+            "preservation retry performs no WAL write");
+        auto updated = index.update_metadata(file.id, 2, "new", { "blue" });
+        auto retired = index.retire(file.id, updated.revision);
+        index.collect_file(file.id, retired.revision);
+        while (index.collect_keys(1)) {
+        }
+        auto second =
+            accept("second", { SelectorKind::namespace_tag, "red", "tenant" },
+                PurgeMode::remove, 20, 140, 100);
+        size_t processed = 99;
+        check(ngx_http_cache_purge_coordinator_expire_propagation(
+                  coordinator.native(), 151, 8, &processed, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_BUSY
+                  && processed == 0,
+            "new PREPARING rule prevents history collection");
+        check(get(149).invalidate_ms == 10,
+            "failed expiry retains the original snapshot");
+        activate(second, 140);
+        check(ngx_http_cache_purge_coordinator_expire_propagation(
+                  coordinator.native(), 151, 8, &processed, &error)
+                      == 0
+                  && processed == 1,
+            error.message);
+        auto result = get(151);
+        check(!result.invalidate_ms && result.delete_ms == 20,
+            "later TAG rule renews retained membership after file collection");
+        auto wrong =
+            accept("wrong", { SelectorKind::namespace_tag, "red", "other" },
+                PurgeMode::remove, 999, 200, 1000);
+        activate(wrong, 200);
+        auto host =
+            accept("host", { SelectorKind::host_tag, "red", "alias.test" },
+                PurgeMode::invalidate, 30, 220, 100);
+        activate(host, 220);
+        check(ngx_http_cache_purge_coordinator_expire_propagation(
+                  coordinator.native(), 241, 8, &processed, &error)
+                      == 0
+                  && processed == 1,
+            error.message);
+        result = get(241);
+        check(result.invalidate_ms == 30 && !result.delete_ms,
+            "history renewal uses retained TAGs and persistent host aliases "
+            "with namespace isolation");
+        check(ngx_http_cache_purge_coordinator_expire_propagation(
+                  coordinator.native(), 321, 8, &processed, &error)
+                      == 0
+                  && processed == 1,
+            error.message);
+        get(321, NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND);
+        while (index.collect_keys(1)) {
+        }
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
+    munmap(shared, size);
+}
+
 int
 main(int argc, char **argv)
 {
     try {
         if (argc == 1) {
             ngx_http_cache_purge_test_file_propagation();
+            ngx_http_cache_purge_test_retention();
         }
         char temporary[] = "/tmp/ncp-coordinator-XXXXXX";
         const char *path = argc == 3 ? argv[2] : mkdtemp(temporary);

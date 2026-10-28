@@ -720,7 +720,7 @@ ngx_http_cache_purge_publications_open(const ngx_http_cache_purge_root_t *roots,
             || (roots[i].zone.len
                 && memchr(roots[i].zone.data, 0, roots[i].zone.len))
             || (roots[i].kind < NGX_HTTP_CACHE_PURGE_ROOT_CACHE
-                || roots[i].kind > NGX_HTTP_CACHE_PURGE_ROOT_NATIVE)
+                || roots[i].kind > NGX_HTTP_CACHE_PURGE_ROOT_PROXY)
             || (roots[i].kind != NGX_HTTP_CACHE_PURGE_ROOT_TEMP
                 && roots[i].zone.len == 0))
         {
@@ -2270,10 +2270,13 @@ ngx_http_cache_purge_publication_inode(ngx_http_cache_rocksdb_bytes_t metadata,
 }
 
 int
-ngx_http_cache_purge_publications_remove(ngx_http_cache_purge_publications_t *p,
+ngx_http_cache_purge_publications_remove_checked(
+    ngx_http_cache_purge_publications_t *p,
     ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_expected_t *expected,
-    int anchor, int lease, uint32_t uid, uint32_t *outcome,
+    int anchor, int lease, uint32_t uid,
+    ngx_http_cache_purge_publication_guard_pt guard, void *data,
+    uint32_t *outcome,
     ngx_http_cache_purge_index_match_t *out,
     ngx_http_cache_rocksdb_error_t *error)
 {
@@ -2450,6 +2453,12 @@ ngx_http_cache_purge_publications_remove(ngx_http_cache_purge_publications_t *p,
         }
     }
     filesystem = 0;
+    if (guard != NULL) {
+        rc = guard(data, &file, error);
+        if (rc != 0) {
+            goto done;
+        }
+    }
     rc = ngx_http_cache_purge_publication_apply(store,
         NGX_HTTP_CACHE_PURGE_INDEX_RETIRE, file.id, file.revision,
         &retired, error);
@@ -2515,6 +2524,18 @@ done:
     free((void *) address.data);
     ngx_http_cache_purge_index_file_free(&file);
     return rc;
+}
+
+int
+ngx_http_cache_purge_publications_remove(ngx_http_cache_purge_publications_t *p,
+    ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *expected,
+    int anchor, int lease, uint32_t uid, uint32_t *outcome,
+    ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_purge_publications_remove_checked(p, store, expected,
+        anchor, lease, uid, NULL, NULL, outcome, out, error);
 }
 
 static int
