@@ -2962,6 +2962,11 @@ ngx_http_cache_purge_component_work(ngx_http_cache_purge_component_t *c,
         }
     }
     if (page.done) {
+        if (page.count == 0 && after.len != 0) {
+            /* The exhausted suffix may have ready work before its bookmark.
+             * Recheck the head once before taking the idle backoff. */
+            c->work_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC);
+        }
         c->work_after_len = 0;
     }
     ngx_http_cache_purge_operation_page_free(&page);

@@ -19,6 +19,7 @@ p.add_argument('--component', type=Path)
 a = p.parse_args()
 checks = []
 roots = []
+timings = {}
 for cut in ('prepared', 'rename', 'index', 'marker', 'missing'):
     root = Path(tempfile.mkdtemp(prefix='cache-purge-file-publication-', dir='/tmp'))
     roots.append(str(root))
@@ -326,7 +327,11 @@ def background_delete(cut):
             expected_paths = {'a/first': 1, 'a/second': 2, 'a/other': 6}
             if cut == 'native-many':
                 expected_paths.update({f'a/bulk-{n}': n for n in range(10, 50)})
+            draining = time.monotonic()
             while True:
+                if cut == 'native-many':
+                    assert time.monotonic() - draining < 20, (
+                        'ready background work delayed across queue wraps', completed)
                 request = until(lambda: native() or
                                 ('done' if operation()['stage'] == operation('independent')['stage'] == 4
                                  and rpc(10, b'\0' * 4 + b'\x01')[0] == 0 else None))
@@ -353,6 +358,7 @@ def background_delete(cut):
                 ack('y')
                 completed += 1
                 assert completed <= len(expected_paths) * 2
+            timings[cut] = time.monotonic() - draining
             assert completed == len(expected_paths) * 2 and set(seen.values()) == {2} and restarted_collection, seen
             assert not first.exists() and not (root / 'cache-b/a/second').exists()
             assert (root / 'cache/a/fresh').exists()
@@ -474,6 +480,6 @@ if a.component:
                 'validation-unrelated-delete'):
         background_delete(cut)
 
-a.output.write_text(json.dumps({'checks': checks, 'directories': roots,
+a.output.write_text(json.dumps({'checks': checks, 'directories': roots, 'timings': timings,
     'scope': 'Real PREPARE/FINISH, xattrs, rename and durable index publication recovery; not nginx integration or power-loss testing'}, indent=2) + '\n')
 print('PASS file/index publication crash cuts and repeated recovery', flush=True)
