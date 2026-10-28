@@ -418,7 +418,7 @@ ngx_http_cache_purge_test_host_migration(const std::string &path)
         raw_write(store, cf, damaged, "broken object");
         fails(
             NGX_HTTP_CACHE_ROCKSDB_CORRUPT, [&] { Index interrupted(store); });
-        check(ngx_http_cache_purge_test_raw(store, "M:index") == "9"
+        check(ngx_http_cache_purge_test_raw(store, "M:index") == "10"
                   && ngx_http_cache_purge_test_raw(store, "M:host-cursor")
                          == "O"
                                 + std::string(reinterpret_cast<const char *>(
@@ -1571,7 +1571,7 @@ ngx_http_cache_purge_test_retention(const std::string &path)
                     reinterpret_cast<const char *>(first.id.data()), 16));
         raw_write(store, cf, "M:index", "6");
         Index upgraded(store);
-        check(ngx_http_cache_purge_test_raw(store, "M:index") == "9"
+        check(ngx_http_cache_purge_test_raw(store, "M:index") == "10"
                   && ngx_http_cache_purge_test_raw(store,
                          "O"
                              + std::string(reinterpret_cast<const char *>(
@@ -1870,6 +1870,207 @@ ngx_http_cache_purge_test_retention(const std::string &path)
         "expired history releases database ownership");
 }
 
+static void
+ngx_http_cache_purge_test_alias_snapshots(const std::string &path)
+{
+    check(mkdir(path.c_str(), 0700) == 0, "alias snapshot directory");
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    options.cursor_lifetime_ms = 5000;
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    ngx_http_cache_rocksdb_error_t error{};
+    check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
+              == 0,
+        error.message);
+    auto item = file(4201, "/alias-snapshot");
+    const auto cf = NGX_HTTP_CACHE_ROCKSDB_DEFAULT;
+    ngx_http_cache_purge_alias_query_t *query = nullptr;
+    auto open = [&] {
+        check(ngx_http_cache_purge_index_aliases_open(
+                  store, bytes(item.key), &query, &error)
+                  == 0,
+            error.message);
+    };
+    auto drain = [&] {
+        std::set<std::pair<uint32_t, std::string>> aliases;
+        ngx_http_cache_rocksdb_bytes_t value{};
+        uint32_t kind = 0;
+        int rc;
+        while ((rc = ngx_http_cache_purge_index_aliases_next(
+                    query, &kind, &value, &error))
+               == 0)
+        {
+            check(kind == NGX_HTTP_CACHE_PURGE_URL
+                      || kind == NGX_HTTP_CACHE_PURGE_HOST,
+                "streamed alias has an explicit kind");
+            aliases.emplace(
+                kind, std::string(reinterpret_cast<const char *>(value.data),
+                          value.len));
+        }
+        check(rc == NGX_HTTP_CACHE_ROCKSDB_DONE && !value.len && !kind,
+            "alias enumeration clears output at completion");
+        return aliases;
+    };
+    auto close = [&] {
+        check(ngx_http_cache_purge_index_aliases_close(&query, &error) == 0
+                  && !query,
+            "close alias snapshot");
+    };
+    std::string counter;
+    {
+        Index index(store);
+        install(index, item);
+        counter = "k" + ngx_http_cache_purge_test_raw(store, "K" + item.key);
+        auto raw = ngx_http_cache_purge_test_raw(store, counter);
+        check(raw.size() == 16 && ngx_http_cache_purge_test_number(raw, 0) == 1
+                  && ngx_http_cache_purge_test_number(raw, 8) == 2,
+            "key count and alias revision share one record");
+        for (unsigned i = 0; i < 512; i++) {
+            auto host = "alias-" + std::to_string(i) + ".test";
+            auto url = "https://" + host + "/snapshot";
+            check(ngx_http_cache_purge_index_observe(
+                      store, bytes(item.key), bytes(url), bytes(host), &error)
+                      == 0,
+                error.message);
+        }
+        open();
+        auto original_query = query;
+        int foreign_result = 0;
+        std::thread foreign([&] {
+            foreign_result =
+                ngx_http_cache_purge_index_aliases_close(&query, nullptr);
+        });
+        foreign.join();
+        check(foreign_result == NGX_HTTP_CACHE_ROCKSDB_OWNER
+                  && query == original_query,
+            "foreign-thread close preserves the owner's alias query");
+        check(ngx_http_cache_purge_index_aliases_check(query, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_INVALID,
+            "an incomplete scan cannot authorize mutation");
+        auto old = drain();
+        check(
+            old.size() == 1026
+                && ngx_http_cache_purge_index_aliases_check(query, &error) == 0,
+            "more than 64 URL and host aliases stream completely");
+        ngx_http_cache_rocksdb_stats_t before{}, after{};
+        check(ngx_http_cache_rocksdb_stats(store, &before, &error) == 0,
+            "repeated alias baseline");
+        check(ngx_http_cache_purge_index_observe(store, bytes(item.key),
+                  bytes(item.url), bytes(item.host), &error)
+                  == 0,
+            "repeat existing associations");
+        check(
+            ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
+                && before.writes == after.writes
+                && ngx_http_cache_purge_index_aliases_check(query, &error) == 0,
+            "repeat observations neither write nor invalidate snapshots");
+        auto other = file(4202, "/unrelated");
+        install(index, other);
+        check(ngx_http_cache_purge_index_aliases_check(query, &error) == 0,
+            "unrelated cache fills do not invalidate an alias snapshot");
+        auto duplicate = item;
+        duplicate.id = id(4203);
+        duplicate.path = "duplicate";
+        install(index, duplicate);
+        auto retired = index.retire(duplicate.id, 2);
+        index.collect_file(duplicate.id, retired.revision);
+        check(ngx_http_cache_purge_index_aliases_check(query, &error) == 0,
+            "file reference count changes preserve the alias revision");
+        close();
+
+        for (bool host_only : { false, true }) {
+            open();
+            auto host = host_only ? "new-host.test" : item.host;
+            auto url = host_only ? item.url : "https://new-alias.test/item";
+            check(ngx_http_cache_purge_index_observe(
+                      store, bytes(item.key), bytes(url), bytes(host), &error)
+                      == 0,
+                error.message);
+            check(drain().size() == old.size(),
+                "new associations are absent from an existing snapshot");
+            check(ngx_http_cache_purge_index_aliases_check(query, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+                "new URL or host invalidates a completed mutation check");
+            close();
+            open();
+            old = drain();
+            check(ngx_http_cache_purge_index_aliases_check(query, &error) == 0,
+                "restarted scan covers newly observed associations");
+            close();
+        }
+
+        raw = ngx_http_cache_purge_test_raw(store, counter);
+        raw_write(store, cf, counter, raw.substr(0, 8));
+        raw_write(store, cf, "M:index", "9");
+        auto keys = raw_keys(store, cf);
+        check(ngx_http_cache_purge_index_init(store, &error) == 0,
+            "schema 9 upgrades without rebuilding metadata");
+        check(raw_keys(store, cf) == keys
+                  && ngx_http_cache_purge_test_raw(store, counter).size() == 8
+                  && ngx_http_cache_purge_test_raw(store, "M:index") == "10",
+            "schema 9 migration does not scan or rewrite legacy counters");
+        open();
+        drain();
+        check(ngx_http_cache_purge_index_aliases_check(query, &error) == 0,
+            "legacy eight-byte counter has a stable initial revision");
+        index.add_url(item.key, "https://lazy-upgrade.test/item");
+        check(ngx_http_cache_purge_test_raw(store, counter).size() == 16
+                  && ngx_http_cache_purge_index_aliases_check(query, &error)
+                         == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "first new alias upgrades the counter and invalidates old scans");
+        close();
+        raw = ngx_http_cache_purge_test_raw(store, counter);
+        raw_write(store, cf, counter,
+            raw.substr(0, 8) + ngx_http_cache_purge_test_number(UINT64_MAX));
+        auto prior = raw_keys(store, cf);
+        fails(NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+            [&] { index.add_url(item.key, "https://overflow.test/item"); });
+        check(raw_keys(store, cf) == prior,
+            "alias revision overflow rolls back dictionaries and postings");
+        raw_write(store, cf, counter, raw);
+        open();
+        drain();
+        retired = index.retire(item.id, 2);
+        index.collect_file(item.id, retired.revision);
+        check(index.collect_keys(1) > 0,
+            "alias collection proceeds in a bounded batch");
+        check(ngx_http_cache_purge_index_aliases_check(query, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "partial alias collection invalidates a previous snapshot");
+        close();
+        while (index.collect_keys(32)) {
+        }
+        retired = index.retire(other.id, 2);
+        index.collect_file(other.id, retired.revision);
+        while (index.collect_keys(32)) {
+        }
+        check(raw_keys(store, cf).size() == 3,
+            "alias revisions leave no extra rows after key collection");
+        install(index, item);
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
+        "close alias database before restart");
+    options.cursor_lifetime_ms = 20;
+    check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
+              == 0,
+        error.message);
+    open();
+    drain();
+    check(ngx_http_cache_purge_index_aliases_check(query, &error) == 0,
+        "alias counter and membership survive restart");
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    check(ngx_http_cache_purge_index_aliases_check(query, &error)
+              == NGX_HTTP_CACHE_ROCKSDB_EXPIRED,
+        "completed scan still has its original snapshot deadline");
+    close();
+    ngx_http_cache_rocksdb_stats_t stats{};
+    check(ngx_http_cache_rocksdb_stats(store, &stats, &error) == 0
+              && !stats.active_cursors && !stats.cursor_handles,
+        "alias close releases all cursors and snapshots");
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
+        "close alias snapshot database");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1880,6 +2081,8 @@ main(int argc, char **argv)
         char path[] = "/tmp/cache-purge-index-test-XXXXXX";
         check(mkdtemp(path) != nullptr, "test directory");
         ngx_http_cache_purge_test_tag_groups();
+        ngx_http_cache_purge_test_alias_snapshots(
+            std::string(path) + "-aliases");
         ngx_http_cache_purge_test_native_migration(
             std::string(path) + "-migration");
         ngx_http_cache_purge_test_native_bindings(

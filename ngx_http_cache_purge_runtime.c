@@ -87,7 +87,7 @@ ngx_http_cache_purge_runtime_create(ngx_conf_t *cf)
     layout->vary_capacity = sizeof(((ngx_http_file_cache_header_t *) 0)->vary);
     layout->variant_offset = offsetof(ngx_http_file_cache_header_t, variant);
     if (rt->options.abi != NGX_HTTP_CACHE_PURGE_COMPONENT_ABI
-        || ngx_http_cache_purge_component_abi_10()
+        || ngx_http_cache_purge_component_abi_11()
                != NGX_HTTP_CACHE_PURGE_COMPONENT_ABI
         || ngx_array_init(&rt->roots, cf->pool, 2, sizeof(ngx_str_t)) != NGX_OK
         || ngx_array_init(&rt->file_roots, cf->pool, 8,
@@ -2862,7 +2862,7 @@ ngx_http_cache_purge_api_render(ngx_http_cache_purge_api_t *ctx,
             "\"selectors\":[\"host\",\"url\",\"key\",\"prefix\",\"tag\"],"
             "\"modes\":[\"invalidate\",\"delete\"],\"binary_selectors\":true,"
             "\"tag_scopes\":[\"namespace\",\"host\"],\"max_tags\":64,"
-            "\"index_schema\":9,\"ledger_schema\":4,"
+            "\"index_schema\":10,\"ledger_schema\":4,"
             "\"propagation_timeout_ms\":\"%uL\","
             "\"propagation_protocols\":[],\"proxy_propagation_ready\":false,"
             "\"proxy_header_transport\":\"%s\","

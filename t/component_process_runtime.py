@@ -50,9 +50,11 @@ class Component:
         env.pop('CACHE_PURGE_TEST_CACHE_ROOT', None)
         env.pop('CACHE_PURGE_TEST_TEMP_ROOT', None)
         env.pop('CACHE_PURGE_TEST_CACHE_ZONE', None)
-        env.pop('CACHE_PURGE_TEST_OBJECT_SEED', None)
         if seed:
-            env['CACHE_PURGE_TEST_OBJECT_SEED'] = '1'
+            # Preparing 2,048 durable aliases is fixture setup, not startup.
+            subprocess.run([str(args.binary), str(path), '--seed'], env=env,
+                           stdout=subprocess.DEVNULL, stderr=self.stderr,
+                           timeout=60, check=True)
         if roots:
             env['CACHE_PURGE_TEST_CACHE_ROOT'], env['CACHE_PURGE_TEST_TEMP_ROOT'] = map(str, roots)
         self.process = subprocess.Popen(command, env=env,

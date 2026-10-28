@@ -75,6 +75,9 @@ visit(void *data, const ngx_http_cache_purge_control_match_t *match)
 int
 main(int argc, char **argv)
 {
+    if (argc == 3 && std::strcmp(argv[2], "--seed") == 0) {
+        return ngx_http_cache_purge_test_seed(argv[1]);
+    }
     if (argc != 6 && argc != 7) {
         return 2;
     }
@@ -163,12 +166,6 @@ main(int argc, char **argv)
                 return 4;
             }
             origin = true;
-        }
-    }
-    if (std::getenv("CACHE_PURGE_TEST_OBJECT_SEED")) {
-        int rc = ngx_http_cache_purge_test_seed(argv[1]);
-        if (rc != 0) {
-            return rc;
         }
     }
     int rc = ngx_http_cache_purge_component_start(

@@ -215,7 +215,7 @@ The existing worker executor resumes the bounded scan from durable checkpoints.
 Admission checks that requirement even when no resident rule remains; successful
 conditional validation satisfies it without replacing the entity. Requirements
 are monotonic within one ledger and are collected with their retired file.
-Index schema 9 upgrades existing index records without rebuilding cache files.
+Index schema 10 upgrades existing index records without rebuilding cache files.
 The worker executor backfills native proxy representation bindings in bounded
 batches, retaining a durable cursor across restarts. Completed migrations do not
 rescan the index. Unresolved legacy identities remain explicitly marked by key;
@@ -421,7 +421,7 @@ On graceful reload, the old worker requests asynchronous executor shutdown so
 long-lived HTTP responses do not keep the database owner indefinitely. Its
 executor finishes the current operation and closes the DB before the replacement
 opens it. The old worker can continue sending its response and joins the stopped
-executor when it exits. The component C ABI is 10; rebuild its archives together
+executor when it exits. The component C ABI is 11; rebuild its archives together
 with the addon. Upgrading from an earlier component ABI or shared-control ABI 4
 or earlier requires a full nginx restart; persisted cache files and indexes are
 retained. An old executor cannot serve the new object-query opcode during a
@@ -589,6 +589,15 @@ bounded steps. It selects native Vary hashes from a transient snapshot of the
 proxy request headers, preserving duplicate-header order and nginx's Accept-*
 normalization. Headers are neither logged nor persisted. A control publication
 change or expired snapshot discards the partial result and requires a retry.
+
+A separate alias iterator streams URL and host associations from one snapshot
+and checks its revision before a mutation can use the completed result. The
+revision adds eight bytes to the existing per-key file counter; no new table or
+per-alias metadata is required. Repeated observations and file-count-only changes
+preserve it, while alias insertion and collection advance it atomically with
+their postings. Existing eight-byte counters upgrade on their next mutation.
+This prepares bounded mutation checks; the older mutation callbacks have not yet
+switched to this iterator and retain their existing alias limits.
 
 Managed proxy-cache requests now resolve these associations asynchronously at
 the cache-entry gate. One IPC request holds its bounded input until completion,

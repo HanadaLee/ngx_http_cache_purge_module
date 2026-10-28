@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define NGX_HTTP_CACHE_PURGE_COMPONENT_ABI 10
+#define NGX_HTTP_CACHE_PURGE_COMPONENT_ABI 11
 #define NGX_HTTP_CACHE_PURGE_PROTOCOL_VERSION 1
 #define NGX_HTTP_CACHE_PURGE_FRAME_SIZE 24
 
@@ -161,7 +161,7 @@ typedef struct {
 void ngx_http_cache_purge_component_options(
     ngx_http_cache_purge_component_options_t *options);
 /* Link-time header/archive compatibility marker. */
-uint32_t ngx_http_cache_purge_component_abi_10(void);
+uint32_t ngx_http_cache_purge_component_abi_11(void);
 
 /* Only start after fork in the selected nginx worker, never while parsing
  * configuration or in master. Copies its inputs and starts one executor thread.
@@ -973,6 +973,28 @@ int ngx_http_cache_purge_index_visit_hosts(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_expected_t *file, size_t max_hosts,
     size_t max_bytes, ngx_http_cache_purge_index_visit_pt visit, void *data,
     ngx_http_cache_rocksdb_error_t *error);
+typedef struct ngx_http_cache_purge_alias_query_s
+    ngx_http_cache_purge_alias_query_t;
+
+/* One snapshot, one borrowed alias per call, URL then HOST. No total-count
+ * limit; cursor lifetime and reusable buffers remain bounded. Before using
+ * a completed scan to authorize a mutation, check that its key's aliases
+ * are unchanged. Check and mutation must run on the same executor turn. */
+int ngx_http_cache_purge_index_aliases_open(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_rocksdb_bytes_t key,
+    ngx_http_cache_purge_alias_query_t **query,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_aliases_next(
+    ngx_http_cache_purge_alias_query_t *query, uint32_t *kind,
+    ngx_http_cache_rocksdb_bytes_t *value,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_aliases_check(
+    ngx_http_cache_purge_alias_query_t *query,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_aliases_close(
+    ngx_http_cache_purge_alias_query_t **query,
+    ngx_http_cache_rocksdb_error_t *error);
+
 int ngx_http_cache_purge_index_visit_key_urls(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_bytes_t key, size_t max_values, size_t max_bytes,
     ngx_http_cache_purge_index_visit_pt visit, void *data,

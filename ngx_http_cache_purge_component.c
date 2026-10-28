@@ -3404,7 +3404,7 @@ ngx_http_cache_purge_component_options(
 }
 
 uint32_t
-ngx_http_cache_purge_component_abi_10(void)
+ngx_http_cache_purge_component_abi_11(void)
 {
     return NGX_HTTP_CACHE_PURGE_COMPONENT_ABI;
 }
