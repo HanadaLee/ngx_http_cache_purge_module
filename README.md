@@ -8,7 +8,7 @@ RocksDB bridge in `rocksdb/`; the entire purge implementation uses C. Its
 executor, shared controls and operation coordination share one source file.
 The persistent index and filesystem publication logic each have their own C
 implementation. Test-only C++ adapters and wire encoders live under `t/`.
-Production code is organized into 12 source/header files across the two modules;
+Production code is organized into 11 source/header files across the two modules;
 new behavior is added within these responsibility boundaries.
 
 New cache-file records use atomic WAL batches with deferred synchronization.
@@ -41,9 +41,9 @@ value interning and native representation or association queries.
 
 HTTP cache invalidation for nginx proxy, FastCGI, SCGI, and uWSGI caches.
 
-The module is undergoing a storage and lifecycle redesign. The default build
-implements the legacy PURGE/REFRESH interfaces. An opt-in development build now
-connects RocksDB ownership, durable operations, and shared control publication to
+The module is undergoing a storage and lifecycle redesign. All builds use the
+persistent index and connect RocksDB ownership, durable operations, and shared
+control publication to
 one executor in ordinary nginx worker 0. Real upstream fills now enter the
 persistent index through standard module interfaces. File-response admission now
 checks the selected descriptor and shared FENCE table. The development HTTP API
@@ -390,34 +390,26 @@ budget per worker, with a three-second overall IPC deadline. The limits apply
 after the response body is complete and do not turn normal HITs into origin
 requests. Request inputs and each publication payload are separately bounded
 to 128 KiB; these limits exclude allocator overhead and native nginx buffers.
-The persistent build replaces the legacy generation form of `cache_purge_key`
-with its single-expression index meaning and does not register generation
-namespace directives or variables. Observed URL aliases are persisted during
+`cache_purge_key` takes one index expression. Generation namespaces, inline
+PURGE/REFRESH handlers, directory walks and the old shared-memory task queue
+have been removed; their directives are rejected rather than silently ignored. Observed URL aliases are persisted during
 file-response admission and survive restarts without index rebuilding.
 
 ## Current features
 
-- Exact-key and trailing-wildcard cache removal.
-- Inline PURGE requests or a dedicated purge location.
-- Bounded background filesystem cleanup, with optional nginx thread pools.
-- Vary-aware removal and per-cache queue/status metrics.
-- Legacy generation-key invalidation and conditional proxy REFRESH.
+- Persistent URL, key, host, prefix and scoped TAG lookup across cache zones.
+- Durable Invalidate/Delete acceptance and background file processing.
+- Immediate request admission barriers and protection against old cache writers.
+- Slice/Vary associations, conditional validation and restart recovery.
+- Bounded database, IPC and shared-control memory budgets.
 
-Legacy tasks operate on their selected cache zone/path. They do not provide the
-new persistent cross-zone index or its immediate invalidation guarantees.
+The default and only build uses RocksDB. Existing legacy configurations must
+migrate to the management API and explicit index expressions. Propagation,
+SCM integration and whole-system resource acceptance remain under development.
 
 ## Build
 
-```sh
-./configure --add-module=/path/to/ngx_http_cache_purge
-make
-```
-
-For a dynamic module, use `--add-dynamic-module` and build with `make modules`.
-Use compatible nginx sources and build options. `--with-compat` does not make a
-binary module portable across arbitrary nginx versions or C libraries.
-
-The storage, index, and component libraries can be built separately on Linux
+First build the storage, index, and component libraries on Linux
 with RocksDB and OpenSSL development packages. RocksDB must provide its CMake
 targets. Tests also require Python 3:
 
@@ -430,7 +422,7 @@ ctest --test-dir /tmp/cache-purge-store --output-on-failure
 Its blocking APIs belong on the index component's execution thread.
 They must not run on an HTTP worker's event loop.
 
-To build the development runtime into nginx, supply the directory containing
+To build the runtime into nginx, supply the directory containing
 the CMake archives when configuring the addon:
 
 ```sh
@@ -439,7 +431,8 @@ CACHE_PURGE_ROCKSDB_LIB_DIR=/tmp/cache-purge-store \
 make
 ```
 
-Dynamic persistent builds produce two module files. Load the provider first:
+For dynamic modules use `--add-dynamic-module` and `make modules`. The build
+produces two module files; load the provider first:
 
 ```nginx
 load_module modules/ngx_http_cache_rocksdb_module.so;
@@ -831,17 +824,33 @@ Capabilities currently report proxy propagation as unavailable.
 
 ## Usage
 
+With `ngx_http_cache_key_module` loaded, use its component snapshots for cache
+identity and index selectors. Configure the store and state zone as shown above.
+
 ```nginx
-location / {
-    proxy_cache cache_zone;
-    proxy_cache_key "$scheme://$host$request_uri";
-    proxy_cache_purge PURGE from 127.0.0.1;
-    proxy_pass http://origin;
+proxy_cache_path /var/cache/nginx keys_zone=cache_zone:4m;
+
+server {
+    listen 80;
+
+    location / {
+        proxy_cache cache_zone;
+        proxy_cache_key $cache_key_full;
+        cache_purge_key $cache_key_base;
+        cache_purge_url $cache_key_url;
+        proxy_pass http://origin;
+    }
+
+    location /__cache_purge/ {
+        allow 127.0.0.1;
+        deny all;
+        cache_purge_api;
+    }
 }
 ```
 
-Restrict purge and refresh endpoints to authorized callers. Do not expose them as
-unrestricted public cache-control APIs.
+Submit Invalidate/Delete operations to the management API. Authentication and
+source restrictions are nginx configuration responsibilities.
 
 Runtime regression tests and benchmark programs are under `t/`. Design, rollout,
 and validation records are maintained outside this repository. The independent

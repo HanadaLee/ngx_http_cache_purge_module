@@ -740,6 +740,26 @@ def variant_hashes(item, language):
     return main, variant
 
 checks = []
+obsolete_directives = (
+    'cache_purge_namespace old 1m /tmp/old-state;',
+    'proxy_cache_purge on;', 'fastcgi_cache_purge on;',
+    'scgi_cache_purge on;', 'uwsgi_cache_purge on;',
+    'proxy_cache_refresh old $uri;',
+    'cache_purge_refresh_profile /old/ /;',
+    'cache_purge_refresh_timeout 1s;',
+    'cache_purge_response_type json;', 'cache_purge_thread_pool default;',
+    'cache_purge_background_queue on;', 'cache_purge_queue_size 10;',
+    'cache_purge_batch_size 10;', 'cache_purge_throttle_ms 10ms;',
+    'cache_purge_legacy_status off;', 'cache_purge_vary_aware on;',
+    'cache_purge_queue_status /tmp/old-cache;',
+)
+for directive in obsolete_directives:
+    candidate_path = run / 'obsolete.conf'
+    candidate_path.write_text(config.replace('http {', 'http {\n' + directive, 1))
+    tested = subprocess.run([str(build / 'objs/nginx'), '-t', '-p', str(run) + '/', '-c', str(candidate_path)],
+                            env=env, capture_output=True, text=True, timeout=15)
+    assert tested.returncode != 0 and ('unknown directive "' + directive.split()[0] + '"') in tested.stderr, tested.stderr
+checks.append('removed generation, inline PURGE/REFRESH and SHM queue directives fail configuration explicitly')
 rogue = f'''  location = /rogue-cache {{
     proxy_pass http://127.0.0.1:{origin.server_port};
   }}

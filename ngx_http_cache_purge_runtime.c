@@ -1913,21 +1913,6 @@ ngx_http_cache_purge_api_merge(ngx_conf_t *cf,
         "X-Cache-Purge-Fence"
     };
 
-#if (NGX_EXPR)
-    if (ngx_conf_merge_expr_flag_value(cf, &conf->ignore_propagation,
-                                       prev->ignore_propagation, 0) != NGX_OK)
-    {
-        return NGX_CONF_ERROR;
-    }
-    if (ngx_conf_merge_expr_flag_value(cf, &conf->propagation,
-                                       prev->propagation, 0) != NGX_OK)
-    {
-        return NGX_CONF_ERROR;
-    }
-#else
-    ngx_conf_merge_value(conf->ignore_propagation, prev->ignore_propagation, 0);
-    ngx_conf_merge_value(conf->propagation, prev->propagation, 0);
-#endif
     headers[0] = &conf->tag_namespace_header;
     previous[0] = &prev->tag_namespace_header;
     for (i = 1; i < 4; i++) {
