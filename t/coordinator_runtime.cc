@@ -891,6 +891,167 @@ ngx_http_cache_purge_test_keep_pages()
     munmap(shared, size);
 }
 
+static void
+ngx_http_cache_purge_test_expiry_pages()
+{
+    char path[] = "/tmp/ncp-expiry-pages-XXXXXX";
+    check(mkdtemp(path) != nullptr, "paged expiry directory");
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    check(ngx_http_cache_rocksdb_open(path, &options, &store, &error) == 0,
+        error.message);
+    size_t size = ngx_http_cache_purge_control_size(262144, 8);
+    void *shared = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    check(shared != MAP_FAILED
+              && ngx_http_cache_purge_control_init(
+                     shared, size, 262144, 8, &error)
+                     == 0,
+        "paged expiry shared memory");
+    {
+        Index index(store);
+        Operations operations(store);
+        Coordinator coordinator(operations, shared, size);
+        ready(coordinator);
+        File file;
+        file.key = "expiry-key";
+        file.url = "https://expiry.test/item";
+        file.host = "expiry.test";
+        file.tag_namespace = "tenant";
+        file.root = "/cache";
+        file.zone = "a";
+        unsigned char main[16] = {}, variant[16] = {};
+        for (unsigned i = 1; i <= 2; i++) {
+            file.id[15] = i;
+            file.path = std::to_string(i);
+            file.tags = { i == 1 ? "red" : "blue" };
+            main[15] = i;
+            auto raw = ngx_http_cache_purge_native_file(file);
+            ngx_http_cache_purge_index_match_t prepared{};
+            check(ngx_http_cache_purge_index_prepare_native(
+                      store, &raw, nullptr, main, variant, &prepared, &error)
+                      == 0,
+                error.message);
+            index.commit(file.id, prepared.revision);
+            auto expected = ngx_http_cache_purge_native_expected(file.id, 2);
+            ngx_http_cache_purge_retention_t times{ 10, 200, 0, 0 };
+            check(ngx_http_cache_purge_index_keep_propagation(
+                      store, &expected, main, variant, 100, &times, &error)
+                      == 0,
+                error.message);
+        }
+        for (unsigned i = 0; i < 96; i++) {
+            auto host = "expiry-alias-" + std::to_string(i) + ".test";
+            check(ngx_http_cache_purge_index_observe(store,
+                      ngx_http_cache_purge_native_bytes(file.key),
+                      ngx_http_cache_purge_native_bytes("https://" + host),
+                      ngx_http_cache_purge_native_bytes(host), &error)
+                      == 0,
+                error.message);
+        }
+        for (unsigned i = 1; i <= 2; i++) {
+            file.id[15] = i;
+            auto retired = index.retire(file.id, 2);
+            index.collect_file(file.id, retired.revision);
+        }
+        auto op = coordinator.accept(
+            { "host-red",
+                { SelectorKind::host_tag, "red", "expiry-alias-95.test" },
+                PurgeMode::remove, 20, "expiry-pages" },
+            150, 1000);
+        ready(coordinator);
+        operations.activate(op.input.id, op.revision, 150);
+        coordinator.refresh();
+        ready(coordinator);
+        auto get = [&](unsigned n, int code = 0) {
+            main[15] = n;
+            ngx_http_cache_purge_fence_t value{};
+            check(ngx_http_cache_purge_index_get_propagation(store,
+                      ngx_http_cache_purge_native_bytes(file.key), main,
+                      ngx_http_cache_purge_native_bytes(file.vary), variant,
+                      201, &value, &error)
+                      == code,
+                error.message);
+            return value;
+        };
+        size_t processed = 99;
+        check(ngx_http_cache_purge_coordinator_expire_propagation(
+                  coordinator.native(), 201, 8, &processed, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_BUSY
+                  && !processed,
+            "large retained identity starts bounded expiry work");
+        ngx_http_cache_rocksdb_stats_t stats{};
+        check(ngx_http_cache_rocksdb_stats(store, &stats, &error) == 0
+                  && !stats.cursor_handles,
+            "pending expiry retains no database cursor between steps");
+        file.id[15] = 3;
+        file.path = "new-alias-owner";
+        file.url = "https://expiry-new.test/item";
+        file.host = "expiry-new.test";
+        main[15] = 3;
+        auto raw = ngx_http_cache_purge_native_file(file);
+        ngx_http_cache_purge_index_match_t prepared{};
+        check(ngx_http_cache_purge_index_prepare_native(
+                  store, &raw, nullptr, main, variant, &prepared, &error)
+                  == 0,
+            error.message);
+        index.commit(file.id, prepared.revision);
+        for (unsigned i = 0; i < 16; i++) {
+            coordinator.step();
+        }
+        check(ngx_http_cache_purge_coordinator_expire_propagation(
+                  coordinator.native(), 201, 8, &processed, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_BUSY
+                  && !processed,
+            "new alias from a concurrent fill restarts history expiry");
+        auto retired_new = index.retire(file.id, 2);
+        index.collect_file(file.id, retired_new.revision);
+        for (unsigned i = 0; i < 16; i++) {
+            coordinator.step();
+        }
+        check(ngx_http_cache_purge_coordinator_expire_propagation(
+                  coordinator.native(), 201, 8, &processed, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_BUSY
+                  && processed == 1,
+            "completed first membership commits before the next scan yields");
+        check(get(1).delete_ms == 20,
+            "renewal matches a host TAG beyond the old alias count limit");
+        check(!get(2).invalidate_ms && !get(2).delete_ms,
+            "pending second membership remains indexed until checked");
+        for (unsigned i = 0; i < 16; i++) {
+            coordinator.step();
+        }
+        check(ngx_http_cache_purge_coordinator_expire_propagation(
+                  coordinator.native(), 201, 8, &processed, &error)
+                      == 0
+                  && processed == 1,
+            "second membership with no live match is collected independently");
+        get(2, NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND);
+        check(ngx_http_cache_purge_coordinator_expire_propagation(
+                  coordinator.native(), 1151, 8, &processed, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_BUSY
+                  && !processed,
+            "renewed membership retains its original next deadline");
+        for (unsigned i = 0; i < 16; i++) {
+            coordinator.step();
+        }
+        check(ngx_http_cache_purge_coordinator_expire_propagation(
+                  coordinator.native(), 1151, 8, &processed, &error)
+                      == 0
+                  && processed == 1,
+            "expired later operation does not reopen a propagation window");
+        get(1, NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND);
+        while (index.collect_keys(32)) {
+        }
+        check(ngx_http_cache_rocksdb_stats(store, &stats, &error) == 0
+                  && !stats.cursor_handles && !stats.active_cursors,
+            "completed expiry releases its retained input and snapshots");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
+    munmap(shared, size);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -900,6 +1061,7 @@ main(int argc, char **argv)
             ngx_http_cache_purge_test_object_propagation();
             ngx_http_cache_purge_test_retention();
             ngx_http_cache_purge_test_keep_pages();
+            ngx_http_cache_purge_test_expiry_pages();
         }
         char temporary[] = "/tmp/ncp-coordinator-XXXXXX";
         const char *path = argc == 3 ? argv[2] : mkdtemp(temporary);

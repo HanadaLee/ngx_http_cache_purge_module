@@ -611,8 +611,15 @@ query identities during 304 processing. Both retention and guard scans release
 all database cursors between batches and resume from a 17-byte position after
 checking the unchanged alias revision. Repeated 304 calls reuse their transaction,
 payload and lease while guards are pending, including after durable completion
-while final admission still waits. Retained-history expiry and diagnostic
-propagation visitors still need this paging integration.
+while final admission still waits.
+
+Retained-history expiry now uses one bounded background scan, releasing cursors
+between alias batches. Before collection it matches later local rules against
+the retained namespace/TAG membership and all persisted aliases. Each completed
+membership commits independently, so a later pending scan cannot roll back its
+progress. Completed scans wake collection immediately; waiting does not extend
+the original propagation deadlines. Diagnostic propagation visitors still need
+this paging integration.
 
 Managed proxy-cache requests now resolve these associations asynchronously at
 the cache-entry gate. One IPC request holds its bounded input until completion,
@@ -631,9 +638,9 @@ through deletion and restart, 304 TAG replacement, and slice isolation.
 Full propagation remains unfinished. A new accepted operation between the gate
 and upstream request creation currently rejects sending; maintenance publication
 changes with the same ledger and operation sequence preserve the completed
-result. Retained-history expiry and diagnostic propagation visitors still have
-a 64-alias traversal bound. File validation and retention before mutation no
-longer have that count limit.
+result. Diagnostic propagation visitors still have a 64-alias traversal bound.
+File validation, retention before mutation and retained-history expiry no longer
+have that count limit.
 Uncached proxy routes, unsupported cache methods, complete tier integration,
 and loaded memory/latency acceptance remain open. Capabilities reports the sender transport as
 `filter` or `variables`, while `proxy_propagation_ready` remains false.

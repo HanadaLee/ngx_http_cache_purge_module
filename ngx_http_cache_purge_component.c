@@ -29,6 +29,8 @@ static int ngx_http_cache_purge_keep_tick(
     ngx_http_cache_purge_coordinator_t *coordinator);
 static int ngx_http_cache_purge_keep_pending(
     ngx_http_cache_purge_coordinator_t *coordinator);
+static int ngx_http_cache_purge_expiry_ready(
+    ngx_http_cache_purge_coordinator_t *coordinator);
 static int ngx_http_cache_purge_guard_tick(
     ngx_http_cache_purge_coordinator_t *coordinator);
 static int ngx_http_cache_purge_guard_pending(
@@ -3020,6 +3022,11 @@ ngx_http_cache_purge_component_controls(ngx_http_cache_purge_component_t *c,
     }
     *progress = ngx_http_cache_purge_keep_tick(c->coordinator);
     *progress |= ngx_http_cache_purge_guard_tick(c->coordinator);
+    if (ngx_http_cache_purge_expiry_ready(c->coordinator)
+        && ngx_http_cache_purge_component_load32(&c->cleanup_state) == 0)
+    {
+        c->collect_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC);
+    }
     rc = ngx_http_cache_purge_coordinator_status(c->coordinator, &state,
                                                  &publication, error);
     if (rc != 0) {
@@ -6154,6 +6161,7 @@ struct ngx_http_cache_purge_coordinator_s {
     pid_t                                   pid;
     pthread_t                               thread;
     ngx_http_cache_purge_keep_t            *keeps[4];
+    ngx_http_cache_purge_keep_t            *expiry;
     size_t                                  keep_next;
     ngx_http_cache_purge_guard_t           *guards[4];
     size_t                                  guard_next;
@@ -6419,10 +6427,11 @@ struct ngx_http_cache_purge_keep_s {
     ngx_http_cache_purge_propagation_context_t  match;
     ngx_http_cache_purge_alias_query_t         *aliases;
     ngx_http_cache_purge_alias_stamp_t          stamp;
+    ngx_http_cache_purge_retention_t            retained;
     ngx_http_cache_rocksdb_error_t              error;
     uint64_t                                    publication, sequence;
     uint64_t                                    expires;
-    int                                         done, status;
+    int                                         done, status, history;
 };
 
 static void
@@ -6493,7 +6502,12 @@ ngx_http_cache_purge_keep_step(ngx_http_cache_purge_keep_t *keep)
             rc = ngx_http_cache_purge_component_retention_result(p, &retained,
                 &keep->error);
         }
-        if (rc == 0 && (retained.invalidate_ms || retained.delete_ms)) {
+        if (rc == 0) {
+            keep->retained = retained;
+        }
+        if (rc == 0 && !keep->history
+            && (retained.invalidate_ms || retained.delete_ms))
+        {
             rc = ngx_http_cache_purge_index_native_identity(c->operations.store,
                 &keep->expected, main, variant, &keep->error);
             if (rc == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) {
@@ -6511,7 +6525,9 @@ ngx_http_cache_purge_keep_step(ngx_http_cache_purge_keep_t *keep)
     keep->status = rc;
     keep->expires = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 5000;
     (void) ngx_http_cache_purge_index_aliases_close(&keep->aliases, NULL);
-    ngx_http_cache_purge_index_file_free(&keep->file);
+    if (!keep->history) {
+        ngx_http_cache_purge_index_file_free(&keep->file);
+    }
 }
 
 static int
@@ -6520,8 +6536,22 @@ ngx_http_cache_purge_keep_tick(ngx_http_cache_purge_coordinator_t *c)
     ngx_http_cache_purge_keep_t  *keep;
     uint64_t                      now;
     size_t                        i, selected;
+    int                           progress;
 
     now = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC);
+    progress = 0;
+    keep = c->expiry;
+    if (keep != NULL) {
+        if (now >= keep->expires || keep->sequence != c->expected.last_sequence
+            || (!keep->done && (c->state != NGX_HTTP_CACHE_PURGE_COORD_READY
+                               || keep->publication != c->publication)))
+        {
+            ngx_http_cache_purge_keep_free(&c->expiry);
+        } else if (!keep->done) {
+            ngx_http_cache_purge_keep_step(keep);
+            progress = 1;
+        }
+    }
     selected = 4;
     for (i = 0; i < 4; i++) {
         keep = c->keeps[i];
@@ -6544,7 +6574,14 @@ ngx_http_cache_purge_keep_tick(ngx_http_cache_purge_coordinator_t *c)
             return 1;
         }
     }
-    return 0;
+    return progress;
+}
+
+static int
+ngx_http_cache_purge_expiry_ready(ngx_http_cache_purge_coordinator_t *c)
+{
+    return c->state == NGX_HTTP_CACHE_PURGE_COORD_READY
+           && c->expiry != NULL && c->expiry->done;
 }
 
 static int
@@ -6557,7 +6594,7 @@ ngx_http_cache_purge_keep_pending(ngx_http_cache_purge_coordinator_t *c)
             return 1;
         }
     }
-    return 0;
+    return c->expiry != NULL && !c->expiry->done;
 }
 
 int
@@ -6706,23 +6743,151 @@ done:
 static int
 ngx_http_cache_purge_component_retention_guard(void *data,
     const ngx_http_cache_purge_retained_context_t *snapshot, uint64_t now,
-    ngx_http_cache_purge_retention_t *keep,
+    ngx_http_cache_purge_retention_t *retained,
     ngx_http_cache_rocksdb_error_t *error)
 {
-    ngx_http_cache_purge_propagation_context_t  p;
-    int                                         rc;
+    ngx_http_cache_purge_coordinator_t          *c;
+    ngx_http_cache_purge_keep_t                 *keep;
+    ngx_http_cache_purge_propagation_context_t  *p;
+    ngx_http_cache_rocksdb_bytes_t               fields[66], *out;
+    unsigned char                               *bytes;
+    size_t                                       i, size;
+    int                                          rc, equal;
 
-    memset(&p, 0, sizeof(p));
-    p.coordinator = data;
-    p.context.key = snapshot->key;
-    p.context.tag_namespace = snapshot->tag_namespace;
-    p.context.tags = snapshot->tags;
-    p.context.tag_count = snapshot->tag_count;
-    p.context.now_ms = now;
-    p.context.proxy = 1;
-    rc = ngx_http_cache_purge_component_propagation_resolve(&p, error);
-    return rc ? rc : ngx_http_cache_purge_component_retention_result(&p, keep,
-        error);
+    c = data;
+    keep = c->expiry;
+    if (snapshot->tag_count > 64) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid expiry TAG count");
+    }
+    if (keep != NULL) {
+        equal = keep->sequence == c->expected.last_sequence
+                && keep->file.tag_count == snapshot->tag_count
+                && ngx_http_cache_purge_control_bytes_equal(keep->file.key,
+                    snapshot->key)
+                && ngx_http_cache_purge_control_bytes_equal(
+                    keep->file.tag_namespace, snapshot->tag_namespace);
+        for (i = 0; equal && i < snapshot->tag_count; i++) {
+            equal = ngx_http_cache_purge_control_bytes_equal(
+                keep->file.tags[i], snapshot->tags[i]);
+        }
+        if (equal) {
+            if (!keep->done) {
+                return ngx_http_cache_purge_control_error(error,
+                    NGX_HTTP_CACHE_ROCKSDB_BUSY, "history expiry scan pending");
+            }
+            rc = keep->status;
+            if (rc == 0) {
+                rc = ngx_http_cache_purge_index_aliases_validate(
+                    c->operations.store, &keep->stamp, error);
+            } else if (error != NULL) {
+                *error = keep->error;
+            }
+            if (rc == 0) {
+                *retained = keep->retained;
+            }
+            ngx_http_cache_purge_keep_free(&c->expiry);
+            if (rc != NGX_HTTP_CACHE_ROCKSDB_CONFLICT
+                && rc != NGX_HTTP_CACHE_ROCKSDB_EXPIRED)
+            {
+                goto done;
+            }
+        } else {
+            ngx_http_cache_purge_keep_free(&c->expiry);
+        }
+    }
+    fields[0] = snapshot->key;
+    fields[1] = snapshot->tag_namespace;
+    size = 0;
+    for (i = 0; i < snapshot->tag_count + 2; i++) {
+        if (i >= 2) {
+            fields[i] = snapshot->tags[i - 2];
+        }
+        if (fields[i].len > 131072 - size) {
+            return ngx_http_cache_purge_control_error(error,
+                NGX_HTTP_CACHE_ROCKSDB_LIMIT, "expiry identity exceeds budget");
+        }
+        size += fields[i].len;
+    }
+    keep = calloc(1, sizeof(*keep));
+    if (keep == NULL) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "expiry query allocation failed");
+    }
+    keep->file.storage = malloc(size ? size : 1);
+    if (keep->file.storage == NULL) {
+        free(keep);
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "expiry identity allocation failed");
+    }
+    c->expiry = keep;
+    bytes = keep->file.storage;
+    for (i = 0; i < snapshot->tag_count + 2; i++) {
+        out = i == 0 ? &keep->file.key
+              : i == 1 ? &keep->file.tag_namespace : &keep->file.tags[i - 2];
+        out->data = bytes;
+        out->len = fields[i].len;
+        if (fields[i].len) {
+            memcpy(bytes, fields[i].data, fields[i].len);
+            bytes += fields[i].len;
+        }
+    }
+    keep->file.tag_count = snapshot->tag_count;
+    keep->history = 1;
+    keep->publication = c->publication;
+    keep->sequence = c->expected.last_sequence;
+    keep->expires = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 3000;
+    p = &keep->match;
+    p->coordinator = c;
+    p->context.key = keep->file.key;
+    p->context.tag_namespace = keep->file.tag_namespace;
+    p->context.tags = keep->file.tags;
+    p->context.tag_count = keep->file.tag_count;
+    p->context.now_ms = now;
+    p->context.proxy = 1;
+    p->remaining = 1024;
+    if (c->validation_reader == NULL) {
+        rc = ngx_http_cache_purge_control_reader_open(c->shared,
+            c->shared_bytes, &c->validation_reader, error);
+    } else {
+        rc = 0;
+    }
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_component_propagation_lookup(p, error);
+    }
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_index_aliases_open(c->operations.store,
+            keep->file.key, &keep->aliases, error);
+    }
+    if (rc != 0) {
+        ngx_http_cache_purge_keep_free(&c->expiry);
+        return rc;
+    }
+    ngx_http_cache_purge_keep_step(keep);
+    if (!keep->done) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_BUSY, "history expiry scan pending");
+    }
+    rc = keep->status;
+    if (error != NULL) {
+        *error = keep->error;
+    }
+    if (rc == 0) {
+        *retained = keep->retained;
+    }
+    ngx_http_cache_purge_keep_free(&c->expiry);
+
+done:
+    if (rc == 0) {
+        /* Waiting for a batch must not restart or extend an expired window. */
+        if (retained->invalidate_until_ms <= now) {
+            retained->invalidate_ms = retained->invalidate_until_ms = 0;
+        }
+        if (retained->delete_until_ms <= now) {
+            retained->delete_ms = retained->delete_until_ms = 0;
+        }
+    }
+    return rc;
 }
 
 int
@@ -6730,7 +6895,8 @@ ngx_http_cache_purge_coordinator_expire_propagation(
     ngx_http_cache_purge_coordinator_t *c, uint64_t now, size_t budget,
     size_t *processed, ngx_http_cache_rocksdb_error_t *error)
 {
-    int  rc;
+    size_t  done;
+    int     rc;
 
     if (processed != NULL) {
         *processed = 0;
@@ -6743,10 +6909,26 @@ ngx_http_cache_purge_coordinator_expire_propagation(
         return ngx_http_cache_purge_control_error(error,
             NGX_HTTP_CACHE_ROCKSDB_BUSY, "expiry awaits control publication");
     }
-    return ngx_http_cache_purge_index_expire_propagation_checked(
-        c->operations.store, now, budget,
-        c->count ? ngx_http_cache_purge_component_retention_guard : NULL,
-        c, processed, error);
+    if (processed == NULL || !budget || budget > 32 || !now) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid history expiry budget");
+    }
+    /* Commit each completed membership independently. A later pending scan
+     * must not roll back earlier entries and repeatedly rescan that prefix. */
+    while (*processed < budget) {
+        rc = ngx_http_cache_purge_index_expire_propagation_checked(
+            c->operations.store, now, 1,
+            c->count ? ngx_http_cache_purge_component_retention_guard : NULL,
+            c, &done, error);
+        if (rc != 0) {
+            return rc;
+        }
+        *processed += done;
+        if (done == 0) {
+            break;
+        }
+    }
+    return 0;
 }
 
 struct ngx_http_cache_purge_object_query_s {
@@ -8462,6 +8644,7 @@ ngx_http_cache_purge_coordinator_close(ngx_http_cache_purge_coordinator_t **p,
         ngx_http_cache_purge_keep_free(&c->keeps[keep_index]);
         ngx_http_cache_purge_guard_free(&c->guards[keep_index]);
     }
+    ngx_http_cache_purge_keep_free(&c->expiry);
     if (c->validation_reader != NULL) {
         rc = ngx_http_cache_purge_control_reader_close(&c->validation_reader,
                                                        error);
