@@ -1046,8 +1046,12 @@ try:
     retired = v.finish_file(631, lease)
     assert retired[-1] == 3 and v.call(2, identity(631))[0] == 3
     assert os.getxattr(target, 'user.ngx_cache_purge.id')[7] == 1
+    v.inspect_file((str(validation_cache), 'zone-a', 'a/00/630'), fd, code=7)
+    v.admit_file((str(validation_cache), 'zone-a', 'a/00/630'),
+                 'team\x1fhttps\x1fa.test\x1f/late-tag\x1f', 'https://a.test/late-tag', fd, code=7)
     os.close(fd)
     check(True, 'FINISH rejects a late prepared replacement whose old TAG was invalidated before its catalogue commit')
+    check(True, 'an aborted native replacement is rejected immediately by inspection and admission despite its remaining PREPARED marker')
 
     watermark = validating.watermark()
     source = validation_temp / 'fresh-632'; source.write_bytes(b'fresh request with changed TAG')

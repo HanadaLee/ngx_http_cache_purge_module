@@ -5,6 +5,7 @@ import array
 import base64
 import calendar
 import concurrent.futures
+import contextlib
 import hashlib
 import http.client
 import http.server
@@ -642,6 +643,43 @@ def watermark(item):
     value = origin_metadata(item)
     return value[4:20], int.from_bytes(value[20:28], 'big')
 
+@contextlib.contextmanager
+def prepared_replacement(item):
+    target = ready_file(item)
+    address = b''.join(string(item[name]) for name in ('root', 'zone', 'path'))
+    acquired, lease = rpc(20, address, receive_fd=True)
+    temporary = None
+    fd = -1
+    try:
+        d = Decode(acquired)
+        assert d.string() == item['root'] and d.take(16) == item['id']
+        d.take(16); d.number(8); d.end()
+        fd, name = tempfile.mkstemp(dir=run / 'temp')
+        temporary = Path(name)
+        # Copy native bytes, not the old instance's publication marker.
+        temporary.write_bytes(target.read_bytes())
+        ident = os.urandom(16)
+        fields = ('key', 'url', 'host', 'namespace', 'root', 'zone', 'path', 'range', 'vary')
+        payload = (ident + b''.join(string(item[name]) for name in fields)
+                   + string(origin_metadata(item)) + bytes([len(item['tags'])])
+                   + b''.join(map(string, item['tags'])) + item['flags']
+                   + b''.join(map(string, item['components'])) + item['id']
+                   + string(str(temporary)))
+        assert rpc(18, payload, (lease, fd)) == ident + struct.pack('>QB', 1, 1)
+        temporary.replace(target)
+
+        def finish():
+            result = rpc(19, ident + struct.pack('>Q', 1), (lease,))
+            assert result == ident + struct.pack('>QB', 2, 2), result
+            ready_file(record(ident))
+
+        yield finish
+    finally:
+        if fd >= 0: os.close(fd)
+        if temporary is not None: temporary.unlink(missing_ok=True)
+        os.close(lease)
+
+
 def variant_hashes(item, language):
     value = origin_metadata(item)
     assert len(value) == 64
@@ -1064,12 +1102,7 @@ try:
     assert retired(unmarked['id'])
     checks.append('a native HIT with no publication marker refills and replaces its old index instance before later reuse')
     assert get('/read-wait')[1] == 'MISS'
-    waiting_file = ready_file(records('/read-wait', 1)[0])
-    waiting_marker = os.getxattr(waiting_file, 'user.ngx_cache_purge.id')
-    os.setxattr(waiting_file, 'user.ngx_cache_purge.id', waiting_marker[:7] + b'\1' + waiting_marker[8:])
-    release = threading.Timer(.15, os.setxattr, (waiting_file, 'user.ngx_cache_purge.id', waiting_marker))
-    before_wait = time.monotonic(); release.start()
-    try:
+    with prepared_replacement(records('/read-wait', 1)[0]) as finish:
         with socket.create_connection(('127.0.0.1', port), timeout=5) as held:
             held.sendall(b'GET /read-wait HTTP/1.1\r\nHost: cache.test\r\nConnection: close\r\n\r\n')
             held.settimeout(.05)
@@ -1077,20 +1110,24 @@ try:
                 early = held.recv(1)
                 raise AssertionError(('unverified response bytes escaped', early))
             except socket.timeout: pass
+            finish()
             held.settimeout(5)
             response = http.client.HTTPResponse(held); response.begin()
             assert response.status == 200 and response.getheader('X-Status') == 'HIT'
             assert response.read() == b'/read-wait'
-        assert time.monotonic() - before_wait >= .1
-    finally: release.join()
     assert calls.count('/read-wait') == 1
-    checks.append('PREPARED-marker reads wait asynchronously until READY without exposing bytes or fetching a new entity')
-    os.setxattr(waiting_file, 'user.ngx_cache_purge.id', waiting_marker[:7] + b'\1' + waiting_marker[8:])
-    with socket.create_connection(('127.0.0.1', port), timeout=5) as abandoned:
-        abandoned.sendall(b'GET /read-wait HTTP/1.1\r\nHost: cache.test\r\nConnection: close\r\n\r\n')
-        time.sleep(.04)
-    os.setxattr(waiting_file, 'user.ngx_cache_purge.id', waiting_marker)
-    assert get('/read-wait')[1] == 'HIT'
+    checks.append('reads of a real PREPARE_FILE transaction wait asynchronously until FINISH_FILE without exposing bytes or fetching a new entity')
+    with prepared_replacement(records('/read-wait', 1)[0]) as finish:
+        with socket.create_connection(('127.0.0.1', port), timeout=5) as abandoned:
+            abandoned.sendall(b'GET /read-wait HTTP/1.1\r\nHost: cache.test\r\nConnection: close\r\n\r\n')
+            abandoned.settimeout(.05)
+            try:
+                early = abandoned.recv(1)
+                raise AssertionError(('unverified response bytes escaped', early))
+            except socket.timeout: pass
+        finish()
+    assert get('/read-wait') == (200, 'HIT', b'/read-wait')
+    assert calls.count('/read-wait') == 1
     checks.append('client abandonment during descriptor inspection drains without losing later HITs')
     assert get('/asset?z=b')[1] == 'MISS'
     both = records('/asset', 2)

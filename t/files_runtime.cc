@@ -197,6 +197,124 @@ validation_guard(void *data, const ngx_http_cache_purge_index_file_t *file,
     return data ? NGX_HTTP_CACHE_ROCKSDB_CONFLICT : 0;
 }
 
+static void
+ngx_http_cache_purge_test_pending_inspection()
+{
+    char root[] = "/tmp/ncp-pending-inspect-XXXXXX";
+    check(mkdtemp(root) != nullptr, "pending inspection directory");
+    std::string path(root), cache = path + "/cache", database = path + "/db";
+    std::filesystem::create_directories(cache);
+    std::filesystem::create_directories(database);
+    int anchor_fd;
+    check(ngx_http_cache_purge_file_locks_open(
+              (database + "/leases").c_str(), getuid(), 1, &anchor_fd, &error)
+              == 0,
+        "pending inspection lock anchor");
+    Descriptor anchor(anchor_fd);
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    check(
+        ngx_http_cache_rocksdb_open(database.c_str(), &options, &store, &error)
+            == 0,
+        "pending inspection database");
+    {
+        Index index(store);
+        Publications publications(
+            { { cache, "cache", NGX_HTTP_CACHE_PURGE_ROOT_CACHE } }, database);
+        for (unsigned scenario = 0; scenario < 4; scenario++) {
+            File file;
+            file.id = id(scenario + 1);
+            file.key = "pending-" + std::to_string(scenario);
+            file.url = "https://example.test/" + file.key;
+            file.host = "example.test";
+            file.tag_namespace = "tenant";
+            file.root = cache;
+            file.zone = "cache";
+            file.path = file.key;
+            std::string target = cache + '/' + file.path;
+            std::string temp = target + ".tmp";
+            unsigned char digest[16];
+            uint64_t offset;
+            int lease_fd;
+            check(ngx_http_cache_purge_file_address(
+                      bytes(target), digest, &offset, &error)
+                          == 0
+                      && ngx_http_cache_purge_file_lease_acquire(
+                             (database + "/leases").c_str(), anchor.fd, offset,
+                             &lease_fd, &error)
+                             == 0,
+                "pending inspection publication lease");
+            Descriptor lease(lease_fd);
+            Descriptor fd(open(
+                temp.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600));
+            body(fd.fd);
+            publications.prepare(index, { file, {} }, temp, anchor.fd, lease.fd,
+                fd.fd, getuid());
+            check(rename(temp.c_str(), target.c_str()) == 0,
+                "rename prepared inspection file");
+            auto inspect = [&](int expected, const char *message) {
+                ngx_http_cache_purge_index_file_t inspected{};
+                int rc = ngx_http_cache_purge_publications_inspect(
+                    publications.native(), store, bytes(cache),
+                    bytes(file.zone), bytes(file.path), fd.fd, getuid(),
+                    &inspected, &error);
+                check(rc == expected, message);
+                if (rc != 0) {
+                    check(inspected.key.len == 0 && inspected.revision == 0,
+                        "failed pending inspection returns no admission proof");
+                }
+                ngx_http_cache_purge_index_file_free(&inspected);
+                intact(fd.fd);
+            };
+            inspect(NGX_HTTP_CACHE_ROCKSDB_BUSY,
+                "a live prepared transaction still waits for publication");
+            if (scenario == 0) {
+                index.abort_prepare(file.id, 1);
+                inspect(NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+                    "an aborted prepared file cannot become ready by waiting");
+            } else if (scenario == 1) {
+                auto moved = target + ".moved";
+                check(rename(target.c_str(), moved.c_str()) == 0,
+                    "detach prepared descriptor without unlinking it");
+                inspect(NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+                    "a detached prepared descriptor is rejected before "
+                    "waiting");
+                check(rename(moved.c_str(), target.c_str()) == 0,
+                    "restore the actual prepared instance");
+                inspect(NGX_HTTP_CACHE_ROCKSDB_BUSY,
+                    "restored active prepared instance remains pending");
+                auto committed = index.commit_pending(file.id, 1);
+                inspect(NGX_HTTP_CACHE_ROCKSDB_BUSY,
+                    "committed intent still waits for its ready marker");
+                index.discard_publication(file.id, committed.revision);
+                inspect(NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+                    "discarded committed intent does not wait on a prepared "
+                    "marker");
+            } else if (scenario == 2) {
+                index.commit(file.id, 1);
+                inspect(NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+                    "a prepared marker without an intent cannot authorize "
+                    "waiting");
+            } else {
+                auto committed = index.commit_pending(file.id, 1);
+                inspect(NGX_HTTP_CACHE_ROCKSDB_BUSY,
+                    "durable commit does not substitute for ready publication");
+                check(ngx_http_cache_purge_file_marker_publish(
+                          fd.fd, file.id.data(), digest, 1, &error)
+                          == 0,
+                    "publish ready marker before clearing intent");
+                inspect(NGX_HTTP_CACHE_ROCKSDB_BUSY,
+                    "a ready marker with a durable intent still waits");
+                index.publish(file.id, committed.revision);
+                inspect(0, "fully published file is admitted");
+            }
+        }
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
+        "close pending inspection database");
+}
+
 static int
 validation(
     const std::string &mode, const std::string &path, bool with_origin = false)
@@ -991,6 +1109,7 @@ main(int argc, char **argv)
                        validation(argv[1], argv[2]) :
                        publication(argv[1], argv[2]);
         }
+        ngx_http_cache_purge_test_pending_inspection();
         char root[] = "/tmp/cache-purge-files-XXXXXX";
         check(mkdtemp(root) != nullptr, "temporary directory");
         std::string path(root), target = path + "/final";

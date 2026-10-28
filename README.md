@@ -117,8 +117,12 @@ explicit count and byte budgets, with no complete alias set retained in memory.
 `INSPECT_FILE` checks the actual cache descriptor on the executor through bounded
 IPC. It requires a READY marker, a committed current index record with no pending
 intent, and matching root/zone/path and same-filesystem publication identity.
-Unknown, unfinished, changed, replaced and evicted instances are rejected without
-repairing files or writing the database. The worker client duplicates and transfers
+Reads wait only while a matching publication intent can still complete. A
+PREPARED marker left by an aborted, detached or superseded transaction is
+rejected immediately instead of consuming the inspection timeout. READY files
+under conditional validation still wait for that transaction to finish.
+Unknown, changed, replaced and evicted instances are rejected without repairing
+files or writing the database. The worker client duplicates and transfers
 one descriptor; the caller keeps its original. Inspection alone does not attest
 purge freshness. The native file-response consumer also checks key, URL, host,
 prefix and scoped TAG FENCEs, then commits its decision under a short shared

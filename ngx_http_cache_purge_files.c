@@ -1956,11 +1956,6 @@ ngx_http_cache_purge_publications_inspect(
     if (rc != 0) {
         goto done;
     }
-    if (marker.state != NGX_HTTP_CACHE_PURGE_FILE_READY) {
-        rc = ngx_http_cache_purge_result(error, NGX_HTTP_CACHE_ROCKSDB_BUSY,
-                                           "cache file publication is pending");
-        goto done;
-    }
     rc = ngx_http_cache_purge_publication_address(target, path, &address,
                                                   error);
     if (rc == 0) {
@@ -1976,7 +1971,9 @@ ngx_http_cache_purge_publications_inspect(
     if (rc != 0) {
         goto done;
     }
-    if (file.state != NGX_HTTP_CACHE_PURGE_INDEX_COMMITTED
+    if ((file.state != NGX_HTTP_CACHE_PURGE_INDEX_COMMITTED
+         && !(file.state == NGX_HTTP_CACHE_PURGE_INDEX_PREPARED
+              && marker.state == NGX_HTTP_CACHE_PURGE_FILE_PREPARED))
         || !ngx_http_cache_purge_publication_equal(
             file.root, ngx_http_cache_purge_publication_bytes(target->path))
         || !ngx_http_cache_purge_publication_equal(file.zone, zone)
@@ -1989,25 +1986,20 @@ ngx_http_cache_purge_publications_inspect(
     if (rc != 0) {
         goto done;
     }
-    if (intent) {
-        rc = ngx_http_cache_purge_result(
-            error, NGX_HTTP_CACHE_ROCKSDB_BUSY,
-            "cache index publication is pending");
-        goto done;
-    }
-    rc = ngx_http_cache_purge_index_current(store, file.root, path, &current,
-                                             error);
-    if (rc != 0) {
-        goto done;
-    }
-    if (memcmp(current.id, marker.id, 16) != 0
-        || current.revision != file.revision || current.state != file.state)
-    {
+    if (marker.state == NGX_HTTP_CACHE_PURGE_FILE_PREPARED && !intent) {
         goto mismatch;
     }
-    rc = ngx_http_cache_purge_publication_proof(file.metadata, &proof, error);
-    if (rc != 0) {
-        goto done;
+    if (file.state == NGX_HTTP_CACHE_PURGE_INDEX_COMMITTED) {
+        rc = ngx_http_cache_purge_index_current(store, file.root, path,
+                                                 &current, error);
+        if (rc != 0) {
+            goto done;
+        }
+        if (memcmp(current.id, marker.id, 16) != 0
+            || current.revision != file.revision || current.state != file.state)
+        {
+            goto mismatch;
+        }
     }
     rc = ngx_http_cache_purge_publication_beneath(target->fd, path, 1, 0,
                                                   &named_fd, error);
@@ -2021,10 +2013,28 @@ ngx_http_cache_purge_publications_inspect(
         rc = ngx_http_cache_purge_io(error, "recheck selected cache instance");
         goto done;
     }
-    if (!ngx_http_cache_purge_publication_same(&proof, &received)
-        || !ngx_http_cache_purge_publication_same(&proof, &named)
+    if (received.st_dev != named.st_dev || received.st_ino != named.st_ino
         || received.st_nlink != 1 || named.st_nlink != 1
         || received.st_uid != peer_uid || named.st_uid != peer_uid)
+    {
+        goto mismatch;
+    }
+    /*
+     * A prepared marker can outlive an aborted or replaced transaction.
+     * Only a live intent for the selected instance can justify waiting.
+     * Validation may be rewriting the header of an existing READY file.
+     */
+    if (intent && marker.state == NGX_HTTP_CACHE_PURGE_FILE_READY) {
+        rc = ngx_http_cache_purge_result(error, NGX_HTTP_CACHE_ROCKSDB_BUSY,
+            "cache index publication is pending");
+        goto done;
+    }
+    rc = ngx_http_cache_purge_publication_proof(file.metadata, &proof, error);
+    if (rc != 0) {
+        goto done;
+    }
+    if (!ngx_http_cache_purge_publication_same(&proof, &received)
+        || !ngx_http_cache_purge_publication_same(&proof, &named))
     {
         goto mismatch;
     }
@@ -2041,6 +2051,11 @@ ngx_http_cache_purge_publications_inspect(
         || memcmp(after.address, marker.address, 16))
     {
         goto mismatch;
+    }
+    if (marker.state == NGX_HTTP_CACHE_PURGE_FILE_PREPARED) {
+        rc = ngx_http_cache_purge_result(error, NGX_HTTP_CACHE_ROCKSDB_BUSY,
+            "cache file publication is pending");
+        goto done;
     }
     *out = file;
     memset(&file, 0, sizeof(file));
