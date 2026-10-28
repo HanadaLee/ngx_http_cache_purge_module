@@ -232,6 +232,8 @@ propagation_config = '''cache_key_namespace prop;
   proxy_set_header X-Cache-Purge-Mode $cache_purge_propagation_mode;
   proxy_set_header X-Cache-Purge-Fence $cache_purge_propagation_fence;
   proxy_set_header X-Cache-Purge-Namespace "";'''
+propagation_alias_config = propagation_config.replace(
+    'cache_purge_url $cache_key_url;', 'cache_purge_url "$scheme://$host$uri";')
 config = loads + f'''daemon off; master_process on; worker_processes {a.workers};
 pid {run}/pid; error_log {run}/error.log debug;
 thread_pool default threads=2;
@@ -263,6 +265,9 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
       proxy_cache_revalidate on; proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /propagation/slice {{ {propagation_config}
       {slice_config} proxy_set_header Range $slice_range;
+      proxy_pass http://127.0.0.1:{origin.server_port}; }}
+  location /propagation/aliases/ {{ {propagation_alias_config}
+      cache_key_uri /propagation/aliases/shared;
       proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location / {{ cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
                 proxy_pass http://127.0.0.1:{origin.server_port}; }}
@@ -1727,6 +1732,19 @@ try:
     propagated(propagation_headers(uri, span='bytes=1024-2047'))
     propagated(propagation_headers(uri, span='bytes=2048-3071'))
     checks.append('known TAG propagation respects native slice identities instead of expanding a match to all files with the same key')
+
+    uri = '/propagation/aliases/source'
+    policies[uri] = 'many-aliases'
+    assert prop_get(uri) == (200, 'MISS', uri.encode())
+    original = prop_records(uri, 1)[0]
+    for number in range(96):
+        alias_uri = '/propagation/aliases/observed-' + str(number)
+        assert prop_get(alias_uri) == (200, 'HIT', uri.encode())
+    deleted_at = tag_push('prop-many-aliases', 'many-aliases')
+    until(lambda: record(original['id'], optional=True) is None)
+    assert prop_get(alias_uri)[0] == 200
+    propagated(propagation_headers(alias_uri), (0, deleted_at))
+    checks.append('background Delete preserves TAG associations across more than 64 URL aliases and later requests still propagate the original requirement')
 finally:
     capacity_gate.set()
     validation_release.set()

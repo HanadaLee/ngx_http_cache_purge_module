@@ -596,8 +596,14 @@ revision adds eight bytes to the existing per-key file counter; no new table or
 per-alias metadata is required. Repeated observations and file-count-only changes
 preserve it, while alias insertion and collection advance it atomically with
 their postings. Existing eight-byte counters upgrade on their next mutation.
-This prepares bounded mutation checks; the older mutation callbacks have not yet
-switched to this iterator and retain their existing alias limits.
+Before proxy files lose their old associations, retention now uses this iterator
+in batches of 32 aliases. The existing executor advances at most four pending
+scans in round-robin order. It checks the control publication and alias revision
+before persisting a complete result. Completed scans release their snapshots and
+file buffers; short-lived results are reused only after checking the selected
+file revision, accepted operation sequence and current alias stamp. No new
+thread, process or database is used. File validation and retained-history expiry
+still use older bounded visitors and need the same integration.
 
 Managed proxy-cache requests now resolve these associations asynchronously at
 the cache-entry gate. One IPC request holds its bounded input until completion,
@@ -616,7 +622,8 @@ through deletion and restart, 304 TAG replacement, and slice isolation.
 Full propagation remains unfinished. A new accepted operation between the gate
 and upstream request creation currently rejects sending; maintenance publication
 changes with the same ledger and operation sequence preserve the completed
-result. Older mutation/retention paths still have a 64-alias traversal bound.
+result. File validation and retained-history expiry still have a 64-alias
+traversal bound; retention before file mutation no longer has that count limit.
 Uncached proxy routes, unsupported cache methods, complete tier integration,
 and loaded memory/latency acceptance remain open. Capabilities reports the sender transport as
 `filter` or `variables`, while `proxy_propagation_ready` remains false.

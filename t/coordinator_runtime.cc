@@ -728,6 +728,169 @@ ngx_http_cache_purge_test_retention()
     munmap(shared, size);
 }
 
+static void
+ngx_http_cache_purge_test_keep_pages()
+{
+    char path[] = "/tmp/ncp-keep-pages-XXXXXX";
+    check(mkdtemp(path) != nullptr, "paged retention directory");
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    options.cursor_lifetime_ms = 5000;
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    check(ngx_http_cache_rocksdb_open(path, &options, &store, &error) == 0,
+        error.message);
+    size_t size = ngx_http_cache_purge_control_size(262144, 8);
+    void *shared = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    check(shared != MAP_FAILED
+              && ngx_http_cache_purge_control_init(
+                     shared, size, 262144, 8, &error)
+                     == 0,
+        "paged retention shared memory");
+    {
+        Index index(store);
+        Operations operations(store);
+        Coordinator coordinator(operations, shared, size);
+        ready(coordinator);
+        File file;
+        file.key = "keep-key";
+        file.url = "https://keep.test/item";
+        file.host = "keep.test";
+        file.tag_namespace = "tenant";
+        file.tags = { "red" };
+        file.root = "/cache";
+        file.zone = "a";
+        unsigned char main[16] = {}, variant[16] = {};
+        ngx_http_cache_purge_index_expected_t expected[5]{};
+        for (unsigned i = 0; i < 5; i++) {
+            file.id[15] = i + 1;
+            file.path = std::to_string(i);
+            main[15] = i + 1;
+            auto raw = ngx_http_cache_purge_native_file(file);
+            ngx_http_cache_purge_index_match_t prepared{};
+            check(ngx_http_cache_purge_index_prepare_native(
+                      store, &raw, nullptr, main, variant, &prepared, &error)
+                      == 0,
+                error.message);
+            index.commit(file.id, prepared.revision);
+            expected[i] = ngx_http_cache_purge_native_expected(file.id, 2);
+        }
+        for (unsigned i = 0; i < 160; i++) {
+            auto host = "alias-" + std::to_string(i) + ".test";
+            check(ngx_http_cache_purge_index_observe(store,
+                      ngx_http_cache_purge_native_bytes(file.key),
+                      ngx_http_cache_purge_native_bytes("https://" + host),
+                      ngx_http_cache_purge_native_bytes(host), &error)
+                      == 0,
+                error.message);
+        }
+        auto add = [&](const char *name, Selector selector, PurgeMode mode,
+                       uint64_t issued) {
+            auto op = coordinator.accept(
+                { name, selector, mode, issued, "keep-pages" }, 100, 60000);
+            ready(coordinator);
+            operations.activate(op.input.id, op.revision, 100);
+            coordinator.refresh();
+            ready(coordinator);
+        };
+        auto keep = [&](unsigned n) {
+            return ngx_http_cache_purge_coordinator_keep_file(
+                coordinator.native(), &expected[n], 110, &error);
+        };
+        auto retained = [&](unsigned n, int code = 0) {
+            main[15] = n + 1;
+            ngx_http_cache_purge_fence_t value{};
+            check(ngx_http_cache_purge_index_get_propagation(store,
+                      ngx_http_cache_purge_native_bytes(file.key), main,
+                      ngx_http_cache_purge_native_bytes(file.vary), variant,
+                      110, &value, &error)
+                      == code,
+                error.message);
+            return value;
+        };
+        auto advance = [&] {
+            for (unsigned i = 0; i < 64; i++) {
+                coordinator.step();
+            }
+        };
+        add("red", { SelectorKind::namespace_tag, "red", "tenant" },
+            PurgeMode::invalidate, 10);
+        add("late-host", { SelectorKind::host_tag, "red", "late.test" },
+            PurgeMode::remove, 30);
+        check(keep(0) == NGX_HTTP_CACHE_ROCKSDB_BUSY,
+            "large retention scan yields instead of a fixed-alias failure");
+        retained(0, NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND);
+        coordinator.step();
+        check(ngx_http_cache_purge_index_observe(store,
+                  ngx_http_cache_purge_native_bytes(file.key),
+                  ngx_http_cache_purge_native_bytes("https://late.test/item"),
+                  ngx_http_cache_purge_native_bytes("late.test"), &error)
+                  == 0,
+            "observe a matching host during a retention scan");
+        advance();
+        retained(0, NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND);
+        check(keep(0) == NGX_HTTP_CACHE_ROCKSDB_BUSY,
+            "changed alias stamp restarts without publishing a partial result");
+        advance();
+        check(keep(0) == 0 && retained(0).invalidate_ms == 10
+                  && retained(0).delete_ms == 30,
+            "restarted retention includes late host TAG associations");
+        ngx_http_cache_rocksdb_stats_t before{}, after{};
+        check(ngx_http_cache_rocksdb_stats(store, &before, &error) == 0
+                  && !before.cursor_handles,
+            "completed retention unpins snapshots");
+        check(keep(0) == 0
+                  && ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
+                  && before.writes == after.writes,
+            "completed retention retries need no alias rescan or WAL write");
+
+        add("new-red", { SelectorKind::namespace_tag, "red", "tenant" },
+            PurgeMode::invalidate, 40);
+        for (unsigned i = 0; i < 5; i++) {
+            check(keep(i) == NGX_HTTP_CACHE_ROCKSDB_BUSY,
+                "four retention slots bound concurrently retained metadata");
+        }
+        check(ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
+                  && after.cursor_handles <= 8,
+            "four retention scans retain at most eight cursors");
+        advance();
+        for (unsigned i = 0; i < 4; i++) {
+            check(keep(i) == 0 && retained(i).invalidate_ms == 40,
+                "round-robin coordinator work completes each pending file");
+        }
+        check(keep(4) == NGX_HTTP_CACHE_ROCKSDB_BUSY,
+            "a completed slot can admit another file");
+        add("during-scan", { SelectorKind::namespace_tag, "red", "tenant" },
+            PurgeMode::remove, 50);
+        coordinator.step();
+        check(keep(4) == NGX_HTTP_CACHE_ROCKSDB_BUSY,
+            "new accepted controls invalidate pending retention work");
+        advance();
+        check(keep(4) == 0 && retained(4).delete_ms == 50,
+            "restarted retention uses the new published controls");
+        check(ngx_http_cache_purge_index_observe(store,
+                  ngx_http_cache_purge_native_bytes(file.key),
+                  ngx_http_cache_purge_native_bytes("https://another.test"),
+                  ngx_http_cache_purge_native_bytes("another.test"), &error)
+                  == 0,
+            "change aliases after a completed retention result");
+        check(keep(4) == NGX_HTTP_CACHE_ROCKSDB_BUSY,
+            "completed memo checks current aliases before reuse");
+        auto changed = index.update_metadata(file.id, 2, "changed", { "blue" });
+        check(keep(4) == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "completed memo cannot authorize a changed file revision");
+        (void) changed;
+        check(keep(0) == NGX_HTTP_CACHE_ROCKSDB_BUSY,
+            "leave a pending retention scan for coordinator shutdown");
+    }
+    ngx_http_cache_rocksdb_stats_t stats{};
+    check(ngx_http_cache_rocksdb_stats(store, &stats, &error) == 0
+              && !stats.cursor_handles && !stats.active_cursors,
+        "coordinator shutdown releases active retention queries");
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
+    munmap(shared, size);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -736,6 +899,7 @@ main(int argc, char **argv)
             ngx_http_cache_purge_test_file_propagation();
             ngx_http_cache_purge_test_object_propagation();
             ngx_http_cache_purge_test_retention();
+            ngx_http_cache_purge_test_keep_pages();
         }
         char temporary[] = "/tmp/ncp-coordinator-XXXXXX";
         const char *path = argc == 3 ? argv[2] : mkdtemp(temporary);

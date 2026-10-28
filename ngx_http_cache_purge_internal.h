@@ -976,6 +976,10 @@ int ngx_http_cache_purge_index_visit_hosts(ngx_http_cache_rocksdb_t *store,
 typedef struct ngx_http_cache_purge_alias_query_s
     ngx_http_cache_purge_alias_query_t;
 
+typedef struct {
+    uint64_t  key_id, revision;
+} ngx_http_cache_purge_alias_stamp_t;
+
 /* One snapshot, one borrowed alias per call, URL then HOST. No total-count
  * limit; cursor lifetime and reusable buffers remain bounded. Before using
  * a completed scan to authorize a mutation, check that its key's aliases
@@ -990,6 +994,15 @@ int ngx_http_cache_purge_index_aliases_next(
     ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_aliases_check(
     ngx_http_cache_purge_alias_query_t *query,
+    ngx_http_cache_rocksdb_error_t *error);
+/* A completed, checked scan can release its snapshot while a bounded caller
+ * retains this stamp. Revalidate immediately before reusing its result. */
+int ngx_http_cache_purge_index_aliases_stamp(
+    ngx_http_cache_purge_alias_query_t *query,
+    ngx_http_cache_purge_alias_stamp_t *stamp,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_aliases_validate(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_alias_stamp_t *stamp,
     ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_aliases_close(
     ngx_http_cache_purge_alias_query_t **query,
@@ -1104,12 +1117,15 @@ int ngx_http_cache_purge_index_expire_propagation_checked(
     ngx_http_cache_rocksdb_t *store, uint64_t now, size_t budget,
     ngx_http_cache_purge_retention_guard_pt guard, void *data,
     size_t *removed, ngx_http_cache_rocksdb_error_t *error);
-/* The checked expiry count includes renewed as well as removed snapshots.
- * Its guard is read-only and returns the current local requirements. */
+/* BUSY retains bounded scan progress. coordinator_step() or the executor's
+ * normal loop advances it; callers must retry before discarding the file's
+ * associations. Completion is rechecked against the file and alias stamp. */
 int ngx_http_cache_purge_coordinator_keep_file(
     ngx_http_cache_purge_coordinator_t *coordinator,
     const ngx_http_cache_purge_index_expected_t *file, uint64_t now,
     ngx_http_cache_rocksdb_error_t *error);
+/* The checked expiry count includes renewed as well as removed snapshots.
+ * Its guard is read-only and returns the current local requirements. */
 int ngx_http_cache_purge_coordinator_expire_propagation(
     ngx_http_cache_purge_coordinator_t *coordinator, uint64_t now,
     size_t budget, size_t *processed, ngx_http_cache_rocksdb_error_t *error);

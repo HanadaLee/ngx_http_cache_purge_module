@@ -7468,6 +7468,80 @@ ngx_http_cache_purge_index_aliases_check(
 }
 
 int
+ngx_http_cache_purge_index_aliases_stamp(
+    ngx_http_cache_purge_alias_query_t *query,
+    ngx_http_cache_purge_alias_stamp_t *stamp,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    int  rc;
+
+    if (stamp == NULL) {
+        return ngx_http_cache_purge_index_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "missing alias stamp output");
+    }
+    memset(stamp, 0, sizeof(*stamp));
+    rc = ngx_http_cache_purge_index_aliases_check(query, error);
+    if (rc == 0) {
+        stamp->key_id = query->key_id;
+        stamp->revision = query->revision;
+    }
+    return rc;
+}
+
+int
+ngx_http_cache_purge_index_aliases_validate(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_alias_stamp_t *stamp,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_rocksdb_bytes_t   key;
+    ngx_http_cache_rocksdb_buffer_t  value;
+    unsigned char                    raw_key[9], raw_value[16];
+    uint64_t                         id, revision;
+    unsigned                         i;
+    int                              rc;
+
+    if (store == NULL || stamp == NULL || !stamp->key_id) {
+        return ngx_http_cache_purge_index_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid alias stamp");
+    }
+    raw_key[0] = 'k';
+    id = stamp->key_id;
+    for (i = 0; i < 8; i++) {
+        raw_key[8 - i] = (unsigned char) id;
+        id >>= 8;
+    }
+    key.data = raw_key;
+    key.len = sizeof(raw_key);
+    value.data = raw_value;
+    value.capacity = sizeof(raw_value);
+    value.length = 0;
+    rc = ngx_http_cache_rocksdb_get(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+        key, &value, error);
+    if (rc == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) {
+        return ngx_http_cache_purge_index_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "alias stamp key was collected");
+    }
+    if (rc == NGX_HTTP_CACHE_ROCKSDB_BUFFER
+        || (rc == 0 && value.length != 8 && value.length != 16))
+    {
+        return ngx_http_cache_purge_index_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid alias stamp counter");
+    }
+    if (rc != 0) {
+        return rc;
+    }
+    revision = 0;
+    if (value.length == 16) {
+        for (i = 8; i < 16; i++) {
+            revision = (revision << 8) | raw_value[i];
+        }
+    }
+    return ngx_http_cache_purge_index_error(error,
+        revision == stamp->revision ? 0 : NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+        revision == stamp->revision ? "" : "key alias stamp changed");
+}
+
+int
 ngx_http_cache_purge_index_aliases_close(
     ngx_http_cache_purge_alias_query_t **query,
     ngx_http_cache_rocksdb_error_t *error)
