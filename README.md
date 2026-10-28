@@ -27,6 +27,10 @@ before removing FENCE. Power loss can replay intermediate work, but cannot lose
 an accepted task or turn incomplete work into a completed receipt. The explicit
 checkpoint API remains synchronous, including replay of a deferred checkpoint.
 File and directory fsync ordering is retained.
+The WAL sync group includes both single-file/native preparation and the batch
+preparation API. Native representation bindings and their file intent remain in
+the same atomic batch. Tests count actual WAL sync calls through these entry
+points and verify process recovery and loss of an unsynchronized WAL suffix.
 
 HTTP cache invalidation for nginx proxy, FastCGI, SCGI, and uWSGI caches.
 

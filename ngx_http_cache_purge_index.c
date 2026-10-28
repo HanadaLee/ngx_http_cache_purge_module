@@ -6498,6 +6498,7 @@ ngx_http_cache_purge_index_prepare_internal(ngx_http_cache_rocksdb_t *store,
         expected.revision = result.revision;
         ngx_http_cache_purge_index_native_bind(tx, &expected, main, variant);
     }
+    tx->deferred = 1;
     ngx_http_cache_purge_index_tx_commit(tx);
     if (tx->context->status == 0) {
         *out = result;

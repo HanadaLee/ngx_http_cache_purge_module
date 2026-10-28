@@ -5,11 +5,13 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <set>
 #include <thread>
 
 using namespace ngx_http_cache_purge;
+extern "C" unsigned ngx_http_cache_purge_test_sync_count(void);
 extern "C" unsigned ngx_http_cache_purge_test_query_api(
     ngx_http_cache_rocksdb_t *, const unsigned char *, size_t,
     const unsigned char *);
@@ -96,6 +98,136 @@ install(Index &index, const File &record, const FileId &previous = {})
     check(prepared.state == FileState::prepared && prepared.revision == 1,
         "prepare state");
     return index.commit(record.id, prepared.revision);
+}
+
+static void
+ngx_http_cache_purge_test_prepare_sync(const std::string &path)
+{
+    check(mkdir(path.c_str(), 0700) == 0, "prepare sync directory");
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    ngx_http_cache_rocksdb_error_t error{};
+    check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
+              == 0,
+        error.message);
+    {
+        Index index(store);
+        unsigned char main[16] = { 1 }, variant[16] = { 2 };
+        auto source = file(1, "/prepare-sync");
+        auto raw = ngx_http_cache_purge_native_file(source);
+        ngx_http_cache_purge_index_match_t prepared{};
+        auto before = ngx_http_cache_purge_test_sync_count();
+        check(ngx_http_cache_purge_index_prepare_native(
+                  store, &raw, nullptr, main, variant, &prepared, &error)
+                  == 0,
+            error.message);
+        check(ngx_http_cache_purge_test_sync_count() == before,
+            "native PREPARE must join the bounded WAL sync group");
+        auto pending = index.commit_pending(source.id, prepared.revision);
+        index.publish(source.id, pending.revision);
+        check(ngx_http_cache_purge_test_sync_count() == before,
+            "native COMMIT_PENDING and PUBLISH do not sync separately");
+        index.prepare(file(2, "/prepare-single"));
+        check(ngx_http_cache_purge_test_sync_count() == before,
+            "single-file PREPARE must join the bounded WAL sync group");
+        check(ngx_http_cache_rocksdb_sync(store, &error) == 0
+                  && ngx_http_cache_purge_test_sync_count() == before + 1,
+            "one barrier synchronizes all prepared and published records");
+        auto retired = index.retire(source.id, index.get(source.id).revision);
+        check(retired.state == FileState::retired
+                  && ngx_http_cache_purge_test_sync_count() == before + 2,
+            "retirement continues to synchronize immediately");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
+}
+
+static void
+ngx_http_cache_purge_test_prepare_recovery(
+    const std::string &mode, const std::string &path)
+{
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    ngx_http_cache_rocksdb_error_t error{};
+    check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
+              == 0,
+        error.message);
+    {
+        Index index(store);
+        auto source = file(2, "/native-deferred");
+        unsigned char main[16] = { 1 }, variant[16] = { 2 };
+        if (mode == "--crash-native-deferred") {
+            install(index, file(1, "/synced"));
+            check(ngx_http_cache_rocksdb_sync(store, &error) == 0,
+                "synchronize baseline before native preparation");
+            for (const auto &entry : std::filesystem::directory_iterator(path))
+            {
+                if (entry.path().extension() == ".log") {
+                    std::cout << "WAL " << entry.path().string() << ' '
+                              << entry.file_size() << std::endl;
+                }
+            }
+            auto raw = ngx_http_cache_purge_native_file(source);
+            ngx_http_cache_purge_index_match_t prepared{};
+            auto before = ngx_http_cache_purge_test_sync_count();
+            check(ngx_http_cache_purge_index_prepare_native(
+                      store, &raw, nullptr, main, variant, &prepared, &error)
+                      == 0,
+                error.message);
+            auto pending = index.commit_pending(source.id, prepared.revision);
+            index.publish(source.id, pending.revision);
+            check(ngx_http_cache_purge_test_sync_count() == before,
+                "native preparation and publication remain unsynchronized");
+            _exit(0);
+        }
+        check(index.get(id(1)).state == FileState::committed,
+            "synced baseline survives both restart and WAL-tail loss");
+        if (mode == "--recover-native-deferred") {
+            auto saved = index.get(source.id);
+            auto expected =
+                ngx_http_cache_purge_native_expected(source.id, saved.revision);
+            unsigned char actual_main[16], actual_variant[16];
+            check(saved.state == FileState::committed
+                      && ngx_http_cache_purge_index_native_identity(store,
+                             &expected, actual_main, actual_variant, &error)
+                             == 0
+                      && std::memcmp(main, actual_main, 16) == 0
+                      && std::memcmp(variant, actual_variant, 16) == 0,
+                "process restart recovers the published native identity");
+        } else {
+            check(mode == "--recover-native-lost", "native recovery mode");
+            fails(NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND,
+                [&] { index.get(source.id); });
+            auto query = index.query({ SelectorKind::url, source.url, "" });
+            Match match;
+            check(!query->next(match),
+                "WAL-tail loss leaves no URL relation for the lost file");
+            query.reset();
+            query = index.pending_fills();
+            check(!query->next(match),
+                "WAL-tail loss leaves no partial native fill intent");
+            query.reset();
+            ngx_http_cache_purge_representation_query_t *representations =
+                nullptr;
+            ngx_http_cache_rocksdb_bytes_t vary{};
+            check(ngx_http_cache_purge_index_representations_open(store,
+                      ngx_http_cache_purge_native_bytes(source.key), main,
+                      &representations, &error)
+                          == 0
+                      && ngx_http_cache_purge_index_representations_next(
+                             representations, &vary, &error)
+                             == NGX_HTTP_CACHE_ROCKSDB_DONE,
+                "WAL-tail loss leaves no partial native binding");
+            check(ngx_http_cache_purge_index_representations_close(
+                      &representations, &error)
+                      == 0,
+                "close absent native representation query");
+        }
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
+    std::cout << "PASS " << mode << ' ' << assertions << " assertions"
+              << std::endl;
 }
 static std::vector<unsigned>
 scan(Index &index, const Selector &selector)
@@ -2130,6 +2262,20 @@ int
 main(int argc, char **argv)
 {
     try {
+        if (argc == 3 && std::string(argv[1]) == "--prepare-sync") {
+            ngx_http_cache_purge_test_prepare_sync(argv[2]);
+            std::cout << "PASS native and single-file PREPARE sync barriers"
+                      << std::endl;
+            return 0;
+        }
+        if (argc == 3
+            && (std::string(argv[1]) == "--crash-native-deferred"
+                || std::string(argv[1]) == "--recover-native-deferred"
+                || std::string(argv[1]) == "--recover-native-lost"))
+        {
+            ngx_http_cache_purge_test_prepare_recovery(argv[1], argv[2]);
+            return 0;
+        }
         if (argc == 3) {
             return process_test(argv[1], argv[2]);
         }
@@ -2575,6 +2721,8 @@ main(int argc, char **argv)
         ngx_http_cache_purge_test_validation_policy(
             std::string(path) + "-validation");
         ngx_http_cache_purge_test_retention(std::string(path) + "-retention");
+        ngx_http_cache_purge_test_prepare_sync(
+            std::string(path) + "-prepare-sync");
         std::cout << "PASS " << assertions << " index assertions; database "
                   << path << std::endl;
         return 0;
