@@ -668,6 +668,12 @@ after request creation and verify refreshed headers and new cache publication.
 An origin response begun before local acceptance can finish, but its original
 local writer cannot publish an old reusable entity.
 
+A transient cache-entry publication conflict can skip the initial object query.
+That BYPASS path resolves its requirements at the first-send gate and retries an
+unavailable initial writer registration within the same three-second deadline.
+It does not send an incomplete requirement or turn a transient missing snapshot
+into an immediate request-creation error.
+
 Proxy locations configured with `cache_purge_key` also resolve propagation when
 `proxy_cache` is off, a variable zone resolves to off, or the method is excluded
 from caching. They use an explicit key capture and the native key builder to

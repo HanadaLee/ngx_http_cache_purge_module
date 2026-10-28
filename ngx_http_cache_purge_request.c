@@ -488,6 +488,8 @@ static size_t ngx_http_cache_purge_retire_bytes;
 static ngx_queue_t ngx_http_cache_purge_origins;
 static ngx_uint_t ngx_http_cache_purge_origins_initialized;
 static u_char ngx_http_cache_purge_origin_ledger[16];
+static ngx_int_t ngx_http_cache_purge_capture_origin(
+    ngx_http_cache_purge_capture_t *ctx);
 static void ngx_http_cache_purge_capture_origin_release(
     ngx_http_cache_purge_capture_t *ctx);
 static void ngx_http_cache_purge_read_event(ngx_event_t *event);
@@ -954,9 +956,15 @@ ngx_http_cache_purge_propagation_snapshot(ngx_http_cache_purge_capture_t *ctx)
     int                                       rc;
 
     r = ctx->request;
-    if (ctx->failed || !ctx->local_ready
-        || ngx_http_cache_purge_runtime_reader(r, &reader, &error) != 0)
-    {
+    if (ctx->failed || ctx->local_failed) {
+        return NGX_ERROR;
+    }
+    if (!ctx->local_ready) {
+        /* A transient cache-entry failure can bypass the initial query.
+         * The first-send gate must resolve it before dispatching upstream. */
+        return NGX_AGAIN;
+    }
+    if (ngx_http_cache_purge_runtime_reader(r, &reader, &error) != 0) {
         return NGX_ERROR;
     }
     fence = ctx->local_fence;
@@ -1219,12 +1227,19 @@ ngx_http_cache_purge_send_grant(ngx_http_cache_purge_capture_t *ctx)
     if (!ctx->local_ready) {
         return NGX_AGAIN;
     }
-    if (ctx->failed || (!ctx->detached && !ctx->origin_registered)) {
+    if (ctx->failed) {
         ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
                       "cache purge send admission unavailable: "
                       "failed:%ui origin:%ui", (ngx_uint_t) ctx->failed,
                       (ngx_uint_t) ctx->origin_registered);
         return NGX_ERROR;
+    }
+    if (!ctx->detached && !ctx->origin_registered
+        && ngx_http_cache_purge_capture_origin(ctx) != NGX_OK)
+    {
+        /* No bytes have been sent yet. Retry an initial registration that
+         * collided with publication within the existing send deadline. */
+        return NGX_AGAIN;
     }
     if (ngx_http_cache_purge_runtime_reader(ctx->request, &reader, &error)
         != 0) {
@@ -1752,7 +1767,9 @@ ngx_http_cache_purge_send_output(void *data, ngx_chain_t *in)
         r->main->count++;
         r->main->blocked++;
         ngx_http_cache_purge_read_count++;
+        ctx->read_event.data = ctx;
         ctx->read_event.handler = ngx_http_cache_purge_send_event;
+        ctx->read_event.log = r->connection->log;
         ngx_post_event(&ctx->read_event, &ngx_posted_events);
     }
     return NGX_AGAIN;
