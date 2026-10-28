@@ -411,7 +411,8 @@ SCM integration and whole-system resource acceptance remain under development.
 
 First build the storage, index, and component libraries on Linux
 with RocksDB and OpenSSL development packages. RocksDB must provide its CMake
-targets. Tests also require Python 3:
+targets. The unified test runner requires Python 3.9+ and CMake 3.21+ for JUnit
+reporting:
 
 ```sh
 cmake -S . -B /tmp/cache-purge-store -DCACHE_PURGE_STORE_TESTS=ON
@@ -427,25 +428,34 @@ the CMake archives when configuring the addon:
 
 ```sh
 CACHE_PURGE_ROCKSDB_LIB_DIR=/tmp/cache-purge-store \
-    ./configure --add-module=/path/to/ngx_http_cache_purge
+    ./configure --add-module=/path/to/ngx_http_cache_key_module \
+                --add-module=/path/to/ngx_http_cache_purge
 make
 ```
 
 For dynamic modules use `--add-dynamic-module` and `make modules`. The build
-produces two module files; load the provider first:
+from this repository produces two module files. For component-based identities,
+compile with the key addon present and load that project's module before them:
 
 ```nginx
+load_module modules/ngx_http_cache_key_module.so;
 load_module modules/ngx_http_cache_rocksdb_module.so;
 load_module modules/ngx_http_cache_purge_module.so;
 ```
+
+The key addon can be omitted when index expressions do not use its outputs.
+Loading it later does not enable a purge binary compiled without its API.
 
 Register the persistent purge addon after other header-filter addons, or load its
 dynamic module last among them. Its admission filter must run before slice and
 other filters modify response state. Startup and `nginx -t` reject an unsafe
 filter order when `cache_purge_key` is configured.
 
-The module requires HTTP cache support; configure rejects builds with HTTP or
-HTTP cache disabled. The persistent runtime also requires Linux and
+The module requires nginx 1.31.7 or newer for complex-value script status
+propagation. Older nginx versions are rejected at configure time; loading a
+module alone cannot prove that its cache-admission guards work. HTTP cache
+support is required; configure rejects builds with HTTP or HTTP cache disabled.
+The persistent runtime also requires Linux and
 `master_process on`. It uses standard worker initialization, timers, and exit
 callbacks. It does
 not require privileged-agent support or an additional nginx core patch. Only
@@ -851,6 +861,53 @@ server {
 
 Submit Invalidate/Delete operations to the management API. Authentication and
 source restrictions are nginx configuration responsibilities.
+
+## Tests and release artifacts
+
+`make test` builds and runs the persistent backend suites. `make test-http`
+also checks worker ownership and IPC, native fill ownership, and the complete
+HTTP capture/purge suite. Run HTTP tests as an ordinary user:
+
+```sh
+make test-http NGINX_SOURCE=/path/to/nginx-git \
+    CACHE_KEY_SOURCE=/path/to/ngx_http_cache_key_module \
+    REPORT_DIR=/tmp/cache-http-results
+make test-sanitize NGINX_SOURCE=/path/to/nginx-git \
+    CACHE_KEY_SOURCE=/path/to/ngx_http_cache_key_module \
+    REPORT_DIR=/tmp/cache-http-sanitized
+```
+
+Choose an empty report directory for each run. Failures stop the runner, retain
+logs, and mark `run.json` as failed; an empty backend report is not success.
+The nginx input is an unchanged Git source snapshot. The optional `--expr`
+argument to `t/persistent_runtime.py` adds the expression module to HTTP tests.
+
+The Dockerfile is only a disposable test environment, with no database service.
+It uses a named `cache-key` build context so a local checkout can be tested
+without publishing it. CI uses a pinned Git commit, which must exist remotely:
+
+```sh
+docker build -f t/Dockerfile --target integration \
+    --build-context cache-key=/path/to/ngx_http_cache_key_module \
+    -t cache-purge-test .
+mkdir /tmp/cache-container-results
+docker run --rm --network none --user "$(id -u):$(id -g)" \
+    -e TEST_DYNAMIC=true \
+    --mount type=bind,src=/tmp/cache-container-results,dst=/reports \
+    cache-purge-test
+```
+
+Legacy TAP, generation, directory-walk and old queue fixtures are removed.
+The manual benchmark workflow measures the current control table only; its
+results do not represent HTTP or physical deletion throughput. PVS traces both
+the C backend/C++ bridge and configured HTTP objects. Release builds package
+both `.so` files, compile against the pinned key API, and exercise an actual
+fill, HIT and durable Delete using those packaged files before comparing
+repeat-build archive bytes. Set `CACHE_KEY_SOURCE` to a local key-module Git
+checkout for local package verification; otherwise the builder fetches the
+pinned revision. The key module remains a separate project's deliverable.
+The target host needs the RocksDB shared library recorded
+in `BUILD-INFO.txt`; it is not a standalone service.
 
 Runtime regression tests and benchmark programs are under `t/`. Design, rollout,
 and validation records are maintained outside this repository. The independent

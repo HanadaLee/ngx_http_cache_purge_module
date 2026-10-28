@@ -8,6 +8,11 @@ if [[ ! "$MODULE_VERSION" =~ ^4\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]
     echo "Invalid MODULE_VERSION: expected 4.x.y[-prerelease] without a v prefix" >&2
     exit 1
 fi
+IFS=. read -r nginx_major nginx_minor nginx_patch <<< "$NGINX_VERSION"
+if (( 10#$nginx_major * 1000000 + 10#$nginx_minor * 1000 + 10#$nginx_patch < 1031007 )); then
+    echo "The persistent modules require nginx 1.31.7 or newer" >&2
+    exit 1
+fi
 module_dir=$(pwd)
 export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}
 [[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]]
@@ -23,40 +28,66 @@ trap 'rm -rf "$work"' EXIT
 name="ngx_http_cache_purge-${MODULE_VERSION}-nginx-${NGINX_VERSION}-linux-${arch}"
 stage="$work/$name"
 mkdir -p "$stage"
+key_revision=${CACHE_KEY_REVISION:-df6fbd33e201d2567fc6326c186ade6018b12747}
+[[ "$key_revision" =~ ^[0-9a-f]{40}$ ]]
+mkdir "$work/key"
+if [[ -n ${CACHE_KEY_SOURCE:-} ]]; then
+    git -C "$CACHE_KEY_SOURCE" archive "$key_revision" | tar -xf - -C "$work/key"
+else
+    git -C "$work/key" init -q
+    git -C "$work/key" remote add origin "${CACHE_KEY_REPOSITORY:-https://git.hanada.info/hanada/ngx_http_cache_key_module.git}"
+    git -C "$work/key" fetch --depth=1 origin "$key_revision"
+    git -C "$work/key" checkout --detach -q FETCH_HEAD
+    test "$(git -C "$work/key" rev-parse HEAD)" = "$key_revision"
+fi
 sh t/download.sh "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" "$work/nginx.tar.gz"
 tar --no-same-owner -xzf "$work/nginx.tar.gz" -C "$work"
+cmake -S "$module_dir" -B "$work/backend" -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    "-DCMAKE_C_FLAGS=-ffile-prefix-map=$work=/usr/src/build -ffile-prefix-map=$module_dir=/usr/src/ngx_http_cache_purge" \
+    "-DCMAKE_CXX_FLAGS=-ffile-prefix-map=$work=/usr/src/build -ffile-prefix-map=$module_dir=/usr/src/ngx_http_cache_purge"
+cmake --build "$work/backend" --parallel "${BUILD_JOBS:-2}"
+export CACHE_PURGE_ROCKSDB_LIB_DIR="$work/backend"
 cd "$work/nginx-$NGINX_VERSION"
 ./configure --with-compat --with-threads --with-http_ssl_module \
+    --add-dynamic-module="$work/key" \
     --add-dynamic-module="$module_dir" \
     --with-cc-opt="-ffile-prefix-map=$work=/usr/src/build -ffile-prefix-map=$module_dir=/usr/src/ngx_http_cache_purge"
-make -j"$(getconf _NPROCESSORS_ONLN)"
-cp objs/ngx_http_cache_purge_module.so "$stage/"
+make -j"${BUILD_JOBS:-2}"
+cp objs/ngx_http_cache_rocksdb_module.so objs/ngx_http_cache_purge_module.so "$stage/"
 # Exercise the delivered .so, rather than a statically linked module.
 mkdir -p "$work/runtime/logs" "$work/runtime/cache"
 user_directive=
 if [[ $(id -u) == 0 ]]; then user_directive="user $(id -un) $(id -gn);"; fi
 cat > "$work/runtime/nginx.conf" <<EOF
 $user_directive
+load_module $stage/ngx_http_cache_rocksdb_module.so;
 load_module $stage/ngx_http_cache_purge_module.so;
 pid logs/nginx.pid;
 error_log stderr;
 events {}
 http {
     access_log off;
+    cache_purge_store $work/runtime/index cache=16m write_buffer=4m;
+    cache_purge_state_zone release_control 4m;
     proxy_cache_path $work/runtime/cache keys_zone=release:1m;
     server {
         listen 127.0.0.1:18080;
-        location /purge/ { proxy_cache_purge release \$uri; }
+        location /__cache_purge/ { cache_purge_api; allow 127.0.0.1; deny all; }
     }
 }
 EOF
 objs/nginx -p "$work/runtime/" -c nginx.conf -t
+python3 "$module_dir/t/release_runtime.py" --nginx "$PWD/objs/nginx" \
+    --modules "$stage" --key-module "$PWD/objs/ngx_http_cache_key_module.so" \
+    --root "$work/package-test" --output "$work/package-test.json"
 cp "$module_dir/LICENSE" "$stage/"
 cp "$module_dir/README.md" "$stage/README.md"
 {
     printf 'Module: %s\nCommit: %s\nNGINX: %s\nArchitecture: %s\n' \
         "$MODULE_VERSION" "$(git -C "$module_dir" rev-parse HEAD)" "$NGINX_VERSION" "$arch"
     printf 'SOURCE_DATE_EPOCH: %s\n' "$SOURCE_DATE_EPOCH"
+    printf 'Cache key API revision: %s\n' "$key_revision"
+    cat "$work/package-test.json"
     cat /etc/os-release
     getconf GNU_LIBC_VERSION
     cc --version
@@ -67,8 +98,11 @@ cp "$module_dir/README.md" "$stage/README.md"
     dpkg-query -W -f='${Package}=${Version}\n' | sort
     objs/nginx -V 2>&1
     sha256sum "$work/nginx.tar.gz"
-    readelf -d "$stage/ngx_http_cache_purge_module.so"
-    readelf --version-info "$stage/ngx_http_cache_purge_module.so"
+    pkg-config --modversion rocksdb
+    for shared in "$stage"/*.so; do
+        readelf -d "$shared"
+        readelf --version-info "$shared"
+    done
 } > "$stage/BUILD-INFO.txt"
 # Record stable source paths, not ephemeral runner directories.
 python3 - "$stage/BUILD-INFO.txt" "$work" "$module_dir" <<'PYTHON'
@@ -77,7 +111,7 @@ path = pathlib.Path(sys.argv[1])
 text = path.read_text().replace(sys.argv[2], '/usr/src/build')
 path.write_text(text.replace(sys.argv[3], '/usr/src/ngx_http_cache_purge'))
 PYTHON
-(cd "$stage" && sha256sum ngx_http_cache_purge_module.so > SHA256SUMS)
+(cd "$stage" && sha256sum ngx_http_cache_rocksdb_module.so ngx_http_cache_purge_module.so > SHA256SUMS)
 chmod 644 "$stage"/*
 tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 \
     --numeric-owner --format=gnu -cf - -C "$work" "$name" \

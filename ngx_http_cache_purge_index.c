@@ -3684,9 +3684,9 @@ ngx_http_cache_purge_index_group_open(ngx_http_cache_purge_query_t *q,
     }
     size = sizeof(*group) + selector->value.len + selector->scope.len;
     group = calloc(1, size);
-    if (!ngx_http_cache_purge_index_require(q, group != NULL,
-            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "TAG group allocation failed"))
-    {
+    if (group == NULL) {
+        ngx_http_cache_purge_index_fail(q, NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+                                        "TAG group allocation failed");
         return;
     }
     q->group = group;
@@ -4200,10 +4200,9 @@ ngx_http_cache_purge_index_tx_alloc(ngx_http_cache_purge_index_tx_t *tx,
         return NULL;
     }
     data = malloc(size);
-    if (!ngx_http_cache_purge_index_require(
-            q, data != NULL, NGX_HTTP_CACHE_ROCKSDB_LIMIT,
-            "index transaction allocation failed"))
-    {
+    if (data == NULL) {
+        ngx_http_cache_purge_index_fail(q, NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+                                        "index transaction allocation failed");
         return NULL;
     }
     q->bytes += size;

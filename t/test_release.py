@@ -44,7 +44,7 @@ class ReleasePublication(unittest.TestCase):
             gh.write_text(GH)
             gh.chmod(0o755)
             assets = [f'ngx_http_cache_purge-{tag}-nginx-{v}-linux-{a}.{e}'
-                      for v in ('1.30.6', '1.31.7')
+                      for v in ('1.31.7',)
                       for a in ('x86_64', 'aarch64') for e in ('tar.gz', 'zip')]
             for name in assets[1:] if missing else assets:
                 (root / 'dist' / name).write_bytes(name.encode())
@@ -100,6 +100,14 @@ class ReleasePublication(unittest.TestCase):
 
 
 class ReleaseTagContract(unittest.TestCase):
+    def test_builder_rejects_unsupported_core_before_download(self):
+        env = dict(os.environ, MODULE_VERSION='4.0.0-test', NGINX_VERSION='1.30.6')
+        result = subprocess.run(['bash', str(ROOT / 'tools/build-release-module.sh')],
+                                cwd=ROOT, env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('require nginx 1.31.7 or newer', result.stderr)
+        self.assertNotIn('Downloading', result.stdout)
+
     def test_workflow_filters_match_unprefixed_release_tags(self):
         workflow = (ROOT / '.github/workflows/build-test-release.yml').read_text()
         self.assertIn("tags: ['4.*']", workflow)

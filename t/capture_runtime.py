@@ -48,8 +48,9 @@ for source, destination in [(repo, addon), (a.key, key)]:
 for path in (repo / 'rocksdb').iterdir():
     if path.suffix in ('.c', '.h'):
         (addon / 'rocksdb' / path.name).write_bytes(path.read_bytes().replace(b'\r\n', b'\n'))
-revision = subprocess.check_output(['git', '-C', str(a.nginx), 'rev-parse', a.nginx_ref], text=True).strip()
-archive = subprocess.check_output(['git', '-c', 'core.autocrlf=false', '-C', str(a.nginx), 'archive', revision])
+git = ['git', '-c', 'safe.directory=' + str(a.nginx), '-C', str(a.nginx)]
+revision = subprocess.check_output(git + ['rev-parse', a.nginx_ref], text=True).strip()
+archive = subprocess.check_output(git + ['-c', 'core.autocrlf=false', 'archive', revision])
 subprocess.run(['tar', '-xf', '-', '-C', str(build)], input=archive, check=True)
 source_patch = b''
 if a.core_working_tree:
@@ -58,7 +59,9 @@ if a.core_working_tree:
     subprocess.run(['git', 'apply', '-'], cwd=build, input=source_patch, check=True)
 env = os.environ.copy()
 env['CACHE_PURGE_ROCKSDB_LIB_DIR'] = str(a.libraries)
-env['CACHE_PURGE_ROCKSDB_LIBS'] = ('-lrocksdb' if a.dynamic else '/usr/lib/x86_64-linux-gnu/librocksdb.a') + ' -lcrypto -lsnappy -lz -lbz2 -llz4 -lzstd -lstdc++ -lm -pthread'
+engine = '-lrocksdb' if a.dynamic else str(Path(subprocess.check_output(
+    ['pkg-config', '--variable=libdir', 'rocksdb'], text=True).strip()) / 'librocksdb.a')
+env['CACHE_PURGE_ROCKSDB_LIBS'] = engine + ' -lcrypto -lsnappy -lz -lbz2 -llz4 -lzstd -lstdc++ -lm -pthread'
 option = '--add-dynamic-module=' if a.dynamic else '--add-module='
 configure = 'auto/configure' if (build / 'auto/configure').exists() else 'configure'
 command = ['sh', configure, '--prefix=' + str(root / 'default'), '--with-debug', '--with-threads',

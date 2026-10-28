@@ -87,7 +87,8 @@ if not (build / 'src').exists():
 
 env = os.environ.copy()
 env['CACHE_PURGE_ROCKSDB_LIB_DIR'] = str(a.libraries)
-engine = '-lrocksdb' if a.shared_rocksdb else '/usr/lib/x86_64-linux-gnu/librocksdb.a'
+engine = '-lrocksdb' if a.shared_rocksdb else str(Path(subprocess.check_output(
+    ['pkg-config', '--variable=libdir', 'rocksdb'], text=True).strip()) / 'librocksdb.a')
 env['CACHE_PURGE_ROCKSDB_LIBS'] = engine + ' -lcrypto -lsnappy -lz -lbz2 -llz4 -lzstd -lstdc++ -lm -pthread'
 env['CACHE_PURGE_PROBE_HEADERS'] = str(addon)
 print('BUILD', root, flush=True)

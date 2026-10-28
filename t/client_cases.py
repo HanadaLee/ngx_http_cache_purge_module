@@ -202,7 +202,7 @@ def run_client_cases(Run, root, checks):
         assert marker[:8] == b'NCF1\0\0\0\1' and marker[8:24] == (501).to_bytes(16, 'big')
         assert rpc('/rpc/?op=2', (501).to_bytes(16, 'big'))[2][0] == 1
         checks.append('real worker sends lease and native request-body temp descriptors; component registers a durable PREPARED file')
-        final_path = case.path / 'cache-a/prepared-501'
+        final_path = case.path / 'cache-a' / f'{501:032x}'
         temporary_path.rename(final_path)
         value = rpc('/rpc-files/?' + query + '&finish=1', b'finish')
         assert value[0] == 200 and value[2] == (501).to_bytes(16, 'big') + struct.pack('>QB', 2, 2), value

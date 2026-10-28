@@ -365,7 +365,8 @@ ngx_http_cache_purge_probe_rpc_prepare_body(
         ngx_http_finalize_request(r, 500);
         return;
     }
-    target.len = ngx_sprintf(target.data, "prepared-%i", id) - target.data;
+    /* The proxy binding requires a hash-shaped native basename. */
+    target.len = ngx_sprintf(target.data, "%032xL", (int64_t) id) - target.data;
     ctx->request = r;
     ctx->client = client;
     ctx->timeout = timeout;

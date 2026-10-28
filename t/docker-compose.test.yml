@@ -1,74 +1,32 @@
-# Run from t/; build context is the repository root.
+# Disposable test containers only; no runtime database service is introduced.
 x-test-base: &test-base
   image: ngx-cache-purge-test:${NGINX_VERSION:-1.31.7}-${UBUNTU_VERSION:-24.04}
   build:
     context: ..
     dockerfile: t/Dockerfile
     target: integration
+    additional_contexts:
+      cache-key: ${CACHE_KEY_CONTEXT:-https://git.hanada.info/hanada/ngx_http_cache_key_module.git#df6fbd33e201d2567fc6326c186ade6018b12747}
     args:
       NGINX_VERSION: ${NGINX_VERSION:-1.31.7}
       UBUNTU_VERSION: ${UBUNTU_VERSION:-24.04}
+  user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
   volumes:
-    - ..:/src
+    - ..:/src:ro
     - ./test-results:/reports
-  environment: &test-environment
-    TEST_REPORT_DIR: ${TEST_REPORT_DIR:-}
-
-x-verify-base: &verify-base
-  <<: *test-base
-  image: ngx-cache-purge-verify:${NGINX_VERSION:-1.31.7}-${UBUNTU_VERSION:-24.04}
-  build:
-    context: ..
-    dockerfile: t/Dockerfile
-    target: verify
-    args:
-      NGINX_VERSION: ${NGINX_VERSION:-1.31.7}
-      UBUNTU_VERSION: ${UBUNTU_VERSION:-24.04}
   environment:
-    <<: *test-environment
+    TEST_DYNAMIC: ${TEST_DYNAMIC:-false}
+    TEST_SANITIZE: ${TEST_SANITIZE:-false}
     CC: ${CC:-gcc}
+    CXX: ${CXX:-g++}
 
 services:
   nginx-test:
     <<: *test-base
-    command: ["sh", "t/run_tests.sh"]
-
-  test-basic:
-    <<: *test-base
-    command: ["sh", "t/run_tests.sh", "t/basic.t"]
-
-  test-queue:
-    <<: *test-base
-    command: ["sh", "t/run_tests.sh", "t/background_queue.t"]
-
-  test-config:
-    <<: *test-base
-    command: ["sh", "t/run_tests.sh", "t/config.t"]
-
-  test-memory:
-    <<: *test-base
-    command: ["sh", "t/run_tests.sh", "t/memory.t"]
-
-  test-performance:
-    <<: *test-base
-    command: ["sh", "t/run_tests.sh", "t/performance.t"]
-
-  test-native:
-    <<: *test-base
-    command: ["sh", "t/run_tests.sh", "t/native_helpers.t"]
-
-  test-runtime:
-    <<: *test-base
-    command: ["sh", "t/run_tests.sh", "t/purge_runtime.t"]
-
-  test-verify:
-    <<: *verify-base
-    command: ["perl", "t/build_verify.pl", "--nginx-source", "/opt/nginx"]
-
+    command: ["python3", "t/persistent_runtime.py", "--reports", "/reports/run"]
   test-sanitize:
-    <<: *verify-base
-    command: ["perl", "t/build_verify.pl", "--nginx-source", "/opt/nginx", "--threads", "--sanitize", "--workers", "16", "--files", "16384"]
-
+    <<: *test-base
+    command: ["python3", "t/persistent_runtime.py", "--sanitize", "--reports", "/reports/asan"]
   test-pvs:
     image: ngx-cache-purge-pvs:${NGINX_VERSION:-1.31.7}-${UBUNTU_VERSION:-24.04}
     build:
@@ -81,19 +39,9 @@ services:
     volumes:
       - ..:/src:ro
       - ./test-results:/reports
-    # The build tracer needs ptrace only in this analysis container.
-    cap_add:
-      - SYS_PTRACE
+    cap_add: [SYS_PTRACE]
     environment:
       LICENSE_NAME: ${LICENSE_NAME:-}
       LICENSE_KEY: ${LICENSE_KEY:-}
       PVS_JOBS: ${PVS_JOBS:-2}
     command: ["bash", "t/pvs_studio.sh"]
-
-  test-valgrind:
-    <<: *test-base
-    environment:
-      <<: *test-environment
-      TEST_NGINX_USE_VALGRIND: "1"
-      TEST_NGINX_VALGRIND_EXIT_ON_FIRST_ERR: "1"
-    command: ["sh", "t/run_tests.sh", "t/memory.t"]

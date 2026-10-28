@@ -33,6 +33,12 @@ command -v plog-converter >/dev/null
 pvs-studio-analyzer credentials "$LICENSE_NAME" "$LICENSE_KEY"
 unset LICENSE_NAME LICENSE_KEY
 
+backend=$(mktemp -d)
+trap 'rm -rf "$backend"' EXIT
+cmake -S "$module" -B "$backend" -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build "$backend" --parallel "$jobs"
+export CACHE_PURGE_ROCKSDB_LIB_DIR="$backend"
+
 cd "$nginx"
 configure=./configure
 [ -f "$configure" ] || configure=./auto/configure
@@ -44,7 +50,13 @@ configure=./configure
 targets=$(perl "$module/t/pvs_targets.pl" "$module/config" objs/Makefile)
 mapfile -t objects <<< "$targets"
 # Force every module unit into the trace even on a previously built tree.
-pvs-studio-analyzer trace -- make -f objs/Makefile -B -j"$jobs" "${objects[@]}"
+pvs-studio-analyzer trace -- bash -c '
+    set -e
+    cmake --build "$1" --clean-first --parallel "$2"
+    jobs=$2
+    shift 2
+    make -f objs/Makefile -B -j"$jobs" "$@"
+' bash "$backend" "$jobs" "${objects[@]}"
 # Keep diagnostics in this module, including its platform headers; NGINX core
 # and generated registration sources are outside the module's analysis scope.
 pvs-studio-analyzer analyze -j "$jobs" -e "$nginx" \

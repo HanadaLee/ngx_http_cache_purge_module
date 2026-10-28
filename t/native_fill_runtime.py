@@ -19,6 +19,7 @@ p = argparse.ArgumentParser()
 p.add_argument('--output', type=Path, required=True)
 p.add_argument('--nginx', type=Path, required=True)
 p.add_argument('--nginx-ref', default='HEAD')
+p.add_argument('--libraries', type=Path, required=True)
 p.add_argument('--dynamic', action='store_true')
 p.add_argument('--sanitize', action='store_true')
 
@@ -27,8 +28,9 @@ repo = Path(__file__).resolve().parents[1]
 root = Path(tempfile.mkdtemp(prefix='cache-native-fill-'))
 build = root / 'nginx'
 core = str(a.nginx)
-revision = subprocess.check_output(['git', '-C', core, 'rev-parse', a.nginx_ref], text=True).strip()
-archive = subprocess.check_output(['git', '-c', 'core.autocrlf=false', '-C', core, 'archive', revision])
+git = ['git', '-c', 'safe.directory=' + core, '-C', core]
+revision = subprocess.check_output(git + ['rev-parse', a.nginx_ref], text=True).strip()
+archive = subprocess.check_output(git + ['-c', 'core.autocrlf=false', 'archive', revision])
 addon, probe = root / 'addon', root / 'probe'
 for directory in (addon, probe): directory.mkdir()
 for source, target in [(repo / 'config', addon / 'config'),
@@ -36,9 +38,14 @@ for source, target in [(repo / 'config', addon / 'config'),
                        *[(path, addon / path.name) for path in repo.glob('*.h')],
                        *[(path, probe / path.name) for path in (repo / 't/native_fill_probe').iterdir()]]:
     target.write_bytes(source.read_bytes().replace(b'\r\n', b'\n'))
+(addon / 'rocksdb').mkdir()
+for source in (repo / 'rocksdb').iterdir():
+    if source.suffix in ('.c', '.h'):
+        (addon / 'rocksdb' / source.name).write_bytes(source.read_bytes().replace(b'\r\n', b'\n'))
 env = os.environ.copy()
 env['CACHE_PURGE_PROBE_HEADERS'] = str(addon)
-env.pop('CACHE_PURGE_ROCKSDB_LIB_DIR', None)
+env['CACHE_PURGE_ROCKSDB_LIB_DIR'] = str(a.libraries)
+env['CACHE_PURGE_ROCKSDB_LIBS'] = '-lrocksdb -lcrypto -lstdc++ -lm -pthread'
 build.mkdir()
 subprocess.run(['tar', '-xf', '-', '-C', str(build)], input=archive, check=True)
 configure = 'auto/configure' if (build / 'auto/configure').exists() else 'configure'
@@ -51,6 +58,18 @@ if a.sanitize:
              '--with-ld-opt=-fsanitize=address,undefined -no-pie']
 with (root / 'build.log').open('w') as log:
     subprocess.run(args, cwd=build, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
+    if a.sanitize:
+        # Native x86 MD5 deliberately uses unaligned word loads. Preserve
+        # alignment instrumentation for every module and other core object.
+        makefile = build / 'objs/Makefile'
+        text = makefile.read_text()
+        begin = text.index('objs/src/core/ngx_md5.o:')
+        end = text.index('\n\n', begin)
+        rule = text[begin:end]
+        assert '$(CC) -c $(CFLAGS)' in rule
+        rule = rule.replace('$(CC) -c $(CFLAGS)',
+                            '$(CC) -c $(CFLAGS) -fno-sanitize=alignment')
+        makefile.write_text(text[:begin] + rule + text[end:])
     subprocess.run(['make', '-j2'], cwd=build, stdout=log, stderr=subprocess.STDOUT, check=True)
 with tarfile.open(fileobj=io.BytesIO(archive)) as source:
     members = [m for m in source if m.isfile() and m.name.startswith('src/')]
@@ -92,7 +111,11 @@ with socket.socket() as s: s.bind(('127.0.0.1', 0)); port = s.getsockname()[1]
 run = root / ('run-' + str(time.time_ns())); run.mkdir()
 (run / 'cache').mkdir(); (run / 'logs').mkdir()
 modules = ''.join('load_module ' + str(build / 'objs' / name) + ';\n' for name in
-                  ('ngx_http_cache_purge_module.so', 'ngx_http_native_fill_probe_module.so')) if a.dynamic else ''
+                  ('ngx_http_cache_rocksdb_module.so', 'ngx_http_cache_purge_module.so',
+                   'ngx_http_native_fill_probe_module.so')) if a.dynamic else ''
+extension = any(line.split() == ['#define', 'NGX_RESTY_EXT', '1']
+                for line in (build / 'objs/ngx_auto_config.h').read_text().splitlines())
+slice_config = 'slice on; slice_size 1024;' if extension else 'slice 1024;'
 config = modules + f'''daemon off; master_process on; worker_processes 2;
 pid {run}/pid; error_log {run}/error.log debug;
 thread_pool default threads=2;
@@ -106,7 +129,7 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
   add_header X-Status $upstream_cache_status always;
   location / {{ proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /thread {{ aio threads; aio_write on; proxy_pass http://127.0.0.1:{origin.server_port}; }}
-  location /slice {{ slice 1024; proxy_set_header Range $slice_range;
+  location /slice {{ {slice_config} proxy_set_header Range $slice_range;
                     proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /nocache {{ proxy_no_cache 1; proxy_pass http://127.0.0.1:{origin.server_port}; }}
  }}
@@ -202,7 +225,12 @@ logs = (run / 'error.log').read_text() + (run / 'stdout.log').read_text()
 assert not any(s in logs for s in ('AddressSanitizer', 'runtime error:', 'LeakSanitizer', '[alert]')), logs[-5000:]
 result = {'root': str(root), 'run': str(run), 'native_revision': revision, 'native_source_files_unchanged': len(members),
           'checks': checks, 'sanitizer': a.sanitize, 'production_fill_helper': True, 'dynamic': a.dynamic,
-          'addon_sha256': {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in addon.iterdir()},
+          'addon_sha256': {str(path.relative_to(addon)): hashlib.sha256(path.read_bytes()).hexdigest()
+                           for path in addon.rglob('*') if path.is_file()},
+          'library_sha256': {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                             for path in a.libraries.glob('libngx_http_cache_*.a')},
+          'sanitizer_exclusions': ['nonnull-attribute', 'alignment for native ngx_md5.o only',
+                                   'leak:ngx_event_process_init'] if a.sanitize else [],
           'probe_sha256': {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in probe.iterdir()},
           'scope': 'Native header/finalize fill ownership only; timer test consumer, no durable index or complete purge consumer'}
 a.output.write_text(json.dumps(result, indent=2) + '\n')

@@ -17,6 +17,8 @@ args = sys.argv[1:]
 stage = name
 if name == 'pvs-studio-analyzer':
     stage = args[0]
+elif name == 'cmake':
+    stage = 'cmake-configure' if '-S' in args else 'cmake-trace' if '--clean-first' in args else 'cmake-build'
 elif name == 'plog-converter':
     stage = args[args.index('-t') + 1]
 with open(os.environ['PVS_TEST_CALLS'], 'a') as log:
@@ -33,6 +35,8 @@ if stage == 'configure':
     config = (pathlib.Path(module) / 'config').read_text()
     sources = re.search(r'CACHE_PURGE_SRCS="([^"]+)"', config, re.S).group(1)
     units = re.findall(r'\$ngx_addon_dir/(ngx_http_cache_purge_\w+)\.c', sources)
+    if '$ngx_addon_dir/rocksdb/ngx_http_cache_rocksdb_module.c' in config:
+        units.append('ngx_http_cache_rocksdb_module')
     rules = ['objs/addon/fixture/' + unit + '.o: ' + module + '/' + unit + '.c'
              for unit in units]
     if os.environ.get('PVS_TEST_MISSING_TARGET'):
@@ -62,7 +66,7 @@ class AnalysisPipeline(unittest.TestCase):
             configure.parent.mkdir(exist_ok=True)
             configure.write_text(TOOL)
             configure.chmod(0o755)
-            for name in ('make', 'pvs-studio-analyzer', 'plog-converter'):
+            for name in ('make', 'cmake', 'pvs-studio-analyzer', 'plog-converter'):
                 path = tools / name
                 path.write_text(TOOL)
                 path.chmod(0o755)
@@ -88,7 +92,7 @@ class AnalysisPipeline(unittest.TestCase):
                 result, calls = self.run_pipeline(git_source=git_source)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual([stage for stage, _ in calls],
-                                 ['credentials', 'configure', 'trace', 'make',
+                                 ['credentials', 'cmake-configure', 'cmake-build', 'configure', 'trace', 'cmake-trace', 'make',
                                   'analyze', 'tasklist', 'json', 'sarif'])
                 args = dict(calls)
                 self.assertEqual(args['credentials'],
@@ -99,6 +103,7 @@ class AnalysisPipeline(unittest.TestCase):
                 config = (ROOT / 'config').read_text()
                 sources = re.search(r'CACHE_PURGE_SRCS="([^"]+)"', config, re.S).group(1)
                 units = re.findall(r'\$ngx_addon_dir/(ngx_http_cache_purge_\w+)\.c', sources)
+                units.append('ngx_http_cache_rocksdb_module')
                 self.assertEqual(args['make'][4:],
                                  ['objs/addon/fixture/' + unit + '.o' for unit in units])
                 excluded = args['analyze'][args['analyze'].index('-e') + 1]
@@ -110,7 +115,7 @@ class AnalysisPipeline(unittest.TestCase):
                 self.assertEqual(args['sarif'][-1], 'relative.json')
 
     def test_each_failed_stage_stops_the_pipeline(self):
-        stages = ['credentials', 'configure', 'trace', 'make', 'analyze', 'tasklist', 'json', 'sarif']
+        stages = ['credentials', 'cmake-configure', 'cmake-build', 'configure', 'trace', 'cmake-trace', 'make', 'analyze', 'tasklist', 'json', 'sarif']
         for stage in stages:
             with self.subTest(stage=stage):
                 result, calls = self.run_pipeline(fail=stage)
@@ -121,7 +126,7 @@ class AnalysisPipeline(unittest.TestCase):
         result, calls = self.run_pipeline(missing_target=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('expected one object target', result.stderr)
-        self.assertEqual([name for name, _ in calls], ['credentials', 'configure'])
+        self.assertEqual([name for name, _ in calls], ['credentials', 'cmake-configure', 'cmake-build', 'configure'])
 
     def test_stale_reports_are_not_reused(self):
         result, calls = self.run_pipeline(stale=True)

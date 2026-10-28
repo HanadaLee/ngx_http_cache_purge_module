@@ -11,6 +11,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+int ngx_http_cache_purge_test_main(int argc, char **argv) __asm__("main");
+
 static unsigned                       ngx_http_cache_purge_test_count;
 static ngx_http_cache_rocksdb_error_t ngx_http_cache_purge_test_error;
 
@@ -606,7 +608,7 @@ ngx_http_cache_purge_test_fence(void)
 }
 
 int
-main(int argc, char **argv)
+ngx_http_cache_purge_test_main(int argc, char **argv)
 {
     ngx_http_cache_rocksdb_t               *store;
     ngx_http_cache_purge_operations_t       ops;
@@ -621,7 +623,7 @@ main(int argc, char **argv)
     size_t  expired;
     int     rc;
 
-    unsigned char raw[1024];
+    unsigned char raw[1024], schema[] = "10";
     char          path[] = "/tmp/ngx-cache-ledger-c-XXXXXX";
     const char    binding[] = { 'a', '\0', 'b' };
 
@@ -639,7 +641,7 @@ main(int argc, char **argv)
     ngx_http_cache_purge_test_check(mkdtemp(path) != NULL, "test directory");
     store = ngx_http_cache_purge_test_open(path);
     /* Only the ledger is tested here; the file index has its own suite. */
-    ngx_http_cache_purge_test_write(store, "M:index", (unsigned char *) "10", 2);
+    ngx_http_cache_purge_test_write(store, "M:index", schema, 2);
     ngx_http_cache_purge_test_check(
         ngx_http_cache_purge_operations_init(&ops, store, NULL,
                                              &ngx_http_cache_purge_test_error)

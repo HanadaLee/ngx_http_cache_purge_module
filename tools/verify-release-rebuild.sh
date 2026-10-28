@@ -17,7 +17,7 @@ if len(expected) != 2:
 rows = []
 passed = True
 for second in expected:
-    first = pathlib.Path('dist') / second.name
+    first = pathlib.Path(os.environ.get('RELEASE_OUTPUT_DIR', 'dist')) / second.name
     digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
     original = digest(first)
     match = original == digest(second)

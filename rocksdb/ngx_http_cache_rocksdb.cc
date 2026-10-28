@@ -2,6 +2,9 @@
 #include "ngx_http_cache_rocksdb.h"
 
 #include <rocksdb/cache.h>
+#if __has_include(<rocksdb/advanced_cache.h>)
+#include <rocksdb/advanced_cache.h>
+#endif
 #include <rocksdb/db.h>
 #include <rocksdb/filter_policy.h>
 #include <rocksdb/table.h>

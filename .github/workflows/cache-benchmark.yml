@@ -1,121 +1,35 @@
-name: Cache purge benchmark
+name: Persistent control lookup benchmark
 
 on:
   workflow_dispatch:
-    inputs:
-      files:
-        description: Unrelated native cache files (filled through HTTP)
-        type: choice
-        options: ['1000', '10000', '100000', '1000000']
-        default: '10000'
-      variants:
-        description: Representations of the purged key
-        type: choice
-        options: ['2', '16', '66']
-        default: '16'
-      mode:
-        description: Cleanup implementation
-        type: choice
-        options: [compare, legacy-vary, generation, generation-threads]
-        default: compare
-      trials:
-        description: Repeated purges with verified refills
-        type: choice
-        options: ['5', '10']
-        default: '5'
-      workers:
-        description: NGINX workers
-        type: choice
-        options: ['1', '4']
-        default: '1'
-      levels:
-        description: Native cache directory layout
-        type: choice
-        options: ['1:2', '2:2', flat]
-        default: '1:2'
 
 permissions:
   contents: read
 
-concurrency:
-  group: cache-benchmark-${{ github.ref }}
-  cancel-in-progress: false
-
-env:
-  DOCKER_BUILD_RECORD_RETENTION_DAYS: 7
-  NGINX_VERSION: '1.31.7'
-
 jobs:
-  benchmark:
+  control-lookup:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - id: apt
-        uses: ./.github/actions/apt-mirror
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - name: Build measurement image
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: t/Dockerfile
-          target: benchmark
-          load: true
-          tags: ngx-cache-purge-benchmark:local
-          build-args: NGINX_VERSION=${{ env.NGINX_VERSION }}
-          secrets: ${{ steps.apt.outputs.buildkit_secret }}
-          secret-files: |
-            apt_ca=/etc/ssl/certs/ca-certificates.crt
-          cache-from: |
-            type=gha,scope=cache-benchmark
-            type=gha,scope=verify-${{ env.NGINX_VERSION }}
-            type=gha,scope=integration-${{ env.NGINX_VERSION }}-24.04
-          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,scope=cache-benchmark,mode=max,ignore-error=true,timeout=5m' || '' }}
-          provenance: false
-          sbom: false
-      - uses: ./.github/actions/image-size
-        with:
-          image: ngx-cache-purge-benchmark:local
-      - name: Collect native layouts and stack frames
+      - uses: ./.github/actions/apt-mirror
+      - run: sudo apt-get update && sudo apt-get install -y cmake librocksdb-dev libssl-dev
+      - name: Build current control-table benchmark
         run: |
-          mkdir -p reports/cache-benchmark "$RUNNER_TEMP/cache-benchmark"
-          docker run --rm --network none \
-            --mount "type=bind,src=$PWD/reports/cache-benchmark,dst=/reports" \
-            ngx-cache-purge-benchmark:local \
-            sh -c 'cp -R /opt/benchmark/reports/. /reports/'
-      - name: Run bounded cache experiment
-        id: experiment
-        env:
-          BENCH_FILES: ${{ inputs.files }}
-          BENCH_VARIANTS: ${{ inputs.variants }}
-          BENCH_MODE: ${{ inputs.mode }}
-          BENCH_TRIALS: ${{ inputs.trials }}
-          BENCH_WORKERS: ${{ inputs.workers }}
-          BENCH_LEVELS: ${{ inputs.levels }}
+          cmake -S . -B /tmp/cache-benchmark -DCMAKE_BUILD_TYPE=Release -DCACHE_PURGE_STORE_TESTS=ON
+          cmake --build /tmp/cache-benchmark --target cache_purge_control_benchmark --parallel 2
+      - name: Measure bounded control lookup
         run: |
-          # Cache files live on the runner bind mount, outside Docker's overlay.
-          timeout --signal=TERM --kill-after=30s 30m \
-            docker run --rm --init --network none -e GITHUB_SHA \
-              --mount "type=bind,src=$RUNNER_TEMP/cache-benchmark,dst=/bench-work" \
-              --mount "type=bind,src=$PWD/reports/cache-benchmark,dst=/reports" \
-              ngx-cache-purge-benchmark:local \
-              python3 t/cache_benchmark.py --work /bench-work --output /reports \
-                --files "$BENCH_FILES" --variants "$BENCH_VARIANTS" \
-                --mode "$BENCH_MODE" --trials "$BENCH_TRIALS" \
-                --workers "$BENCH_WORKERS" --levels "$BENCH_LEVELS"
-      - name: Publish measurement summary
-        if: always()
-        env:
-          BENCH_OUTCOME: ${{ steps.experiment.outcome }}
-        run: |
-          python3 t/cache_benchmark_report.py reports/cache-benchmark \
-            --outcome "${BENCH_OUTCOME:-unknown}" >> "$GITHUB_STEP_SUMMARY"
+          mkdir reports
+          /tmp/cache-benchmark/cache_purge_control_benchmark > reports/single.json
+          /tmp/cache-benchmark/cache_purge_control_benchmark --tag-groups > reports/two-tags.json
+          /tmp/cache-benchmark/cache_purge_control_benchmark --tag-groups-64 > reports/64-tags.json
+          printf '%s\n' 'Synthetic control-table lookup only; no HTTP, index enumeration or physical deletion throughput claim.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: cache-benchmark-${{ github.run_id }}-${{ github.run_attempt }}
-          path: reports/cache-benchmark/
+          name: control-lookup-results
+          path: reports/
           retention-days: 7
-          if-no-files-found: warn

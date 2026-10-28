@@ -13,6 +13,23 @@ if [ -z "$CACHE_PURGE_ROCKSDB_LIB_DIR" ]; then
     exit 1
 fi
 
+# Admission and key guards require complex-value script status propagation.
+ngx_feature="nginx cache script status support (1.31.7+)"
+ngx_feature_name=
+ngx_feature_run=no
+ngx_feature_incs='#include <nginx.h>
+                  #if nginx_version < 1031007
+                  #error nginx 1.31.7 or newer is required
+                  #endif'
+ngx_feature_path="src/core $NGX_OBJS"
+ngx_feature_libs=
+ngx_feature_test='return 0;'
+. auto/feature
+if [ "$ngx_found" != yes ]; then
+    echo "ngx_http_cache_purge_module requires nginx 1.31.7 or newer"
+    exit 1
+fi
+
 # Mirror the enabled upstream protocols in the module's compile guards.
 if [ "$HTTP_PROXY" = "YES" ]; then
     have=NGX_HTTP_PROXY . auto/have

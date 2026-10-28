@@ -1927,7 +1927,7 @@ ngx_http_cache_purge_incoming_parse(ngx_http_cache_purge_capture_t *ctx)
     }
     if (!seen[0] || !seen[1] || !seen[2] || values[0].len == 0
         || values[0].len > 20 || values[0].data[0] == '0'
-        || values[2].len == 0 || values[2].len != 28
+        || values[2].len != 28
         || values[2].len + conf->propagation_header[2].len + 4
            > NGX_HTTP_CACHE_PURGE_PROPAGATION_LINE)
     {

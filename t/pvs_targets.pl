@@ -8,7 +8,8 @@ sub read_file {
     return <$file>;
 }
 
-my ($sources) = read_file($ARGV[0]) =~ /CACHE_PURGE_SRCS="([^"]+)"/s;
+my $manifest = read_file($ARGV[0]);
+my ($sources) = $manifest =~ /CACHE_PURGE_SRCS="([^"]+)"/s;
 die "missing module source manifest\n" unless defined $sources;
 $sources =~ s/\\\r?\n/ /g;
 my @paths = split ' ', $sources;
@@ -17,6 +18,8 @@ my @units = map {
     m{^\$ngx_addon_dir/(\w+)\.c$} or die "unsupported module source: $_\n";
     $1;
 } @paths;
+push @units, 'ngx_http_cache_rocksdb_module'
+    if $manifest =~ m{\$ngx_addon_dir/rocksdb/ngx_http_cache_rocksdb_module\.c};
 my $makefile = read_file($ARGV[1]);
 my @targets;
 for my $unit (@units) {
