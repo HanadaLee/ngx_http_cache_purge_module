@@ -3839,6 +3839,8 @@ struct ngx_http_cache_purge_control_reader_s {
     ngx_http_cache_purge_control_shared_t  *shared;
     uint32_t                                slot;
     uint64_t                                token;
+    uint64_t                                propagation_version;
+    uint64_t                                propagation_until;
     pid_t                                   pid;
     pthread_t                               thread;
     int                                     pinned;
@@ -5995,14 +5997,15 @@ ngx_http_cache_purge_fence_decode(ngx_http_cache_rocksdb_bytes_t input,
     return 0;
 }
 
-int
-ngx_http_cache_purge_control_watermark(
-    ngx_http_cache_purge_control_reader_t *r,
+static int
+ngx_http_cache_purge_control_snapshot(
+    ngx_http_cache_purge_control_reader_t *r, uint64_t now, int *needed,
     ngx_http_cache_purge_watermark_t *watermark, uint64_t *publication,
     ngx_http_cache_rocksdb_error_t *error)
 {
     ngx_http_cache_purge_control_matcher_t  m;
-    uint64_t                                version;
+    uint64_t                                version, until;
+    uint32_t                                i;
     int                                     rc;
     static const unsigned char zero[16] = { 0 };
 
@@ -6028,6 +6031,26 @@ ngx_http_cache_purge_control_watermark(
         rc = ngx_http_cache_purge_control_error(error,
             NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND, "control has no durable ledger");
     }
+    if (rc == 0 && needed != NULL
+        && r->propagation_version != version)
+    {
+        /* Cache only a scalar deadline per immutable image, not its records.
+         * PREPARING requirements have no active window to expire yet. */
+        until = 0;
+        for (i = 0; i < m.image->records; i++) {
+            if (m.records[i].flags & NGX_HTTP_CACHE_PURGE_CONTROL_PREPARING) {
+                until = UINT64_MAX;
+                break;
+            }
+            if ((m.records[i].flags & NGX_HTTP_CACHE_PURGE_CONTROL_PROPAGATE)
+                && m.records[i].until > until)
+            {
+                until = m.records[i].until;
+            }
+        }
+        r->propagation_until = until;
+        r->propagation_version = version;
+    }
     if (rc == 0
         && (!ngx_http_cache_purge_control_load(&r->shared->serving)
             || ngx_http_cache_purge_control_load(&r->shared->publication)
@@ -6040,12 +6063,49 @@ ngx_http_cache_purge_control_watermark(
         memcpy(watermark->ledger, m.image->ledger, 16);
         watermark->sequence = m.image->sequence;
         *publication = version;
+        if (needed != NULL) {
+            *needed = r->propagation_until == UINT64_MAX
+                      || now < r->propagation_until;
+        }
     }
     if (rc == NGX_HTTP_CACHE_ROCKSDB_CORRUPT) {
         ngx_http_cache_purge_control_store(&r->shared->serving, 0);
     }
     ngx_http_cache_purge_control_unpin(r);
     return rc;
+}
+
+int
+ngx_http_cache_purge_control_watermark(
+    ngx_http_cache_purge_control_reader_t *r,
+    ngx_http_cache_purge_watermark_t *watermark, uint64_t *publication,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_purge_control_snapshot(r, 0, NULL, watermark,
+                                                  publication, error);
+}
+
+int
+ngx_http_cache_purge_control_propagation_needed(
+    ngx_http_cache_purge_control_reader_t *r, uint64_t now, int *needed,
+    ngx_http_cache_purge_watermark_t *watermark, uint64_t *publication,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    if (needed != NULL) {
+        *needed = 1;
+    }
+    if (needed == NULL || now == 0) {
+        if (watermark != NULL) {
+            memset(watermark, 0, sizeof(*watermark));
+        }
+        if (publication != NULL) {
+            *publication = 0;
+        }
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid propagation time output");
+    }
+    return ngx_http_cache_purge_control_snapshot(r, now, needed, watermark,
+                                                  publication, error);
 }
 
 int

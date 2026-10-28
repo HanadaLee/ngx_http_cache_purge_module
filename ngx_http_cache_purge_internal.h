@@ -292,6 +292,13 @@ int ngx_http_cache_purge_control_watermark(
     ngx_http_cache_purge_control_reader_t *reader,
     ngx_http_cache_purge_watermark_t *watermark, uint64_t *publication,
     ngx_http_cache_rocksdb_error_t *error);
+/* A zero result in needed proves there are no outgoing local requirements
+ * anywhere in this serving image at now_ms. It does not authorize a cache
+ * read or filter incoming requirements. On error, needed remains true. */
+int ngx_http_cache_purge_control_propagation_needed(
+    ngx_http_cache_purge_control_reader_t *reader, uint64_t now_ms, int *needed,
+    ngx_http_cache_purge_watermark_t *watermark, uint64_t *publication,
+    ngx_http_cache_rocksdb_error_t *error);
 /* Announce active/unknown before taking an origin snapshot, then publish the
  * oldest active snapshot. active=0 clears it only after those requests cannot
  * issue more writes. One reader coalesces all requests on its owning thread. */

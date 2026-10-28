@@ -845,15 +845,21 @@ ngx_http_cache_purge_propagation_reply(ngx_http_cache_purge_call_t *call,
 static ngx_int_t
 ngx_http_cache_purge_propagation_query(ngx_http_cache_purge_capture_t *ctx)
 {
-    ngx_http_request_t  *r;
-    ngx_list_part_t     *part;
-    ngx_table_elt_t     *headers;
-    ngx_str_t           payload, fields[4];
-    ngx_uint_t          i, count;
-    ngx_msec_t          timeout;
-    size_t              size;
-    u_char             *p;
-    ngx_int_t           rc;
+    ngx_http_cache_purge_control_reader_t  *reader;
+    ngx_http_cache_purge_watermark_t        watermark;
+    ngx_http_cache_rocksdb_error_t          error;
+    ngx_http_request_t                     *r;
+    ngx_list_part_t                        *part;
+    ngx_table_elt_t                        *headers;
+    ngx_time_t                             *now;
+    ngx_str_t                               payload, fields[4];
+    uint64_t                                publication;
+    ngx_uint_t                              i, count;
+    ngx_msec_t                              timeout;
+    size_t                                  size;
+    u_char                                 *p;
+    ngx_int_t                               rc;
+    int                                     needed;
 
     r = ctx->request;
     timeout = ctx->deadline - ngx_current_msec;
@@ -861,6 +867,22 @@ ngx_http_cache_purge_propagation_query(ngx_http_cache_purge_capture_t *ctx)
         || ngx_http_cache_purge_runtime_client(r, &ctx->client) != NGX_OK)
     {
         return NGX_ERROR;
+    }
+    now = ngx_timeofday();
+    if (ngx_http_cache_purge_runtime_reader(r, &reader, &error) == 0
+        && ngx_http_cache_purge_control_propagation_needed(reader,
+               (uint64_t) now->sec * 1000 + now->msec, &needed,
+               &watermark, &publication, &error) == 0
+        && !needed)
+    {
+        /* Local admission and incoming requirements remain independent. A
+         * new accepted sequence is checked again before the first send. */
+        ngx_memzero(&ctx->local_fence, sizeof(ctx->local_fence));
+        ctx->local_watermark = watermark;
+        ctx->local_publication = publication;
+        ctx->local_ready = 1;
+        ngx_post_event(&ctx->read_event, &ngx_posted_events);
+        return NGX_OK;
     }
     fields[0] = ctx->key;
     fields[1] = ctx->url;

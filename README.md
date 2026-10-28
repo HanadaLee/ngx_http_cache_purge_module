@@ -632,7 +632,15 @@ progress. Completed scans wake collection immediately; waiting does not extend
 the original propagation deadlines.
 
 Managed proxy-cache requests now resolve these associations asynchronously at
-the cache-entry gate. One IPC request holds its bounded input until completion,
+the cache-entry gate. When the serving control image proves there are no local
+outgoing requirements, requests skip the object lookup. Each reader keeps only
+the image version and latest propagation deadline, rescanning the bounded rule
+image when its version changes. PREPARING rules always require a lookup. This
+shortcut still checks the accepted sequence before upstream dispatch, preserves
+incoming requirements, and does not bypass local cache admission. It also applies
+after all outgoing windows expire, while local FENCEs may remain active.
+
+When a lookup is needed, one IPC request holds its bounded input until completion,
 disconnect or the original deadline. The executor admits at most four object
 queries and advances eight steps per dispatch, allowing other peers to run.
 Between batches each object retains one snapshot cursor and releases its

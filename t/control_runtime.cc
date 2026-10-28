@@ -223,6 +223,124 @@ propagation_reference(const std::vector<Operation> &ops, const Context &c,
 }
 
 static void
+propagation_needed_tests()
+{
+    char path[] = "/tmp/ncp-propagation-needed-XXXXXX";
+    check(mkdtemp(path) != nullptr, "idle propagation ledger directory");
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    expect(ngx_http_cache_rocksdb_open(path, &options, &store, &error), 0,
+        "idle propagation ledger");
+    size_t size = ngx_http_cache_purge_control_size(1024 * 1024, 8);
+    void *shared = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    check(shared != MAP_FAILED, "idle propagation shared region");
+    expect(
+        ngx_http_cache_purge_control_init(shared, size, 1024 * 1024, 8, &error),
+        0, "initialize idle propagation controls");
+    ngx_http_cache_purge_control_reader_t *reader = nullptr;
+    expect(
+        ngx_http_cache_purge_control_reader_open(shared, size, &reader, &error),
+        0, "idle propagation reader");
+    {
+        Index index(store);
+        Operations ledger(store);
+        Coordinator coordinator(ledger, shared, size);
+        auto ready = [&] {
+            for (unsigned i = 0; i < 1000; i++) {
+                if (coordinator.state() == Coordination::ready) {
+                    return;
+                }
+                check(coordinator.step(), "idle propagation recovery");
+            }
+            throw std::runtime_error("idle propagation recovery deadline");
+        };
+        auto draining = [&] {
+            for (unsigned i = 0; i < 1000; i++) {
+                if (coordinator.state() == Coordination::draining) {
+                    return;
+                }
+                check(coordinator.step(), "idle propagation publication");
+            }
+            throw std::runtime_error("idle propagation publication deadline");
+        };
+        auto query = [&](uint64_t now, int expected, uint64_t sequence,
+                         int wanted = 0) {
+            ngx_http_cache_purge_watermark_t watermark{};
+            uint64_t publication = 123;
+            int needed = -1;
+            expect(ngx_http_cache_purge_control_propagation_needed(
+                       reader, now, &needed, &watermark, &publication, &error),
+                wanted, "global propagation summary");
+            check(needed == expected, "global propagation requirement");
+            if (wanted == 0) {
+                check(publication == coordinator.publication()
+                          && watermark.sequence == sequence
+                          && std::memcmp(
+                                 watermark.ledger, ledger.native()->ledger, 16)
+                                 == 0,
+                    "idle proof and watermark share a publication");
+            } else {
+                check(publication == 0 && watermark.sequence == 0,
+                    "failed summary cannot publish idle proof");
+            }
+        };
+        query(2000, 1, 0, NGX_HTTP_CACHE_ROCKSDB_BUSY);
+        ready();
+        query(2000, 0, 0);
+        query(0, 1, 0, NGX_HTTP_CACHE_ROCKSDB_INVALID);
+        auto input =
+            operation(1, SelectorKind::namespace_tag, "news", "one").input;
+        auto op = coordinator.accept(input, 2000, 120000);
+        ready();
+        query(UINT64_MAX, 1, 1);
+        op = ledger.activate(input.id, op.revision, 2000);
+        coordinator.refresh();
+        draining();
+        query(2000, 1, 0, NGX_HTTP_CACHE_ROCKSDB_BUSY);
+        ready();
+        query(2000, 1, 1);
+        query(121999, 1, 1);
+        query(122000, 0, 1);
+        query(123000, 0, 1);
+        query(121999, 1, 1);
+        Context c;
+        c.ns = "one";
+        c.tags = { "news" };
+        check(!lookup(reader, c, true, 123000).empty(),
+            "outgoing idle proof does not clear a local FENCE");
+        check(ledger.expire_propagation(123000) == 1,
+            "persist expiry without materializing the FENCE");
+        coordinator.refresh();
+        ready();
+        query(2000, 0, 1);
+        auto second = operation(2, SelectorKind::host, "different.test").input;
+        auto next = coordinator.accept(second, 124000, 120000);
+        ready();
+        query(UINT64_MAX, 1, 2);
+        next = ledger.activate(second.id, next.revision, 125000);
+        coordinator.refresh();
+        ready();
+        query(245000, 0, 2);
+        query(244999, 1, 2);
+        for (unsigned i = 0; i < 100; i++) {
+            query(i % 2 ? 245000 : 244999, i % 2 ? 0 : 1, 2);
+        }
+        coordinator.refresh();
+        draining();
+        query(245000, 1, 0, NGX_HTTP_CACHE_ROCKSDB_BUSY);
+        ready();
+        query(245000, 0, 2);
+    }
+    expect(ngx_http_cache_purge_control_reader_close(&reader, &error), 0,
+        "close idle propagation reader");
+    expect(ngx_http_cache_rocksdb_close(&store, &error), 0,
+        "close idle propagation ledger");
+    munmap(shared, size);
+}
+
+static void
 propagation_tests()
 {
     char path[] = "/tmp/ncp-propagation-control-XXXXXX";
@@ -451,6 +569,7 @@ int
 main()
 {
     try {
+        propagation_needed_tests();
         propagation_tests();
         size_t size = ngx_http_cache_purge_control_size(2 * 1024 * 1024, 32);
         void *memory = mmap(nullptr, size, PROT_READ | PROT_WRITE,
