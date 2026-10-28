@@ -6288,7 +6288,7 @@ struct ngx_http_cache_purge_keep_s {
     ngx_http_cache_rocksdb_error_t              error;
     uint64_t                                    publication, sequence;
     uint64_t                                    expires;
-    int                                         done, status, history;
+    int                                         done, status, history, consumed;
 };
 
 static void
@@ -6380,7 +6380,10 @@ ngx_http_cache_purge_keep_step(ngx_http_cache_purge_keep_t *keep)
     }
     keep->done = 1;
     keep->status = rc;
-    keep->expires = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 5000;
+    if (keep->history) {
+        keep->expires =
+            ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 5000;
+    }
     (void) ngx_http_cache_purge_index_aliases_close(&keep->aliases, NULL);
     if (!keep->history) {
         ngx_http_cache_purge_index_file_free(&keep->file);
@@ -6519,6 +6522,12 @@ ngx_http_cache_purge_coordinator_keep_file(
                 *error = keep->error;
             }
             if (rc == 0) {
+                if (!keep->consumed) {
+                    keep->consumed = 1;
+                    keep->expires =
+                        ngx_http_cache_purge_component_now(CLOCK_MONOTONIC)
+                        + 5000;
+                }
                 goto done;
             }
             ngx_http_cache_purge_keep_free(&c->keeps[i]);
@@ -6530,7 +6539,7 @@ ngx_http_cache_purge_coordinator_keep_file(
             slot = i;
             break;
         }
-        if (keep == NULL || keep->done) {
+        if (keep == NULL || (keep->done && keep->consumed)) {
             slot = i;
         }
     }
@@ -6582,6 +6591,9 @@ ngx_http_cache_purge_coordinator_keep_file(
     ngx_http_cache_purge_keep_step(keep);
     if (keep->done) {
         rc = keep->status;
+        keep->consumed = 1;
+        keep->expires =
+            ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 5000;
         if (error != NULL) {
             *error = keep->error;
         }
@@ -7401,7 +7413,7 @@ struct ngx_http_cache_purge_guard_s {
     ngx_http_cache_rocksdb_error_t             error;
     uint64_t                                   publication, sequence, expires;
     uint64_t                                   remove;
-    int                                        done, status;
+    int                                        done, status, consumed;
 };
 
 static void
@@ -7461,7 +7473,8 @@ ngx_http_cache_purge_guard_step(ngx_http_cache_purge_guard_t *guard)
     }
     guard->done = 1;
     guard->status = rc;
-    guard->expires = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 5000;
+    /* Keep the original deadline until the caller consumes this result.
+     * New arrivals must not make a completed scan restart indefinitely. */
     (void) ngx_http_cache_purge_index_aliases_close(&guard->aliases, NULL);
 }
 
@@ -7569,6 +7582,12 @@ ngx_http_cache_purge_guard_aliases(ngx_http_cache_purge_coordinator_t *c,
                     *error = guard->error;
                 }
                 if (rc == 0) {
+                    if (!guard->consumed) {
+                        guard->consumed = 1;
+                        guard->expires =
+                            ngx_http_cache_purge_component_now(CLOCK_MONOTONIC)
+                            + 5000;
+                    }
                     *invalidate = guard->match.required;
                     *remove = guard->remove;
                     return 0;
@@ -7585,7 +7604,7 @@ ngx_http_cache_purge_guard_aliases(ngx_http_cache_purge_coordinator_t *c,
         }
         if (guard == NULL) {
             slot = i;
-        } else if (guard->done
+        } else if (guard->done && guard->consumed
                    && (reusable == 4
                        || guard->expires < c->guards[reusable]->expires))
         {
@@ -7648,6 +7667,8 @@ ngx_http_cache_purge_guard_aliases(ngx_http_cache_purge_coordinator_t *c,
             NGX_HTTP_CACHE_ROCKSDB_BUSY, "file alias guard pending");
     }
     rc = guard->status;
+    guard->consumed = 1;
+    guard->expires = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 5000;
     if (error != NULL) {
         *error = guard->error;
     }

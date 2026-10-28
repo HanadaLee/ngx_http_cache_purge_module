@@ -941,6 +941,8 @@ ngx_http_cache_purge_test_keep_pages()
                   && !after.cursor_handles && !after.active_cursors,
             "four pending retention scans release cursors between batches");
         advance();
+        check(keep(4) == NGX_HTTP_CACHE_ROCKSDB_BUSY,
+            "a new file cannot evict an unconsumed completed retention scan");
         for (unsigned i = 0; i < 4; i++) {
             check(keep(i) == 0 && retained(i).invalidate_ms == 40,
                 "round-robin coordinator work completes each pending file");

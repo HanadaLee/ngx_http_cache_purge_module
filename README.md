@@ -624,6 +624,11 @@ checking the unchanged alias revision. Repeated 304 calls reuse their transactio
 payload and lease while guards are pending, including after durable completion
 while final admission still waits.
 
+Completed retention and alias-guard scans keep their slot until a caller consumes
+the result or the original three-second deadline expires. New arrivals cannot
+evict an unread completion and force it to scan again. Consumed results remain
+eligible for bounded reuse after rechecking their identity and alias revision.
+
 Retained-history expiry now uses one bounded background scan, releasing cursors
 between alias batches. Before collection it matches later local rules against
 the retained namespace/TAG membership and all persisted aliases. Each completed

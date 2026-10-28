@@ -975,6 +975,41 @@ try:
     os.close(lease); os.close(selected)
     check(True, 'large URL alias sets yield before validation, then complete the same transaction and permit stamped read admission')
 
+    held_guards = [make_validation_file(n, '/guard-results') for n in range(622, 627)]
+    guard_key = 'team\x1fhttps\x1fa.test\x1f/guard-results\x1f'
+    for number in range(64):
+        v.call(12, string(guard_key) + string(f'https://a.test/guard-alias/{number}'))
+    def guard_read(number, code):
+        return v.admit_file((str(validation_cache), 'zone-a', f'a/00/{622 + number}'),
+                            guard_key, 'https://a.test/guard-results', held_guards[number][2], code=code)
+    for number in range(4):
+        guard_read(number, 6)
+    # Each PING advances the real component loop; no timing sleep decides
+    # completion. Four scans need fewer than 128 eight-alias dispatches.
+    for _ in range(128):
+        v.call(1)
+    guard_read(4, 6)
+    for number in range(4):
+        result = guard_read(number, (0, 6))
+        assert v.last_result == 0, 'a new file evicted an unconsumed completed alias guard'
+    def fifth_guard():
+        result = guard_read(4, (0, 6))
+        return result if v.last_result == 0 else None
+    wait_for(fifth_guard)
+    validation_operation('guard-result-expiry', 1, 'https://a.test/unrelated-guard-expiry')
+    wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+    for number in range(4):
+        guard_read(number, 6)
+    for _ in range(128):
+        v.call(1)
+    guard_read(4, 6)
+    wait_for(fifth_guard, timeout=4)
+    for _, lease, selected in held_guards:
+        os.close(lease)
+        os.close(selected)
+    check(True, 'completed alias guards survive new arrivals until consumed, then their slots permit continued progress')
+    check(True, 'abandoned completed alias guards release their slots at the original three-second deadline')
+
     target, lease, selected = make_validation_file(621, '/host-rule')
     validation_operation('validation-host', 4, 'business.test')
     wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
