@@ -842,6 +842,27 @@ int ngx_http_cache_purge_index_native_identity(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_expected_t *file,
     unsigned char main[16], unsigned char variant[16],
     ngx_http_cache_rocksdb_error_t *error);
+
+typedef struct ngx_http_cache_purge_representation_query_s
+    ngx_http_cache_purge_representation_query_t;
+
+/* Executor-owned Vary definitions for one native main key across zones.
+ * Merges current postings and retained memberships in one bounded snapshot,
+ * seeking past all variants of each definition. Empty Vary is a valid result.
+ * Missing migration data returns BUSY, never a false empty catalog. Borrowed
+ * output lasts until the next call/close. Close after DONE or any error. */
+int ngx_http_cache_purge_index_representations_open(
+    ngx_http_cache_rocksdb_t *store, ngx_http_cache_rocksdb_bytes_t key,
+    const unsigned char main[16],
+    ngx_http_cache_purge_representation_query_t **query,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_representations_next(
+    ngx_http_cache_purge_representation_query_t *query,
+    ngx_http_cache_rocksdb_bytes_t *vary,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_representations_close(
+    ngx_http_cache_purge_representation_query_t **query,
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_prepare_batch(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_fill_t *files, size_t count,
     ngx_http_cache_purge_index_match_t *out,
@@ -975,6 +996,20 @@ typedef struct {
     size_t                           tag_count;
     ngx_http_cache_purge_retention_t times;
 } ngx_http_cache_purge_retained_context_t;
+
+/* Select the request's native variant for the last emitted Vary definition.
+ * Memberships and dictionaries share the catalog snapshot. member returns
+ * one current/retained TAG set, DONE, or BUSY after budget (1-32) row/phase
+ * steps; BUSY resumes on this query. Uncommitted files are skipped. Returned
+ * contexts never grant cache admission. The next definition drops selection.
+ */
+int ngx_http_cache_purge_index_representations_select(
+    ngx_http_cache_purge_representation_query_t *query,
+    const unsigned char variant[16], ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_representations_member(
+    ngx_http_cache_purge_representation_query_t *query, size_t budget,
+    ngx_http_cache_purge_retained_context_t *context,
+    ngx_http_cache_rocksdb_error_t *error);
 
 typedef struct ngx_http_cache_purge_retained_query_s
     ngx_http_cache_purge_retained_query_t;

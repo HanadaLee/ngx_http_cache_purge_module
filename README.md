@@ -576,6 +576,12 @@ identity; it never persists the raw key. Unresolved files remain explicit and
 are retried in bounded batches, without rewriting unchanged rows or rescanning
 the full index. A missing or conflicting file is not proof of an empty TAG set.
 
+The index can enumerate distinct Vary definitions for a native main key, then
+stream only the selected variant's current and retained TAG memberships from
+the same snapshot. Definition scans seek past whole variant groups. Unfinished
+migration and expired or corrupt snapshots return errors rather than a false
+empty result; uncommitted file postings do not supply TAG memberships.
+
 Full propagation remains unfinished: representation selection and request-path
 integration are still pending. The intended
 TAG scope is known current or retained edge associations; completely unknown

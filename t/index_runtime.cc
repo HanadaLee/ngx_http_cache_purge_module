@@ -1120,6 +1120,252 @@ ngx_http_cache_purge_test_native_migration(const std::string &path)
 }
 
 static void
+ngx_http_cache_purge_test_representations(const std::string &path)
+{
+    check(mkdir(path.c_str(), 0700) == 0, "representation directory");
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    options.cursor_lifetime_ms = 300;
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    ngx_http_cache_rocksdb_error_t error{};
+    check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
+              == 0,
+        error.message);
+    {
+        Index index(store);
+        const auto cf = NGX_HTTP_CACHE_ROCKSDB_DEFAULT;
+        unsigned char main[16] = { 1 }, variant[16] = { 2 };
+        auto first = file(1001, "/representations");
+        auto insert = [&](unsigned i, const std::string &vary, bool retained) {
+            auto f = file(i, "/representations");
+            f.vary = vary;
+            if (i % 2 == 0) {
+                f.root = "/cache/other-zone";
+                f.zone = "other";
+            }
+            variant[14] = i >> 8;
+            variant[15] = i;
+            ngx_http_cache_purge_index_match_t prepared{};
+            auto raw = ngx_http_cache_purge_native_file(f);
+            check(ngx_http_cache_purge_index_prepare_native(
+                      store, &raw, nullptr, main, variant, &prepared, &error)
+                      == 0,
+                error.message);
+            index.commit(f.id, prepared.revision);
+            if (retained) {
+                auto expected = ngx_http_cache_purge_native_expected(f.id, 2);
+                ngx_http_cache_purge_retention_t times{ 10, 200, 0, 0 };
+                check(ngx_http_cache_purge_index_keep_propagation(
+                          store, &expected, main, variant, 100, &times, &error)
+                          == 0,
+                    error.message);
+                auto retired = index.retire(f.id, 2);
+                index.collect_file(f.id, retired.revision);
+            }
+        };
+        insert(1001, "", false);
+        insert(1002, "Accept-Language", false);
+        insert(1003, "Cookie", true);
+        insert(1004, "Accept-Language", true);
+        for (unsigned i = 1010; i < 1210; i++) {
+            insert(i, "Accept-Language", false);
+        }
+        main[0] = 2;
+        insert(1210, "X-Other-Slice", false);
+        main[0] = 1;
+        for (unsigned i = 1300; i < 1304; i++) {
+            auto pending = file(i, "/representations");
+            pending.tags = { "unpublished" };
+            auto raw = ngx_http_cache_purge_native_file(pending);
+            variant[14] = 1002 >> 8;
+            variant[15] = 1002 & 255;
+            ngx_http_cache_purge_index_match_t prepared{};
+            check(ngx_http_cache_purge_index_prepare_native(
+                      store, &raw, nullptr, main, variant, &prepared, &error)
+                      == 0,
+                "pending members share a selected representation");
+        }
+        ngx_http_cache_purge_representation_query_t *query = nullptr;
+        auto open = [&](int expected = 0) {
+            check(ngx_http_cache_purge_index_representations_open(store,
+                      ngx_http_cache_purge_native_bytes(first.key), main,
+                      &query, &error)
+                      == expected,
+                error.message);
+            check((query != nullptr) == (expected == 0),
+                "failed catalog open retains no handle");
+        };
+        auto close = [&] {
+            check(
+                ngx_http_cache_purge_index_representations_close(&query, &error)
+                        == 0
+                    && query == nullptr,
+                "release representation snapshot");
+        };
+        std::string expected_tag = "photo";
+        auto members = [&](unsigned selected) {
+            unsigned char variant[16] = { 2 };
+            variant[14] = selected >> 8;
+            variant[15] = selected;
+            check(ngx_http_cache_purge_index_representations_select(
+                      query, variant, &error)
+                      == 0,
+                "select the native variant in the catalog snapshot");
+            unsigned count = 0, steps = 0;
+            for (;;) {
+                ngx_http_cache_purge_retained_context_t context{};
+                int rc = ngx_http_cache_purge_index_representations_member(
+                    query, 1, &context, &error);
+                check(++steps < 20, "membership advances within each budget");
+                if (rc == NGX_HTTP_CACHE_ROCKSDB_DONE) {
+                    break;
+                }
+                if (rc == NGX_HTTP_CACHE_ROCKSDB_BUSY) {
+                    check(context.tag_count == 0 && context.key.len == 0,
+                        "yield does not publish a partial membership");
+                    continue;
+                }
+                check(rc == 0, error.message);
+                check(ngx_http_cache_purge_cpp_bytes(context.key) == first.key,
+                    "membership belongs to the selected key");
+                bool found_tag = false;
+                for (size_t i = 0; i < context.tag_count; i++) {
+                    found_tag |= ngx_http_cache_purge_cpp_bytes(context.tags[i])
+                                 == expected_tag;
+                    check(ngx_http_cache_purge_cpp_bytes(context.tags[i])
+                              != "unpublished",
+                        "uncommitted native postings do not supply TAGs");
+                }
+                check(selected != 1002 || found_tag,
+                    "membership TAGs use the catalog snapshot");
+                check(context.times.invalidate_ms
+                          == (selected == 1003 || selected == 1004 ? 10 : 0),
+                    "historical requirements survive selected file removal");
+                count++;
+            }
+            return count;
+        };
+        auto read = [&] {
+            std::set<std::string> values;
+            ngx_http_cache_rocksdb_bytes_t vary{};
+            int rc;
+            while ((rc = ngx_http_cache_purge_index_representations_next(
+                        query, &vary, &error))
+                   == 0)
+            {
+                check(
+                    values.insert(ngx_http_cache_purge_cpp_bytes(vary)).second,
+                    "one result per definition across variants and zones");
+                auto definition = ngx_http_cache_purge_cpp_bytes(vary);
+                unsigned selected = definition.empty()      ? 1001 :
+                                    definition == "Cookie"  ? 1003 :
+                                    definition == "X-Later" ? 1211 :
+                                                              1002;
+                check(members(selected) == 1,
+                    "only exact variant memberships are returned");
+                if (definition == "Accept-Language") {
+                    check(members(1004) == 1 && members(65500) == 0,
+                        "retained variant is separate from unknown variants");
+                }
+            }
+            check(rc == NGX_HTTP_CACHE_ROCKSDB_DONE && vary.len == 0,
+                "catalog terminates without leaking borrowed output");
+            return values;
+        };
+        ngx_http_cache_rocksdb_stats_t before{}, after{};
+        check(ngx_http_cache_rocksdb_stats(store, &before, &error) == 0,
+            "catalog statistics");
+        open();
+        check(ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
+                  && after.active_cursors == before.active_cursors + 2
+                  && after.cursor_handles == before.cursor_handles + 2,
+            "catalog holds only two bounded snapshot cursors");
+        check(read()
+                  == std::set<std::string>({ "", "Accept-Language", "Cookie" }),
+            "catalog merges retained-only fields and excludes other slices");
+        close();
+        check(ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
+                  && before.writes == after.writes
+                  && before.active_cursors == after.active_cursors
+                  && before.cursor_handles == after.cursor_handles,
+            "catalog is read-only and releases both handles");
+        open();
+        insert(1211, "X-Later", false);
+        index.update_metadata(id(1002), 2, "later", { "new-later" });
+        check(read()
+                  == std::set<std::string>({ "", "Accept-Language", "Cookie" }),
+            "catalog definitions and dictionary use the opening snapshot");
+        close();
+        expected_tag = "new-later";
+        open();
+        check(read().count("X-Later") == 1,
+            "new catalog observes later Vary definitions");
+        close();
+        raw_write(store, cf, "M:native-cursor", "O");
+        open(NGX_HTTP_CACHE_ROCKSDB_BUSY);
+        raw_write(store, cf, "M:native-cursor", "", true);
+        std::string posting;
+        for (const auto &key : raw_keys(store, cf)) {
+            if (key[0] == 'n') {
+                posting = key;
+                break;
+            }
+        }
+        std::string missing = "z" + posting.substr(1, 8) + posting.substr(49);
+        raw_write(store, cf, missing, "");
+        open(NGX_HTTP_CACHE_ROCKSDB_BUSY);
+        raw_write(store, cf, missing, "", true);
+        std::string reverse =
+            "j"
+            + std::string(reinterpret_cast<const char *>(id(1002).data()), 16);
+        auto binding = ngx_http_cache_purge_test_raw(store, reverse);
+        raw_write(store, cf, reverse, "bad");
+        open();
+        ngx_http_cache_rocksdb_bytes_t definition{};
+        do {
+            check(ngx_http_cache_purge_index_representations_next(
+                      query, &definition, &error)
+                      == 0,
+                "find corrupted member's Vary definition");
+        } while (
+            ngx_http_cache_purge_cpp_bytes(definition) != "Accept-Language");
+        variant[14] = 1002 >> 8;
+        variant[15] = 1002 & 255;
+        check(ngx_http_cache_purge_index_representations_select(
+                  query, variant, &error)
+                  == 0,
+            "select corrupt binding");
+        ngx_http_cache_purge_retained_context_t context{};
+        check(ngx_http_cache_purge_index_representations_member(
+                  query, 1, &context, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_CORRUPT
+                  && context.key.len == 0 && context.tag_count == 0,
+            "corrupt binding exposes neither partial TAGs nor false absence");
+        close();
+        raw_write(store, cf, reverse, binding);
+        open();
+        std::this_thread::sleep_for(std::chrono::milliseconds(350));
+        ngx_http_cache_rocksdb_bytes_t vary{};
+        check(ngx_http_cache_purge_index_representations_next(
+                  query, &vary, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_EXPIRED
+                  && vary.len == 0,
+            "expired catalog cannot report false absence");
+        close();
+        main[0] = 99;
+        open();
+        check(read().empty(), "unknown native slice has no definitions");
+        close();
+        first.key = "unknown-key";
+        open();
+        check(read().empty(), "confirmed absent key has no definitions");
+        close();
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
+        "close representation database");
+}
+
+static void
 ngx_http_cache_purge_test_native_bindings(const std::string &path)
 {
     check(mkdir(path.c_str(), 0700) == 0, "native binding directory");
@@ -1596,6 +1842,8 @@ main(int argc, char **argv)
             std::string(path) + "-migration");
         ngx_http_cache_purge_test_native_bindings(
             std::string(path) + "-native");
+        ngx_http_cache_purge_test_representations(
+            std::string(path) + "-representations");
         ngx_http_cache_rocksdb_options_t options;
         ngx_http_cache_rocksdb_options(&options);
         options.cursor_lifetime_ms = 5000;
