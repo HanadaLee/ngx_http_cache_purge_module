@@ -992,6 +992,11 @@ int ngx_http_cache_purge_index_aliases_next(
     ngx_http_cache_purge_alias_query_t *query, uint32_t *kind,
     ngx_http_cache_rocksdb_bytes_t *value,
     ngx_http_cache_rocksdb_error_t *error);
+/* Release this page's snapshot. Next resumes after the last returned alias
+ * with a new bounded snapshot only if the key's alias revision is unchanged. */
+int ngx_http_cache_purge_index_aliases_yield(
+    ngx_http_cache_purge_alias_query_t *query,
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_aliases_check(
     ngx_http_cache_purge_alias_query_t *query,
     ngx_http_cache_rocksdb_error_t *error);

@@ -268,6 +268,7 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
       proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /propagation/aliases/ {{ {propagation_alias_config}
       cache_key_uri /propagation/aliases/shared;
+      proxy_cache_revalidate on;
       proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location / {{ cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
                 proxy_pass http://127.0.0.1:{origin.server_port}; }}
@@ -1742,9 +1743,22 @@ try:
         assert prop_get(alias_uri) == (200, 'HIT', uri.encode())
     deleted_at = tag_push('prop-many-aliases', 'many-aliases')
     until(lambda: record(original['id'], optional=True) is None)
+    policies[alias_uri] = 'alias-old'
     assert prop_get(alias_uri)[0] == 200
     propagated(propagation_headers(alias_uri), (0, deleted_at))
     checks.append('background Delete preserves TAG associations across more than 64 URL aliases and later requests still propagate the original requirement')
+
+    current = prop_records(uri, 1)[0]
+    conditional_paths.add(alias_uri)
+    validation_tags[alias_uri] = 'alias-new'
+    operation = api_input('prop-alias-invalidate',
+                         {'type': 'url', 'value': 'http://prop.test' + uri}, 'invalidate')
+    assert api('/__purge/v2/operations', operation)[0] == 202
+    response = prop_get(alias_uri)
+    assert response == (200, 'REVALIDATED', alias_uri.encode()), response
+    until(lambda: record(current['id'])['tags'] == [b'alias-new'])
+    assert prop_get(alias_uri) == (200, 'HIT', alias_uri.encode())
+    checks.append('Invalidate on one of 97 persisted aliases validates the selected file with 304, replaces TAGs and later HITs without a fixed alias limit')
 finally:
     capacity_gate.set()
     validation_release.set()

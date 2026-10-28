@@ -24,9 +24,14 @@
 #define NGX_HTTP_CACHE_PURGE_COMPONENT_PENDING  -1
 
 typedef struct ngx_http_cache_purge_keep_s  ngx_http_cache_purge_keep_t;
+typedef struct ngx_http_cache_purge_guard_s  ngx_http_cache_purge_guard_t;
 static int ngx_http_cache_purge_keep_tick(
     ngx_http_cache_purge_coordinator_t *coordinator);
 static int ngx_http_cache_purge_keep_pending(
+    ngx_http_cache_purge_coordinator_t *coordinator);
+static int ngx_http_cache_purge_guard_tick(
+    ngx_http_cache_purge_coordinator_t *coordinator);
+static int ngx_http_cache_purge_guard_pending(
     ngx_http_cache_purge_coordinator_t *coordinator);
 
 typedef struct {
@@ -1156,12 +1161,11 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
         if (rc == 0) {
             rc = ngx_http_cache_purge_component_read_stamp(c->coordinator,
                 &file, &publication, &invalidate, error);
-            if (rc == NGX_HTTP_CACHE_ROCKSDB_BUSY
-                || rc == NGX_HTTP_CACHE_ROCKSDB_CONFLICT
-                || rc == NGX_HTTP_CACHE_ROCKSDB_LIMIT)
+            if (rc == NGX_HTTP_CACHE_ROCKSDB_CONFLICT)
             {
                 /* The durable receipt survives a later read rejection.
-                 * A zero stamp cannot authorize native response admission. */
+                 * A zero stamp cannot authorize native response admission.
+                 * Transient guards instead retry this same transaction. */
                 rc = ngx_http_cache_purge_component_error(error, 0, "");
             }
         }
@@ -3015,6 +3019,7 @@ ngx_http_cache_purge_component_controls(ngx_http_cache_purge_component_t *c,
         return 0;
     }
     *progress = ngx_http_cache_purge_keep_tick(c->coordinator);
+    *progress |= ngx_http_cache_purge_guard_tick(c->coordinator);
     rc = ngx_http_cache_purge_coordinator_status(c->coordinator, &state,
                                                  &publication, error);
     if (rc != 0) {
@@ -3193,7 +3198,8 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
         pending = c->coordinator != NULL
                   && (ngx_http_cache_purge_component_load32(&c->control_state)
                           != NGX_HTTP_CACHE_PURGE_COORD_READY
-                      || ngx_http_cache_purge_keep_pending(c->coordinator));
+                      || ngx_http_cache_purge_keep_pending(c->coordinator)
+                      || ngx_http_cache_purge_guard_pending(c->coordinator));
         timeout = 50;
         now = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC);
         if (c->recovery_at <= now) {
@@ -6149,6 +6155,8 @@ struct ngx_http_cache_purge_coordinator_s {
     pthread_t                               thread;
     ngx_http_cache_purge_keep_t            *keeps[4];
     size_t                                  keep_next;
+    ngx_http_cache_purge_guard_t           *guards[4];
+    size_t                                  guard_next;
 };
 
 static int
@@ -6472,7 +6480,11 @@ ngx_http_cache_purge_keep_step(ngx_http_cache_purge_keep_t *keep)
         }
     }
     if (rc == 0) {
-        return;
+        rc = ngx_http_cache_purge_index_aliases_yield(keep->aliases,
+            &keep->error);
+        if (rc == 0) {
+            return;
+        }
     }
     if (rc == NGX_HTTP_CACHE_ROCKSDB_DONE) {
         rc = ngx_http_cache_purge_index_aliases_stamp(keep->aliases,
@@ -7365,7 +7377,7 @@ typedef struct {
     uint64_t                                covered, validated, required;
     uint64_t                               *remove;
     size_t                                  budget;
-    int                                     allow_invalidate;
+    int                                     allow_invalidate, aggregate;
 } ngx_http_cache_purge_validation_context_t;
 
 static int
@@ -7388,7 +7400,12 @@ ngx_http_cache_purge_component_validation_match(void *data,
         return 0;
     }
     if (match->mode == NGX_HTTP_CACHE_PURGE_DELETE && v->remove != NULL) {
-        *v->remove = match->sequence;
+        if (match->sequence > *v->remove) {
+            *v->remove = match->sequence;
+        }
+        if (v->aggregate) {
+            return 0;
+        }
     }
     return NGX_HTTP_CACHE_ROCKSDB_CONFLICT;
 }
@@ -7497,6 +7514,275 @@ ngx_http_cache_purge_component_validation_url(void *data,
     return rc;
 }
 
+struct ngx_http_cache_purge_guard_s {
+    ngx_http_cache_purge_index_expected_t      expected;
+    ngx_http_cache_purge_validation_context_t  match;
+    ngx_http_cache_purge_alias_query_t        *aliases;
+    ngx_http_cache_purge_alias_stamp_t         stamp;
+    ngx_http_cache_rocksdb_bytes_t             fields[66];
+    unsigned char                             *data;
+    ngx_http_cache_rocksdb_error_t             error;
+    uint64_t                                   publication, sequence, expires;
+    uint64_t                                   remove;
+    int                                        done, status;
+};
+
+static void
+ngx_http_cache_purge_guard_free(ngx_http_cache_purge_guard_t **entry)
+{
+    ngx_http_cache_purge_guard_t *guard = *entry;
+
+    if (guard != NULL) {
+        (void) ngx_http_cache_purge_index_aliases_close(&guard->aliases, NULL);
+        free(guard->data);
+        free(guard);
+        *entry = NULL;
+    }
+}
+
+static void
+ngx_http_cache_purge_guard_step(ngx_http_cache_purge_guard_t *guard)
+{
+    ngx_http_cache_purge_validation_context_t  *v;
+    ngx_http_cache_rocksdb_bytes_t              value;
+    uint32_t                                    kind;
+    size_t                                      i;
+    int                                         rc;
+    static const ngx_http_cache_rocksdb_bytes_t empty = { NULL, 0 };
+
+    v = &guard->match;
+    rc = 0;
+    for (i = 0; i < 8; i++) {
+        rc = ngx_http_cache_purge_index_aliases_next(guard->aliases, &kind,
+            &value, &guard->error);
+        if (rc != 0) {
+            break;
+        }
+        /* Each alias has bounded prefix/TAG probes. The whole key does not
+         * consume one fixed budget across all its aliases. */
+        v->budget = 512;
+        v->context.host = v->context.url = empty;
+        rc = kind == NGX_HTTP_CACHE_PURGE_HOST
+             ? ngx_http_cache_purge_component_validation_host(v, value,
+                 &guard->error)
+             : ngx_http_cache_purge_component_validation_url(v, value,
+                 &guard->error);
+        if (rc != 0) {
+            break;
+        }
+    }
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_index_aliases_yield(guard->aliases,
+            &guard->error);
+        if (rc == 0) {
+            return;
+        }
+    }
+    if (rc == NGX_HTTP_CACHE_ROCKSDB_DONE) {
+        rc = ngx_http_cache_purge_index_aliases_stamp(guard->aliases,
+            &guard->stamp, &guard->error);
+    }
+    guard->done = 1;
+    guard->status = rc;
+    guard->expires = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 5000;
+    (void) ngx_http_cache_purge_index_aliases_close(&guard->aliases, NULL);
+}
+
+static int
+ngx_http_cache_purge_guard_tick(ngx_http_cache_purge_coordinator_t *c)
+{
+    ngx_http_cache_purge_guard_t  *guard;
+    uint64_t                       now;
+    size_t                         i, selected;
+
+    now = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC);
+    for (i = 0; i < 4; i++) {
+        guard = c->guards[i];
+        if (guard != NULL
+            && (now >= guard->expires
+                || guard->sequence != c->expected.last_sequence
+                || (!guard->done
+                    && (c->state != NGX_HTTP_CACHE_PURGE_COORD_READY
+                        || guard->publication != c->publication))))
+        {
+            ngx_http_cache_purge_guard_free(&c->guards[i]);
+        }
+    }
+    for (i = 0; i < 4; i++) {
+        selected = (c->guard_next + i) % 4;
+        guard = c->guards[selected];
+        if (guard != NULL && !guard->done) {
+            ngx_http_cache_purge_guard_step(guard);
+            c->guard_next = (selected + 1) % 4;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int
+ngx_http_cache_purge_guard_pending(ngx_http_cache_purge_coordinator_t *c)
+{
+    size_t i;
+
+    for (i = 0; i < 4; i++) {
+        if (c->guards[i] != NULL && !c->guards[i]->done) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int
+ngx_http_cache_purge_guard_aliases(ngx_http_cache_purge_coordinator_t *c,
+    const ngx_http_cache_purge_index_file_t *file, uint64_t *invalidate,
+    uint64_t *remove, ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_guard_t               *guard;
+    ngx_http_cache_purge_validation_context_t  *v;
+    ngx_http_cache_rocksdb_bytes_t              fields[66];
+    unsigned char                              *data;
+    size_t                                      i, j, slot, reusable, bytes;
+    int                                         rc;
+
+    if (file->tag_count > 64) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid guard TAG count");
+    }
+    fields[0] = file->key;
+    fields[1] = file->tag_namespace;
+    bytes = 0;
+    for (i = 0; i < file->tag_count + 2; i++) {
+        if (i >= 2) {
+            fields[i] = file->tags[i - 2];
+        }
+        if (fields[i].len > 131072 - bytes) {
+            return ngx_http_cache_purge_control_error(error,
+                NGX_HTTP_CACHE_ROCKSDB_LIMIT, "guard identity exceeds budget");
+        }
+        bytes += fields[i].len;
+    }
+    slot = 4;
+    reusable = 4;
+    for (i = 0; i < 4; i++) {
+        guard = c->guards[i];
+        if (guard != NULL && guard->sequence == c->expected.last_sequence
+            && guard->expected.revision == file->revision
+            && memcmp(guard->expected.id, file->id, 16) == 0
+            && guard->match.context.tag_count == file->tag_count)
+        {
+            for (j = 0; j < file->tag_count + 2; j++) {
+                if (!ngx_http_cache_purge_control_bytes_equal(fields[j],
+                        guard->fields[j]))
+                {
+                    break;
+                }
+            }
+            if (j == file->tag_count + 2) {
+                if (!guard->done) {
+                    return ngx_http_cache_purge_control_error(error,
+                        NGX_HTTP_CACHE_ROCKSDB_BUSY,
+                        "file alias guard pending");
+                }
+                rc = guard->status;
+                if (rc == 0) {
+                    rc = ngx_http_cache_purge_index_aliases_validate(
+                        c->operations.store, &guard->stamp, error);
+                } else if (error != NULL) {
+                    *error = guard->error;
+                }
+                if (rc == 0) {
+                    *invalidate = guard->match.required;
+                    *remove = guard->remove;
+                    return 0;
+                }
+                ngx_http_cache_purge_guard_free(&c->guards[i]);
+                if (rc != NGX_HTTP_CACHE_ROCKSDB_CONFLICT
+                    && rc != NGX_HTTP_CACHE_ROCKSDB_EXPIRED)
+                {
+                    return rc;
+                }
+                slot = i;
+                break;
+            }
+        }
+        if (guard == NULL) {
+            slot = i;
+        } else if (guard->done
+                   && (reusable == 4
+                       || guard->expires < c->guards[reusable]->expires))
+        {
+            reusable = i;
+        }
+    }
+    if (slot == 4) {
+        slot = reusable;
+    }
+    if (slot == 4) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_BUSY, "file alias guard slots busy");
+    }
+    ngx_http_cache_purge_guard_free(&c->guards[slot]);
+    guard = calloc(1, sizeof(*guard));
+    if (guard == NULL) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "file alias guard allocation failed");
+    }
+    guard->data = malloc(bytes ? bytes : 1);
+    if (guard->data == NULL) {
+        free(guard);
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+            "file alias identity allocation failed");
+    }
+    c->guards[slot] = guard;
+    data = guard->data;
+    for (i = 0; i < file->tag_count + 2; i++) {
+        guard->fields[i].data = data;
+        guard->fields[i].len = fields[i].len;
+        if (fields[i].len) {
+            memcpy(data, fields[i].data, fields[i].len);
+            data += fields[i].len;
+        }
+    }
+    memcpy(guard->expected.id, file->id, 16);
+    guard->expected.revision = file->revision;
+    guard->publication = c->publication;
+    guard->sequence = c->expected.last_sequence;
+    guard->expires = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 3000;
+    v = &guard->match;
+    v->coordinator = c;
+    v->context.key = guard->fields[0];
+    v->context.tag_namespace = guard->fields[1];
+    v->context.tags = guard->fields + 2;
+    v->context.tag_count = file->tag_count;
+    v->remove = &guard->remove;
+    v->allow_invalidate = 1;
+    v->aggregate = 1;
+    rc = ngx_http_cache_purge_index_aliases_open(c->operations.store,
+        file->key, &guard->aliases, error);
+    if (rc != 0) {
+        ngx_http_cache_purge_guard_free(&c->guards[slot]);
+        return rc;
+    }
+    ngx_http_cache_purge_guard_step(guard);
+    if (!guard->done) {
+        return ngx_http_cache_purge_control_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_BUSY, "file alias guard pending");
+    }
+    rc = guard->status;
+    if (error != NULL) {
+        *error = guard->error;
+    }
+    if (rc == 0) {
+        *invalidate = v->required;
+        *remove = guard->remove;
+    } else {
+        ngx_http_cache_purge_guard_free(&c->guards[slot]);
+    }
+    return rc;
+}
+
 static int
 ngx_http_cache_purge_component_record_guard(
     ngx_http_cache_purge_coordinator_t *c,
@@ -7510,6 +7796,8 @@ ngx_http_cache_purge_component_record_guard(
     ngx_http_cache_purge_watermark_t           watermark, validated, required;
     ngx_http_cache_purge_watermark_t           deletion;
     ngx_http_cache_rocksdb_bytes_t             empty;
+    ngx_http_cache_purge_control_match_t       match;
+    uint64_t                                  alias_invalidate, alias_remove;
     size_t                                     i;
     int                                        rc;
 
@@ -7630,19 +7918,24 @@ ngx_http_cache_purge_component_record_guard(
     v.context.tag_namespace = file->tag_namespace;
     v.context.tags = file->tags;
     v.context.tag_count = file->tag_count;
-    rc = ngx_http_cache_purge_index_visit_hosts(c->operations.store,
-        &expected, 64, 65536, ngx_http_cache_purge_component_validation_host,
-        &v, error);
-    if (rc != 0) {
-        return rc;
+    rc = ngx_http_cache_purge_guard_aliases(c, file, &alias_invalidate,
+        &alias_remove, error);
+    if (rc == 0) {
+        memset(&match, 0, sizeof(match));
+        match.flags = NGX_HTTP_CACHE_PURGE_CONTROL_FENCE;
+        match.mode = NGX_HTTP_CACHE_PURGE_DELETE;
+        match.sequence = alias_remove;
+        rc = ngx_http_cache_purge_component_validation_match(&v, &match);
+        if (rc == 0) {
+            match.mode = NGX_HTTP_CACHE_PURGE_INVALIDATE;
+            match.sequence = alias_invalidate;
+            rc = ngx_http_cache_purge_component_validation_match(&v, &match);
+        }
+        if (rc != 0) {
+            rc = ngx_http_cache_purge_control_error(error, rc,
+                "file has an unmet alias requirement");
+        }
     }
-    v.context.host = empty;
-
-    /* Each match unpins its image before the next database read. Acceptance
-     * and metadata updates share this executor, so none can interleave here. */
-    rc = ngx_http_cache_purge_index_visit_urls(c->operations.store,
-        &expected, 64, 65536, ngx_http_cache_purge_component_validation_url,
-        &v, error);
     if (rc == 0 && invalidate != NULL) {
         *invalidate = v.required;
     }
@@ -8167,6 +8460,7 @@ ngx_http_cache_purge_coordinator_close(ngx_http_cache_purge_coordinator_t **p,
     }
     for (keep_index = 0; keep_index < 4; keep_index++) {
         ngx_http_cache_purge_keep_free(&c->keeps[keep_index]);
+        ngx_http_cache_purge_guard_free(&c->guards[keep_index]);
     }
     if (c->validation_reader != NULL) {
         rc = ngx_http_cache_purge_control_reader_close(&c->validation_reader,
@@ -8357,6 +8651,7 @@ ngx_http_cache_purge_coordinator_step(ngx_http_cache_purge_coordinator_t *c,
         break;
     case NGX_HTTP_CACHE_PURGE_COORD_READY:
         (void) ngx_http_cache_purge_keep_tick(c);
+        (void) ngx_http_cache_purge_guard_tick(c);
         return 0;
     default:
         rc = ngx_http_cache_purge_control_error(

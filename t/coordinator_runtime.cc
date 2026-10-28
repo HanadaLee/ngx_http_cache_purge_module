@@ -851,8 +851,8 @@ ngx_http_cache_purge_test_keep_pages()
                 "four retention slots bound concurrently retained metadata");
         }
         check(ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
-                  && after.cursor_handles <= 8,
-            "four retention scans retain at most eight cursors");
+                  && !after.cursor_handles && !after.active_cursors,
+            "four pending retention scans release cursors between batches");
         advance();
         for (unsigned i = 0; i < 4; i++) {
             check(keep(i) == 0 && retained(i).invalidate_ms == 40,

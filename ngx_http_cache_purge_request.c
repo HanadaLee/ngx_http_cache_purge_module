@@ -340,6 +340,7 @@ typedef struct {
 
 typedef struct {
     ngx_http_file_cache_header_t  before, after;
+    ngx_str_t                     payload;
     size_t                        input_bytes;
     u_char                        transaction[16];
     unsigned                      replace_tags : 1;
@@ -2815,6 +2816,18 @@ ngx_http_cache_purge_read_validation_reply(ngx_http_cache_purge_call_t *call,
     v = ctx->validation;
     timeout = ctx->deadline - ngx_current_msec;
     allowed = 0;
+    if (v != NULL && !ctx->request->main->terminated
+        && (ngx_msec_int_t) timeout > 10
+        && reply->transport == NGX_HTTP_CACHE_PURGE_CLIENT_OK
+        && (reply->result == NGX_HTTP_CACHE_ROCKSDB_BUSY
+            || reply->result == NGX_HTTP_CACHE_ROCKSDB_LIMIT
+            || reply->result == NGX_HTTP_CACHE_ROCKSDB_EXPIRED))
+    {
+        /* Keep the transaction and transferred lease while the executor
+         * advances its bounded guards. Reuse the payload on every retry. */
+        ngx_add_timer(&ctx->read_event, 10);
+        return;
+    }
     if (v == NULL || ctx->request->main->terminated
         || (ngx_msec_int_t) timeout <= 0
         || reply->transport != NGX_HTTP_CACHE_PURGE_CLIENT_OK
@@ -2872,6 +2885,7 @@ ngx_http_cache_purge_read_validation_reply(ngx_http_cache_purge_call_t *call,
     p = ngx_http_cache_purge_capture_number(p, ctx->origin.sequence, 8);
     fds[0] = ctx->lease;
     fds[1] = ctx->cache->file.fd;
+    v->payload = payload;
     ctx->rpc = NGX_HTTP_CACHE_PURGE_RPC_VALIDATE;
     if ((size_t) (p - payload.data) == size
         && ngx_http_cache_purge_client_validate_file(ctx->client, &payload,
@@ -2906,6 +2920,7 @@ ngx_http_cache_purge_read_validation_start(ngx_http_cache_purge_capture_t *ctx,
     p = ngx_http_cache_purge_capture_string(payload.data, ctx->root);
     p = ngx_http_cache_purge_capture_string(p, ctx->zone);
     ngx_http_cache_purge_capture_string(p, ctx->path);
+    ctx->validation->payload = payload;
     ctx->rpc = NGX_HTTP_CACHE_PURGE_RPC_VALIDATE_LEASE;
     return ngx_http_cache_purge_client_submit(ctx->client,
         NGX_HTTP_CACHE_PURGE_OP_ACQUIRE_PUBLICATION, &payload, timeout,
@@ -2961,6 +2976,7 @@ ngx_http_cache_purge_read_event(ngx_event_t *event)
     ngx_msec_t  timeout;
     ngx_int_t   rc;
     u_char     *p;
+    int         fds[2];
 
     ctx = event->data;
     r = ctx->request;
@@ -3055,6 +3071,26 @@ ngx_http_cache_purge_read_event(ngx_event_t *event)
                 ctx->validation->after.valid_sec += ctx->validation->after.date;
             }
         }
+    }
+    if (ctx->validation != NULL && ctx->validation->payload.len != 0) {
+        payload = ctx->validation->payload;
+        if (ctx->rpc == NGX_HTTP_CACHE_PURGE_RPC_VALIDATE) {
+            fds[0] = ctx->lease;
+            fds[1] = c->file.fd;
+            rc = ngx_http_cache_purge_client_validate_file(ctx->client,
+                &payload, fds, timeout,
+                ngx_http_cache_purge_read_validation_reply, ctx, &ctx->call);
+        } else {
+            rc = ngx_http_cache_purge_client_submit(ctx->client,
+                NGX_HTTP_CACHE_PURGE_OP_ACQUIRE_PUBLICATION, &payload, timeout,
+                ngx_http_cache_purge_read_validation_reply, ctx, &ctx->call);
+        }
+        if (rc == NGX_BUSY && (ngx_msec_int_t) timeout > 10) {
+            ngx_add_timer(&ctx->read_event, 10);
+        } else if (rc != NGX_OK) {
+            ngx_http_cache_purge_read_complete(ctx, 0);
+        }
+        return;
     }
     root = c->file_cache->path->name;
     zone = c->file_cache->shm_zone->shm.name;

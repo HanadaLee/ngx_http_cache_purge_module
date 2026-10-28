@@ -169,6 +169,7 @@ class Client:
         magic, version, op, request, size, result = struct.unpack('>4sHHQII', self.read(24))
         assert (magic, version, op, request) == (b'NCP1', 1, operation, self.counter)
         data = self.read(size)
+        self.last_result = result
         assert result in (code if isinstance(code, tuple) else (code,)), (result, code, data)
         return data
 
@@ -959,12 +960,20 @@ try:
     for i in range(64):
         v.call(12, string(key) + string(f'https://a.test/many/{i}'))
     previous = v.call(2, identity(620))
-    v.validate_file(validation_packet(620), lease, selected, code=5)
-    v.admit_file((str(validation_cache), 'zone-a', 'a/00/620'), key,
-                 'https://a.test/alias-limit', selected, code=5)
+    packet = validation_packet(620)
+    v.validate_file(packet, lease, selected, code=6)
     assert v.call(2, identity(620)) == previous and target.read_bytes().startswith(b'old-head')
+    def validation_ready():
+        reply = v.validate_file(packet, lease, selected, code=(0, 6))
+        return reply if v.last_result == 0 else None
+    reply = wait_for(validation_ready)
+    assert reply[:9] == b'\x02' + struct.pack('>Q', 4)
+    assert int.from_bytes(reply[-16:-8], 'big') != 0
+    assert target.read_bytes().startswith(b'new-head')
+    assert v.admit_file((str(validation_cache), 'zone-a', 'a/00/620'), key,
+                       'https://a.test/alias-limit', selected) == reply[:-16]
     os.close(lease); os.close(selected)
-    check(True, 'excess URL aliases fail validation without partial TAG or header mutation')
+    check(True, 'large URL alias sets yield before validation, then complete the same transaction and permit stamped read admission')
 
     target, lease, selected = make_validation_file(621, '/host-rule')
     validation_operation('validation-host', 4, 'business.test')

@@ -1891,7 +1891,7 @@ ngx_http_cache_purge_test_alias_snapshots(const std::string &path)
                   == 0,
             error.message);
     };
-    auto drain = [&] {
+    auto drain = [&](bool paged = false) {
         std::set<std::pair<uint32_t, std::string>> aliases;
         ngx_http_cache_rocksdb_bytes_t value{};
         uint32_t kind = 0;
@@ -1906,6 +1906,15 @@ ngx_http_cache_purge_test_alias_snapshots(const std::string &path)
             aliases.emplace(
                 kind, std::string(reinterpret_cast<const char *>(value.data),
                           value.len));
+            if (paged && aliases.size() % 8 == 0) {
+                check(ngx_http_cache_purge_index_aliases_yield(query, &error)
+                          == 0,
+                    "yield aliases without retaining cursors");
+                ngx_http_cache_rocksdb_stats_t stats{};
+                check(ngx_http_cache_rocksdb_stats(store, &stats, &error) == 0
+                          && !stats.cursor_handles && !stats.active_cursors,
+                    "a yielded alias scan holds no database snapshots");
+            }
         }
         check(rc == NGX_HTTP_CACHE_ROCKSDB_DONE && !value.len && !kind,
             "alias enumeration clears output at completion");
@@ -1976,6 +1985,29 @@ ngx_http_cache_purge_test_alias_snapshots(const std::string &path)
         index.collect_file(duplicate.id, retired.revision);
         check(ngx_http_cache_purge_index_aliases_check(query, &error) == 0,
             "file reference count changes preserve the alias revision");
+        close();
+        open();
+        check(ngx_http_cache_purge_index_aliases_yield(query, &error) == 0,
+            "yield before the first alias");
+        check(
+            drain(true) == old
+                && ngx_http_cache_purge_index_aliases_check(query, &error) == 0,
+            "paged snapshots do not repeat or skip URL or host aliases");
+        close();
+        open();
+        check(ngx_http_cache_purge_index_aliases_yield(query, &error) == 0,
+            "yield before concurrent alias mutation");
+        index.add_url(item.key, "https://pause-race.test/item");
+        ngx_http_cache_rocksdb_bytes_t absent{};
+        uint32_t absent_kind = 0;
+        check(ngx_http_cache_purge_index_aliases_next(
+                  query, &absent_kind, &absent, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_CONFLICT
+                  && !absent.len && !absent_kind,
+            "resume rejects changed aliases without returning partial data");
+        close();
+        open();
+        old = drain();
         close();
 
         for (bool host_only : { false, true }) {
@@ -2062,6 +2094,14 @@ ngx_http_cache_purge_test_alias_snapshots(const std::string &path)
     check(ngx_http_cache_purge_index_aliases_check(query, &error)
               == NGX_HTTP_CACHE_ROCKSDB_EXPIRED,
         "completed scan still has its original snapshot deadline");
+    close();
+    open();
+    check(ngx_http_cache_purge_index_aliases_yield(query, &error) == 0,
+        "release a short-lived snapshot before its deadline");
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    check(drain().size() == 2
+              && ngx_http_cache_purge_index_aliases_check(query, &error) == 0,
+        "unchanged aliases resume beyond the preceding page's deadline");
     close();
     ngx_http_cache_rocksdb_stats_t stats{};
     check(ngx_http_cache_rocksdb_stats(store, &stats, &error) == 0

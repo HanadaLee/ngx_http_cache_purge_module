@@ -590,8 +590,8 @@ proxy request headers, preserving duplicate-header order and nginx's Accept-*
 normalization. Headers are neither logged nor persisted. A control publication
 change or expired snapshot discards the partial result and requires a retry.
 
-A separate alias iterator streams URL and host associations from one snapshot
-and checks its revision before a mutation can use the completed result. The
+A separate alias iterator streams URL and host associations from bounded
+snapshots and checks its revision before a mutation can use the completed result. The
 revision adds eight bytes to the existing per-key file counter; no new table or
 per-alias metadata is required. Repeated observations and file-count-only changes
 preserve it, while alias insertion and collection advance it atomically with
@@ -602,8 +602,17 @@ scans in round-robin order. It checks the control publication and alias revision
 before persisting a complete result. Completed scans release their snapshots and
 file buffers; short-lived results are reused only after checking the selected
 file revision, accepted operation sequence and current alias stamp. No new
-thread, process or database is used. File validation and retained-history expiry
-still use older bounded visitors and need the same integration.
+thread, process or database is used.
+
+File admission and publication guards now scan aliases in batches of eight,
+with four bounded query slots. They aggregate requirements separately from the
+caller's entity and validation watermarks. Old and proposed TAG sets use distinct
+query identities during 304 processing. Both retention and guard scans release
+all database cursors between batches and resume from a 17-byte position after
+checking the unchanged alias revision. Repeated 304 calls reuse their transaction,
+payload and lease while guards are pending, including after durable completion
+while final admission still waits. Retained-history expiry and diagnostic
+propagation visitors still need this paging integration.
 
 Managed proxy-cache requests now resolve these associations asynchronously at
 the cache-entry gate. One IPC request holds its bounded input until completion,
@@ -622,8 +631,9 @@ through deletion and restart, 304 TAG replacement, and slice isolation.
 Full propagation remains unfinished. A new accepted operation between the gate
 and upstream request creation currently rejects sending; maintenance publication
 changes with the same ledger and operation sequence preserve the completed
-result. File validation and retained-history expiry still have a 64-alias
-traversal bound; retention before file mutation no longer has that count limit.
+result. Retained-history expiry and diagnostic propagation visitors still have
+a 64-alias traversal bound. File validation and retention before mutation no
+longer have that count limit.
 Uncached proxy routes, unsupported cache methods, complete tier integration,
 and loaded memory/latency acceptance remain open. Capabilities reports the sender transport as
 `filter` or `variables`, while `proxy_propagation_ready` remains false.
