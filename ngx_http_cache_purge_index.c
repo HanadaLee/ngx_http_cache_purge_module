@@ -6093,6 +6093,84 @@ ngx_http_cache_purge_index_native_ready(ngx_http_cache_rocksdb_t *store,
     return ngx_http_cache_purge_index_tx_end(tx, error);
 }
 
+static void
+ngx_http_cache_purge_index_resolve_native(ngx_http_cache_purge_index_tx_t *tx,
+    const ngx_http_cache_purge_index_record_t *record,
+    ngx_http_cache_purge_native_resolver_pt resolver, void *data)
+{
+    ngx_http_cache_purge_query_t          *q;
+    ngx_http_cache_purge_index_value_t     binding, missing;
+    ngx_http_cache_purge_index_file_t      file;
+    ngx_http_cache_purge_index_expected_t  expected;
+    ngx_http_cache_rocksdb_error_t         failure;
+    ngx_http_cache_rocksdb_bytes_t         key;
+    unsigned char                          main[16], variant[16];
+    unsigned                               state;
+    int                                    rc;
+
+    q = tx->context;
+    memcpy(expected.id, record->id, 16);
+    expected.revision = record->revision;
+    binding = ngx_http_cache_purge_index_tx_get(tx,
+        NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+        ngx_http_cache_purge_index_object_key(q, 'j', record->id));
+    if (binding.exists) {
+        if (ngx_http_cache_purge_index_require(q, binding.bytes.len == 32,
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid native binding"))
+        {
+            ngx_http_cache_purge_index_native_bind(tx, &expected,
+                binding.bytes.data, binding.bytes.data + 16);
+        }
+        return;
+    }
+    if (q->status != 0) {
+        return;
+    }
+    memset(&file, 0, sizeof(file));
+    memset(&failure, 0, sizeof(failure));
+    memset(main, 0, sizeof(main));
+    memset(variant, 0, sizeof(variant));
+    state = NGX_HTTP_CACHE_PURGE_NATIVE_MISSING;
+    rc = ngx_http_cache_purge_index_get_file(q->store, record->id, &file,
+        &failure);
+    if (rc == 0) {
+        rc = resolver(data, &file, main, variant, &state, &failure);
+    }
+    ngx_http_cache_purge_index_file_free(&file);
+    if (rc != 0) {
+        ngx_http_cache_purge_index_fail(q, rc,
+            failure.message[0] ? failure.message
+                               : "native migration resolver failed");
+        return;
+    }
+    if (!ngx_http_cache_purge_index_require(q,
+            state <= NGX_HTTP_CACHE_PURGE_NATIVE_MISSING,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID,
+            "invalid native migration resolution"))
+    {
+        return;
+    }
+    if (state == NGX_HTTP_CACHE_PURGE_NATIVE_BIND) {
+        ngx_http_cache_purge_index_native_bind(tx, &expected, main, variant);
+        return;
+    }
+    key = ngx_http_cache_purge_index_posting(q, 'z', record->refs[0], 0,
+        record->id);
+    missing = ngx_http_cache_purge_index_tx_get(tx,
+        NGX_HTTP_CACHE_ROCKSDB_DEFAULT, key);
+    if (!ngx_http_cache_purge_index_require(q,
+            !missing.exists || missing.bytes.len == 0,
+            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid unresolved identity"))
+    {
+        return;
+    }
+    if (missing.exists != (state == NGX_HTTP_CACHE_PURGE_NATIVE_MISSING)) {
+        ngx_http_cache_purge_index_tx_set(tx,
+            NGX_HTTP_CACHE_ROCKSDB_DEFAULT, key, ngx_http_cache_purge_op_empty,
+            state == NGX_HTTP_CACHE_PURGE_NATIVE_MISSING);
+    }
+}
+
 int
 ngx_http_cache_purge_index_migrate_native(ngx_http_cache_rocksdb_t *store,
     size_t budget, ngx_http_cache_purge_native_resolver_pt resolver, void *data,
@@ -6100,15 +6178,10 @@ ngx_http_cache_purge_index_migrate_native(ngx_http_cache_rocksdb_t *store,
 {
     ngx_http_cache_purge_index_tx_t      *tx;
     ngx_http_cache_purge_query_t         *q;
-    ngx_http_cache_purge_index_value_t    cursor, binding;
+    ngx_http_cache_purge_index_value_t    cursor;
     ngx_http_cache_purge_index_record_t   record;
-    ngx_http_cache_purge_index_file_t     file;
-    ngx_http_cache_purge_index_expected_t expected;
-    ngx_http_cache_rocksdb_error_t        failure;
-    unsigned char                         main[16], variant[16];
     size_t                                count;
-    unsigned                              state;
-    int                                   rc, more;
+    int                                   more;
 
     if (done != NULL) {
         *done = 0;
@@ -6157,56 +6230,7 @@ ngx_http_cache_purge_index_migrate_native(ngx_http_cache_rocksdb_t *store,
         {
             break;
         }
-        binding = ngx_http_cache_purge_index_tx_get(tx,
-            NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
-            ngx_http_cache_purge_index_object_key(q, 'j', record.id));
-        if (!binding.exists) {
-            memset(&file, 0, sizeof(file));
-            memset(&failure, 0, sizeof(failure));
-            memset(main, 0, sizeof(main));
-            memset(variant, 0, sizeof(variant));
-            state = NGX_HTTP_CACHE_PURGE_NATIVE_MISSING;
-            rc = ngx_http_cache_purge_index_get_file(store, record.id, &file,
-                &failure);
-            if (rc == 0) {
-                rc = resolver(data, &file, main, variant, &state, &failure);
-            }
-            ngx_http_cache_purge_index_file_free(&file);
-            if (rc != 0) {
-                ngx_http_cache_purge_index_fail(q, rc,
-                    failure.message[0] ? failure.message
-                                       : "native migration resolver failed");
-                break;
-            }
-            if (!ngx_http_cache_purge_index_require(q,
-                    state <= NGX_HTTP_CACHE_PURGE_NATIVE_MISSING,
-                    NGX_HTTP_CACHE_ROCKSDB_INVALID,
-                    "invalid native migration resolution"))
-            {
-                break;
-            }
-            if (state == NGX_HTTP_CACHE_PURGE_NATIVE_BIND) {
-                memcpy(expected.id, record.id, 16);
-                expected.revision = record.revision;
-                ngx_http_cache_purge_index_native_bind(tx, &expected, main,
-                    variant);
-            } else if (state == NGX_HTTP_CACHE_PURGE_NATIVE_MISSING) {
-                ngx_http_cache_purge_index_tx_set(tx,
-                    NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
-                    ngx_http_cache_purge_index_posting(q, 'z', record.refs[0],
-                        0, record.id), ngx_http_cache_purge_op_empty, 1);
-            }
-        } else {
-            if (ngx_http_cache_purge_index_require(q,
-                    binding.bytes.len == 32,
-                    NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid native binding"))
-            {
-                memcpy(expected.id, record.id, 16);
-                expected.revision = record.revision;
-                ngx_http_cache_purge_index_native_bind(tx, &expected,
-                    binding.bytes.data, binding.bytes.data + 16);
-            }
-        }
+        ngx_http_cache_purge_index_resolve_native(tx, &record, resolver, data);
         ngx_http_cache_purge_index_set(q, &q->token,
             ngx_http_cache_purge_index_bytes(&q->outer.key));
         count++;
@@ -6220,6 +6244,81 @@ ngx_http_cache_purge_index_migrate_native(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_purge_index_tx_commit(tx);
     if (q->status == 0) {
         *done = !more;
+    }
+    return ngx_http_cache_purge_index_tx_end(tx, error);
+}
+
+int
+ngx_http_cache_purge_index_retry_native(ngx_http_cache_rocksdb_t *store,
+    size_t budget, ngx_http_cache_purge_native_resolver_pt resolver, void *data,
+    unsigned char bookmark[25], size_t *length,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_index_tx_t      *tx;
+    ngx_http_cache_purge_query_t         *q;
+    ngx_http_cache_purge_index_value_t    value;
+    ngx_http_cache_purge_index_record_t   record;
+    ngx_http_cache_rocksdb_bytes_t        start, number;
+    size_t                                count;
+    int                                   more;
+
+    if (store == NULL || resolver == NULL || bookmark == NULL || length == NULL
+        || !budget || budget > 32
+        || (*length && (*length != 25 || bookmark[0] != 'z')))
+    {
+        return ngx_http_cache_purge_index_error(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid native retry cursor");
+    }
+    tx = ngx_http_cache_purge_index_tx_begin(store, error);
+    if (tx == NULL) {
+        return NGX_HTTP_CACHE_ROCKSDB_LIMIT;
+    }
+    q = tx->context;
+    start.data = bookmark;
+    start.len = *length;
+    ngx_http_cache_purge_index_cursor_open(q, &q->outer,
+        NGX_HTTP_CACHE_ROCKSDB_DEFAULT, ngx_http_cache_purge_op_literal("z"),
+        start, NULL);
+    count = 0;
+    while (count < budget
+           && ngx_http_cache_purge_index_cursor_next(q, &q->outer))
+    {
+        if (!ngx_http_cache_purge_index_require(q,
+                q->outer.key.len == 25 && q->outer.value.len == 0,
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid unresolved identity"))
+        {
+            break;
+        }
+        value = ngx_http_cache_purge_index_tx_get(tx,
+            NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+            ngx_http_cache_purge_index_object_key(q, 'O',
+                q->outer.key.data + 9));
+        number.data = q->outer.key.data + 1;
+        number.len = 8;
+        if (!ngx_http_cache_purge_index_require(q, value.exists,
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "unresolved file is absent")
+            || !ngx_http_cache_purge_index_decode(q, value.bytes, &record)
+            || !ngx_http_cache_purge_index_require(q,
+                memcmp(record.id, q->outer.key.data + 9, 16) == 0
+                && record.refs[0]
+                   == ngx_http_cache_purge_index_integer(q, number),
+                NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "unresolved file differs"))
+        {
+            break;
+        }
+        ngx_http_cache_purge_index_resolve_native(tx, &record, resolver, data);
+        ngx_http_cache_purge_index_set(q, &q->token,
+            ngx_http_cache_purge_index_bytes(&q->outer.key));
+        count++;
+    }
+    more = count == budget
+           && ngx_http_cache_purge_index_cursor_next(q, &q->outer);
+    ngx_http_cache_purge_index_tx_commit(tx);
+    if (q->status == 0) {
+        *length = more ? q->token.len : 0;
+        if (*length) {
+            memcpy(bookmark, q->token.data, *length);
+        }
     }
     return ngx_http_cache_purge_index_tx_end(tx, error);
 }

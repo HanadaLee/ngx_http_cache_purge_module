@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define NGX_HTTP_CACHE_PURGE_COMPONENT_ABI 8
+#define NGX_HTTP_CACHE_PURGE_COMPONENT_ABI 9
 #define NGX_HTTP_CACHE_PURGE_PROTOCOL_VERSION 1
 #define NGX_HTTP_CACHE_PURGE_FRAME_SIZE 24
 
@@ -98,6 +98,12 @@ typedef struct {
 } ngx_http_cache_purge_root_t;
 
 typedef struct {
+    uint32_t  size, version, version_offset, version_size;
+    uint32_t  header_start_offset, crc32_offset;
+    uint32_t  vary_len_offset, vary_offset, vary_capacity, variant_offset;
+} ngx_http_cache_purge_native_layout_t;
+
+typedef struct {
     uint64_t                       token;
     uint64_t                       inode;
     uint32_t                       outcome;
@@ -129,10 +135,12 @@ typedef struct {
     /* shared mapping owned by nginx, valid until stop */
     void *control_memory;
 
-    size_t control_bytes;
-    const ngx_http_cache_purge_root_t
-            *roots; /* Copied by start; opened only on executor. */
-    uint32_t root_count;
+    size_t                                control_bytes;
+
+    /* Copied by start; opened only on executor. */
+    const ngx_http_cache_purge_root_t    *roots;
+    uint32_t                              root_count;
+    ngx_http_cache_purge_native_layout_t  native_layout;
 } ngx_http_cache_purge_component_options_t;
 
 typedef struct {
@@ -150,7 +158,7 @@ typedef struct {
 void ngx_http_cache_purge_component_options(
     ngx_http_cache_purge_component_options_t *options);
 /* Link-time header/archive compatibility marker. */
-uint32_t ngx_http_cache_purge_component_abi_8(void);
+uint32_t ngx_http_cache_purge_component_abi_9(void);
 
 /* Only start after fork in the selected nginx worker, never while parsing
  * configuration or in master. Copies its inputs and starts one executor thread.
@@ -821,6 +829,12 @@ typedef int (*ngx_http_cache_purge_native_resolver_pt)(void *data,
 int ngx_http_cache_purge_index_migrate_native(ngx_http_cache_rocksdb_t *store,
     size_t budget, ngx_http_cache_purge_native_resolver_pt resolver, void *data,
     int *done, ngx_http_cache_rocksdb_error_t *error);
+/* Retry only unresolved rows. The caller-owned bookmark advances on commit;
+ * zero length starts a pass and is returned at its end. No WAL on no change. */
+int ngx_http_cache_purge_index_retry_native(ngx_http_cache_rocksdb_t *store,
+    size_t budget, ngx_http_cache_purge_native_resolver_pt resolver, void *data,
+    unsigned char bookmark[25], size_t *length,
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_native_ready(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_bytes_t key, int *ready,
     ngx_http_cache_rocksdb_error_t *error);
@@ -1104,6 +1118,11 @@ int ngx_http_cache_purge_publications_migrate_native(
     ngx_http_cache_purge_publications_t *publications,
     ngx_http_cache_rocksdb_t *store, size_t budget, int *done,
     ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_publications_retry_native(
+    ngx_http_cache_purge_publications_t *publications,
+    ngx_http_cache_rocksdb_t *store, size_t budget,
+    unsigned char bookmark[25], size_t *length,
+    ngx_http_cache_rocksdb_error_t *error);
 
 typedef struct {
     ngx_http_cache_rocksdb_bytes_t  root;
@@ -1121,6 +1140,12 @@ typedef struct {
 int ngx_http_cache_purge_publications_open(
     const ngx_http_cache_purge_root_t *roots, size_t count,
     const char *database, ngx_http_cache_purge_publications_t **publications,
+    ngx_http_cache_rocksdb_error_t *error);
+/* Copies the compiled native layout and lease path; borrows the anchor fd. */
+int ngx_http_cache_purge_publications_native_layout(
+    ngx_http_cache_purge_publications_t *publications,
+    const ngx_http_cache_purge_native_layout_t *layout,
+    const char *lease_path, int anchor_fd,
     ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_publications_close(
     ngx_http_cache_purge_publications_t **publications,

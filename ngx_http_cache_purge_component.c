@@ -112,6 +112,8 @@ struct ngx_http_cache_purge_component_s {
     ngx_http_cache_purge_component_buffer_t   recovery_bookmark;
     uint64_t                                  recovery_at;
     int                                       native_migrated;
+    unsigned char                             native_bookmark[25];
+    size_t                                    native_bookmark_length;
     unsigned char                             work_after[17];
     size_t                                    work_after_len;
     uint64_t                                  work_at;
@@ -2072,6 +2074,25 @@ ngx_http_cache_purge_component_recover(ngx_http_cache_purge_component_t *c,
         }
     }
 
+    if (c->native_migrated) {
+        rc = ngx_http_cache_purge_publications_retry_native(c->publications,
+            store, 8, c->native_bookmark, &c->native_bookmark_length, error);
+        if (rc == NGX_HTTP_CACHE_ROCKSDB_LIMIT
+            || rc == NGX_HTTP_CACHE_ROCKSDB_EXPIRED)
+        {
+            rc = ngx_http_cache_purge_publications_retry_native(
+                c->publications, store, 1, c->native_bookmark,
+                &c->native_bookmark_length, error);
+        }
+        if (rc != 0) {
+            goto done;
+        }
+        if (c->native_bookmark_length) {
+            c->recovery_at =
+                ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 10;
+        }
+    }
+
     rc = ngx_http_cache_purge_query_open(store, NULL,
                                          NGX_HTTP_CACHE_PURGE_QUERY_PENDING,
                                          bookmark, &query, error);
@@ -3016,6 +3037,14 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
 
     rc = ngx_http_cache_purge_publications_open(
         c->roots, c->options.root_count, c->path, &c->publications, error);
+    if (rc == 0 && c->options.native_layout.size) {
+        rc = ngx_http_cache_purge_component_anchor(c, error);
+        if (rc == 0) {
+            rc = ngx_http_cache_purge_publications_native_layout(
+                c->publications, &c->options.native_layout, c->lease_path,
+                c->lease_anchor, error);
+        }
+    }
     if (rc == 0) {
         rc = ngx_http_cache_purge_index_init(store, error);
     }
@@ -3244,13 +3273,13 @@ ngx_http_cache_purge_component_run(void *data)
          * Release the pending path before handing the DB to a new worker. */
         ngx_http_cache_purge_component_close(&c->cleanup_lease);
     }
-    ngx_http_cache_purge_component_close(&c->lease_anchor);
     if (c->publications != NULL) {
         rc = ngx_http_cache_purge_publications_close(&c->publications, &error);
         if (rc != 0) {
             ngx_http_cache_purge_component_fail(c, &error);
         }
     }
+    ngx_http_cache_purge_component_close(&c->lease_anchor);
     if (store != NULL) {
         rc = ngx_http_cache_rocksdb_close(&store, &error);
         if (rc != 0) {
@@ -3311,7 +3340,7 @@ ngx_http_cache_purge_component_options(
 }
 
 uint32_t
-ngx_http_cache_purge_component_abi_8(void)
+ngx_http_cache_purge_component_abi_9(void)
 {
     return NGX_HTTP_CACHE_PURGE_COMPONENT_ABI;
 }

@@ -968,6 +968,7 @@ ngx_http_cache_purge_test_native_migration(const std::string &path)
     struct Resolution {
         unsigned calls = 0;
         bool fail = true;
+        FileId recovered{};
     } resolution;
     auto resolve = [](void *data, const ngx_http_cache_purge_index_file_t *f,
                        unsigned char *main, unsigned char *variant,
@@ -982,6 +983,9 @@ ngx_http_cache_purge_test_native_migration(const std::string &path)
         *state = metadata == "skip"    ? NGX_HTTP_CACHE_PURGE_NATIVE_SKIP :
                  metadata == "missing" ? NGX_HTTP_CACHE_PURGE_NATIVE_MISSING :
                                          NGX_HTTP_CACHE_PURGE_NATIVE_BIND;
+        if (std::memcmp(r.recovered.data(), f->id, 16) == 0) {
+            *state = NGX_HTTP_CACHE_PURGE_NATIVE_BIND;
+        }
         std::memcpy(main, f->id, 16);
         std::memset(variant, 0, 16);
         return 0;
@@ -1074,6 +1078,26 @@ ngx_http_cache_purge_test_native_migration(const std::string &path)
                   && ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
                   && before.writes == after.writes,
             "completed migration does not scan or write on another call");
+        unsigned char bookmark[25]{};
+        size_t length = 0;
+        calls = resolution.calls;
+        for (unsigned i = 0; i < 2; i++) {
+            check(ngx_http_cache_purge_index_retry_native(
+                      store, 1, resolve, &resolution, bookmark, &length, &error)
+                          == 0
+                      && length == (i == 0 ? 25 : 0),
+                "unresolved retry respects its budget and wraps at pass end");
+        }
+        check(resolution.calls == calls + 2
+                  && ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
+                  && before.writes == after.writes,
+            "unchanged retries visit only missing rows and never write WAL");
+        resolution.recovered = files[1].id;
+        check(ngx_http_cache_purge_index_retry_native(
+                  store, 1, resolve, &resolution, bookmark, &length, &error)
+                      == 0
+                  && length == 25 && ready(files[1]) && !ready(files[4]),
+            "later retry binds the resolved row without clearing other keys");
         expected = ngx_http_cache_purge_native_expected(files[1].id, 2);
         std::memcpy(main, files[1].id.data(), 16);
         check(ngx_http_cache_purge_index_bind_native(

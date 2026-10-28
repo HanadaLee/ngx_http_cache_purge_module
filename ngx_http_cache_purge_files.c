@@ -1,6 +1,7 @@
 /* Copyright (C) Hanada */
 #include "ngx_http_cache_purge_internal.h"
 #include <openssl/sha.h>
+#include <openssl/evp.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -570,6 +571,9 @@ struct ngx_http_cache_purge_publications_s {
     char                                     *database;
     pid_t                                     pid;
     pthread_t                                 thread;
+    ngx_http_cache_purge_native_layout_t      native_layout;
+    char                                     *lease_path;
+    int                                       lease_anchor;
 };
 
 typedef struct {
@@ -596,6 +600,9 @@ static int ngx_http_cache_purge_validation_plan(
     ngx_http_cache_rocksdb_bytes_t metadata,
     ngx_http_cache_purge_validation_plan_t *plan,
     ngx_http_cache_rocksdb_error_t *error);
+static int ngx_http_cache_purge_publication_same(
+    const ngx_http_cache_purge_publication_proof_t *proof,
+    const struct stat *st);
 
 static ngx_http_cache_rocksdb_bytes_t
 ngx_http_cache_purge_publication_bytes(const char *value)
@@ -686,6 +693,7 @@ ngx_http_cache_purge_publication_free(ngx_http_cache_purge_publications_t *p)
     }
     free(p->roots);
     free(p->database);
+    free(p->lease_path);
     free(p);
 }
 
@@ -748,6 +756,7 @@ ngx_http_cache_purge_publications_open(const ngx_http_cache_purge_root_t *roots,
                                            "publication allocation failed");
     }
     p->pid = getpid();
+    p->lease_anchor = -1;
     p->thread = pthread_self();
     if (count) {
         p->roots = calloc(count, sizeof(*p->roots));
@@ -825,6 +834,85 @@ ngx_http_cache_purge_publications_open(const ngx_http_cache_purge_root_t *roots,
 failed:
     ngx_http_cache_purge_publication_free(p);
     return rc;
+}
+
+int
+ngx_http_cache_purge_publications_native_layout(
+    ngx_http_cache_purge_publications_t *p,
+    const ngx_http_cache_purge_native_layout_t *layout,
+    const char *lease_path, int anchor_fd,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    uint32_t     offsets[6], widths[6];
+    size_t       i, j, length;
+    char        *path;
+    struct stat  st;
+    int          rc;
+
+    rc = ngx_http_cache_purge_publication_owner(p, error);
+    if (rc != 0) {
+        return rc;
+    }
+    if (layout == NULL || !layout->version || layout->size > 4096
+        || (layout->version_size != 4 && layout->version_size != 8)
+        || !layout->vary_capacity || layout->vary_capacity > 255
+        || lease_path == NULL || lease_path[0] != '/')
+    {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid native cache layout");
+    }
+    offsets[0] = layout->version_offset;
+    offsets[1] = layout->header_start_offset;
+    offsets[2] = layout->crc32_offset;
+    offsets[3] = layout->vary_len_offset;
+    offsets[4] = layout->vary_offset;
+    offsets[5] = layout->variant_offset;
+    widths[0] = layout->version_size;
+    widths[1] = 2;
+    widths[2] = 4;
+    widths[3] = 1;
+    widths[4] = layout->vary_capacity;
+    widths[5] = 16;
+    for (i = 0; i < 6; i++) {
+        if (widths[i] > layout->size
+            || offsets[i] > layout->size - widths[i])
+        {
+            return ngx_http_cache_purge_result(error,
+                NGX_HTTP_CACHE_ROCKSDB_INVALID, "native field exceeds header");
+        }
+        for (j = 0; j < i; j++) {
+            if (offsets[i] < offsets[j] + widths[j]
+                && offsets[j] < offsets[i] + widths[i])
+            {
+                return ngx_http_cache_purge_result(error,
+                    NGX_HTTP_CACHE_ROCKSDB_INVALID, "native fields overlap");
+            }
+        }
+    }
+    length = strlen(lease_path);
+    if (length > 4096) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "native lease path exceeds limit");
+    }
+    rc = ngx_http_cache_purge_inspect_locks(anchor_fd, &st, error);
+    if (rc != 0) {
+        return rc;
+    }
+    if (st.st_uid != geteuid()) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "native lease owner differs");
+    }
+    path = malloc(length + 1);
+    if (path == NULL) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "native lease allocation failed");
+    }
+    memcpy(path, lease_path, length + 1);
+    free(p->lease_path);
+    p->lease_path = path;
+    p->lease_anchor = anchor_fd;
+    p->native_layout = *layout;
+    return ngx_http_cache_purge_result(error, 0, "");
 }
 
 int
@@ -1448,6 +1536,247 @@ ngx_http_cache_purge_publication_watermark(
 }
 
 static int
+ngx_http_cache_purge_native_read(int fd, void *buffer, size_t length,
+    off_t offset, ngx_http_cache_rocksdb_error_t *error)
+{
+    unsigned char *data;
+    ssize_t        n;
+
+    data = buffer;
+    while (length) {
+        n = pread(fd, data, length, offset);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return ngx_http_cache_purge_io(error, "read native cache key");
+        }
+        if (n == 0) {
+            return ngx_http_cache_purge_result(error,
+                NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "truncated native cache key");
+        }
+        data += n;
+        length -= n;
+        offset += n;
+    }
+    return 0;
+}
+
+/* Recover only identity; neither the raw key nor the header is persisted. */
+static int
+ngx_http_cache_purge_native_file(ngx_http_cache_purge_publications_t *p,
+    ngx_http_cache_purge_publication_root_t *root,
+    const ngx_http_cache_purge_index_file_t *file, unsigned char main[16],
+    unsigned char variant[16], ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_native_layout_t      *layout;
+    ngx_http_cache_purge_publication_proof_t   proof;
+    ngx_http_cache_purge_index_file_t          plain;
+    ngx_http_cache_purge_file_marker_t         marker;
+    ngx_http_cache_rocksdb_bytes_t             address;
+    EVP_MD_CTX                               *md;
+    struct stat                               st;
+    unsigned char                             buffer[4096], digest[16];
+    unsigned char                             filename[16], unused[16];
+    unsigned char                             stored_variant[16], computed[16];
+    uint64_t                                  offset, version;
+    uint32_t                                  short_version, stored_crc, crc;
+    uint16_t                                  start;
+    unsigned                                  size, bit;
+    size_t                                    at, left, count, i;
+    int                                       fd, named, lease, rc;
+
+    if (!p->native_layout.size
+        || (file->state != NGX_HTTP_CACHE_PURGE_INDEX_COMMITTED
+            && file->state != NGX_HTTP_CACHE_PURGE_INDEX_RETIRED)
+        || (file->metadata.len >= 3
+            && memcmp(file->metadata.data, "NFV", 3) == 0))
+    {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND, "native identity is not ready");
+    }
+    rc = ngx_http_cache_purge_publication_proof(file->metadata, &proof, error);
+    if (rc != 0) {
+        return rc;
+    }
+    plain = *file;
+    plain.vary.len = 0;
+    rc = ngx_http_cache_purge_publication_native(&plain, filename, unused,
+        error);
+    if (rc != 0) {
+        return rc;
+    }
+    fd = named = lease = -1;
+    md = NULL;
+    memset(&address, 0, sizeof(address));
+    layout = &p->native_layout;
+    rc = ngx_http_cache_purge_publication_address(root, file->path, &address,
+        error);
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_file_address(address, digest, &offset, error);
+    }
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_file_lease_acquire(p->lease_path,
+            p->lease_anchor, offset, &lease, error);
+    }
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_publication_verify(root, error);
+    }
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_publication_beneath(root->fd, file->path,
+            0, 0, &fd, error);
+    }
+    if (rc != 0) {
+        goto done;
+    }
+    if (fstat(fd, &st) != 0) {
+        rc = ngx_http_cache_purge_io(error, "inspect native cache key");
+        goto done;
+    }
+    if (!S_ISREG(st.st_mode) || st.st_uid != geteuid() || st.st_nlink != 1
+        || !ngx_http_cache_purge_publication_same(&proof, &st))
+    {
+        goto mismatch;
+    }
+    rc = ngx_http_cache_purge_file_marker_read(fd, &marker, error);
+    if (rc != 0) {
+        goto done;
+    }
+    if (marker.state != NGX_HTTP_CACHE_PURGE_FILE_READY
+        || memcmp(marker.id, file->id, 16)
+        || memcmp(marker.address, digest, 16))
+    {
+        goto mismatch;
+    }
+    rc = ngx_http_cache_purge_native_read(fd, buffer, layout->size, 0, error);
+    if (rc != 0) {
+        goto done;
+    }
+    if (layout->version_size == 4) {
+        memcpy(&short_version, buffer + layout->version_offset, 4);
+        version = short_version;
+    } else {
+        memcpy(&version, buffer + layout->version_offset, 8);
+    }
+    memcpy(&start, buffer + layout->header_start_offset, 2);
+    memcpy(&stored_crc, buffer + layout->crc32_offset, 4);
+    if (version != layout->version || start < layout->size + 7
+        || start > proof.size || file->vary.len > layout->vary_capacity
+        || buffer[layout->vary_len_offset] != file->vary.len
+        || memcmp(buffer + layout->vary_offset, file->vary.data,
+            file->vary.len))
+    {
+        goto mismatch;
+    }
+    memcpy(stored_variant, buffer + layout->variant_offset, 16);
+    rc = ngx_http_cache_purge_native_read(fd, buffer, 6, layout->size, error);
+    if (rc != 0) {
+        goto done;
+    }
+    if (memcmp(buffer, "\nKEY: ", 6)) {
+        goto mismatch;
+    }
+    md = EVP_MD_CTX_new();
+    if (md == NULL || EVP_DigestInit_ex(md, EVP_md5(), NULL) != 1) {
+        rc = ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "native digest setup failed");
+        goto done;
+    }
+    crc = UINT32_MAX;
+    at = layout->size + 6;
+    left = start - at - 1;
+    while (left) {
+        count = left < sizeof(buffer) ? left : sizeof(buffer);
+        rc = ngx_http_cache_purge_native_read(fd, buffer, count, (off_t) at,
+            error);
+        if (rc != 0) {
+            goto done;
+        }
+        if (EVP_DigestUpdate(md, buffer, count) != 1) {
+            rc = ngx_http_cache_purge_result(error,
+                NGX_HTTP_CACHE_ROCKSDB_IO, "native digest update failed");
+            goto done;
+        }
+        for (i = 0; i < count; i++) {
+            crc ^= buffer[i];
+            for (bit = 0; bit < 8; bit++) {
+                crc = (crc >> 1) ^ ((crc & 1) ? UINT32_C(0xedb88320) : 0);
+            }
+        }
+        left -= count;
+        at += count;
+    }
+    rc = ngx_http_cache_purge_native_read(fd, buffer, 1, (off_t) at, error);
+    if (rc != 0) {
+        goto done;
+    }
+    if (EVP_DigestFinal_ex(md, computed, &size) != 1 || size != 16
+        || buffer[0] != '\n' || (crc ^ UINT32_MAX) != stored_crc
+        || (memcmp(filename, computed, 16)
+            && memcmp(filename, stored_variant, 16)))
+    {
+        goto mismatch;
+    }
+    rc = ngx_http_cache_purge_file_marker_read(fd, &marker, error);
+    if (rc != 0) {
+        goto done;
+    }
+    if (marker.state != NGX_HTTP_CACHE_PURGE_FILE_READY
+        || memcmp(marker.id, file->id, 16)
+        || memcmp(marker.address, digest, 16))
+    {
+        goto mismatch;
+    }
+    rc = ngx_http_cache_purge_publication_beneath(root->fd, file->path,
+        0, 0, &named, error);
+    if (rc != 0) {
+        goto done;
+    }
+    if (fstat(fd, &st) != 0) {
+        rc = ngx_http_cache_purge_io(error, "recheck native cache descriptor");
+        goto done;
+    }
+    if (st.st_nlink != 1
+        || !ngx_http_cache_purge_publication_same(&proof, &st))
+    {
+        goto mismatch;
+    }
+    if (fstat(named, &st) != 0) {
+        rc = ngx_http_cache_purge_io(error, "recheck native cache name");
+        goto done;
+    }
+    if (st.st_nlink != 1
+        || !ngx_http_cache_purge_publication_same(&proof, &st))
+    {
+        goto mismatch;
+    }
+    memcpy(main, computed, 16);
+    memcpy(variant, stored_variant, 16);
+    rc = 0;
+    goto done;
+
+mismatch:
+    rc = ngx_http_cache_purge_result(error,
+        NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "native cache identity differs");
+
+done:
+    if (md != NULL) {
+        EVP_MD_CTX_free(md);
+    }
+    if (named >= 0) {
+        close(named);
+    }
+    if (fd >= 0) {
+        close(fd);
+    }
+    if (lease >= 0) {
+        close(lease);
+    }
+    free((void *) address.data);
+    return rc;
+}
+
+static int
 ngx_http_cache_purge_publication_resolve_native(void *data,
     const ngx_http_cache_purge_index_file_t *file, unsigned char main[16],
     unsigned char variant[16], unsigned *state,
@@ -1471,8 +1800,15 @@ ngx_http_cache_purge_publication_resolve_native(void *data,
         return 0;
     }
     rc = ngx_http_cache_purge_publication_native(file, main, variant, error);
+    if (rc == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND && file->vary.len) {
+        rc = ngx_http_cache_purge_native_file(p, root, file, main, variant,
+            error);
+    }
     if (rc == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND
-        || rc == NGX_HTTP_CACHE_ROCKSDB_INVALID)
+        || rc == NGX_HTTP_CACHE_ROCKSDB_INVALID
+        || rc == NGX_HTTP_CACHE_ROCKSDB_CONFLICT
+        || rc == NGX_HTTP_CACHE_ROCKSDB_BUSY
+        || rc == NGX_HTTP_CACHE_ROCKSDB_CORRUPT)
     {
         return ngx_http_cache_purge_result(error, 0, "");
     }
@@ -1480,6 +1816,23 @@ ngx_http_cache_purge_publication_resolve_native(void *data,
         *state = NGX_HTTP_CACHE_PURGE_NATIVE_BIND;
     }
     return rc;
+}
+
+int
+ngx_http_cache_purge_publications_retry_native(
+    ngx_http_cache_purge_publications_t *p, ngx_http_cache_rocksdb_t *store,
+    size_t budget, unsigned char bookmark[25], size_t *length,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    int  rc;
+
+    rc = ngx_http_cache_purge_publication_owner(p, error);
+    if (rc != 0) {
+        return rc;
+    }
+    return ngx_http_cache_purge_index_retry_native(store, budget,
+        ngx_http_cache_purge_publication_resolve_native, p, bookmark, length,
+        error);
 }
 
 int

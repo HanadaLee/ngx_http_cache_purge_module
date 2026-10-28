@@ -65,15 +65,29 @@ ngx_http_cache_purge_runtime_configured(ngx_conf_t *cf)
 ngx_http_cache_purge_runtime_t *
 ngx_http_cache_purge_runtime_create(ngx_conf_t *cf)
 {
-    ngx_http_cache_purge_runtime_t *rt;
+    ngx_http_cache_purge_runtime_t       *rt;
+    ngx_http_cache_purge_native_layout_t *layout;
 
     rt = ngx_pcalloc(cf->pool, sizeof(*rt));
     if (rt == NULL) {
         return NULL;
     }
     ngx_http_cache_purge_component_options(&rt->options);
+    layout = &rt->options.native_layout;
+    layout->size = sizeof(ngx_http_file_cache_header_t);
+    layout->version = NGX_HTTP_CACHE_VERSION;
+    layout->version_offset = offsetof(ngx_http_file_cache_header_t, version);
+    layout->version_size =
+        sizeof(((ngx_http_file_cache_header_t *) 0)->version);
+    layout->header_start_offset =
+        offsetof(ngx_http_file_cache_header_t, header_start);
+    layout->crc32_offset = offsetof(ngx_http_file_cache_header_t, crc32);
+    layout->vary_len_offset = offsetof(ngx_http_file_cache_header_t, vary_len);
+    layout->vary_offset = offsetof(ngx_http_file_cache_header_t, vary);
+    layout->vary_capacity = sizeof(((ngx_http_file_cache_header_t *) 0)->vary);
+    layout->variant_offset = offsetof(ngx_http_file_cache_header_t, variant);
     if (rt->options.abi != NGX_HTTP_CACHE_PURGE_COMPONENT_ABI
-        || ngx_http_cache_purge_component_abi_8()
+        || ngx_http_cache_purge_component_abi_9()
                != NGX_HTTP_CACHE_PURGE_COMPONENT_ABI
         || ngx_array_init(&rt->roots, cf->pool, 2, sizeof(ngx_str_t)) != NGX_OK
         || ngx_array_init(&rt->file_roots, cf->pool, 8,

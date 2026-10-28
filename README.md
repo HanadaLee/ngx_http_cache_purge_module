@@ -569,8 +569,15 @@ queries match later local rules against retained memberships without loading all
 metadata into memory. Native representation bindings also preserve access to
 secondary Vary files after their main file is removed.
 
-Full propagation remains unfinished: representation selection, legacy Vary
-identity repair and request-path integration are still pending. The intended
+Legacy Vary records can recover missing hashes from a verified native cache
+file, using the header layout supplied by the nginx build. Recovery streams the
+key through a bounded buffer and verifies its digest, CRC and publication
+identity; it never persists the raw key. Unresolved files remain explicit and
+are retried in bounded batches, without rewriting unchanged rows or rescanning
+the full index. A missing or conflicting file is not proof of an empty TAG set.
+
+Full propagation remains unfinished: representation selection and request-path
+integration are still pending. The intended
 TAG scope is known current or retained edge associations; completely unknown
 objects proceed upstream without TAG-specific retry or broader invalidation.
 Until the local lookup is connected,
