@@ -236,6 +236,12 @@ requires the same publication at final admission. Physical `INSPECT_FILE` remain
 a diagnostic operation. Normal HITs still wait for this database/IPC path;
 foreground isolation is unfinished.
 
+The RocksDB bridge exposes owner-local batch durability tickets. Reading them
+only inspects counters and never synchronizes the WAL. A later deferred batch
+does not revoke an earlier synchronized ticket. Tickets reset on reopen and are
+not persistent cache identities or worker-visible admission proofs. The current
+file publisher does not yet use them to replace `ADMIT_FILE`.
+
 The operation ledger also persists a monotonic write floor with each materialized
 operation. PREPARE, uncommitted FINISH/recovery and new 304 validation writes
 reject origins below that floor even after the rule leaves the resident table.

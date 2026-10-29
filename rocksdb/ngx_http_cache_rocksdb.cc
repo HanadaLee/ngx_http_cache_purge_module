@@ -144,6 +144,7 @@ struct ngx_http_cache_rocksdb_s {
     std::shared_ptr<rocksdb::WriteBufferManager> buffers;
     std::vector<ngx_http_cache_rocksdb_cursor_t *> cursors;
     uint64_t writes = 0;
+    uint64_t synced_writes = 0;
     uint64_t conflicts = 0;
     size_t pending_bytes = 0;
     unsigned pending_writes = 0;
@@ -592,6 +593,11 @@ ngx_http_cache_rocksdb_write_internal(ngx_http_cache_rocksdb_t *store,
             return ngx_http_cache_rocksdb_error(error,
                 NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid cache index batch");
         }
+        if (store->writes == UINT64_MAX) {
+            return ngx_http_cache_rocksdb_error(error,
+                NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+                "cache index batch ticket overflow");
+        }
         if (count > store->options.max_batch_entries
             || condition_count > store->options.max_batch_entries - count)
         {
@@ -690,6 +696,7 @@ ngx_http_cache_rocksdb_write_internal(ngx_http_cache_rocksdb_t *store,
         if (status.ok()) {
             ++store->writes;
             if (write.sync) {
+                store->synced_writes = store->writes;
                 store->pending_bytes = 0;
                 store->pending_writes = 0;
             } else {
@@ -732,10 +739,36 @@ ngx_http_cache_rocksdb_sync(
         }
         auto status = store->db->SyncWAL();
         if (status.ok()) {
+            store->synced_writes = store->writes;
             store->pending_bytes = 0;
             store->pending_writes = 0;
         }
         return ngx_http_cache_rocksdb_result(status, error);
+    });
+}
+
+extern "C" int
+ngx_http_cache_rocksdb_durability(ngx_http_cache_rocksdb_t *store,
+    uint64_t *written, uint64_t *synced, ngx_http_cache_rocksdb_error_t *error)
+{
+    if (written) {
+        *written = 0;
+    }
+    if (synced) {
+        *synced = 0;
+    }
+    return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
+        int rc = ngx_http_cache_rocksdb_check(store, error);
+        if (rc != 0) {
+            return rc;
+        }
+        if (!written || !synced || written == synced) {
+            return ngx_http_cache_rocksdb_error(error,
+                NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid durability output");
+        }
+        *written = store->writes;
+        *synced = store->synced_writes;
+        return NGX_HTTP_CACHE_ROCKSDB_OK;
     });
 }
 

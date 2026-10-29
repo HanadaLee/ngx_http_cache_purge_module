@@ -193,6 +193,38 @@ ngx_http_cache_purge_test_deferred()
     ngx_http_cache_rocksdb_options(&options);
     auto *store = open(path, options);
     const std::string key = "deferred", value = "cache data";
+    auto checkpoint = [&](uint64_t written, uint64_t synced) {
+        uint64_t actual_written = UINT64_MAX, actual_synced = UINT64_MAX;
+        auto syncs = ngx_http_cache_purge_test_sync_count();
+        expect(ngx_http_cache_rocksdb_durability(store, &actual_written,
+                   &actual_synced, &error),
+            0, "read batch durability tickets");
+        require(actual_written == written && actual_synced == synced,
+            "durability tickets distinguish issued and synchronized batches");
+        require(ngx_http_cache_purge_test_sync_count() == syncs,
+            "reading a durability ticket never synchronizes the WAL");
+    };
+    checkpoint(0, 0);
+    uint64_t invalid_written = 99, invalid_synced = 99;
+    expect(ngx_http_cache_rocksdb_durability(store, &invalid_written,
+               &invalid_written, &error),
+        NGX_HTTP_CACHE_ROCKSDB_INVALID, "aliased durability outputs rejected");
+    require(invalid_written == 0, "invalid durability output is cleared");
+    expect(ngx_http_cache_rocksdb_durability(store, nullptr, &invalid_synced,
+               &error),
+        NGX_HTTP_CACHE_ROCKSDB_INVALID, "missing durability output rejected");
+    require(invalid_synced == 0, "other durability output is cleared");
+    int foreign = 0;
+    std::thread other([&] {
+        ngx_http_cache_rocksdb_error_t local{};
+        invalid_written = invalid_synced = 99;
+        foreign = ngx_http_cache_rocksdb_durability(store, &invalid_written,
+            &invalid_synced, &local);
+    });
+    other.join();
+    require(foreign == NGX_HTTP_CACHE_ROCKSDB_OWNER
+                && invalid_written == 0 && invalid_synced == 0,
+        "durability snapshots preserve executor ownership and clear errors");
     std::array<ngx_http_cache_rocksdb_mutation_t, 3> batch;
     for (unsigned i = 0; i < batch.size(); i++) {
         batch[i] = put(static_cast<ngx_http_cache_rocksdb_cf_e>(i), key, value);
@@ -204,6 +236,7 @@ ngx_http_cache_purge_test_deferred()
         NGX_HTTP_CACHE_ROCKSDB_OK, "defer cross-CF durability");
     require(ngx_http_cache_purge_test_sync_count() == before,
         "deferred write does not sync WAL immediately");
+    checkpoint(1, 0);
     for (unsigned i = 0; i < batch.size(); i++) {
         require(get(store, static_cast<ngx_http_cache_rocksdb_cf_e>(i), key)
                     == value,
@@ -212,9 +245,11 @@ ngx_http_cache_purge_test_deferred()
     expect(ngx_http_cache_rocksdb_sync(store, &error), 0, "flush deferred WAL");
     require(ngx_http_cache_purge_test_sync_count() == before + 1,
         "one barrier syncs the deferred batch");
+    checkpoint(1, 1);
     expect(ngx_http_cache_rocksdb_sync(store, &error), 0, "idle WAL barrier");
     require(ngx_http_cache_purge_test_sync_count() == before + 1,
         "idle barriers do not issue sync calls");
+    checkpoint(1, 1);
     before = ngx_http_cache_purge_test_sync_count();
     for (unsigned i = 0; i < 64; i++) {
         expect(ngx_http_cache_rocksdb_write_deferred(
@@ -222,12 +257,22 @@ ngx_http_cache_purge_test_deferred()
             0, "bounded WAL group");
         require(ngx_http_cache_purge_test_sync_count() == before + (i == 63),
             "the sixty-fourth deferred write forces a barrier");
+        checkpoint(i + 2, i == 63 ? 65 : 1);
     }
     before = ngx_http_cache_purge_test_sync_count();
     expect(ngx_http_cache_rocksdb_write_deferred(
                store, batch.data(), batch.size(), nullptr, 0, &error),
         0, "cache before control");
+    checkpoint(66, 65);
+    ngx_http_cache_rocksdb_condition_t absent{
+        NGX_HTTP_CACHE_ROCKSDB_DEFAULT, bytes(key), bytes(""), 0
+    };
+    expect(ngx_http_cache_rocksdb_write(store, batch.data(), batch.size(),
+               &absent, 1, &error),
+        NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "rejected write has no ticket");
+    checkpoint(66, 65);
     write(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, "control", "durable");
+    checkpoint(67, 67);
     require(ngx_http_cache_purge_test_sync_count() == before + 1,
         "ordinary control write still syncs WAL immediately");
     expect(ngx_http_cache_rocksdb_sync(store, &error), 0, "control barrier");
@@ -236,23 +281,28 @@ ngx_http_cache_purge_test_deferred()
     expect(ngx_http_cache_rocksdb_write_deferred(
                store, batch.data(), batch.size(), nullptr, 0, &error),
         0, "defer before close");
+    checkpoint(68, 67);
     before = ngx_http_cache_purge_test_sync_count();
     close(store);
     require(ngx_http_cache_purge_test_sync_count() > before,
         "graceful close syncs outstanding cache batches");
     store = open(path, options);
+    checkpoint(0, 0);
     require(get(store, NGX_HTTP_CACHE_ROCKSDB_TAG, key) == value,
         "closed deferred batch survives reopening");
     expect(ngx_http_cache_rocksdb_write_deferred(
                store, batch.data(), batch.size(), nullptr, 0, &error),
         0, "defer before sync failure");
+    checkpoint(1, 0);
     ngx_http_cache_purge_test_sync_fail(1);
     expect(ngx_http_cache_rocksdb_sync(store, &error),
         NGX_HTTP_CACHE_ROCKSDB_IO, "WAL synchronization failure is reported");
+    checkpoint(1, 0);
     ngx_http_cache_purge_test_sync_fail(0);
     expect(ngx_http_cache_rocksdb_sync(store, &error),
         NGX_HTTP_CACHE_ROCKSDB_IO,
         "a failed WAL cannot silently clear its pending durability");
+    checkpoint(1, 0);
     expect(ngx_http_cache_rocksdb_close(&store, &error),
         NGX_HTTP_CACHE_ROCKSDB_IO,
         "close reports the failed durability barrier");

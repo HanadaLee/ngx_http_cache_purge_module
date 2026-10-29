@@ -140,6 +140,16 @@ int ngx_http_cache_rocksdb_write_deferred(ngx_http_cache_rocksdb_t *store,
 int ngx_http_cache_rocksdb_sync(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_error_t *error);
 
+/* Nonblocking owner-thread snapshot of successful batch tickets since open.
+ * A nonzero written ticket is durable when synced >= that ticket. Later
+ * deferred writes do not revoke an earlier durable ticket. This only reads
+ * counters; it does not sync the WAL or query RocksDB. Tickets belong to this
+ * handle and must not be persisted, sent to workers or reused after reopen.
+ * Zero means no batch on this handle, not proof for a recovered file record.
+ * Outputs are cleared on error and must be distinct non-null pointers. */
+int ngx_http_cache_rocksdb_durability(ngx_http_cache_rocksdb_t *store,
+    uint64_t *written, uint64_t *synced, ngx_http_cache_rocksdb_error_t *error);
+
 /* Bytewise prefix scan, with an optional exclusive resume key in that prefix.
  * An empty prefix scans the whole CF, including the reserved schema marker.
  * No prefix truncation or fixed-length prefix extractor is used. next/get use
