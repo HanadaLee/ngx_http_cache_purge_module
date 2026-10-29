@@ -3096,6 +3096,16 @@ ngx_http_cache_purge_component_controls(ngx_http_cache_purge_component_t *c,
     }
     if (state != NGX_HTTP_CACHE_PURGE_COORD_READY) {
         rc = ngx_http_cache_purge_coordinator_step(c->coordinator, error);
+        if (rc == 0) {
+            rc = ngx_http_cache_purge_coordinator_status(c->coordinator,
+                                                     &state, &publication,
+                                                     error);
+            if (rc == 0 && state == NGX_HTTP_CACHE_PURGE_COORD_DRAINING) {
+                /* Reopen admission before dispatching durable file work. */
+                rc = ngx_http_cache_purge_coordinator_step(c->coordinator,
+                                                         error);
+            }
+        }
         if (rc == NGX_HTTP_CACHE_ROCKSDB_BUSY) {
             rc = 0;
         } else if (rc == 0) {
@@ -8316,15 +8326,15 @@ ngx_http_cache_purge_coordinator_step(ngx_http_cache_purge_coordinator_t *c,
         if (rc == 0) {
             ngx_http_cache_purge_control_stamp(c->pending,
                 c->operations.ledger, c->expected.last_sequence);
-            rc = ngx_http_cache_purge_control_gate_close(c->writer, error);
-        }
-        if (rc == 0) {
             c->state = NGX_HTTP_CACHE_PURGE_COORD_PUBLISHING;
         }
         break;
     case NGX_HTTP_CACHE_PURGE_COORD_PUBLISHING:
-        rc = ngx_http_cache_purge_control_publish(c->writer, c->pending,
-                                                  &publication, error);
+        rc = ngx_http_cache_purge_control_gate_close(c->writer, error);
+        if (rc == 0) {
+            rc = ngx_http_cache_purge_control_publish(c->writer, c->pending,
+                                                      &publication, error);
+        }
         if (rc == 0) {
             c->publication = publication;
             ngx_http_cache_purge_control_image_free(&c->pending);
@@ -8426,13 +8436,14 @@ ngx_http_cache_purge_coordinator_accept_internal(
     if (rc == 0) {
         ngx_http_cache_purge_control_stamp(image, c->operations.ledger,
                                              preview.sequence);
-        rc = ngx_http_cache_purge_control_gate_close(c->writer, error);
     }
     if (rc != 0) {
         ngx_http_cache_purge_operation_free(&c->controls[--c->count]);
         ngx_http_cache_purge_control_image_free(&image);
         goto done;
     }
+    /* Acceptance is not effective until this durable intent is published.
+     * Readers may keep using the previous image while its WAL is synced. */
     rc = submit ? ngx_http_cache_purge_operations_submit(&c->operations, input,
                                         now, propagation_ms, out, error) :
                   ngx_http_cache_purge_operations_accept(&c->operations, input,
@@ -8451,6 +8462,7 @@ ngx_http_cache_purge_coordinator_accept_internal(
     }
     if (rc != 0) {
         /* A write error is ambiguous; recover with the serving gate closed. */
+        ngx_http_cache_purge_control_gate_close(c->writer, NULL);
         ngx_http_cache_purge_control_image_free(&image);
         ngx_http_cache_purge_operation_free(out);
         ngx_http_cache_purge_control_load_begin(c, NULL);

@@ -391,6 +391,11 @@ are rejected without changing their data. nginx-ext ABI remains 1.
 Memory-only errors do not receive separate index records. Initial internal
 receipts remain PREPARING until activation; the HTTP API waits for activation
 and READY before acknowledging reliable acceptance.
+While a new intent waits for durable acceptance, readers keep using the previous
+effective control image. The admission gate closes only for the shared-image
+switch, and the executor attempts to reopen it before dispatching file work.
+An ambiguous write failure still closes admission and recovers from the ledger.
+An unpublished intent cannot produce an effective HTTP receipt.
 
 HTTP workers now have an event-driven Unix IPC client with a reusable connection,
 bounded queues and buffers, absolute deadlines, peer UID verification, and explicit

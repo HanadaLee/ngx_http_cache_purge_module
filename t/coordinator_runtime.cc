@@ -1057,9 +1057,10 @@ main(int argc, char **argv)
                     check(coordinator.state() == Coordination::publishing
                               && op.stage == OperationStage::preparing,
                         "crash point precedes publication");
-                    check(lookup(reader, found, version)
-                              == NGX_HTTP_CACHE_ROCKSDB_BUSY,
-                        "durable/unpublished window blocks cache reads");
+                    check(lookup(reader, found, version) == 0 && !found[0],
+                        "unpublished acceptance retains the previous image");
+                    check(!op.effective_at_ms,
+                        "durable acceptance cannot claim effective before publication");
                     std::cout << "PASS crash after durable acceptance before "
                                  "publication"
                               << std::endl;
