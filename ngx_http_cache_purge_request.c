@@ -424,7 +424,6 @@ typedef struct {
     unsigned  read_ref : 1;
     unsigned  read_header_only : 1;
     unsigned  read_bypass : 1;
-    unsigned  local_started : 1;
     unsigned  local_ready : 1;
     unsigned  local_failed : 1;
     unsigned  incoming_error : 1;
@@ -962,8 +961,8 @@ ngx_http_cache_purge_propagation_snapshot(ngx_http_cache_purge_capture_t *ctx)
         return NGX_ERROR;
     }
     if (!ctx->local_ready) {
-        /* A transient cache-entry failure can bypass the initial query.
-         * The first-send gate must resolve it before dispatching upstream. */
+        /* Resolve propagation only when an upstream request is actually sent.
+         * Cached responses do not need the representation index query. */
         return NGX_AGAIN;
     }
     if (ngx_http_cache_purge_runtime_reader(r, &reader, &error) != 0) {
@@ -4010,27 +4009,6 @@ ngx_http_cache_purge_read_event(ngx_event_t *event)
     c = ctx->cache;
     connection = r->connection;
     if (ctx->read_state == NGX_HTTP_CACHE_PURGE_READ_START) {
-        if (!ctx->incoming_error && ctx->create_request
-            && ngx_http_cache_purge_propagation_possible(r)
-            && !ctx->local_ready && !ctx->local_failed)
-        {
-            if (!ctx->local_started) {
-                ctx->local_started = 1;
-                ctx->deadline = ngx_current_msec
-                                + NGX_HTTP_CACHE_PURGE_CAPTURE_TIMEOUT;
-            }
-            rc = ngx_http_cache_purge_propagation_query(ctx);
-            if (rc == NGX_OK) {
-                return;
-            }
-            if (rc == NGX_BUSY
-                && (ngx_msec_int_t) (ctx->deadline - ngx_current_msec) > 10)
-            {
-                ngx_add_timer(&ctx->read_event, 10);
-                return;
-            }
-            ctx->local_failed = 1;
-        }
         ctx->read_resume = r->write_event_handler;
         c->waiting = 0;
         ctx->read_state = NGX_HTTP_CACHE_PURGE_READ_READY;

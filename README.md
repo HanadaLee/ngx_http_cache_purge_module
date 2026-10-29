@@ -717,14 +717,15 @@ scan slots, stores pending alias results or extends a propagation deadline.
 Dictionary references remain until both files and retained memberships release
 the key; unowned-key collection removes its identity atomically.
 
-Managed proxy-cache requests now resolve these associations asynchronously at
-the cache-entry gate. When the serving control image proves there are no local
-outgoing requirements, requests skip the object lookup. Each reader keeps only
-the image version and latest propagation deadline, rescanning the bounded rule
-image when its version changes. PREPARING rules always require a lookup. This
-shortcut still checks the accepted sequence before upstream dispatch, preserves
-incoming requirements, and does not bypass local cache admission. It also applies
-after all outgoing windows expire, while local FENCEs may remain active.
+Managed proxy requests resolve propagation associations only at the first-send
+gate. A HIT does not query the representation index before reading its cache
+file. When the serving control image has no outgoing requirements, the send gate
+also skips the object lookup. Each reader retains only the image version and
+latest propagation deadline. PREPARING rules still require a lookup before
+dispatch. The gate rechecks the accepted sequence before sending request bytes
+and preserves incoming requirements. This does not bypass local cache admission:
+HITs still use `ADMIT_FILE`, so complete foreground database isolation remains
+unfinished.
 
 When a lookup is needed, one IPC request holds its bounded input until completion,
 disconnect or the original deadline. The executor admits at most four object

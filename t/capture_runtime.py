@@ -1825,6 +1825,24 @@ try:
                                and all(item[2] == 2 for item in v) else None))
         return [record(item[0]) for item in found]
 
+    uri = '/propagation/entry-hit'
+    policies[uri] = 'entry-hit-tag'
+    assert prop_get(uri) == (200, 'MISS', uri.encode())
+    ready_file(prop_records(uri, 1)[0])
+    tag_push('entry-unrelated', 'entry-unrelated-tag')
+    until(lambda: api('/__purge/v2/operations/entry-unrelated')[2]['cleanup']['state'] == 'done')
+    assert prop_get(uri) == (200, 'HIT', uri.encode())
+    initial_requests = int.from_bytes(rpc(1)[40:48], 'big')
+    initial_origins = calls.count(uri)
+    for _ in range(10):
+        assert prop_get(uri) == (200, 'HIT', uri.encode())
+    final_requests = int.from_bytes(rpc(1)[40:48], 'big')
+    hit_query_budget = {'hits': 10, 'component_requests': final_requests - initial_requests,
+                        'maximum_requests_including_final_ping': 11}
+    assert hit_query_budget['component_requests'] <= 11, hit_query_budget
+    assert calls.count(uri) == initial_origins
+    checks.append('HITs do not query the representation index before cache lookup while an unrelated TAG propagation window remains active')
+
     uri = '/propagation/vary'
     policies[(uri, 'en')] = 'known-red'
     policies[(uri, 'de')] = 'known-blue'
@@ -2039,6 +2057,7 @@ result = {'root': str(root), 'run': str(run), 'nginx_revision': revision,
           'dynamic': a.dynamic, 'key_last': a.key_last, 'sanitizer': a.sanitize, 'expr': bool(a.expr), 'extension': extension,
           'sanitizer_exclusions': ['nonnull-attribute', 'alignment instrumentation for native ngx_md5.o only'] if a.sanitize else [],
           'workers': a.workers, 'checks': checks,
+          'hit_query_budget': hit_query_budget,
           'sources': {group: {str(p.relative_to(directory)): hashlib.sha256(p.read_bytes()).hexdigest() for p in directory.rglob('*') if p.is_file()}
                       for group, directory in [('addon', addon), ('key', key)]},
           'library_sha256': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in a.libraries.glob('libngx_http_cache_*.a')},
