@@ -521,6 +521,13 @@ ngx_http_cache_rocksdb_open(const char *path,
         }
         int code = ngx_http_cache_rocksdb_initialize(store.get(), name, error);
         if (code == NGX_HTTP_CACHE_ROCKSDB_OK) {
+            /*
+             * Establish the recovered prefix before exposing local tickets.
+             * Later publications can wait for their existing WAL group.
+             */
+            code = ngx_http_cache_rocksdb_result(store->db->SyncWAL(), error);
+        }
+        if (code == NGX_HTTP_CACHE_ROCKSDB_OK) {
             *output = store.release();
         }
         return code;

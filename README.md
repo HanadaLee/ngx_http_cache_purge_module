@@ -32,8 +32,14 @@ before removing FENCE. Power loss can replay intermediate work, but cannot lose
 an accepted task or turn incomplete work into a completed receipt. The explicit
 checkpoint API remains synchronous, including replay of a deferred checkpoint.
 New entities synchronize their completed data and STAGED identity once in
-FINISH. Target and source directories are synchronized before COMMIT_PENDING;
-READY is then written before the index publication intent is removed. PREPARE
+FINISH. Target and source directories are synchronized before COMMIT_PENDING.
+The executor then waits for that commit's existing WAL group before writing
+READY and removing the publication intent. Each connection retains a 40-byte
+owner-local wait record on 64-bit builds; the bounded recovery scan has one more.
+Waiting does not repeat file syncs, hold a shared-control pin, or force a WAL
+sync per file. The original IPC deadline still applies. After the group syncs,
+the publisher rechecks file identity and current rules before becoming readable.
+Disconnects and timeouts leave the committed intent for bounded recovery. PREPARE
 does not synchronize an unpublished file. A power loss that loses only READY
 causes a MISS. In-place 304 validation and physical deletion retain their syncs.
 STAGED is a new state in the module's existing 40-byte xattr marker; it does not
@@ -239,8 +245,10 @@ foreground isolation is unfinished.
 The RocksDB bridge exposes owner-local batch durability tickets. Reading them
 only inspects counters and never synchronizes the WAL. A later deferred batch
 does not revoke an earlier synchronized ticket. Tickets reset on reopen and are
-not persistent cache identities or worker-visible admission proofs. The current
-file publisher does not yet use them to replace `ADMIT_FILE`.
+not persistent cache identities or worker-visible admission proofs. Opening the
+store synchronizes its recovered WAL prefix before exposing the handle. File
+publication uses these tickets; `ADMIT_FILE` remains until the cache-side proof
+also covers TAGs, invalidation state and representation validation.
 
 The operation ledger also persists a monotonic write floor with each materialized
 operation. PREPARE, uncommitted FINISH/recovery and new 304 validation writes

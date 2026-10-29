@@ -39,7 +39,7 @@ def wait_for(function, timeout=10):
 
 
 class Component:
-    def __init__(self, path, connections=8, timeout=3000, budget=1100000, payload=512 * 1024, shared=None, roots=None, seed=False, reply_gate=None, reply_mode='plain'):
+    def __init__(self, path, connections=8, timeout=3000, budget=1100000, payload=512 * 1024, shared=None, roots=None, seed=False, reply_gate=None, reply_mode='plain', wal_gate=None):
         self.path = path
         path.mkdir(exist_ok=True)
         self.stderr = (root / f'stderr-{len(processes)}.log').open('w')
@@ -50,6 +50,9 @@ class Component:
         env.pop('CACHE_PURGE_TEST_CACHE_ROOT', None)
         env.pop('CACHE_PURGE_TEST_TEMP_ROOT', None)
         env.pop('CACHE_PURGE_TEST_CACHE_ZONE', None)
+        env.pop('CACHE_PURGE_TEST_PUBLICATION_WAL_GATE', None)
+        if wal_gate is not None:
+            env['CACHE_PURGE_TEST_PUBLICATION_WAL_GATE'] = str(wal_gate)
         if reply_gate is not None:
             env['CACHE_PURGE_TEST_REPLY_GATE'] = str(reply_gate)
             env['CACHE_PURGE_TEST_REPLY_MODE'] = reply_mode
@@ -215,10 +218,13 @@ class Client:
         return self.reply(18, code)
 
     def finish_file(self, n, lease, revision=1, code=0):
+        self.begin_finish(n, lease, revision)
+        return self.reply(19, code)
+
+    def begin_finish(self, n, lease, revision=1):
         packet = self.packet(19, identity(n) + struct.pack('>Q', revision))
         assert self.socket.sendmsg([packet[:1]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [lease]))]) == 1
         self.socket.sendall(packet[1:])
-        return self.reply(19, code)
 
     def inspect_file(self, target, fd, code=0):
         packet = self.packet(21, b''.join(map(string, target)))
@@ -330,7 +336,73 @@ def reply_before_poll(label, mode, operation):
     component.stop()
 
 
+def publication_wal_wait(mode):
+    base = root / ('publication-wal-' + mode)
+    base.mkdir()
+    cache, temporary, gate = base / 'cache', base / 'temp', base / 'gate'
+    for path in (cache, temporary, gate):
+        path.mkdir()
+    component = Component(base / 'db', roots=(cache, temporary), wal_gate=gate,
+                          timeout=200 if mode == 'timeout' else 3000)
+    component.opened()
+    client = Client(component.path)
+    source, target = temporary / 'body', cache / 'object'
+    source.write_bytes(b'complete group-published entity')
+    fd = os.open(source, os.O_RDWR | os.O_CLOEXEC)
+    lease = client.lease(str(target))
+    try:
+        payload = record(401, root=str(cache), zone='zone-a', path='object')
+        client.prepare_file(payload + string(str(source)), [lease, fd])
+        source.rename(target)
+        client.begin_finish(401, lease)
+        wait_for(lambda: (gate / 'paused').exists())
+        check((gate / 'armed').exists()
+              and os.getxattr(fd, 'user.ngx_cache_purge.id')[7] == 3
+              and not select.select([client.socket], [], [], .02)[0],
+              'real FINISH keeps STAGED and its reply pending before WAL sync: ' + mode)
+        if mode == 'complete':
+            (gate / 'release').touch()
+            assert client.reply(19) == identity(401) + struct.pack('>QB', 2, 2)
+            assert os.getxattr(fd, 'user.ngx_cache_purge.id')[7] == 2
+            assert len(client.call(1)) == 72
+        else:
+            if mode == 'timeout':
+                time.sleep(.25)
+            else:
+                client.close()
+            os.close(lease)
+            lease = -1
+            if mode == 'restart':
+                component.process.kill()
+                component.process.wait(timeout=5)
+            (gate / 'release').touch()
+            if mode == 'restart':
+                component = Component(base / 'db', roots=(cache, temporary))
+                component.opened()
+            if mode == 'timeout':
+                assert select.select([client.socket], [], [], 5)[0]
+                assert client.socket.recv(1) == b''
+                client.close()
+            wait_for(lambda: os.getxattr(fd, 'user.ngx_cache_purge.id')[7] == 2)
+            client = Client(component.path)
+        selected = (str(cache), 'zone-a', 'object')
+        result = client.inspect_file(selected, fd)
+        assert result[:9] == b'\x02' + struct.pack('>Q', 2)
+        assert not client.call(9, string('') + bytes([32]))[0]
+        assert os.pread(fd, 64, 0) == b'complete group-published entity'
+        check(True, 'WAL wait preserves file identity and resolves its intent: ' + mode)
+    finally:
+        (gate / 'release').touch()
+        if lease >= 0:
+            os.close(lease)
+        os.close(fd)
+        client.close()
+    component.stop()
+
+
 try:
+    for mode in ('complete', 'disconnect', 'timeout', 'restart'):
+        publication_wal_wait(mode)
     for label, mode, operation in [('plain', 'plain', 1), ('lease', 'plain', 17),
                                    ('again', 'again', 1), ('again-lease', 'again', 17),
                                    ('interrupted', 'interrupted', 1), ('partial', 'partial', 1)]:

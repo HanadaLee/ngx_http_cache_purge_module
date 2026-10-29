@@ -1243,9 +1243,8 @@ int ngx_http_cache_purge_publications_finish(
     uint64_t prepared_revision, int anchor_fd, int lease_fd, uint32_t peer_uid,
     ngx_http_cache_purge_index_match_t *match,
     ngx_http_cache_rocksdb_error_t *error);
-/* Production publishers check accepted rules before the first index commit.
- * CONFLICT retires an uncommitted candidate; BUSY keeps it recoverable. The
- * guard is never repeated after its catalogue commit has already happened. */
+/* Production publishers recheck accepted rules on every finish attempt.
+ * CONFLICT retires the candidate; BUSY keeps it recoverable. */
 typedef int (*ngx_http_cache_purge_publication_guard_pt)(void *data,
     const ngx_http_cache_purge_index_file_t *file,
     ngx_http_cache_rocksdb_error_t *error);
@@ -1255,6 +1254,27 @@ int ngx_http_cache_purge_publications_finish_checked(
     ngx_http_cache_purge_publications_t *publications,
     ngx_http_cache_rocksdb_t *store, const unsigned char id[16],
     uint64_t prepared_revision, int anchor_fd, int lease_fd, uint32_t peer_uid,
+    ngx_http_cache_purge_publication_guard_pt guard, void *data,
+    ngx_http_cache_purge_index_match_t *match,
+    ngx_http_cache_rocksdb_error_t *error);
+
+typedef struct {
+    ngx_http_cache_rocksdb_t  *store;
+    unsigned char              id[16];
+    uint64_t                   revision;
+    uint64_t                   ticket;
+} ngx_http_cache_purge_publication_wait_t;
+
+/* Zero-initialize wait for one finish operation on the same open store.
+ * BUSY with wait.store set retains a WAL ticket; retry after its batch syncs.
+ * No file/DB work is repeated while that ticket is unsynchronized. The caller
+ * retains its lease, input and deadline. Other results clear wait. Never send
+ * this owner-local state over IPC or reuse it after the store is closed. */
+int ngx_http_cache_purge_publications_finish_deferred(
+    ngx_http_cache_purge_publications_t *publications,
+    ngx_http_cache_rocksdb_t *store, const unsigned char id[16],
+    uint64_t prepared_revision, int anchor_fd, int lease_fd, uint32_t peer_uid,
+    ngx_http_cache_purge_publication_wait_t *wait,
     ngx_http_cache_purge_publication_guard_pt guard, void *data,
     ngx_http_cache_purge_index_match_t *match,
     ngx_http_cache_rocksdb_error_t *error);

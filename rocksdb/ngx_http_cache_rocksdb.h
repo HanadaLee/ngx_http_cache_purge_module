@@ -108,7 +108,8 @@ uint32_t ngx_http_cache_rocksdb_abi_1(void);
 /* Blocking APIs: call only on the owning worker's executor thread.
  * A handle belongs to its opening process/thread and must never cross fork,
  * IPC or SHM. The directory must already exist and be writable (nginx creates
- * it through ngx_add_path). No C++ exception crosses this boundary. */
+ * it through ngx_add_path). Open synchronizes the recovered WAL prefix before
+ * returning the handle. No C++ exception crosses this boundary. */
 int ngx_http_cache_rocksdb_open(const char *path,
     const ngx_http_cache_rocksdb_options_t *options,
     ngx_http_cache_rocksdb_t **store, ngx_http_cache_rocksdb_error_t *error);
@@ -145,7 +146,8 @@ int ngx_http_cache_rocksdb_sync(ngx_http_cache_rocksdb_t *store,
  * deferred writes do not revoke an earlier durable ticket. This only reads
  * counters; it does not sync the WAL or query RocksDB. Tickets belong to this
  * handle and must not be persisted, sent to workers or reused after reopen.
- * Zero means no batch on this handle, not proof for a recovered file record.
+ * Zero means no batch on this handle; open synchronized the recovered prefix.
+ * These counters alone do not validate any particular recovered file record.
  * Outputs are cleared on error and must be distinct non-null pointers. */
 int ngx_http_cache_rocksdb_durability(ngx_http_cache_rocksdb_t *store,
     uint64_t *written, uint64_t *synced, ngx_http_cache_rocksdb_error_t *error);

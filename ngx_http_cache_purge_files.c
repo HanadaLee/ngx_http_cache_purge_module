@@ -2358,11 +2358,12 @@ done:
     return rc;
 }
 
-int
-ngx_http_cache_purge_publications_finish_checked(
+static int
+ngx_http_cache_purge_publications_finish_run(
     ngx_http_cache_purge_publications_t *p,
     ngx_http_cache_rocksdb_t *store, const unsigned char id[16],
     uint64_t revision, int anchor, int lease, uint32_t peer_uid,
+    ngx_http_cache_purge_publication_wait_t *wait,
     ngx_http_cache_purge_publication_guard_pt guard, void *data,
     ngx_http_cache_purge_index_match_t *out,
     ngx_http_cache_rocksdb_error_t *error)
@@ -2375,9 +2376,10 @@ ngx_http_cache_purge_publications_finish_checked(
     ngx_http_cache_purge_publication_root_t *target, *source;
     struct stat                              st, opened, final_stat;
     unsigned char  digest[16];
-    uint64_t       offset;
+    uint64_t       offset, written, synced;
     size_t                                   i, longest;
     int                                      rc, intent, observed, fd, final;
+    int                                      pending;
 
     ngx_http_cache_purge_result(error, 0, "");
     if (out != NULL) {
@@ -2392,14 +2394,35 @@ ngx_http_cache_purge_publications_finish_checked(
     if (rc != 0) {
         return rc;
     }
+    if (wait != NULL && wait->store != NULL) {
+        if (wait->store != store || memcmp(wait->id, id, 16)) {
+            memset(wait, 0, sizeof(*wait));
+            return ngx_http_cache_purge_result(error,
+                NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                "publication wait belongs to another operation");
+        }
+        rc = ngx_http_cache_rocksdb_durability(store, &written, &synced, error);
+        if (rc != 0) {
+            memset(wait, 0, sizeof(*wait));
+            return rc;
+        }
+        if (synced < wait->ticket) {
+            return ngx_http_cache_purge_result(error,
+                NGX_HTTP_CACHE_ROCKSDB_BUSY, "publication awaits WAL sync");
+        }
+    }
     rc = ngx_http_cache_purge_index_get_file(store, id, &file, error);
     if (rc != 0) {
+        if (wait != NULL) {
+            memset(wait, 0, sizeof(*wait));
+        }
         return rc;
     }
     memset(&address, 0, sizeof(address));
     observed = -1;
     fd = -1;
     final = -1;
+    pending = 0;
     rc = ngx_http_cache_purge_publication_proof(file.metadata, &saved, error);
     if (rc != 0) {
         goto done;
@@ -2419,6 +2442,13 @@ ngx_http_cache_purge_publications_finish_checked(
         result.revision = file.revision;
         result.state = file.state;
         goto success;
+    }
+    if (wait != NULL && wait->store != NULL
+        && file.revision != wait->revision)
+    {
+        rc = ngx_http_cache_purge_result(error, NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "publication changed while awaiting WAL sync");
+        goto done;
     }
     if (file.revision != revision
         && !(revision != UINT64_MAX && file.revision == revision + 1
@@ -2541,15 +2571,17 @@ ngx_http_cache_purge_publications_finish_checked(
             goto done;
         }
     }
-    if (fsync(fd) != 0) {
+    if ((wait == NULL || wait->store == NULL) && fsync(fd) != 0) {
         rc = ngx_http_cache_purge_io(error, "sync final cache file");
         goto done;
     }
-    rc =
-        ngx_http_cache_purge_publication_sync_parents(target, file.path, error);
+    if (wait == NULL || wait->store == NULL) {
+        rc = ngx_http_cache_purge_publication_sync_parents(target, file.path,
+                                                          error);
+    }
     relative.data = saved.temporary.data + source->length + 1;
     relative.len = saved.temporary.len - source->length - 1;
-    if (rc == 0) {
+    if (rc == 0 && (wait == NULL || wait->store == NULL)) {
         rc = ngx_http_cache_purge_publication_sync_parents(source, relative,
                                                            error);
     }
@@ -2564,8 +2596,26 @@ ngx_http_cache_purge_publications_finish_checked(
             store, NGX_HTTP_CACHE_PURGE_INDEX_COMMIT_PENDING, id, file.revision,
             &result, error);
     }
+    if (rc == 0 && wait == NULL) {
+        rc = ngx_http_cache_rocksdb_sync(store, error);
+    }
+    if (rc == 0 && wait != NULL) {
+        rc = ngx_http_cache_rocksdb_durability(store, &written, &synced, error);
+        if (rc == 0 && wait->store == NULL) {
+            wait->store = store;
+            memcpy(wait->id, id, 16);
+            wait->revision = result.revision;
+            wait->ticket = written;
+        }
+        if (rc == 0 && synced < wait->ticket) {
+            pending = 1;
+            rc = ngx_http_cache_purge_result(error,
+                NGX_HTTP_CACHE_ROCKSDB_BUSY, "publication awaits WAL sync");
+            goto done;
+        }
+    }
     if (rc == 0) {
-        /* Data and the prepared identity are durable before this transition.
+        /* Data, identity and index commit are durable before this transition.
          * Losing only READY after publication causes a MISS, never a HIT. */
         rc = ngx_http_cache_purge_file_marker_publish(fd, id, digest, 0, error);
     }
@@ -2613,6 +2663,9 @@ success:
     }
 
 done:
+    if (wait != NULL && !pending) {
+        memset(wait, 0, sizeof(*wait));
+    }
     if (observed >= 0) {
         close(observed);
     }
@@ -2625,6 +2678,37 @@ done:
     free((void *) address.data);
     ngx_http_cache_purge_index_file_free(&file);
     return rc;
+}
+
+int
+ngx_http_cache_purge_publications_finish_checked(
+    ngx_http_cache_purge_publications_t *p,
+    ngx_http_cache_rocksdb_t *store, const unsigned char id[16],
+    uint64_t revision, int anchor, int lease, uint32_t peer_uid,
+    ngx_http_cache_purge_publication_guard_pt guard, void *data,
+    ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_purge_publications_finish_run(p, store, id,
+        revision, anchor, lease, peer_uid, NULL, guard, data, out, error);
+}
+
+int
+ngx_http_cache_purge_publications_finish_deferred(
+    ngx_http_cache_purge_publications_t *p,
+    ngx_http_cache_rocksdb_t *store, const unsigned char id[16],
+    uint64_t revision, int anchor, int lease, uint32_t peer_uid,
+    ngx_http_cache_purge_publication_wait_t *wait,
+    ngx_http_cache_purge_publication_guard_pt guard, void *data,
+    ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    if (wait == NULL) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "missing publication wait state");
+    }
+    return ngx_http_cache_purge_publications_finish_run(p, store, id,
+        revision, anchor, lease, peer_uid, wait, guard, data, out, error);
 }
 
 int

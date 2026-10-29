@@ -71,6 +71,7 @@ typedef struct {
     int                                      parsed;
     uint64_t                                 deadline;
     ngx_http_cache_purge_object_query_t     *object;
+    ngx_http_cache_purge_publication_wait_t  publication_wait;
 } ngx_http_cache_purge_component_peer_t;
 
 struct ngx_http_cache_purge_component_s {
@@ -118,6 +119,7 @@ struct ngx_http_cache_purge_component_s {
     size_t                                    object_queries;
     ngx_http_cache_purge_component_buffer_t   recovery_bookmark;
     uint64_t                                  recovery_at;
+    ngx_http_cache_purge_publication_wait_t   recovery_wait;
     int                                       native_migrated;
     unsigned char                             native_bookmark[25];
     size_t                                    native_bookmark_length;
@@ -1230,11 +1232,18 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
         }
         rc = ngx_http_cache_purge_component_anchor(c, error);
         if (rc == 0) {
-            rc = ngx_http_cache_purge_publications_finish_checked(
+            rc = ngx_http_cache_purge_publications_finish_deferred(
                 c->publications, store, expected[0].id, expected[0].revision,
                 c->lease_anchor, p->input_rights[0], p->uid,
+                &p->publication_wait,
                 ngx_http_cache_purge_component_publication_guard,
                 c, &matches[0], error);
+        }
+        if (rc == NGX_HTTP_CACHE_ROCKSDB_BUSY
+            && p->publication_wait.store != NULL)
+        {
+            rc = NGX_HTTP_CACHE_PURGE_COMPONENT_PENDING;
+            break;
         }
         if (rc == 0) {
             ngx_http_cache_purge_component_put_match(e, &matches[0]);
@@ -1686,7 +1695,7 @@ ngx_http_cache_purge_component_execute(ngx_http_cache_purge_component_t *c,
         ngx_http_cache_purge_component_buffer_free(&e.buffer);
         return e.rc;
     }
-    if (p->object == NULL) {
+    if (p->object == NULL && p->publication_wait.store == NULL) {
         ngx_http_cache_purge_component_add64(&c->requests, 1);
     }
     rc = ngx_http_cache_purge_component_dispatch(c, store, p, &e, error);
@@ -2088,16 +2097,32 @@ ngx_http_cache_purge_component_recover(ngx_http_cache_purge_component_t *c,
     ngx_http_cache_purge_publication_target_t  target;
     ngx_http_cache_rocksdb_bytes_t             bookmark;
     unsigned char                              digest[16];
-    uint64_t                                   offset;
-    int                                       lease, rc;
+    uint64_t                                   offset, written, synced;
+    int                                       lease, rc, pending;
 
     query = NULL;
     lease = -1;
+    pending = 0;
     memset(&file, 0, sizeof(file));
     memset(&target, 0, sizeof(target));
     bookmark.data = c->recovery_bookmark.data;
     bookmark.len = c->recovery_bookmark.len;
     c->recovery_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 1000;
+
+    if (c->recovery_wait.store != NULL) {
+        rc = ngx_http_cache_rocksdb_durability(store, &written, &synced, error);
+        if (rc != 0) {
+            goto done;
+        }
+        c->recovery_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC)
+                         + 10;
+        if (synced < c->recovery_wait.ticket) {
+            pending = 1;
+            goto done;
+        }
+        memcpy(match.id, c->recovery_wait.id, 16);
+        goto inspect;
+    }
 
     if (!c->native_migrated) {
         rc = ngx_http_cache_purge_publications_migrate_native(c->publications,
@@ -2162,6 +2187,8 @@ ngx_http_cache_purge_component_recover(ngx_http_cache_purge_component_t *c,
     }
     ngx_http_cache_purge_query_close(&query, NULL);
     c->recovery_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 10;
+
+inspect:
     rc = ngx_http_cache_purge_index_get_file(store, match.id, &file, error);
     if (rc != 0) {
         goto done;
@@ -2215,15 +2242,21 @@ ngx_http_cache_purge_component_recover(ngx_http_cache_purge_component_t *c,
             rc = ngx_http_cache_purge_index_apply(store,
                 NGX_HTTP_CACHE_PURGE_INDEX_ABORT, &expected, 1, &match, error);
         } else {
-            rc = ngx_http_cache_purge_publications_finish_checked(
+            rc = ngx_http_cache_purge_publications_finish_deferred(
                 c->publications, store, file.id, file.revision, c->lease_anchor,
                 lease, c->options.client_uid,
+                &c->recovery_wait,
                 ngx_http_cache_purge_component_publication_guard,
                 c, &match, error);
+            pending = rc == NGX_HTTP_CACHE_ROCKSDB_BUSY
+                      && c->recovery_wait.store != NULL;
         }
     }
 
 done:
+    if (!pending) {
+        memset(&c->recovery_wait, 0, sizeof(c->recovery_wait));
+    }
     if (query != NULL) {
         ngx_http_cache_purge_query_close(&query, NULL);
     }
@@ -3099,6 +3132,7 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
     size_t                                   start;
     uint64_t                                 expire_at;
     uint64_t                                 sync_at;
+    uint64_t                                 written, synced;
     uint64_t                                 now;
     int                                      rc;
     int                                      progress;
@@ -3196,6 +3230,10 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
                 return rc;
             }
         }
+        rc = ngx_http_cache_rocksdb_durability(store, &written, &synced, error);
+        if (rc != 0) {
+            return rc;
+        }
         memset(events, 0, sizeof(events));
         events[0].fd = c->wake_read;
         events[0].events = POLLIN;
@@ -3219,7 +3257,9 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
             events[i + 2].events = p->output.len ? POLLOUT :
                                    complete      ? 0 :
                                                    POLLIN;
-            ready |= complete && p->output.len == 0;
+            ready |= complete && p->output.len == 0
+                     && (p->publication_wait.store == NULL
+                         || p->publication_wait.ticket <= synced);
         }
         pending = c->coordinator != NULL
                   && ngx_http_cache_purge_component_load32(&c->control_state)
@@ -3294,7 +3334,9 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
                 }
             }
             if (rc == 0 && !executed && !p->output.len && p->parsed
-                && p->input_used == p->input.len)
+                && p->input_used == p->input.len
+                && (p->publication_wait.store == NULL
+                    || p->publication_wait.ticket <= synced))
             {
                 rc = ngx_http_cache_purge_component_execute(c, store, p, error);
                 if (rc == 0) {

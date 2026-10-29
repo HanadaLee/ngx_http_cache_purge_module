@@ -8,11 +8,14 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 
 static unsigned  ngx_http_cache_purge_test_syncs;
 static unsigned  ngx_http_cache_purge_test_sync_error;
+static __thread unsigned ngx_http_cache_purge_test_wal_armed;
+static __thread unsigned ngx_http_cache_purge_test_wal_paused;
 
 typedef struct {
     dev_t     device;
@@ -239,7 +242,11 @@ ngx_http_cache_purge_test_sync(int fd, long operation)
     ngx_http_cache_purge_test_file_sync_t  *watch;
     struct stat                             st;
     char                                    name[64], target[4096];
+    char                                    path[4096];
+    const char                             *directory;
+    unsigned char                           marker[40];
     ssize_t                                 n;
+    int                                     notify;
 
     watch = &ngx_http_cache_purge_test_file_sync;
     if (watch->enabled && fstat(fd, &st) == 0
@@ -255,9 +262,37 @@ ngx_http_cache_purge_test_sync(int fd, long operation)
         }
     }
 
+    directory = getenv("CACHE_PURGE_TEST_PUBLICATION_WAL_GATE");
+    if (directory != NULL && !ngx_http_cache_purge_test_wal_armed
+        && fgetxattr(fd, "user.ngx_cache_purge.id", marker, sizeof(marker))
+           == sizeof(marker)
+        && memcmp(marker, "NCF1", 4) == 0 && marker[7] == 3)
+    {
+        ngx_http_cache_purge_test_wal_armed = 1;
+        snprintf(path, sizeof(path), "%s/armed", directory);
+        notify = open(path, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+        if (notify >= 0) {
+            close(notify);
+        }
+    }
+
     snprintf(name, sizeof(name), "/proc/self/fd/%d", fd);
     n = readlink(name, target, sizeof(target));
     if (n >= 4 && memcmp(target + n - 4, ".log", 4) == 0) {
+        if (directory != NULL && ngx_http_cache_purge_test_wal_armed
+            && !ngx_http_cache_purge_test_wal_paused)
+        {
+            ngx_http_cache_purge_test_wal_paused = 1;
+            snprintf(path, sizeof(path), "%s/paused", directory);
+            notify = open(path, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+            if (notify >= 0) {
+                close(notify);
+            }
+            snprintf(path, sizeof(path), "%s/release", directory);
+            while (access(path, F_OK) != 0) {
+                usleep(1000);
+            }
+        }
         __atomic_add_fetch(&ngx_http_cache_purge_test_syncs, 1,
                            __ATOMIC_RELAXED);
         if (__atomic_load_n(&ngx_http_cache_purge_test_sync_error,

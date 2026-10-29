@@ -557,11 +557,12 @@ def rpc(op, payload=b'', fds=(), receive_fd=False, codes=(0,)):
                 for level, kind, data in control:
                     assert (level, kind) == (socket.SOL_SOCKET, socket.SCM_RIGHTS)
                     received.frombytes(data)
-                assert len(received) == 1 and not flags & socket.MSG_CTRUNC
+                assert not flags & socket.MSG_CTRUNC
             magic, version, operation, ident, length, result = struct.unpack('>4sHHQII', first + read(24 - len(first)))
             body = read(length)
             assert (magic, version, operation, ident) == (b'NCP1', 1, op, 1)
             assert result in codes, (result, body)
+            if receive_fd: assert len(received) == (1 if result == 0 else 0)
             if result != 0: return None
             return (body, received.pop()) if receive_fd else body
         finally:
@@ -569,7 +570,8 @@ def rpc(op, payload=b'', fds=(), receive_fd=False, codes=(0,)):
 
 def physical_remove(item, outcome=1, collected=False):
     path = Path(os.fsdecode(item['root'])) / os.fsdecode(item['path'])
-    _, lease = rpc(17, string(str(path)), receive_fd=True)
+    _, lease = until(lambda: rpc(17, string(str(path)), receive_fd=True,
+                                 codes=(0, 6)))
     try:
         removed = rpc(24, item['id'] + struct.pack('>Q', item['revision']), (lease,),
                       codes=(0, 1) if collected else (0,))
@@ -590,9 +592,23 @@ def query(value, kind=1, scope=''):
         assert next_cursor and next_cursor != cursor and len(found) < 1000
         cursor = next_cursor
 def records(path, count, host='cache.test'):
-    found = until(lambda: (v if len(v := query('http://' + host + path)) == count
-                           and all(item[2] == 2 for item in v) else None))
-    return [record(item[0]) for item in found]
+    # Fixture setup requires published files. query()/record() remain available
+    # for tests that intentionally observe an intermediate index transaction.
+    def published():
+        found = query('http://' + host + path)
+        if len(found) != count or any(item[2] != 2 for item in found): return None
+        result = [record(item[0]) for item in found]
+        for item in result:
+            target = Path(os.fsdecode(item['root'])) / os.fsdecode(item['path'])
+            try:
+                marker = os.getxattr(target, 'user.ngx_cache_purge.id')
+            except OSError as error:
+                if error.errno in (2, 61): return None  # ENOENT / ENODATA
+                raise
+            assert len(marker) == 40 and marker[:7] == b'NCF1\0\0\0' and marker[7] in (1, 2, 3)
+            if marker[7] != 2 or marker[8:24] != item['id']: return None
+        return result
+    return until(published)
 
 def record(ident, optional=False):
     raw = rpc(2, ident, codes=(0, 1) if optional else (0,))
@@ -650,8 +666,13 @@ def writers(sequence):
     return int.from_bytes(value, 'big')
 def ready_file(item):
     path = Path(os.fsdecode(item['root'])) / os.fsdecode(item['path'])
-    marker = os.getxattr(path, 'user.ngx_cache_purge.id')
-    assert len(marker) == 40 and marker[:8] == b'NCF1\0\0\0\2' and marker[8:24] == item['id'], (path, marker.hex(), item['id'].hex())
+    def published():
+        marker = os.getxattr(path, 'user.ngx_cache_purge.id')
+        assert len(marker) == 40 and marker[:7] == b'NCF1\0\0\0' and marker[7] in (1, 2, 3) and marker[8:24] == item['id'], (path, marker.hex(), item['id'].hex())
+        return marker[7] == 2
+    # COMMITTED retains its intent while the WAL group awaits durability.
+    # An admitted file requires the separate READY publication as well.
+    until(published)
     metadata = item['metadata']
     if metadata.startswith(b'NFR1'):
         assert int.from_bytes(metadata[60:64], 'big') == len(metadata) - 64

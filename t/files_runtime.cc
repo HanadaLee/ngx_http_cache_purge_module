@@ -20,6 +20,8 @@ extern "C" int ngx_http_cache_purge_test_watch_file(
 extern "C" unsigned ngx_http_cache_purge_test_file_sync_count(void);
 extern "C" void ngx_http_cache_purge_test_watch_marker(
     unsigned, void (*)(int, void *));
+extern "C" unsigned ngx_http_cache_purge_test_sync_count(void);
+extern "C" void ngx_http_cache_purge_test_sync_fail(unsigned);
 static unsigned assertions;
 static ngx_http_cache_rocksdb_error_t error;
 static void
@@ -1305,6 +1307,163 @@ ngx_http_cache_purge_test_publication_sync_case(
         "close publication sync database");
 }
 
+static void
+ngx_http_cache_purge_test_publication_wal(const std::string &path,
+    unsigned scenario)
+{
+    std::filesystem::create_directories(path + "/cache");
+    std::filesystem::create_directories(path + "/db");
+    int anchor_fd, lease_fd;
+    check(ngx_http_cache_purge_file_locks_open(
+              (path + "/locks").c_str(), getuid(), 1, &anchor_fd, &error) == 0,
+        "open WAL publication anchor");
+    Descriptor anchor(anchor_fd);
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    check(ngx_http_cache_rocksdb_open(
+              (path + "/db").c_str(), &options, &store, &error) == 0,
+        "open WAL publication database");
+    {
+        Index index(store);
+        Publications publications(
+            { { path + "/cache", "cache", NGX_HTTP_CACHE_PURGE_ROOT_CACHE } },
+            path + "/db");
+        File file;
+        file.id = id(1);
+        file.key = "wal-publication";
+        file.url = "https://example.test/wal";
+        file.host = "example.test";
+        file.tag_namespace = "team";
+        file.root = path + "/cache";
+        file.zone = "cache";
+        file.path = "file";
+        auto target = file.root + '/' + file.path;
+        auto temporary = file.root + "/temporary";
+        unsigned char digest[16];
+        uint64_t offset, written, synced;
+        check(ngx_http_cache_purge_file_address(
+                  bytes(target), digest, &offset, &error) == 0,
+            "derive WAL publication address");
+        check(ngx_http_cache_purge_file_lease_acquire(
+                  (path + "/locks").c_str(), anchor.fd, offset, &lease_fd,
+                  &error) == 0,
+            "acquire WAL publication lease");
+        Descriptor lease(lease_fd);
+        Descriptor fd(open(temporary.c_str(),
+            O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600));
+        body(fd.fd);
+        publications.prepare(index, { file, {} }, temporary, anchor.fd,
+            lease.fd, fd.fd, getuid());
+        check(rename(temporary.c_str(), target.c_str()) == 0,
+            "rename WAL publication file");
+        check(ngx_http_cache_purge_test_watch_file(
+                  fd.fd, 0, nullptr, nullptr) == 0,
+            "observe one publication file sync");
+        unsigned guards = 0;
+        auto guard = [](void *data,
+                         const ngx_http_cache_purge_index_file_t *,
+                         ngx_http_cache_rocksdb_error_t *) {
+            ++*static_cast<unsigned *>(data);
+            return 0;
+        };
+        ngx_http_cache_purge_publication_wait_t wait{};
+        ngx_http_cache_purge_index_match_t result{};
+        auto finish = [&](bool veto = false) {
+            auto reject = [](void *,
+                              const ngx_http_cache_purge_index_file_t *,
+                              ngx_http_cache_rocksdb_error_t *) -> int {
+                return NGX_HTTP_CACHE_ROCKSDB_CONFLICT;
+            };
+            return ngx_http_cache_purge_publications_finish_deferred(
+                publications.native(), store, file.id.data(), 1, anchor.fd,
+                lease.fd, getuid(), &wait, veto ? +reject : +guard, &guards,
+                &result, &error);
+        };
+        unsigned syncs = ngx_http_cache_purge_test_sync_count();
+        check(finish() == NGX_HTTP_CACHE_ROCKSDB_BUSY && wait.store == store
+                  && wait.ticket != 0 && result.revision == 0,
+            "deferred finish waits after the index commit");
+        uint64_t ticket = wait.ticket;
+        check(index.get(file.id).state == FileState::committed
+                  && index.has_fill_intent(file.id),
+            "waiting retains a recoverable committed intent");
+        ngx_http_cache_purge_file_marker_t marker{};
+        check(ngx_http_cache_purge_file_marker_read(fd.fd, &marker, &error) == 0
+                  && marker.state == NGX_HTTP_CACHE_PURGE_FILE_STAGED,
+            "unflushed index cannot publish READY");
+        for (unsigned i = 0; i < 5; i++) {
+            check(finish() == NGX_HTTP_CACHE_ROCKSDB_BUSY
+                      && wait.ticket == ticket && guards == 1,
+                "unsynced retry retains the ticket without repeating work");
+        }
+        check(ngx_http_cache_purge_test_file_sync_count() == 1
+                  && ngx_http_cache_purge_test_sync_count() == syncs,
+            "one file sync and no per-file WAL synchronization");
+        if (scenario == 3) {
+            ngx_http_cache_purge_test_sync_fail(1);
+            check(ngx_http_cache_rocksdb_sync(store, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_IO,
+                "failed WAL barrier is reported");
+            ngx_http_cache_purge_test_sync_fail(0);
+            check(finish() == NGX_HTTP_CACHE_ROCKSDB_BUSY,
+                "failed WAL sync cannot authorize READY");
+            check(ngx_http_cache_purge_file_marker_read(
+                      fd.fd, &marker, &error) == 0
+                      && marker.state == NGX_HTTP_CACHE_PURGE_FILE_STAGED,
+                "failed barrier leaves the file staged");
+        } else {
+            check(ngx_http_cache_rocksdb_sync(store, &error) == 0,
+                "flush the shared WAL group");
+            check(ngx_http_cache_rocksdb_durability(
+                      store, &written, &synced, &error) == 0
+                      && synced >= ticket,
+                "the shared group covers the publication ticket");
+            const std::string key = "C:later-dirty", value = "later";
+            ngx_http_cache_rocksdb_mutation_t mutation{
+                NGX_HTTP_CACHE_ROCKSDB_DEFAULT, NGX_HTTP_CACHE_ROCKSDB_PUT,
+                bytes(key), bytes(value) };
+            check(ngx_http_cache_rocksdb_write_deferred(
+                      store, &mutation, 1, nullptr, 0, &error) == 0,
+                "leave newer unrelated index work unsynchronized");
+            if (scenario == 2) {
+                check(unlink(target.c_str()) == 0,
+                    "remove the staged instance before resume");
+                Descriptor replacement(open(target.c_str(),
+                    O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600));
+                body(replacement.fd);
+            }
+            check(finish(scenario == 1) == 0 && wait.store == nullptr,
+                "synchronized continuation completes and releases its state");
+            check(result.state == (scenario == 0 ?
+                      NGX_HTTP_CACHE_PURGE_INDEX_COMMITTED :
+                      NGX_HTTP_CACHE_PURGE_INDEX_RETIRED)
+                      && !index.has_fill_intent(file.id),
+                "continuation rechecks current rules and physical identity");
+            check(ngx_http_cache_purge_test_file_sync_count() == 1,
+                "continuation does not repeat file synchronization");
+            check(ngx_http_cache_purge_file_marker_read(
+                      fd.fd, &marker, &error) == 0
+                      && marker.state == (scenario == 0 ?
+                          NGX_HTTP_CACHE_PURGE_FILE_READY :
+                          NGX_HTTP_CACHE_PURGE_FILE_STAGED),
+                "only a still-valid synchronized instance becomes READY");
+            if (scenario == 0) {
+                check(guards == 2
+                          && ngx_http_cache_purge_test_sync_count()
+                                 == syncs + 1,
+                    "newer dirty work does not delay or resync this file");
+            }
+        }
+        check(ngx_http_cache_purge_test_watch_file(
+                  -1, 0, nullptr, nullptr) == 0,
+            "stop publication file observation");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error)
+              == (scenario == 3 ? NGX_HTTP_CACHE_ROCKSDB_IO : 0),
+        "close WAL publication database");
+}
+
 static int
 ngx_http_cache_purge_test_collection_replacement(
     const std::string &mode, const std::string &path)
@@ -1474,6 +1633,11 @@ main(int argc, char **argv)
         for (unsigned scenario = 0; scenario < 6; scenario++) {
             ngx_http_cache_purge_test_publication_sync_case(
                 std::string(sync_root) + '/' + std::to_string(scenario),
+                scenario);
+        }
+        for (unsigned scenario = 0; scenario < 4; scenario++) {
+            ngx_http_cache_purge_test_publication_wal(
+                std::string(sync_root) + "/wal-" + std::to_string(scenario),
                 scenario);
         }
         char root[] = "/tmp/cache-purge-files-XXXXXX";
