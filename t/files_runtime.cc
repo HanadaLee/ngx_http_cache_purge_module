@@ -102,6 +102,7 @@ publication(const std::string &mode, const std::string &path)
     file.url = "https://example.test/file";
     file.host = "example.test";
     file.tag_namespace = "tenant";
+    file.key = identity_key(file.tag_namespace, file.url, file.misc);
     file.root = path + "/cache";
     file.zone = "cache";
     file.path = "file";
@@ -239,6 +240,7 @@ ngx_http_cache_purge_test_pending_inspection()
             file.url = "https://example.test/" + file.key;
             file.host = "example.test";
             file.tag_namespace = "tenant";
+            file.key = identity_key(file.tag_namespace, file.url, file.misc);
             file.root = cache;
             file.zone = "cache";
             file.path = file.key;
@@ -357,6 +359,7 @@ validation(
     file.url = "https://example.test/value";
     file.host = "example.test";
     file.tag_namespace = "tenant";
+    file.key = identity_key(file.tag_namespace, file.url, file.misc);
     file.tags = { "red" };
     file.root = path + "/cache";
     file.zone = "cache";
@@ -889,6 +892,7 @@ background_delete(const std::string &mode, const std::string &path)
             file.url = url;
             file.host = "example.test";
             file.tag_namespace = "tenant";
+            file.key = identity_key(file.tag_namespace, file.url, file.misc);
             file.root = path + '/' + zone;
             file.zone = zone;
             file.path = std::string("a/") + name;
@@ -1019,6 +1023,7 @@ removal(const std::string &mode, const std::string &path)
         file.url = "https://example.test/remove";
         file.host = "example.test";
         file.tag_namespace = "tenant";
+        file.key = identity_key(file.tag_namespace, file.url, file.misc);
         file.tags = { "tag" };
         file.root = path + "/cache";
         file.zone = "cache";
@@ -1181,6 +1186,7 @@ ngx_http_cache_purge_test_publication_sync_case(
         file.url = "https://example.test/sync";
         file.host = "example.test";
         file.tag_namespace = "tenant";
+        file.key = identity_key(file.tag_namespace, file.url, file.misc);
         file.root = path + "/cache";
         file.zone = "cache";
         file.path = "file";
@@ -1536,6 +1542,7 @@ ngx_http_cache_purge_test_publication_wal(const std::string &path,
         file.url = "https://example.test/wal";
         file.host = "example.test";
         file.tag_namespace = "team";
+        file.key = identity_key(file.tag_namespace, file.url, file.misc);
         file.root = path + "/cache";
         file.zone = "cache";
         file.path = "file";
@@ -1703,6 +1710,7 @@ ngx_http_cache_purge_test_collection_replacement(
         file.url = "https://example.test/replacement";
         file.host = "example.test";
         file.tag_namespace = "tenant";
+        file.key = identity_key(file.tag_namespace, file.url, file.misc);
         file.root = path + "/cache";
         file.zone = "cache";
         file.path = "file";

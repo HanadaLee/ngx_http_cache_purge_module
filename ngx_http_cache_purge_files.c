@@ -938,58 +938,6 @@ ngx_http_cache_purge_publication_valid(ngx_http_cache_rocksdb_bytes_t value,
 }
 
 int
-ngx_http_cache_purge_identity_digest(ngx_http_cache_rocksdb_bytes_t url,
-    ngx_http_cache_rocksdb_bytes_t tag_namespace,
-    ngx_http_cache_rocksdb_bytes_t misc,
-    unsigned char digest[NGX_HTTP_CACHE_PURGE_IDENTITY_DIGEST_SIZE],
-    ngx_http_cache_rocksdb_error_t *error)
-{
-    EVP_MD_CTX                     *ctx;
-    ngx_http_cache_rocksdb_bytes_t   fields[3];
-    unsigned char                    length[4];
-    unsigned                         size;
-    size_t                           i;
-    int                              ok;
-
-    if (digest == NULL || !ngx_http_cache_purge_publication_valid(url, 32768)
-        || !ngx_http_cache_purge_publication_valid(tag_namespace, 32768)
-        || !ngx_http_cache_purge_publication_valid(misc, 32768))
-    {
-        return ngx_http_cache_purge_result(error,
-            NGX_HTTP_CACHE_ROCKSDB_INVALID,
-            "invalid configured cache identity");
-    }
-    fields[0] = tag_namespace;
-    fields[1] = url;
-    fields[2] = misc;
-    ctx = EVP_MD_CTX_new();
-    if (ctx == NULL) {
-        return ngx_http_cache_purge_result(error,
-            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "identity digest allocation failed");
-    }
-    ok = EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1
-         && EVP_DigestUpdate(ctx, "NCI1", 4) == 1;
-    for (i = 0; ok && i < 3; i++) {
-        ngx_http_cache_purge_publication_encode(length, fields[i].len, 4);
-        ok = EVP_DigestUpdate(ctx, length, sizeof(length)) == 1;
-        if (ok && fields[i].len) {
-            ok = EVP_DigestUpdate(ctx, fields[i].data, fields[i].len) == 1;
-        }
-    }
-    if (ok) {
-        ok = EVP_DigestFinal_ex(ctx, digest, &size) == 1
-             && size == NGX_HTTP_CACHE_PURGE_IDENTITY_DIGEST_SIZE;
-    }
-    EVP_MD_CTX_free(ctx);
-    if (!ok) {
-        memset(digest, 0, NGX_HTTP_CACHE_PURGE_IDENTITY_DIGEST_SIZE);
-        return ngx_http_cache_purge_result(error, NGX_HTTP_CACHE_ROCKSDB_IO,
-            "configured cache identity digest failed");
-    }
-    return ngx_http_cache_purge_result(error, 0, "");
-}
-
-int
 ngx_http_cache_purge_tag_digest(ngx_http_cache_rocksdb_bytes_t tag,
     unsigned char digest[NGX_HTTP_CACHE_PURGE_TAG_DIGEST_SIZE],
     ngx_http_cache_rocksdb_error_t *error)

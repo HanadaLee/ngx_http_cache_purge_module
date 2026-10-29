@@ -437,7 +437,8 @@ ngx_http_cache_purge_test_publication(void)
     memset(&fill, 0, sizeof(fill));
     fill.file.id[15] = 1;
     fill.file.state = NGX_HTTP_CACHE_PURGE_INDEX_PREPARED;
-    fill.file.key = ngx_http_cache_purge_test_bytes("key");
+    fill.file.key = ngx_http_cache_purge_test_bytes(
+        "4c60bd333203469ddec57c847143677c730dc9231a334e4a6132cb74f07d93a3");
     fill.file.url =
         ngx_http_cache_purge_test_bytes("https://example.test/file");
     fill.file.host = ngx_http_cache_purge_test_bytes("example.test");
@@ -623,7 +624,7 @@ ngx_http_cache_purge_test_main(int argc, char **argv)
     size_t  expired;
     int     rc;
 
-    unsigned char raw[1024], schema[] = "12";
+    unsigned char raw[1024], schema[] = "13";
     char          path[] = "/tmp/ngx-cache-ledger-c-XXXXXX";
     const char    binding[] = { 'a', '\0', 'b' };
 

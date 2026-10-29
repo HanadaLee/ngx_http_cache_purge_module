@@ -489,7 +489,7 @@ def background_delete(cut):
                 if isinstance(value, str): value = value.encode()
                 return struct.pack('>I', len(value)) + value
 
-            fields = ['pending-key', 'https://other.test/pending', 'other.test', 'tenant',
+            fields = [hashlib.sha256(b'NCI1' + string('tenant') + string('https://other.test/pending') + string('')).hexdigest(), 'https://other.test/pending', 'other.test', 'tenant',
                       str(root / 'cache'), 'cache', 'a/pending', '', '']
             record = ((99).to_bytes(16, 'big') + b''.join(map(string, fields))
                       + string('unknown-origin') + string('')

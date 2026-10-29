@@ -113,6 +113,7 @@ ngx_http_cache_purge_test_object_propagation()
         red.url = "https://cache.test/item";
         red.host = "cache.test";
         red.tag_namespace = "tenant";
+        red.key = identity_key(red.tag_namespace, red.url, red.misc);
         red.root = "/cache";
         red.zone = "a";
         red.path = "red";
@@ -387,6 +388,7 @@ ngx_http_cache_purge_test_propagation_policy()
         red.url = "https://cache.test/item";
         red.host = "cache.test";
         red.tag_namespace = "tenant";
+        red.key = identity_key(red.tag_namespace, red.url, red.misc);
         red.root = "/cache";
         red.zone = "a";
         red.path = "red";
@@ -592,7 +594,7 @@ ngx_http_cache_purge_test_retention()
         file.url = "https://cache.test/object";
         file.host = "cache.test";
         file.tag_namespace = "tenant";
-        file.structured_key = true;
+        file.key = identity_key(file.tag_namespace, file.url, file.misc);
         file.structured_url = true;
         file.components = { "tenant", "https", "cache.test", "/object", "",
             "" };
@@ -814,6 +816,7 @@ ngx_http_cache_purge_test_keep_pages()
         file.url = "https://keep.test/item";
         file.host = "keep.test";
         file.tag_namespace = "tenant";
+        file.key = identity_key(file.tag_namespace, file.url, file.misc);
         file.tags = { "red" };
         file.root = "/cache";
         file.zone = "a";
@@ -923,6 +926,7 @@ ngx_http_cache_purge_test_expiry_pages()
         file.url = "https://expiry.test/item";
         file.host = "expiry.test";
         file.tag_namespace = "tenant";
+        file.key = identity_key(file.tag_namespace, file.url, file.misc);
         file.root = "/cache";
         file.zone = "a";
         unsigned char main[16] = {}, variant[16] = {};

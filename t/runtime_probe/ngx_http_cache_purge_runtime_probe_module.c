@@ -333,7 +333,9 @@ ngx_http_cache_purge_probe_rpc_prepare_body(
     ngx_msec_t timeout)
 {
     ngx_str_t root, zone = ngx_string("a"), value, target, address;
-    ngx_str_t fields[] = { ngx_string("publication-probe"),
+    ngx_str_t fields[] =
+        { ngx_string("521feb8189785034bc9272829afd66a1"
+                     "fa198ec25073cb1cebe623f2a0df633e"),
                            ngx_string("https://probe.test/publication"),
                            ngx_string("probe.test"),
                            ngx_string("team"),

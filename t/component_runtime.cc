@@ -30,7 +30,8 @@ ngx_http_cache_purge_test_seed(const char *path)
     ngx_http_cache_purge_index_file_t file{};
     file.id[15] = 1;
     file.state = NGX_HTTP_CACHE_PURGE_INDEX_PREPARED;
-    file.key = bytes("object-key");
+    file.key = bytes("f395371434f03a40a806d1362909b7a151"
+                     "63b120a97f6277c7a65f9e436ea73b");
     file.url = bytes("https://object.test/item");
     file.host = bytes("object.test");
     file.tag_namespace = bytes("team");

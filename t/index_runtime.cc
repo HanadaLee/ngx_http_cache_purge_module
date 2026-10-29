@@ -26,16 +26,19 @@ check(bool value, const char *message)
 }
 template <class Function>
 static void
-fails(int code, Function function)
+fails_at(int line, int code, Function function)
 {
     try {
         function();
     } catch (const IndexError &error) {
-        check(error.code == code, error.what());
+        check(error.code == code,
+            ("line " + std::to_string(line) + ": " + error.what()).c_str());
         return;
     }
-    throw std::runtime_error("expected an index failure");
+    throw std::runtime_error("expected an index failure at line "
+        + std::to_string(line));
 }
+#define fails(code, ...)  fails_at(__LINE__, code, __VA_ARGS__)
 static FileId
 id(unsigned n)
 {
@@ -52,22 +55,8 @@ numeric(const FileId &value)
 static std::string
 key(const std::array<std::string, 6> &parts)
 {
-    std::string result;
-    for (unsigned i = 0; i != 5; ++i) {
-        if (i) {
-            result += '\x1f';
-        }
-        for (unsigned char c : parts[i]) {
-            if (c == '\\') {
-                result += "\\\\";
-            } else if (c == 31) {
-                result += "\\x1F";
-            } else {
-                result += static_cast<char>(c);
-            }
-        }
-    }
-    return result;
+    return identity_key(parts[0], parts[1] + "://" + parts[2] + parts[3],
+        parts[4]);
 }
 static File
 file(unsigned n, std::string uri = "/dir/a", std::string misc = "",
@@ -89,7 +78,7 @@ file(unsigned n, std::string uri = "/dir/a", std::string misc = "",
     result.vary = "Accept-Language";
     result.tags = { "photo", "common", "photo" };
     result.metadata = "proof:v1";
-    result.structured_key = result.structured_url = true;
+    result.structured_url = true;
     return result;
 }
 static Match
@@ -1183,6 +1172,7 @@ ngx_http_cache_purge_test_tag_groups()
         b.tags = d.tags = { "beta" };
         c.tags = { "gamma" };
         d.tag_namespace = "other";
+        d.key = identity_key(d.tag_namespace, d.url, d.misc);
         e.tags = { "alpha" };
         f.tags = { std::string("\0a", 2) };
         b.root = "/cache/b";
@@ -1859,7 +1849,7 @@ ngx_http_cache_purge_test_retention(const std::string &path)
                 + std::string(
                     reinterpret_cast<const char *>(first.id.data()), 16));
         Index upgraded(store);
-        check(ngx_http_cache_purge_test_raw(store, "M:index") == "12"
+        check(ngx_http_cache_purge_test_raw(store, "M:index") == "13"
                   && ngx_http_cache_purge_test_raw(store,
                          "O"
                              + std::string(reinterpret_cast<const char *>(
@@ -2183,8 +2173,8 @@ ngx_http_cache_purge_test_fixed_identity(const std::string &path)
     isolated.key = key(isolated.components);
     {
         Index index(store);
-        check(ngx_http_cache_purge_index_schema_12() == 12
-                  && ngx_http_cache_purge_test_raw(store, "M:index") == "12",
+        check(ngx_http_cache_purge_index_schema_13() == 13
+                  && ngx_http_cache_purge_test_raw(store, "M:index") == "13",
             "immutable identity schema is explicit");
         install(index, source);
         install(index, other);
@@ -2212,12 +2202,46 @@ ngx_http_cache_purge_test_fixed_identity(const std::string &path)
                   == std::set<unsigned>({ 7001, 7002, 7003, 7004 }),
             "one URL retains independent misc and namespace keys");
         const auto cf = NGX_HTTP_CACHE_ROCKSDB_DEFAULT;
-        auto counter =
-            "k" + ngx_http_cache_purge_test_raw(store, "K" + source.key);
+        auto counter = "k" + ngx_http_cache_purge_test_raw(
+                                 store, identity_projection(source.key));
         auto identity = ngx_http_cache_purge_test_raw(store, counter);
-        check(identity.size() == 40
+        check(identity.size() == 72
                   && ngx_http_cache_purge_test_number(identity, 0) == 2,
-            "file count and URL/host/namespace/misc refs share one row");
+            "one row stores counts, component IDs and a binary digest");
+        auto dictionaries = raw_keys(store, cf);
+        check(std::find(dictionaries.begin(), dictionaries.end(),
+                  "V" + counter.substr(1)) == dictionaries.end(),
+            "internal identity has no general text dictionary row");
+        check(ngx_http_cache_purge_test_raw(store,
+                  identity_projection(source.key)) == counter.substr(1),
+            "exact identity is a direct 33-byte binary lookup");
+        auto variants = raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_URL);
+        const auto url_id = identity.substr(8, 8);
+        const auto scope_id = identity.substr(24, 8);
+        const auto misc_id = identity.substr(32, 8);
+        const auto secondary = "A" + url_id + scope_id + misc_id;
+        check(secondary.size() == 25
+                  && std::count(variants.begin(), variants.end(), secondary)
+                         == 1,
+            "all slices and zones share one URL/namespace/misc posting");
+        for (const auto &entry : variants) {
+            if (entry[0] == 'A') {
+                check(entry.size() == 25,
+                    "secondary postings contain only fixed component IDs");
+            }
+        }
+        for (size_t length : { 1U, 3U, 8U, 63U, 64U }) {
+            const auto prefix = source.key.substr(0, length);
+            std::set<unsigned> expected;
+            for (const auto &item : { source, other, variant, isolated }) {
+                if (item.key.compare(0, prefix.size(), prefix) == 0) {
+                    expected.insert(numeric(item.id));
+                }
+            }
+            check(selected(index, { SelectorKind::key_prefix, prefix, "" })
+                      == expected,
+                "legacy digest-prefix reads preserve odd/even hex boundaries");
+        }
         ngx_http_cache_rocksdb_stats_t before{}, after{};
         check(ngx_http_cache_rocksdb_stats(store, &before, &error) == 0,
             error.message);
@@ -2260,11 +2284,11 @@ ngx_http_cache_purge_test_fixed_identity(const std::string &path)
         check(selected(index, { SelectorKind::url, source.url, "" })
                   == std::set<unsigned>({ 7003, 7004 }),
             "collecting one identity preserves other keys of the same URL");
-        raw_write(store, cf, "M:index", "11");
-        fails(NGX_HTTP_CACHE_ROCKSDB_SCHEMA, [&] { Index old(store); });
-        check(ngx_http_cache_purge_test_raw(store, "M:index") == "11",
-            "schema without explicit misc is rejected without rewriting data");
         raw_write(store, cf, "M:index", "12");
+        fails(NGX_HTTP_CACHE_ROCKSDB_SCHEMA, [&] { Index old(store); });
+        check(ngx_http_cache_purge_test_raw(store, "M:index") == "12",
+            "previous layout is rejected without rewriting data or tasks");
+        raw_write(store, cf, "M:index", "13");
     }
     check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
     check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
@@ -2475,8 +2499,8 @@ main(int argc, char **argv)
             for (bool url : { false, true }) {
                 auto cf = url ? NGX_HTTP_CACHE_ROCKSDB_URL :
                                 NGX_HTTP_CACHE_ROCKSDB_DEFAULT;
-                auto projection = std::string(1, url ? 'U' : 'K')
-                                  + (url ? corrupt.url : corrupt.key);
+                auto projection = url ? "U" + corrupt.url :
+                                        identity_projection(corrupt.key);
                 const std::string foreign_id(8, '\x7f');
                 raw_write(store, cf, projection, foreign_id);
                 ngx_http_cache_rocksdb_stats_t before, after;
@@ -2527,7 +2551,7 @@ main(int argc, char **argv)
             fails(NGX_HTTP_CACHE_ROCKSDB_INVALID, [&] { index.prepare(bad); });
             bad = file(7);
             bad.url += "wrong";
-            fails(NGX_HTTP_CACHE_ROCKSDB_INVALID, [&] { index.prepare(bad); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_CONFLICT, [&] { index.prepare(bad); });
             fails(NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
                 [&] { index.collect_file(a.id, 2); });
 
@@ -2621,7 +2645,7 @@ main(int argc, char **argv)
                 file(30, "/long/" + std::string(6000, 'x'), "a\\b\x1f");
             install(index, long_file);
             check(index.get(long_file.id).key == long_file.key,
-                "component key reconstructs escapes");
+                "long URL and binary misc round trip through compact identity");
             check(selected(index, { SelectorKind::url_prefix,
                                       "https://shared.cache.test/long/"
                                           + std::string(5000, 'x'),
@@ -2656,11 +2680,10 @@ main(int argc, char **argv)
             old_key.structured_url = false;
             install(index, old_key);
             auto key_alias = file(43, old_key.key);
-            key_alias.key = "/key-leaf";
             key_alias.structured_key = false;
             install(index, key_alias);
-            check(index.get(key_alias.id).key == "/key-leaf",
-                "key role retained before URL flattens its former parent");
+            check(index.get(key_alias.id).key == key_alias.key,
+                "identity digest used inside another URL remains independent");
 
             std::vector<Fill> fills;
             for (unsigned n = 100; n != 132; ++n) {
@@ -2670,19 +2693,19 @@ main(int argc, char **argv)
             ngx_http_cache_rocksdb_stats_t before, after;
             check(ngx_http_cache_rocksdb_stats(store, &before, &error) == 0,
                 "batch initial stats");
+            auto oversized = fills;
+            for (auto &entry : oversized) {
+                entry.file.metadata.assign(16384, 'p');
+            }
             fails(NGX_HTTP_CACHE_ROCKSDB_LIMIT,
-                [&] { index.prepare_batch(fills); });
+                [&] { index.prepare_batch(oversized); });
             check(ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
                       && after.writes == before.writes,
                 "oversized relationship batch is entirely rolled back");
-            auto batched = index.prepare_batch(
-                std::vector<Fill>(fills.begin(), fills.begin() + 16));
-            auto tail = index.prepare_batch(
-                std::vector<Fill>(fills.begin() + 16, fills.end()));
-            batched.insert(batched.end(), tail.begin(), tail.end());
+            auto batched = index.prepare_batch(fills);
             check(ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
-                      && after.writes == before.writes + 2,
-                "smaller batches preserve the configured entry budget");
+                      && after.writes == before.writes + 1,
+                "compact identities fit the 32-file batch into one write");
             std::vector<ExpectedFile> revisions;
             for (const auto &entry : batched) {
                 revisions.push_back({ entry.id, entry.revision });

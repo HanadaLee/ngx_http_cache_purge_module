@@ -325,13 +325,17 @@ The existing worker executor resumes the bounded scan from durable checkpoints.
 Admission checks that requirement even when no resident rule remains; successful
 conditional validation satisfies it without replacing the entity. Requirements
 are monotonic within one ledger and are collected with their retired file.
-Index schema 12 stores one immutable URL/host/namespace/misc identity per key.
-The misc value has its own dictionary reference and is returned independently
-of transient key compression hints. File proofs bind this persisted value;
-empty and binary misc values remain distinct. Prototype schemas 1-11 are
+Index schema 13 stores one immutable URL/host/namespace/misc identity per key.
+The URL secondary key contains only fixed URL, namespace and misc IDs; its value
+is the internal key ID. One entry covers every slice, Vary file and cache zone.
+Exact identity lookup uses a 32-byte binary digest, with no whole-key text
+dictionary or duplicate text projection. The misc bytes have one shared
+dictionary reference per identity and are returned independently. File proofs
+bind these persisted values; empty and binary misc values remain distinct.
+Prototype schemas 1-12 are
 rejected without modifying their data; this release
 does not provide an automatic migration. Existing tasks and index data must be
-preserved when planning a transition. Reopening schema 12 reuses its WAL-backed
+preserved when planning a transition. Reopening schema 13 reuses its WAL-backed
 index without scanning cache directories. Native representation repair retains
 its bounded durable cursor; unresolved identities cannot imply an empty TAG set.
 Older module archives are rejected by a schema-specific configure link check.
@@ -372,7 +376,7 @@ Host+TAG enumeration chooses between host-to-key traversal and TAG postings,
 using dictionary reference counts as a bounded heuristic; bookmarks preserve the
 chosen plan. Associations are reclaimed when the key loses its last file.
 
-Schema 12 requires the fixed identity described above; older prototype indexes
+Schema 13 requires the compact identity described above; older prototype indexes
 are rejected without changing their data. nginx-ext ABI remains 1.
 
 Memory-only errors do not receive separate index records. Initial internal
@@ -466,8 +470,9 @@ Identity is captured once per cache operation. Physical main/Vary digests still
 come from nginx; range is not an identity input and is not parsed from the key.
 All physical slices and zones remain associated with their configured identity.
 
-The current index uses a bounded internal digest for the namespace/URL/misc
-identity. Its final URL-scoped misc secondary layout is still in progress.
+The index uses a bounded internal digest for the namespace/URL/misc identity.
+Its URL secondary layout stores component IDs and the internal key ID, without
+repeating URL or native key bytes. The digest is internal lookup material.
 The protocol switches control index capture, invalidation checks and PURGE
 handling. Key submissions use configured identity values, without an encoded
 key input. Existing JSON submission/status endpoints remain available.
@@ -840,16 +845,23 @@ by the publisher; neither request lookup computes SHA-256. Both retain the same
 namespace/host scope, group deduplication, output budgets and original operation
 callbacks. Added entries and digest bytes count against the existing shared-bank
 limit. Digests are internal matching material, not authentication or L2 headers.
-NCF2 files carry these TAG digests. Current HTTP HITs still use the
-database-backed raw TAG path until worker-side proof admission is integrated.
+NCF2 files carry these TAG digests. Ordinary HTTP HITs match them against shared
+rules after the independent proof read; retained TAG lookup on MISS still uses
+the database executor.
 An empty namespace is a valid exact scope, distinct from every named namespace;
 it never falls back to the request host or means all namespaces.
 
-The per-key identity row contains five unsigned 64-bit values: file count,
-URL, host, namespace and misc dictionary IDs. A fill cannot
+The per-key identity row contains five unsigned 64-bit values (file count,
+URL, host, namespace and misc dictionary IDs) and the 32-byte internal digest.
+Its 72-byte value needs no separate text dictionary record for that digest.
+A fill cannot
 change the identity of an existing key; a conflicting batch rolls back entirely.
 One URL may still select multiple misc/namespace keys, with multiple zones,
-slices and Vary files under each key. URL-to-key and host-to-key postings remain;
+slices and Vary files under each key. The URL posting is
+`A | url_id | namespace_id | misc_id -> key_id`, with 25-byte keys and 8-byte
+values; IDs are fixed-width big-endian integers. Misc bytes remain in the shared
+dictionary, and enumeration order is by ID rather than by misc text.
+Host-to-key postings remain;
 the redundant reverse alias rows and alias revision counters have been removed.
 Internal opcode 12 is retired and rejected without renumbering later operations.
 

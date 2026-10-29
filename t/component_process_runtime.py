@@ -124,9 +124,14 @@ def identity(value):
     return value.to_bytes(16, 'big')
 
 
+def cache_key(uri, misc=''):
+    return hashlib.sha256(b'NCI1' + string('team') + string('https://a.test' + uri)
+                          + string(misc)).hexdigest()
+
+
 def record(n, root='/cache/a', uri='/dir/a', misc='', metadata='proof-v1', zone=None, path=None,
            tags=('photo', 'common')):
-    fields = ['team\x1fhttps\x1fa.test\x1f' + uri + '\x1f' + misc,
+    fields = [cache_key(uri, misc),
               'https://a.test' + uri, 'business.test', 'team', root,
               zone or ('zone-a' if root == '/cache/a' else 'zone-b'), path or f'a/00/{n}', 'bytes=0-99', 'lang']
     return (identity(n) + b''.join(map(string, fields)) + string(metadata) + string(misc)
@@ -714,7 +719,7 @@ try:
     check(found == [1, 2, 3], 'bounded pages with client-owned bookmark')
     c.call(13, identity(1) + struct.pack('>Q', 2) + string('validated') + b'\x01' + string('new'))
     check(c.page(5, 'new', 'team')[0] == [1], 'metadata TAG replacement over IPC')
-    c.call(12, string('team\x1fhttps\x1fa.test\x1f/dir/a\x1f') + string('https://alias.test/a'), code=4)
+    c.call(12, string(cache_key('/dir/a')) + string('https://alias.test/a'), code=4)
     check(c.page(1, 'https://alias.test/a')[0] == [], 'a second URL is rejected over IPC')
     c.close()
 
@@ -949,7 +954,7 @@ try:
 
     target, lease, selected = make_validation_file(605, '/read-alias', metadata=validation_origin)
     address = (str(validation_cache), 'zone-a', 'a/00/605')
-    key = 'team\x1fhttps\x1fa.test\x1f/read-alias\x1f'
+    key = cache_key('/read-alias')
     original = v.call(2, identity(605))
     writes = struct.unpack('>9Q', v.call(1))[1]
     v.admit_file(address, key, 'https://a.test/forbidden-alias', selected, code=4, host=None)
@@ -984,7 +989,7 @@ try:
     full_origin = validating.watermark()
     target, lease, selected = make_validation_file(607, '/conditional', metadata=full_origin)
     address = (str(validation_cache), 'zone-a', 'a/00/607')
-    key = 'team\x1fhttps\x1fa.test\x1f/conditional\x1f'
+    key = cache_key('/conditional')
     validation_operation('conditional-first', 5, 'tag-607', 'team', mode=1)
     wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
     origin = validating.watermark()
@@ -1055,7 +1060,7 @@ try:
     assert v.validate_file(packet, lease, selected)[:9] == b'\x02' + struct.pack('>Q', 6)
     check(True, 'an unrelated accepted rule permits validation through the bounded URL visitor')
 
-    key = 'team\x1fhttps\x1fa.test\x1f/validate\x1f'
+    key = cache_key('/validate')
     v.call(12, string(key) + string('https://a.test/alias'), code=4)
     assert validating.match()[0] == 0
     validating.guard()
@@ -1076,8 +1081,8 @@ try:
     os.close(lease); os.close(selected)
 
     # Each operation uses a distinct file/tag until the final broad host rule.
-    cases = [(610, 0, 'team\x1fhttps\x1fa.test\x1f/scope-610\x1f', ''),
-             (611, 2, 'team\x1fhttps\x1fa.test\x1f/scope-611', ''),
+    cases = [(610, 0, cache_key('/scope-610'), ''),
+             (611, 2, cache_key('/scope-611')[:16], ''),
              (612, 3, 'https://a.test/scope-612', ''),
              (613, 5, 'tag-613', 'team'), (614, 6, 'tag-614', 'business.test')]
     for n, kind, value, scope in cases:
@@ -1098,7 +1103,7 @@ try:
     check(True, 'validation checks exact/prefix keys, URL prefixes and scoped old TAGs before catalogue mutation')
 
     target, lease, selected = make_validation_file(620, '/alias-limit')
-    key = 'team\x1fhttps\x1fa.test\x1f/alias-limit\x1f'
+    key = cache_key('/alias-limit')
     packet = validation_packet(620)
     reply = v.validate_file(packet, lease, selected)
     assert reply[:9] == b'\x02' + struct.pack('>Q', 4)
@@ -1110,7 +1115,7 @@ try:
     check(True, 'fixed URL identity validates in one call and permits stamped read admission')
 
     held_guards = [make_validation_file(n, '/guard-results') for n in range(622, 627)]
-    guard_key = 'team\x1fhttps\x1fa.test\x1f/guard-results\x1f'
+    guard_key = cache_key('/guard-results')
     def guard_read(number):
         return v.admit_file((str(validation_cache), 'zone-a', f'a/00/{622 + number}'),
                             guard_key, 'https://a.test/guard-results', held_guards[number][2])
@@ -1163,7 +1168,7 @@ try:
     assert os.getxattr(target, 'user.ngx_cache_purge.id')[7] == 3
     v.inspect_file((str(validation_cache), 'zone-a', 'a/00/630'), fd, code=7)
     v.admit_file((str(validation_cache), 'zone-a', 'a/00/630'),
-                 'team\x1fhttps\x1fa.test\x1f/late-tag\x1f', 'https://a.test/late-tag', fd, code=7)
+                 cache_key('/late-tag'), 'https://a.test/late-tag', fd, code=7)
     os.close(fd)
     check(True, 'FINISH rejects a late prepared replacement whose old TAG was invalidated before its catalogue commit')
     check(True, 'an aborted native replacement is rejected immediately by inspection and admission despite its remaining PREPARED marker')
@@ -1304,7 +1309,7 @@ try:
         + string('https://a.test/new-delete-alias') + string('') + string('validation-test')) + 40] == 4)
     wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
     address = (str(validation_cache), 'zone-a', 'a/00/655')
-    key = 'team\x1fhttps\x1fa.test\x1f/late-delete-alias\x1f'
+    key = cache_key('/late-delete-alias')
     v.admit_file(address, key, 'https://a.test/new-delete-alias', selected, code=7)
     assert target.exists() and v.call(2, identity(655))[0] == 2
     assert v.page(1, 'https://a.test/new-delete-alias')[0] == []
@@ -1452,7 +1457,7 @@ try:
     data += b'\x05' + string('red') + string('team') + string('object-ipc')
     probe.call(14, data)
     wait_for(lambda: struct.unpack('>IQ', probe.call(16))[0] == 6)
-    payload = b''.join(map(string, ('object-key', 'https://object.test/item', 'object.test', 'team')))
+    payload = b''.join(map(string, ('f395371434f03a40a806d1362909b7a15163b120a97f6277c7a65f9e436ea73b', 'https://object.test/item', 'object.test', 'team')))
     payload += b'\x01' + b'\0' * 15 + struct.pack('>I', 1)
     payload += string('X-Query-Test') + string('retained until completion')
     probe.call(31, b'', code=4)

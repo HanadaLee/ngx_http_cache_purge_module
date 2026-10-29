@@ -22,6 +22,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <openssl/sha.h>
 
 namespace ngx_http_cache_purge {
 
@@ -55,6 +56,42 @@ struct File {
     bool structured_url = false;
     std::array<std::string, 6> components;
 };
+
+inline std::string
+identity_key(const std::string &scope, const std::string &url,
+    const std::string &misc)
+{
+    std::string framed = "NCI1";
+    for (const auto &field : { scope, url, misc }) {
+        for (int shift : { 24, 16, 8, 0 }) {
+            framed += static_cast<char>(field.size() >> shift);
+        }
+        framed += field;
+    }
+    unsigned char digest[32];
+    SHA256(reinterpret_cast<const unsigned char *>(framed.data()),
+        framed.size(), digest);
+    static const char hex[] = "0123456789abcdef";
+    std::string result;
+    for (unsigned char byte : digest) {
+        result += hex[byte >> 4];
+        result += hex[byte & 15];
+    }
+    return result;
+}
+
+inline std::string
+identity_projection(const std::string &key)
+{
+    if (key.size() != 64) {
+        throw std::runtime_error("invalid test identity length");
+    }
+    std::string result = "K";
+    for (size_t i = 0; i < key.size(); i += 2) {
+        result += static_cast<char>(std::stoul(key.substr(i, 2), nullptr, 16));
+    }
+    return result;
+}
 
 struct Match {
     FileId id{};

@@ -170,6 +170,7 @@ ngx_http_cache_purge_test_checkpoint_loss(
     file.url = "https://example.test/progress";
     file.host = "example.test";
     file.tag_namespace = "team";
+    file.key = identity_key(file.tag_namespace, file.url, file.misc);
     file.root = "/cache/a";
     file.zone = "a";
     file.path = "0/00/progress";
