@@ -327,6 +327,8 @@ typedef struct {
     ngx_http_complex_value_t  empty;
     ngx_str_t                 read_pool_name;
     ngx_thread_pool_t        *read_pool;
+    ngx_str_t                 publish_pool_name;
+    ngx_thread_pool_t        *publish_pool;
 } ngx_http_cache_purge_capture_main_t;
 
 typedef struct {
@@ -389,24 +391,40 @@ typedef struct {
 } ngx_http_cache_purge_origin_t;
 
 typedef struct {
-    ngx_queue_t                      queue;
-    ngx_pool_t                      *pool;
-    ngx_http_cache_purge_client_t   *client;
-    ngx_http_cache_purge_call_t     *call;
-    ngx_http_cache_purge_origin_t    registration;
-    ngx_http_cache_t                 cache;
-    ngx_temp_file_t                  temporary;
-    ngx_event_t                      timer, retry;
-    ngx_str_t                        fields[9], misc, tags[64], payload;
-    ngx_str_t                        metadata;
-    size_t                           reserved;
-    ngx_uint_t                       tag_count, rpc;
-    ngx_msec_t                       deadline;
-    u_char                           id[16], previous[16];
-    int                              lease;
-    unsigned                         owned : 1;
-    unsigned                         need_finish : 1;
-    unsigned                         native_update : 1;
+    ngx_str_t        source, target;
+    ngx_atomic_t     cancelled;
+    ngx_file_uniq_t  uniq;
+    off_t            fs_size;
+    ngx_int_t        result;
+    int              fd;
+    unsigned         cleanup:1;
+} ngx_http_cache_purge_publication_io_t;
+
+typedef struct {
+    ngx_queue_t                           queue;
+    ngx_pool_t                           *pool;
+    ngx_http_cache_purge_client_t        *client;
+    ngx_http_cache_purge_call_t          *call;
+    ngx_http_cache_purge_origin_t         registration;
+    ngx_http_cache_t                      cache;
+    ngx_temp_file_t                       temporary;
+    ngx_thread_pool_t                    *thread_pool;
+    ngx_thread_task_t                     io_task;
+    ngx_http_cache_purge_publication_io_t io;
+    ngx_event_t                           timer, retry;
+    ngx_str_t                             fields[9], misc, tags[64], payload;
+    ngx_str_t                             metadata;
+    size_t                                reserved;
+    ngx_uint_t                            tag_count, rpc;
+    ngx_msec_t                            deadline;
+    u_char                                id[16], previous[16];
+    int                                   lease;
+    unsigned                              owned : 1;
+    unsigned                              need_finish : 1;
+    unsigned                              native_update : 1;
+    unsigned                              io_active : 1;
+    unsigned                              cancelled : 1;
+    unsigned                              cleaned : 1;
 } ngx_http_cache_purge_publication_t;
 
 typedef struct {
@@ -516,6 +534,7 @@ static ngx_uint_t ngx_http_cache_purge_origins_initialized;
 static u_char ngx_http_cache_purge_origin_ledger[16];
 static ngx_queue_t ngx_http_cache_purge_publications;
 static ngx_uint_t ngx_http_cache_purge_publications_initialized;
+static ngx_uint_t ngx_http_cache_purge_publications_stopping;
 static ngx_int_t ngx_http_cache_purge_capture_origin(
     ngx_http_cache_purge_capture_t *ctx);
 static void ngx_http_cache_purge_origin_release(
@@ -547,6 +566,11 @@ static ngx_int_t  ngx_http_cache_purge_capture_step(ngx_http_request_t *,
 static void
 ngx_http_cache_purge_publication_reply(ngx_http_cache_purge_call_t *, void *,
     const ngx_http_cache_purge_reply_t *);
+static void ngx_http_cache_purge_publication_free(
+    ngx_http_cache_purge_publication_t *job);
+static void ngx_http_cache_purge_publication_finish(
+    ngx_http_cache_purge_publication_t *job, ngx_int_t result);
+static void ngx_http_cache_purge_publication_io_done(ngx_event_t *event);
 
 static void *ngx_http_cache_purge_capture_create_main(ngx_conf_t *cf);
 static void *ngx_http_cache_purge_capture_create_conf(ngx_conf_t *cf);
@@ -606,6 +630,10 @@ static ngx_command_t  ngx_http_cache_purge_capture_commands[] = {
     { ngx_string("cache_purge_read_pool"), NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_str_slot, NGX_HTTP_MAIN_CONF_OFFSET,
       offsetof(ngx_http_cache_purge_capture_main_t, read_pool_name), NULL },
+
+    { ngx_string("cache_purge_publish_pool"), NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot, NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_http_cache_purge_capture_main_t, publish_pool_name), NULL },
 
     ngx_http_cache_purge_identity_command("cache_purge_key_url", 0),
     ngx_http_cache_purge_identity_command("cache_purge_key_misc", 1),
@@ -4611,17 +4639,107 @@ ngx_http_cache_purge_capture_allocate(ngx_http_cache_purge_capture_t *ctx,
     payload->data = ngx_pnalloc(ctx->publication_pool, bytes);
     return payload->data ? NGX_OK : NGX_ERROR;
 }
+/* Thread context contains only owned paths, a descriptor and result fields. */
+static void
+ngx_http_cache_purge_publication_io(void *data, ngx_log_t *log)
+{
+    ngx_http_cache_purge_publication_io_t  *io = data;
+    ngx_ext_rename_file_t                   ext;
+    ngx_file_info_t                         info;
+    ngx_err_t                               err;
+
+    io->result = NGX_ABORT;
+    if (io->cleanup) {
+        if (ngx_delete_file(io->source.data) == NGX_FILE_ERROR) {
+            err = ngx_errno;
+            if (err != NGX_ENOENT) {
+                ngx_log_error(NGX_LOG_CRIT, log, err,
+                              ngx_delete_file_n " \"%V\" failed", &io->source);
+            }
+        }
+        if (io->fd != NGX_INVALID_FILE) {
+            ngx_close_file(io->fd);
+            io->fd = NGX_INVALID_FILE;
+        }
+        return;
+    }
+    if (ngx_atomic_fetch_add(&io->cancelled, 0)) {
+        return;
+    }
+    ngx_memzero(&ext, sizeof(ext));
+    ext.access = NGX_FILE_OWNER_ACCESS;
+    ext.path_access = NGX_FILE_OWNER_ACCESS;
+    ext.time = -1;
+    ext.create_path = 1;
+    ext.delete_file = 1;
+    ext.log = log;
+    io->uniq = 0;
+    io->fs_size = 0;
+    io->result = ngx_ext_rename_file(&io->source, &io->target, &ext);
+    if (io->result == NGX_OK) {
+        if (ngx_fd_info(io->fd, &info) == NGX_FILE_ERROR) {
+            ngx_log_error(NGX_LOG_CRIT, log, ngx_errno,
+                          ngx_fd_info_n " \"%V\" failed", &io->source);
+            io->result = NGX_ERROR;
+        } else {
+            io->uniq = ngx_file_uniq(&info);
+            io->fs_size = ngx_file_fs_size(&info);
+        }
+    }
+}
+
+static ngx_int_t
+ngx_http_cache_purge_publication_io_post(
+    ngx_http_cache_purge_publication_t *job, ngx_uint_t cleanup)
+{
+    job->io.source = job->temporary.file.name;
+    job->io.target = job->cache.file.name;
+    job->io.fd = job->temporary.file.fd;
+    job->io.cleanup = cleanup;
+    job->io_task.ctx = &job->io;
+    job->io_task.handler = ngx_http_cache_purge_publication_io;
+    job->io_task.event.data = job;
+    job->io_task.event.handler = ngx_http_cache_purge_publication_io_done;
+    job->io_task.event.log = ngx_cycle->log;
+    if (ngx_thread_task_post(job->thread_pool, &job->io_task) != NGX_OK) {
+        return NGX_ERROR;
+    }
+    job->io_active = 1;
+    return NGX_OK;
+}
+
+static void
+ngx_http_cache_purge_publication_cleanup_retry(ngx_event_t *event)
+{
+    ngx_http_cache_purge_publication_free(event->data);
+}
+
+static void
+ngx_http_cache_purge_publication_release_node(
+    ngx_http_cache_purge_publication_t *job)
+{
+    ngx_http_file_cache_t  *cache;
+
+    if (job->cache.node == NULL) {
+        return;
+    }
+    if (job->native_update) {
+        cache = job->cache.file_cache;
+        ngx_shmtx_lock(&cache->shpool->mutex);
+        job->cache.node->count--;
+        ngx_shmtx_unlock(&cache->shpool->mutex);
+    } else {
+        ngx_http_file_cache_free(&job->cache, NULL);
+    }
+    job->cache.node = NULL;
+}
+
 static void
 ngx_http_cache_purge_publication_free(ngx_http_cache_purge_publication_t *job)
 {
-    ngx_http_file_cache_t  *cache;
-    ngx_err_t               err;
-
     if (job->call) {
         ngx_http_cache_purge_client_cancel(job->call);
-    }
-    if (job->timer.timer_set) {
-        ngx_del_timer(&job->timer);
+        job->call = NULL;
     }
     if (job->retry.timer_set) {
         ngx_del_timer(&job->retry);
@@ -4629,23 +4747,39 @@ ngx_http_cache_purge_publication_free(ngx_http_cache_purge_publication_t *job)
     if (job->retry.posted) {
         ngx_delete_posted_event(&job->retry);
     }
-    if (job->owned) {
-        if (job->native_update) {
-            cache = job->cache.file_cache;
-            ngx_shmtx_lock(&cache->shpool->mutex);
-            job->cache.node->count--;
-            ngx_shmtx_unlock(&cache->shpool->mutex);
+    if (job->io_active) {
+        job->cancelled = 1;
+        (void) ngx_atomic_cmp_set(&job->io.cancelled, 0, 1);
+        /* A kernel operation cannot be cancelled by freeing its context.
+         * Keep the bounded slot, lease and cycle alive until completion. */
+        ngx_add_timer(&job->timer, 1000);
+        return;
+    }
+    if (job->owned && !job->cleaned) {
+        if (ngx_http_cache_purge_publications_stopping) {
+            /* No foreground requests remain at the process exit hook. */
+            job->io.source = job->temporary.file.name;
+            job->io.fd = job->temporary.file.fd;
+            job->io.cleanup = 1;
+            ngx_http_cache_purge_publication_io(&job->io, ngx_cycle->log);
+            job->temporary.file.fd = NGX_INVALID_FILE;
+            job->cleaned = 1;
         } else {
-            ngx_http_file_cache_free(&job->cache, NULL);
-        }
-        if (ngx_delete_file(job->temporary.file.name.data) == NGX_FILE_ERROR) {
-            err = ngx_errno;
-            if (err != NGX_ENOENT) {
-                ngx_log_error(NGX_LOG_CRIT, ngx_cycle->log, err,
-                              ngx_delete_file_n " \"%V\" failed",
-                              &job->temporary.file.name);
+            if (ngx_http_cache_purge_publication_io_post(job, 1) != NGX_OK) {
+                /* A full external pool is not a reason to do disk I/O here. */
+                job->retry.handler =
+                    ngx_http_cache_purge_publication_cleanup_retry;
+                ngx_add_timer(&job->retry, 100);
             }
+            ngx_add_timer(&job->timer, 1000);
+            return;
         }
+    }
+    if (job->timer.timer_set) {
+        ngx_del_timer(&job->timer);
+    }
+    if (job->owned) {
+        ngx_http_cache_purge_publication_release_node(job);
         ngx_queue_remove(&job->queue);
         ngx_http_cache_purge_origin_release(&job->registration);
     }
@@ -4664,14 +4798,31 @@ void
 ngx_http_cache_purge_publication_stop(void)
 {
     ngx_http_cache_purge_publication_t  *job;
+    ngx_queue_t                         *q, *next;
 
     if (!ngx_http_cache_purge_publications_initialized) {
         return;
     }
-    while (!ngx_queue_empty(&ngx_http_cache_purge_publications)) {
-        job = ngx_queue_data(ngx_queue_head(&ngx_http_cache_purge_publications),
-                             ngx_http_cache_purge_publication_t, queue);
-        ngx_http_cache_purge_publication_free(job);
+    ngx_http_cache_purge_publications_stopping = 1;
+    for (q = ngx_queue_head(&ngx_http_cache_purge_publications);
+         q != ngx_queue_sentinel(&ngx_http_cache_purge_publications); q = next)
+    {
+        next = ngx_queue_next(q);
+        job = ngx_queue_data(q, ngx_http_cache_purge_publication_t, queue);
+        if (job->io_active) {
+            /* Forced exit may skip the event-loop completion callback. Do
+             * not free memory or close FDs still owned by a posted task.
+             * The process reclaims those; release only worker-owned state. */
+            job->cancelled = 1;
+            (void) ngx_atomic_cmp_set(&job->io.cancelled, 0, 1);
+            if (job->timer.timer_set) {
+                ngx_del_timer(&job->timer);
+            }
+            ngx_http_cache_purge_publication_release_node(job);
+            ngx_http_cache_purge_origin_release(&job->registration);
+        } else {
+            ngx_http_cache_purge_publication_free(job);
+        }
     }
 }
 
@@ -4679,10 +4830,67 @@ static void
 ngx_http_cache_purge_publication_timeout(ngx_event_t *event)
 {
     ngx_http_cache_purge_publication_t  *job = event->data;
+    ngx_msec_int_t                       left;
 
-    ngx_log_error(NGX_LOG_WARN, ngx_cycle->log, 0,
-                  "cache index publication deadline expired");
+    left = (ngx_msec_int_t) (job->deadline - ngx_current_msec);
+    if (left > 0) {
+        ngx_add_timer(event, (ngx_msec_t) left);
+        return;
+    }
+    if (!job->cancelled) {
+        ngx_log_error(NGX_LOG_WARN, ngx_cycle->log, 0,
+                      "cache index publication deadline expired");
+    }
+    job->cancelled = 1;
     ngx_http_cache_purge_publication_free(job);
+}
+
+static void
+ngx_http_cache_purge_publication_io_done(ngx_event_t *event)
+{
+    ngx_http_cache_purge_publication_t     *job = event->data;
+    ngx_http_cache_purge_publication_io_t  *io;
+    ngx_http_file_cache_t                  *cache;
+    ngx_http_file_cache_node_t             *node;
+    off_t                                   size;
+
+    io = &job->io;
+    job->io_active = 0;
+    if (io->cleanup) {
+        job->temporary.file.fd = NGX_INVALID_FILE;
+        job->cleaned = 1;
+        ngx_http_cache_purge_publication_free(job);
+        return;
+    }
+    if (io->result != NGX_ABORT) {
+        /* Match native update's accounting in the event loop. Retain the
+         * transferred reference until FINISH, instead of dropping it here. */
+        cache = job->cache.file_cache;
+        node = job->cache.node;
+        size = (io->fs_size + cache->bsize - 1) / cache->bsize;
+        job->cache.updated = 1;
+        job->cache.updating = 0;
+        job->native_update = 1;
+        ngx_shmtx_lock(&cache->shpool->mutex);
+        node->error = 0;
+        node->uniq = io->uniq;
+        node->body_start = job->cache.body_start;
+        cache->sh->size += size - node->fs_size;
+        node->fs_size = size;
+        if (io->result == NGX_OK) {
+            node->exists = 1;
+        }
+        node->updating = 0;
+        ngx_shmtx_unlock(&cache->shpool->mutex);
+    }
+    if (job->cancelled
+        || (ngx_msec_int_t) (job->deadline - ngx_current_msec) <= 0)
+    {
+        ngx_http_cache_purge_publication_free(job);
+        return;
+    }
+    /* FINISH verifies the actual file even after a failed rename/stat. */
+    ngx_http_cache_purge_publication_finish(job, NGX_DECLINED);
 }
 
 static void *
@@ -4824,26 +5032,12 @@ static void
 ngx_http_cache_purge_publication_finish(ngx_http_cache_purge_publication_t *job,
     ngx_int_t result)
 {
-    ngx_http_request_t      request;
-    ngx_connection_t        connection;
-    ngx_http_file_cache_t  *cache;
-    u_char                 *p;
+    u_char  *p;
 
     if (result == NGX_OK) {
-        cache = job->cache.file_cache;
-        ngx_shmtx_lock(&cache->shpool->mutex);
-        job->cache.node->count++;
-        ngx_shmtx_unlock(&cache->shpool->mutex);
-        job->native_update = 1;
-
-        /* Native update only uses the cache and connection log. No request
-         * pool, upstream, output buffers or callbacks survive the handoff. */
-        ngx_memzero(&request, sizeof(request));
-        ngx_memzero(&connection, sizeof(connection));
-        connection.log = ngx_cycle->log;
-        request.connection = &connection;
-        request.cache = &job->cache;
-        ngx_http_file_cache_update(&request, &job->temporary);
+        if (ngx_http_cache_purge_publication_io_post(job, 0) == NGX_OK) {
+            return;
+        }
     }
     if (!job->need_finish || job->lease < 0) {
         ngx_http_cache_purge_publication_free(job);
@@ -4868,6 +5062,7 @@ ngx_http_cache_purge_capture_step(ngx_http_request_t *r,
     ngx_int_t result, void *data)
 {
     ngx_http_cache_purge_capture_t      *ctx = data;
+    ngx_http_cache_purge_capture_main_t *main;
     ngx_http_cache_purge_publication_t  *job;
     ngx_pool_t                          *pool;
     ngx_pool_cleanup_t                  *cleanup;
@@ -4919,13 +5114,16 @@ ngx_http_cache_purge_capture_step(ngx_http_request_t *r,
         ngx_destroy_pool(pool);
         return NGX_DECLINED;
     }
+    main = ngx_http_get_module_main_conf(r, ngx_http_cache_purge_index_module);
     job->pool = pool;
+    job->thread_pool = main->publish_pool;
     job->lease = -1;
     job->temporary.file.fd = NGX_INVALID_FILE;
     job->reserved = NGX_DEFAULT_POOL_SIZE + sizeof(*job);
     ngx_http_cache_purge_retained_bytes += job->reserved;
     ngx_http_cache_purge_retained_count++;
-    if (ngx_http_cache_purge_runtime_publish_client(r, &job->client) != 0
+    if (job->thread_pool == NULL
+        || ngx_http_cache_purge_runtime_publish_client(r, &job->client) != 0
         || getrandom(job->id, sizeof(job->id), GRND_NONBLOCK)
            != (ssize_t) sizeof(job->id))
     {
@@ -5376,6 +5574,19 @@ ngx_http_cache_purge_capture_post(ngx_conf_t *cf)
         }
     }
 
+    if (main->publish_pool_name.len) {
+        main->publish_pool = ngx_thread_pool_add(cf, &main->publish_pool_name);
+        if (main->publish_pool == NULL) {
+            return NGX_ERROR;
+        }
+        if (main->publish_pool == main->read_pool) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "cache_purge_publish_pool must differ from "
+                "cache_purge_read_pool");
+            return NGX_ERROR;
+        }
+    }
+
     core = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
     phase = ngx_array_push(&core->phases[NGX_HTTP_PRECONTENT_PHASE].handlers);
     if (phase == NULL) {
@@ -5480,6 +5691,13 @@ ngx_http_cache_purge_capture_post(ngx_conf_t *cf)
                 if (main->read_pool == NULL) {
                     ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                         "managed cache locations require cache_purge_read_pool "
+                        "and an explicitly configured nginx thread_pool");
+                    return NGX_ERROR;
+                }
+                if (main->publish_pool == NULL) {
+                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                        "managed cache locations require "
+                        "cache_purge_publish_pool "
                         "and an explicitly configured nginx thread_pool");
                     return NGX_ERROR;
                 }

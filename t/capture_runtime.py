@@ -332,11 +332,13 @@ config = loads + f'''daemon off; master_process on; worker_processes {a.workers}
 pid {run}/pid; error_log {run}/error.log debug;
 thread_pool default threads=2;
 thread_pool proof threads=1 max_queue=64;
+thread_pool publish threads=1 max_queue=64;
 events {{ worker_connections 256; }}
 http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/temp;
  cache_purge_store {run}/index cache=8m write_buffer=2m;
  cache_purge_state_zone capture 4m;
  cache_purge_read_pool proof;
+ cache_purge_publish_pool publish;
  proxy_cache_path {run}/cache-a levels=1:2 keys_zone=a:1m;
  proxy_cache_path {run}/cache-b levels=1:2 keys_zone=b:1m;
  {' '.join(gateway_paths)}
@@ -1090,6 +1092,12 @@ for label, candidate, message in (
          'require cache_purge_read_pool'),
         ('unknown-read-pool', config.replace('cache_purge_read_pool proof;', 'cache_purge_read_pool missing;'),
          'unknown thread pool'),
+        ('missing-publish-pool', config.replace('cache_purge_publish_pool publish;', ''),
+         'require cache_purge_publish_pool'),
+        ('unknown-publish-pool', config.replace('cache_purge_publish_pool publish;', 'cache_purge_publish_pool missing;'),
+         'unknown thread pool'),
+        ('shared-publish-pool', config.replace('cache_purge_publish_pool publish;', 'cache_purge_publish_pool proof;'),
+         'must differ from cache_purge_read_pool'),
         ('missing-url', config.replace('cache_purge_key_url $cache_key_url;', ''),
          'requires cache_purge_key_url'),
         ('empty-url', config.replace('cache_purge_key_url $cache_key_url;', 'cache_purge_key_url "";'),

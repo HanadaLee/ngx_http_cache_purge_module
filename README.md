@@ -438,11 +438,14 @@ the HTTP request or delay reuse of its keepalive connection. Capacity exhaustion
 drops the cache fill; it does not wait for a publication slot. Jobs share the
 existing 64-task and 2 MiB material limits per worker, have a three-second
 deadline and keep draining workers alive until completion or cancellation.
-Native rename/stat still execute on the worker; this change removes the request
-lifetime dependency on IPC and WAL synchronization, not all filesystem latency.
-It works on unmodified nginx without a custom store hook.
-FINISH verifies the actual final file because native update
-does not return a rename result. `t/native_fill_runtime.py` covers the native
+Publication rename/stat and temporary-file cleanup use an explicit nginx thread
+pool separate from HIT proof reads. Completion updates native cache-node
+accounting on the worker event loop. It works on unmodified nginx without a
+custom store hook. An in-flight filesystem operation cannot be cancelled: its
+bounded task and lease remain owned until the thread finishes, even if the
+three-second publication deadline expires. A timed-out job cannot start FINISH.
+FINISH verifies the actual final instance after filesystem and cache-node
+updates. `t/native_fill_runtime.py` covers the native
 lifecycle separately. `t/capture_runtime.py` exercises real native fills through
 the companion key module, worker IPC, WAL preparation, rename and READY
 publication. It also covers selected-descriptor admission, 304 commits,
@@ -614,22 +617,27 @@ The implemented resource directives are:
 
 ```nginx
 thread_pool cache_proof threads=1 max_queue=64;
+thread_pool cache_publish threads=1 max_queue=64;
 
 http {
     cache_purge_store /var/lib/nginx/cache-index cache=16m write_buffer=4m;
     cache_purge_state_zone purge_control 16m;
     cache_purge_read_pool cache_proof;
+    cache_purge_publish_pool cache_publish;
     cache_purge_propagation_timeout 120s;
 }
 ```
 
-`cache_purge_read_pool` selects an nginx-managed pool for file proof reads and
-is required when a cached location enables capture. Keep this pool separate from
-other blocking work. The example creates one thread per HTTP worker; its memory
-and stack are additional to the database budget. Management-only configurations
-do not need it. The module does not implicitly create nginx's default 32-thread
-pool. Request-dependent directives support expr `when`; this HTTP-wide resource
-selection is resolved at configuration time.
+`cache_purge_read_pool` selects an nginx-managed pool for file proof reads;
+`cache_purge_publish_pool` selects a separate pool for completed cache-file
+publication. Both are required when a cached location enables capture. Selecting
+the same pool is rejected. Keep both pools dedicated, with `max_queue=64` or
+more; the example creates two threads per HTTP worker. Their memory and stacks
+are additional to the database budget. Management-only configurations do not
+need them. Neither directive selects a pool by default. If selecting nginx's
+special `default` pool, configure its thread count explicitly.
+Request-dependent directives support expr `when`; these HTTP-wide resource
+selections are resolved at configuration time.
 
 `cache` is the shared database cache budget, including the write-buffer charge;
 it is not a process RSS limit. The database directory must be outside cache-file
