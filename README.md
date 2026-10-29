@@ -465,10 +465,10 @@ come from nginx; range is not an identity input and is not parsed from the key.
 All physical slices and zones remain associated with their configured identity.
 
 The current index uses a bounded internal digest for the namespace/URL/misc
-identity. Its final URL-scoped misc secondary layout and request-facing key
-selector migration are still in progress. The protocol switches now control
-index capture and invalidation checks; the inline PURGE entrypoint is still
-being implemented. Existing JSON submission/status endpoints remain available.
+identity. Its final URL-scoped misc secondary layout is still in progress.
+The protocol switches control index capture, invalidation checks and PURGE
+handling. Key submissions use configured identity values, without an encoded
+key input. Existing JSON submission/status endpoints remain available.
 `cache_purge_key`, `cache_purge_url` and `cache_purge_tag_namespace` are obsolete
 and rejected as unknown directives.
 
@@ -483,9 +483,10 @@ budget per worker, with a three-second overall IPC deadline. The limits apply
 after the response body is complete and do not turn normal HITs into origin
 requests. Request inputs and each publication payload are separately bounded
 to 128 KiB; these limits exclude allocator overhead and native nginx buffers.
-Generation namespaces, inline PURGE/REFRESH handlers, directory walks and the old
-shared-memory task queue have been removed; their directives are rejected rather
-than silently ignored. New captures do not add arbitrary request URL/Host aliases.
+Generation namespaces, legacy zone/key PURGE syntax, REFRESH handlers, directory
+walks and the old shared-memory task queue have been removed; obsolete directives
+are rejected rather than silently ignored. New captures do not add arbitrary
+request URL/Host aliases.
 The backend rejects identity changes and no longer has alias observation,
 pagination or revision APIs. This does not complete foreground database isolation.
 
@@ -493,12 +494,13 @@ pagination or revision APIs. This does not complete foreground database isolatio
 
 - Persistent URL, key, host, prefix and scoped TAG lookup across cache zones.
 - Durable Invalidate/Delete acceptance and background file processing.
+- PURGE on business or dedicated channels, using independently configured identity.
 - Immediate request admission barriers and protection against old cache writers.
 - Slice/Vary associations, conditional validation and restart recovery.
 - Bounded database, IPC and shared-control memory budgets.
 
 The default and only build uses RocksDB. Existing legacy configurations must
-migrate to the management API and explicit index expressions. Propagation,
+migrate to explicit index expressions and the current management interfaces. Propagation,
 SCM integration and whole-system resource acceptance remain under development.
 
 ## Build
@@ -591,6 +593,82 @@ while stopped. Existing directories are not recursively chowned. Store and
 state-zone identity changes require a full restart.
 These directives initialize the component and its resources. Add an explicit
 management location to expose the development HTTP API.
+
+## PURGE requests
+
+Enable any one of the four protocol switches in a location to handle `PURGE`
+after nginx access controls. Normal requests still use their protocol's own
+switch. PURGE is not forwarded to the upstream; disabled locations retain their
+ordinary handler. Business and dedicated channels use the same durable
+acceptance path and cover all matching zones. No cache zone or `proxy_pass` is
+needed in a dedicated channel.
+
+Control header names are independently configurable at http/server/location
+scope and inherit. Defaults are:
+
+| Directive | Default header | Value |
+| --- | --- | --- |
+| `cache_purge_type_header` | `X-Cache-Purge-Type` | `url` (default), `key`, `prefix`, `host`, `tag`, `host-tag` |
+| `cache_purge_action_header` | `X-Cache-Purge-Action` | `delete` (default) or `invalidate` |
+| `cache_purge_tags_header` | `X-Cache-Purge-Tags` | Comma-separated TAGs; any match, at most 64 |
+| `cache_purge_operation_id_header` | `X-Cache-Purge-Operation-Id` | Optional stable operation ID |
+| `cache_purge_issued_at_header` | `X-Cache-Purge-Issued-At` | Optional positive Unix timestamp in milliseconds |
+
+Type and action values are case insensitive; TAGs are case sensitive. Duplicate
+control headers, unsupported values and request bodies are rejected. The ID and
+issued time must be supplied together. Omitting both generates a new ID and
+uses the current time. For reliable retries after uncertain delivery, provide
+both and keep them, the action and the target unchanged; conflicts return 409.
+There is no module-side authentication.
+
+Target values come only from configuration:
+
+| Type | Target |
+| --- | --- |
+| `url` | Exact `cache_purge_key_url`, covering all indexed variants |
+| `key` | Exact URL, misc and namespace tuple, covering all slices/Vary/zones |
+| `prefix` | Literal byte prefix of configured URL; no glob or regex parsing |
+| `host` | Host from the configured URL authority |
+| `tag` | Configured namespace plus the TAG header |
+| `host-tag` | Host from the configured URL plus the TAG header |
+
+Only the required identity expressions are evaluated. Namespace TAG requests can
+omit a URL input; their location still declares its URL expression. Empty misc
+is one exact variant, and an empty namespace is one exact scope. The management
+connection Host does not replace the configured target. No physical key or
+filename is accepted or required.
+
+A dedicated channel can select inputs entirely through configuration:
+
+```nginx
+location /purge/ {
+    proxy_cache_purge on;
+    cache_purge_key_url $http_x_cache_purge_url;
+    cache_purge_key_misc $http_x_cache_purge_misc;
+    cache_purge_key_namespace $http_x_cache_purge_namespace;
+    allow 127.0.0.1;
+    deny all;
+}
+```
+
+The three identity header names above are configuration choices, not names
+looked up by module code. A business channel can switch its misc expression to a
+request header for PURGE using `map` or an expr `when` before its normal fallback.
+
+```sh
+curl -X PURGE http://127.0.0.1/purge/ \
+    -H 'X-Cache-Purge-Url: https://example.test/video.mp4' \
+    -H 'X-Cache-Purge-Type: key' \
+    -H 'X-Cache-Purge-Misc: variant-a'
+```
+
+202 means the task is durable and its invalidation rules are active; it does not
+wait for file processing. Closing the connection or restarting nginx does not
+cancel accepted work. The JSON response contains the operation ID and progress.
+A dedicated channel returns `status_url: null`; use a separately configured
+`cache_purge_api` status endpoint with that ID. Internal key digests are not
+exposed as user-entered keys. Normal managed HITs still use the database-backed
+admission path while foreground isolation is being completed.
 
 ## Persistent management API
 
@@ -898,8 +976,11 @@ Example request body:
 }
 ```
 
-Selectors include exact `key`, `url`, `host`, `prefix` with `field: key|url`,
-and scoped `tag`. Matching uses the index across zones. Binary selector values
+JSON selectors include `url`, `host`, URL `prefix` and scoped `tag`. The optional
+prefix `field` must be `url`. Whole-key and key-prefix submissions return 412;
+use PURGE with configured URL/misc/namespace for exact key operations. Existing
+accepted tasks retain their stored semantics and status access. Matching uses
+the index across zones. Binary selector values
 use `encoding: base64`. TAG accepts `values: ["tag-a", "tag-b"]` with
 `match: any` and `scope: namespace|host`;
 the scope value comes from the configured namespace header. Its default name is

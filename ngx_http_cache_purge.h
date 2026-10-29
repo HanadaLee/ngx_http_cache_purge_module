@@ -18,6 +18,7 @@ typedef struct ngx_http_cache_purge_call_s   ngx_http_cache_purge_call_t;
 ngx_int_t ngx_http_cache_purge_request_identity(ngx_http_request_t *r,
     ngx_str_t *url, ngx_str_t *misc, ngx_str_t *namespace, ngx_str_t *host,
     ngx_str_t *key);
+ngx_int_t ngx_http_cache_purge_method_handler(ngx_http_request_t *r);
 
 typedef enum {
     NGX_HTTP_CACHE_PURGE_CLIENT_OK = 0,
@@ -181,6 +182,7 @@ typedef struct {
     ngx_str_t     api_prefix;
     ngx_str_t     tag_namespace_header;
     ngx_str_t     propagation_header[3];
+    ngx_str_t     method_header[5];
 #if (NGX_EXPR)
     ngx_array_t  *ignore_propagation;
     ngx_array_t  *propagation;

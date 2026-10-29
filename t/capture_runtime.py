@@ -275,6 +275,12 @@ for name, server in gateways.items():
       {name}_param REQUEST_METHOD GET; {name}_param REQUEST_URI $uri;
       {name}_pass 127.0.0.1:{server.server_address[1]};
     }}''')
+    switches = ' '.join(f'{protocol}_cache_purge {"on" if protocol == name else "off"};'
+                        for protocol in ('proxy', 'fastcgi', 'scgi', 'uwsgi'))
+    gateway_locations.append(f'''location /push-{name}/ {{
+      {switches} proxy_cache off;
+      cache_purge_key_url $http_x_target;
+    }}''')
 modules = ['ngx_http_cache_rocksdb_module', 'ngx_http_cache_purge_module']
 modules.insert(len(modules) if a.key_last else 0, 'ngx_http_cache_key_module')
 loads = ''.join(f'load_module {build}/objs/{name}.so;\n' for name in modules) if a.dynamic else ''
@@ -336,6 +342,7 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
  resolver_timeout 5s;
  map $arg_gate $send_host {{ default $arg_gate; "" 127.0.0.1; }}
  map $arg_z $zone {{ default a; b b; off off; }}
+ map $request_method $inline_misc {{ default $arg_m; PURGE $http_x_misc; }}
  cache_key_namespace tenant; cache_key_uri $uri; cache_key_misc $arg_m; cache_key_range $slice_range;
  cache_purge_key_url $cache_key_url;
  cache_purge_key_misc $cache_key_misc;
@@ -356,6 +363,26 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
       cache_purge_tag_namespace_header X-Test-Purge-Scope; }}
   location /__denied/v2/ {{ cache_purge_api; proxy_cache off; deny all; }}
   location /__open/v2/ {{ cache_purge_api; proxy_cache off; }}
+  location /push/ {{ proxy_cache off;
+      cache_purge_key_url $http_x_target;
+      cache_purge_key_misc $http_x_misc;
+      cache_purge_key_namespace $http_x_namespace; }}
+  location /push-custom/ {{ proxy_cache off;
+      cache_purge_key_url $http_x_target;
+      cache_purge_key_misc $http_x_misc;
+      cache_purge_key_namespace $http_x_namespace;
+      cache_purge_type_header X-Test-Type;
+      cache_purge_action_header X-Test-Action;
+      cache_purge_tags_header X-Test-Tags;
+      cache_purge_operation_id_header X-Test-Id;
+      cache_purge_issued_at_header X-Test-Issued; }}
+  location /push-denied/ {{ deny all; proxy_cache off; }}
+  location /push-off/ {{ proxy_cache_purge off; fastcgi_cache_purge off;
+      scgi_cache_purge off; uwsgi_cache_purge off;
+      proxy_pass http://127.0.0.1:{origin.server_port}; }}
+  location /inline/ {{ cache_purge_key_misc $inline_misc;
+      proxy_cache_revalidate on;
+      proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /propagation/ {{ {propagation_config}
       proxy_cache_revalidate on; proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /propagation/send-race {{ {propagation_config}
@@ -503,6 +530,14 @@ if extension and a.expr:
       cache_purge_key_url $arg_missing;
       proxy_cache_key "$uri|$arg_misc";
       proxy_pass http://127.0.0.1:{origin.server_port};
+    }}
+    location /push-when/ {{
+      fastcgi_cache_purge off; scgi_cache_purge off; uwsgi_cache_purge off;
+      expr allow_push = $arg_allow 1;
+      when allow_push {{ proxy_cache_purge on; }}
+      proxy_cache_purge off;
+      cache_purge_key_url $http_x_target;
+      proxy_cache off; proxy_pass http://127.0.0.1:{origin.server_port};
     }}
     '''
     config = config.replace('location = /negative-error', error_when + 'location = /negative-error')
@@ -847,6 +882,169 @@ def variant_hashes(item, language):
     assert item['path'].split(b'/')[-1] in (main.hex().encode(), variant.hex().encode())
     return main, variant
 
+def inline_purge_cases():
+    def purge(path, headers=None):
+        status, response_headers, body = get(path, headers, method='PURGE', details=True)
+        return status, response_headers, json.loads(body)
+
+    def accepted(path, headers=None):
+        status, response_headers, receipt = purge(path, headers)
+        assert status == 202 and receipt['effective'] and receipt['durable'] and receipt['ready'], (status, receipt)
+        assert response_headers['Cache-Control'] == 'no-store'
+        assert receipt['status_url'] is None and len(receipt['request_digest']) == 64
+        return receipt
+
+    def status(receipt):
+        return api('/__purge/v2/operations/' + receipt['operation_id'])[2]
+
+    uri = '/inline/url'
+    for suffix in ('', '?m=other', '?z=b'):
+        assert get(uri + suffix)[1] == 'MISS'
+    old = records(uri, 3)
+    for item in old: ready_file(item)
+    before = calls.count(uri)
+    pushed = accepted(uri)
+    assert pushed['selector'] == {'type': 'url', 'value': 'http://cache.test' + uri}
+    assert pushed['mode'] == 'delete' and calls.count(uri) == before
+    fresh_bodies[uri] = b'inline-url-fresh'
+    for suffix in ('', '?m=other', '?z=b'):
+        deleted_response(uri + suffix, b'inline-url-fresh')
+    checks.append('PURGE on the business URL defaults to durable URL Delete across misc variants and zones without reaching upstream')
+    for protocol in gateways:
+        uri = '/' + protocol + '/inline'
+        assert get(uri)[1] == 'MISS'
+        ready_file(records(uri, 1)[0])
+        accepted('/push-' + protocol + '/control', {'X-Target': 'http://cache.test' + uri})
+        deleted_response(uri, (protocol + ':body').encode())
+    checks.append('each non-proxy protocol switch independently activates the PURGE handler on a channel without an upstream or cache zone')
+    if extension and a.expr:
+        assert get('/push-when/disabled', method='PURGE')[0] == 501
+        accepted('/push-when/enabled?allow=1', {'X-Target': 'http://cache.test/inline/conditional'})
+        checks.append('expr when controls PURGE activation after access checks and preserves the disabled location handler')
+
+    uri = '/inline/key'
+    for suffix in ('', '?m=one', '?m=two', '?m=one&z=b'):
+        assert get(uri + suffix)[1] == 'MISS'
+    for item in records(uri, 4): ready_file(item)
+    headers = {'X-Cache-Purge-Type': 'KEY', 'X-Misc': 'one',
+               'X-Cache-Purge-Operation-Id': 'inline-key-one',
+               'X-Cache-Purge-Issued-At': str(int(time.time() * 1000))}
+    pushed = accepted(uri, headers)
+    assert pushed['selector'] == {'type': 'key'}
+    assert accepted(uri, headers)['sequence'] == pushed['sequence']
+    assert purge(uri, {**headers, 'X-Misc': 'two'})[0] == 409
+    fresh_bodies[uri] = b'inline-key-fresh'
+    deleted_response(uri + '?m=one', b'inline-key-fresh')
+    deleted_response(uri + '?m=one&z=b', b'inline-key-fresh')
+    assert get(uri + '?m=two') == (200, 'HIT', uri.encode())
+    assert get(uri) == (200, 'HIT', uri.encode())
+    accepted(uri, {'X-Cache-Purge-Type': 'key'})
+    deleted_response(uri, b'inline-key-fresh')
+    assert get(uri + '?m=two') == (200, 'HIT', uri.encode())
+    checks.append('PURGE key uses configured URL and header-supplied misc, keeps empty misc exact, and supports stable retries with conflict detection')
+
+    target = 'http://cache.test' + uri
+    accepted('/push/arbitrary-route', {'Host': 'purge.test', 'X-Target': target,
+             'X-Cache-Purge-Type': 'key', 'X-Misc': 'two', 'X-Namespace': 'other'})
+    assert get(uri + '?m=two') == (200, 'HIT', uri.encode())
+    custom = {'Host': 'purge.test', 'X-Target': target, 'X-Misc': 'two', 'X-Namespace': 'tenant',
+              'X-Test-Type': 'key', 'X-Test-Action': 'Delete', 'X-Test-Id': 'inline-custom',
+              'X-Test-Issued': str(int(time.time() * 1000)), 'X-Cache-Purge-Type': 'host'}
+    pushed = accepted('/push-custom/unrelated-path', custom)
+    assert pushed['selector'] == {'type': 'key'} and pushed['operation_id'] == 'inline-custom'
+    assert accepted('/push-custom/unrelated-path', custom)['sequence'] == pushed['sequence']
+    deleted_response(uri + '?m=two', b'inline-key-fresh')
+    checks.append('dedicated PURGE channels use configured targets and namespace isolation; custom control headers override their default names')
+
+    tagged = ('/inline/tag-a', '/inline/tag-b')
+    for path, tag in zip(tagged, ('inline-red', 'inline-blue')):
+        policies[path] = tag
+        conditional_paths.add(path)
+        assert get(path)[1] == 'MISS'
+        ready_file(records(path, 1)[0])
+    policies['/raw/inline-tag'] = 'inline-red'
+    assert get('/raw/inline-tag')[1] == 'MISS'
+    ready_file(records('/raw/inline-tag', 1)[0])
+    pushed = accepted('/push/no-target-url', {'X-Cache-Purge-Type': 'tag',
+             'X-Cache-Purge-Action': 'Invalidate', 'X-Cache-Purge-Tags': 'inline-red, inline-blue, inline-red',
+             'X-Namespace': 'tenant'})
+    assert pushed['selector']['values'] == ['inline-blue', 'inline-red']
+    assert pushed['tag_namespace'] == 'tenant'
+    for path in tagged:
+        assert get(path) == (200, 'REVALIDATED', path.encode())
+        assert get(path)[1] == 'HIT'
+    assert get('/raw/inline-tag')[1] == 'HIT'
+    accepted('/push-custom/tag', {'X-Test-Type': 'tag', 'X-Test-Tags': 'inline-red',
+             'X-Test-Action': 'delete', 'X-Namespace': 'rawtenant'})
+    deleted_response('/raw/inline-tag', b'/raw/inline-tag')
+    checks.append('namespace TAG PURGE evaluates only namespace, canonicalizes groups, supports Invalidate/304 and honors renamed TAG headers')
+
+    for path in ('/empty-namespace-inline', '/inline/named-tag'):
+        policies[path] = 'inline-empty'
+        assert get(path)[1] == 'MISS'
+        ready_file(records(path, 1)[0])
+    pushed = accepted('/push/empty', {'X-Cache-Purge-Type': 'tag', 'X-Cache-Purge-Tags': 'inline-empty'})
+    assert pushed['tag_namespace'] == ''
+    deleted_response('/empty-namespace-inline', b'/empty-namespace-inline')
+    assert get('/inline/named-tag')[1] == 'HIT'
+    checks.append('an absent namespace expression value remains the exact empty TAG scope')
+
+    uri = '/inline/host-tag'
+    policies[uri] = 'inline-host-tag'
+    for host in ('inline-host.test', 'other-inline.test'):
+        assert get(uri, {'Host': host})[1] == 'MISS'
+        ready_file(record(until(lambda: (items[0][0] if (items := query('http://' + host + uri)) else None))))
+    accepted('/push/host-tag', {'Host': 'purge.test', 'X-Target': 'http://inline-host.test/unused',
+             'X-Cache-Purge-Type': 'host-tag', 'X-Cache-Purge-Tags': 'inline-host-tag'})
+    deleted_response(uri, uri.encode(), {'Host': 'inline-host.test'})
+    assert get(uri, {'Host': 'other-inline.test'})[1] == 'HIT'
+    accepted('/push/host', {'Host': 'purge.test', 'X-Target': 'http://other-inline.test/unused', 'X-Cache-Purge-Type': 'host'})
+    deleted_response(uri, uri.encode(), {'Host': 'other-inline.test'})
+    checks.append('host and host-scoped TAG PURGE derive the target host from configuration, not the management connection Host')
+
+    for path in ('/inline/bulk/a', '/inline/bulk/b'):
+        assert get(path)[1] == 'MISS'
+        ready_file(records(path, 1)[0])
+    item = records('/inline/bulk/a', 1)[0]
+    target = ready_file(item)
+    address = b''.join(string(item[name]) for name in ('root', 'zone', 'path'))
+    _, lease = rpc(20, address, receive_fd=True)
+    try:
+        pushed = accepted('/push/prefix', {'X-Target': 'http://cache.test/inline/bulk/', 'X-Cache-Purge-Type': 'prefix'})
+        assert status(pushed)['cleanup']['state'] != 'done' and target.exists()
+        assert get('/asset')[1] == 'HIT'
+    finally:
+        os.close(lease)
+    until(lambda: status(pushed)['cleanup']['state'] == 'done')
+    assert not target.exists()
+    checks.append('prefix PURGE returns effective durable acceptance while a file lease is held; cleanup completes after the lease is released')
+
+    previous = api('/__purge/v2/capabilities')[2]['last_sequence']
+    invalid = ({'X-Cache-Purge-Type': 'regex'}, {'X-Cache-Purge-Type': ''},
+               {'X-Cache-Purge-Action': 'refresh'}, {'X-Cache-Purge-Operation-Id': 'missing-time'},
+               {'X-Cache-Purge-Issued-At': '1'}, {'X-Cache-Purge-Type': 'tag'},
+               {'X-Cache-Purge-Tags': 'unselected'}, {'X-Cache-Purge-Type': 'key', 'X-Namespace': 'bad,name'})
+    for headers in invalid:
+        status_code, _, rejected = purge('/push/invalid', {'X-Target': 'http://cache.test/inline/invalid', **headers})
+        assert status_code == 400 and rejected['outcome'] == 'not_submitted', rejected
+    assert purge('/push/missing-target')[0] == 400
+    conn = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+    conn.putrequest('PURGE', '/inline/duplicate', skip_host=True)
+    conn.putheader('Host', 'cache.test')
+    conn.putheader('X-Cache-Purge-Type', 'url'); conn.putheader('X-Cache-Purge-Type', 'host')
+    conn.endheaders(); reply = conn.getresponse()
+    assert reply.status == 400 and json.loads(reply.read())['outcome'] == 'not_submitted'
+    conn.close()
+    conn = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+    conn.request('PURGE', '/inline/body', body='x', headers={'Host': 'cache.test'})
+    reply = conn.getresponse(); assert reply.status == 400
+    reply.read(); conn.close()
+    assert get('/push-denied/blocked', method='PURGE')[0] == 403
+    assert get('/push-off/native', method='PURGE')[0] == 501
+    assert api('/__purge/v2/capabilities')[2]['last_sequence'] == previous
+    checks.append('PURGE preserves access controls and disabled handlers and rejects malformed, duplicate, ambiguous or body-bearing requests before acceptance')
+
+
 checks = []
 obsolete_directives = (
     'cache_purge_key $cache_key_base;', 'cache_purge_url $cache_key_url;',
@@ -974,6 +1172,7 @@ try:
         assert get('/misc-proof?m=' + misc)[1] == 'HIT'
     assert misc_proofs[0] != misc_proofs[1]
     checks.append('two configured misc values under one URL produce independently verified distinct file proofs')
+    inline_purge_cases()
     conditional_paths.add('/empty-namespace')
     assert get('/empty-namespace') == (200, 'MISS', b'/empty-namespace')
     empty_namespace = records('/empty-namespace', 1)[0]
@@ -1681,6 +1880,12 @@ try:
     assert caps['authentication'] == 'nginx-configuration' and 'signed_events' not in caps
     assert caps['propagation_timeout_ms'] == '120000'
     assert caps['index_schema'] == 12
+    assert caps['purge_method'] and 'key' not in caps['json_selectors']
+    assert caps['control_headers']['purge_type'] == 'X-Cache-Purge-Type'
+    assert caps['control_headers']['purge_action'] == 'X-Cache-Purge-Action'
+    assert caps['control_headers']['purge_tags'] == 'X-Cache-Purge-Tags'
+    assert caps['control_headers']['operation_id'] == 'X-Cache-Purge-Operation-Id'
+    assert caps['control_headers']['issued_at'] == 'X-Cache-Purge-Issued-At'
     assert caps['control_headers']['tag_namespace'] == 'X-Cache-Purge-Namespace'
     assert caps['index_id'] == ledger.hex() and caps['max_tags'] == 64
     assert caps['invalidate_stale_policy'] == ('forbid' if extension else 'native')
@@ -1752,20 +1957,23 @@ try:
     assert get(uri)[0] == 200
     key_file = records(uri, 1)[0]; ready_file(key_file)
     operation = api_input('api-key', {'type': 'key', 'value': key_file['key'].decode()})
-    assert api('/__purge/v2/operations', operation)[0] == 202
+    rejected = api('/__purge/v2/operations', operation)
+    assert rejected[0] == 412 and rejected[2]['error'] == 'use_purge_key'
+    assert api('/__purge/v2/operations/api-key')[0] == 404
+    assert get(uri)[1] == 'HIT'
     import base64
     raw_key = b'\xff\x00binary-prefix'
     operation = api_input('api-binary', {'type': 'prefix', 'field': 'key',
                           'encoding': 'base64', 'value': base64.b64encode(raw_key).decode()})
     binary_receipt = api('/__purge/v2/operations', operation)
-    assert binary_receipt[0] == 202 and binary_receipt[2]['selector']['encoding'] == 'base64'
-    assert base64.b64decode(binary_receipt[2]['selector']['value']) == raw_key
+    assert binary_receipt[0] == 412 and binary_receipt[2]['error'] == 'key_prefix_not_supported'
+    assert api('/__purge/v2/operations/api-binary')[0] == 404
     assert api('/__purge/v2/operations', api_input('api-host',
                {'type': 'host', 'value': 'unpopulated-api.test', 'include_subdomains': False}))[0] == 202
-    unicode_input = api_input('api-unicode', {'type': 'key', 'value': 'absent/\U0001f680'})
+    unicode_input = api_input('api-unicode', {'type': 'url', 'value': 'https://cache.test/absent/\U0001f680'})
     unicode_reply = api('/__purge/v2/operations', raw=json.dumps(unicode_input, ensure_ascii=True).encode())
-    assert unicode_reply[0] == 202 and unicode_reply[2]['selector']['value'] == 'absent/\U0001f680'
-    checks.append('HTTP exact key, binary key prefix, empty host matches and Unicode surrogate pairs preserve selector bytes')
+    assert unicode_reply[0] == 202 and unicode_reply[2]['selector']['value'] == 'https://cache.test/absent/\U0001f680'
+    checks.append('JSON rejects whole-key and key-prefix submissions without acceptance while URL/host selectors preserve their bytes')
 
     uri = '/api-tag'
     policies[uri] = 'api-red'
@@ -1870,7 +2078,7 @@ try:
         result = api('/__purge/v2/operations', raw=body)
         assert result[0] == 400, (body, result)
     assert api('/__purge/v2/operations', malformed, headers={'Content-Type': 'text/plain'})[0] == 415
-    bad_base64 = api_input('api-invalid', {'type': 'key', 'encoding': 'base64', 'value': 'YQ==garbage'})
+    bad_base64 = api_input('api-invalid', {'type': 'url', 'encoding': 'base64', 'value': 'YQ==garbage'})
     assert api('/__purge/v2/operations', bad_base64)[0] == 400
     signed = dict(malformed, event={**malformed['event'], 'signature': 'not-verified'})
     assert api('/__purge/v2/operations', signed)[0] == 400
@@ -1922,12 +2130,13 @@ try:
     held_path = ready_file(held_file)
     _, lease = rpc(17, string(str(held_path)), receive_fd=True)
     try:
-        operation = api_input('api-disconnected',
-                              {'type': 'tag', 'values': ['api-held-member', 'api-held-unused']})
         conn = http.client.HTTPConnection('127.0.0.1', port, timeout=15)
-        conn.request('POST', '/__purge/v2/operations', json.dumps(operation),
-                     {'Host': 'cache.test', 'Content-Type': 'application/json',
-                      'X-Cache-Purge-Namespace': 'tenant'})
+        conn.request('PURGE', '/push/disconnected', headers={
+            'Host': 'purge.test', 'X-Namespace': 'tenant',
+            'X-Cache-Purge-Type': 'tag',
+            'X-Cache-Purge-Tags': 'api-held-member, api-held-unused',
+            'X-Cache-Purge-Operation-Id': 'api-disconnected',
+            'X-Cache-Purge-Issued-At': str(int(time.time() * 1000))})
         response = conn.getresponse()
         assert response.status == 202
         response.close()
@@ -1949,7 +2158,7 @@ try:
               'writers', writers(int(restored['sequence'])), 'file_exists', held_path.exists(), flush=True)
         raise
     assert not held_path.exists()
-    checks.append('HTTP TAG-group acceptance does not wait for a held file lease; disconnection and nginx restart preserve autonomous cleanup and the original effective time')
+    checks.append('PURGE TAG-group acceptance does not wait for a held file lease; disconnection and nginx restart preserve autonomous cleanup and the original effective time')
 
     def propagation_headers(path, language=None, span=None):
         return next(headers for uri, headers in reversed(propagation_calls)

@@ -116,12 +116,12 @@ http {{
 process = None
 
 
-def request(path, payload=None):
+def request(path, payload=None, method=None, headers=None):
     conn = http.client.HTTPConnection('127.0.0.1', port, timeout=8)
     try:
-        conn.request('POST' if payload is not None else 'GET', path,
+        conn.request(method or ('POST' if payload is not None else 'GET'), path,
                      json.dumps(payload) if payload is not None else None,
-                     {'Host': 'request-host.test', 'Content-Type': 'application/json'})
+                     {'Host': 'request-host.test', 'Content-Type': 'application/json', **(headers or {})})
         reply = conn.getresponse()
         return reply.status, reply.getheader('X-Cache-Status'), reply.read()
     finally:
@@ -226,15 +226,16 @@ try:
         assert request('/default-off')[1] == 'HIT'
         assert record(b'http://format.test/default-off') is None
         checks.append('store/state resources alone leave locations disabled; omitted namespace and misc are empty')
-        payload = {'version': 'ngx-http-cache-purge/v2', 'operation_id': 'format-delete',
-                   'mode': 'delete', 'selector': {'type': 'url', 'value': 'http://format.test/plain'},
-                   'event': {'issuer': 'test', 'stream_id': 'format', 'sequence': '1',
-                             'issued_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}}
-        status, _, body = request('/api/operations', payload)
+        status, _, body = request('/case-0', method='PURGE')
         receipt = json.loads(body)
         assert status == 202 and receipt['effective'] and receipt['durable'], receipt
         assert request('/case-0')[1] in ('MISS', 'BYPASS')
-        checks.append('URL Delete remains effective with an independent native key producer')
+        checks.append('PURGE URL Delete reads its configured target without a key module or native key parser')
+        status, _, body = request('/case-1', method='PURGE', headers={'X-Cache-Purge-Type': 'key'})
+        receipt = json.loads(body)
+        assert status == 202 and receipt['effective'] and receipt['selector'] == {'type': 'key'}
+        assert request('/case-1')[1] in ('MISS', 'BYPASS')
+        checks.append('PURGE key uses independently configured namespace/URL/misc and does not require an encoded user key')
         children = Path(f'/proc/{process.pid}/task/{process.pid}/children').read_text().split()
         assert children
         for pid in children:

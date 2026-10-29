@@ -60,6 +60,36 @@ static ngx_command_t  ngx_http_cache_purge_module_commands[] = {
     { ngx_string("cache_purge_api"), NGX_HTTP_LOC_CONF | NGX_CONF_NOARGS,
       ngx_http_cache_purge_api_conf, NGX_HTTP_LOC_CONF_OFFSET, 0, NULL },
 
+    { ngx_string("cache_purge_type_header"),
+      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF
+      | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_http_cache_purge_api_header_conf, NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_purge_loc_conf_t, method_header[0]), NULL },
+
+    { ngx_string("cache_purge_action_header"),
+      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF
+      | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_http_cache_purge_api_header_conf, NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_purge_loc_conf_t, method_header[1]), NULL },
+
+    { ngx_string("cache_purge_tags_header"),
+      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF
+      | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_http_cache_purge_api_header_conf, NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_purge_loc_conf_t, method_header[2]), NULL },
+
+    { ngx_string("cache_purge_operation_id_header"),
+      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF
+      | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_http_cache_purge_api_header_conf, NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_purge_loc_conf_t, method_header[3]), NULL },
+
+    { ngx_string("cache_purge_issued_at_header"),
+      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF
+      | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_http_cache_purge_api_header_conf, NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_purge_loc_conf_t, method_header[4]), NULL },
+
     { ngx_string("cache_purge_tag_namespace_header"),
       NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF
       | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,

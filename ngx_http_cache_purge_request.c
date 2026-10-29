@@ -2477,8 +2477,16 @@ ngx_http_cache_purge_request_identity(ngx_http_request_t *r,
     fields[0] = url;
     fields[1] = misc;
     fields[2] = namespace;
+    if ((host != NULL && url == NULL)
+        || (key != NULL && (url == NULL || misc == NULL || namespace == NULL)))
+    {
+        return NGX_ERROR;
+    }
     total = 0;
     for (i = 0; i < 3; i++) {
+        if (fields[i] == NULL) {
+            continue;
+        }
 #if (NGX_EXPR)
         rc = ngx_http_get_expr_complex_value(r, conf->identity[i], &value);
 #else
@@ -2502,15 +2510,18 @@ ngx_http_cache_purge_request_identity(ngx_http_request_t *r,
         input[i].data = fields[i]->data;
         input[i].len = fields[i]->len;
     }
-    if (namespace->len > 255) {
+    if (namespace != NULL && namespace->len > 255) {
         return NGX_ERROR;
     }
-    for (i = 0; i < namespace->len; i++) {
+    for (i = 0; namespace != NULL && i < namespace->len; i++) {
         if (namespace->data[i] <= 0x20 || namespace->data[i] >= 0x7f
             || namespace->data[i] == ',')
         {
             return NGX_ERROR;
         }
+    }
+    if (url == NULL) {
+        return NGX_OK;
     }
     prefix = url->len >= 7
                  && ngx_strncmp(url->data, "http://", 7) == 0 ? 7 :
@@ -2538,17 +2549,25 @@ ngx_http_cache_purge_request_identity(ngx_http_request_t *r,
     {
         return NGX_ERROR;
     }
-    host->len = parsed.host.len;
-    host->data = ngx_pnalloc(r->pool, host->len);
+    if (host != NULL) {
+        host->len = parsed.host.len;
+        host->data = ngx_pnalloc(r->pool, host->len);
+        if (host->data == NULL) {
+            return NGX_ERROR;
+        }
+        ngx_strlow(host->data, parsed.host.data, host->len);
+    }
+    if (key == NULL) {
+        return NGX_OK;
+    }
     key->len = 64;
     key->data = ngx_pnalloc(r->pool, key->len);
-    if (host->data == NULL || key->data == NULL
+    if (key->data == NULL
         || ngx_http_cache_purge_identity_digest(input[0], input[2], input[1],
                                                digest, &error) != 0)
     {
         return NGX_ERROR;
     }
-    ngx_strlow(host->data, parsed.host.data, host->len);
     ngx_hex_dump(key->data, digest, sizeof(digest));
     return NGX_OK;
 }
@@ -2603,6 +2622,32 @@ ngx_http_cache_purge_protocol_possible(
 #else
     return conf->protocol[n] == 1;
 #endif
+}
+
+static ngx_int_t
+ngx_http_cache_purge_method(ngx_http_request_t *r)
+{
+    ngx_uint_t  i;
+    ngx_flag_t  enabled;
+
+    if (r->method_name.len != 5
+        || ngx_strncmp(r->method_name.data, "PURGE", 5) != 0)
+    {
+        return NGX_DECLINED;
+    }
+    for (i = 0; i < 4; i++) {
+        enabled = ngx_http_cache_purge_protocol_enabled(r, i);
+        if (enabled == 1) {
+            r->write_event_handler = ngx_http_request_empty_handler;
+            ngx_http_finalize_request(r,
+                                      ngx_http_cache_purge_method_handler(r));
+            return NGX_DONE;
+        }
+        if (enabled != 0) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+    }
+    return NGX_DECLINED;
 }
 
 static ngx_int_t
@@ -4698,6 +4743,8 @@ ngx_http_cache_purge_capture_post(ngx_conf_t *cf)
     void                               ***locations = main->locations.elts;
     ngx_uint_t                            i, j, k;
     ngx_flag_t                            resources;
+    ngx_http_core_main_conf_t            *core;
+    ngx_http_handler_pt                 *phase;
 #if (NGX_EXPR)
     ngx_http_expr_complex_value_ctx_t    *identity;
     ngx_uint_t                            n;
@@ -4771,6 +4818,13 @@ ngx_http_cache_purge_capture_post(ngx_conf_t *cf)
     if (!main->enabled) {
         return NGX_OK;
     }
+
+    core = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
+    phase = ngx_array_push(&core->phases[NGX_HTTP_PRECONTENT_PHASE].handlers);
+    if (phase == NULL) {
+        return NGX_ERROR;
+    }
+    *phase = ngx_http_cache_purge_method;
 
     for (i = 0; cf->cycle->modules[i]; i++) {
         module = cf->cycle->modules[i];
