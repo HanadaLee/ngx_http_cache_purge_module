@@ -8332,11 +8332,12 @@ ngx_http_cache_purge_index_retention_expiry(ngx_http_cache_purge_query_t *q,
     return ngx_http_cache_purge_index_bytes(&q->key);
 }
 
-int
-ngx_http_cache_purge_index_keep_propagation(ngx_http_cache_rocksdb_t *store,
+static int
+ngx_http_cache_purge_index_keep_propagation_internal(
+    ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_expected_t *file,
     const unsigned char main[16], const unsigned char variant[16], uint64_t now,
-    const ngx_http_cache_purge_retention_t *retention,
+    const ngx_http_cache_purge_retention_t *retention, int deferred,
     ngx_http_cache_rocksdb_error_t *error)
 {
     ngx_http_cache_purge_index_tx_t      *tx;
@@ -8362,6 +8363,7 @@ ngx_http_cache_purge_index_keep_propagation(ngx_http_cache_rocksdb_t *store,
     if (tx == NULL) {
         return NGX_HTTP_CACHE_ROCKSDB_LIMIT;
     }
+    tx->deferred = deferred;
     q = tx->context;
     if (!ngx_http_cache_purge_index_load(tx, file, &record)
         || !ngx_http_cache_purge_index_require(q,
@@ -8473,6 +8475,36 @@ ngx_http_cache_purge_index_keep_propagation(ngx_http_cache_rocksdb_t *store,
         ngx_http_cache_purge_op_empty, 1);
     ngx_http_cache_purge_index_tx_commit(tx);
     return ngx_http_cache_purge_index_tx_end(tx, error);
+}
+
+int
+ngx_http_cache_purge_index_keep_propagation(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file,
+    const unsigned char main[16], const unsigned char variant[16], uint64_t now,
+    const ngx_http_cache_purge_retention_t *retention,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    int  rc;
+
+    rc = ngx_http_cache_purge_index_keep_propagation_internal(store, file,
+        main, variant, now, retention, 0, error);
+    if (rc == 0) {
+        /* A replay can confirm a snapshot written by the deferred path. */
+        rc = ngx_http_cache_rocksdb_sync(store, error);
+    }
+    return rc;
+}
+
+int
+ngx_http_cache_purge_index_keep_propagation_deferred(
+    ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file,
+    const unsigned char main[16], const unsigned char variant[16], uint64_t now,
+    const ngx_http_cache_purge_retention_t *retention,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_purge_index_keep_propagation_internal(store, file,
+        main, variant, now, retention, 1, error);
 }
 
 int

@@ -40,6 +40,10 @@ The WAL sync group includes both single-file/native preparation and the batch
 preparation API. Native representation bindings and their file intent remain in
 the same atomic batch. Tests count actual WAL sync calls through these entry
 points and verify process recovery and loss of an unsynchronized WAL suffix.
+Executor retention of matched historical associations also joins this
+group. A changing RETIRE or 304 validation intent synchronizes earlier retained
+associations; deferred replacement and collection follow them in WAL order.
+Explicit retention remains synchronous, including a replay of a deferred result.
 Background collection of retired records and unreferenced key metadata also
 joins this bounded sync group. After synchronous retirement, lost collection
 progress restores retired records for another cleanup pass. If the lost suffix

@@ -200,6 +200,187 @@ ngx_http_cache_purge_test_collect_sync(const std::string &path)
 }
 
 static void
+ngx_http_cache_purge_test_retention_sync(const std::string &path)
+{
+    check(mkdir(path.c_str(), 0700) == 0, "retention sync directory");
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    ngx_http_cache_rocksdb_error_t error{};
+    check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
+              == 0,
+        error.message);
+    {
+        Index index(store);
+        auto source = file(1, "/retention-sync");
+        auto published = install(index, source);
+        auto expected =
+            ngx_http_cache_purge_native_expected(source.id, published.revision);
+        unsigned char main[16] = { 1 }, variant[16] = { 2 };
+        ngx_http_cache_purge_retention_t times{ 10, 500, 20, 700 };
+        check(ngx_http_cache_rocksdb_sync(store, &error) == 0, error.message);
+        auto before = ngx_http_cache_purge_test_sync_count();
+        auto keep = [&] {
+            check(ngx_http_cache_purge_index_keep_propagation_deferred(
+                      store, &expected, main, variant, 100, &times, &error)
+                      == 0,
+                error.message);
+        };
+        keep();
+        check(ngx_http_cache_purge_test_sync_count() == before,
+            "retained associations must join the bounded WAL sync group");
+        ngx_http_cache_purge_fence_t found{};
+        check(ngx_http_cache_purge_index_get_propagation(store,
+                  ngx_http_cache_purge_native_bytes(source.key), main,
+                  ngx_http_cache_purge_native_bytes(source.vary), variant, 100,
+                  &found, &error)
+                      == 0
+                  && found.invalidate_ms == 10 && found.delete_ms == 20,
+            "deferred retention is immediately visible to requests");
+        ngx_http_cache_rocksdb_stats_t original{}, replayed{};
+        check(ngx_http_cache_rocksdb_stats(store, &original, &error) == 0,
+            error.message);
+        keep();
+        check(ngx_http_cache_rocksdb_stats(store, &replayed, &error) == 0
+                  && original.writes == replayed.writes
+                  && ngx_http_cache_purge_test_sync_count() == before,
+            "deferred replay neither rewrites nor synchronizes a snapshot");
+        check(ngx_http_cache_purge_index_keep_propagation(
+                  store, &expected, main, variant, 100, &times, &error)
+                      == 0
+                  && ngx_http_cache_purge_test_sync_count() == before + 1,
+            "explicit replay synchronizes an existing deferred snapshot");
+        times.delete_ms++;
+        before = ngx_http_cache_purge_test_sync_count();
+        keep();
+        index.retire(source.id, expected.revision);
+        check(ngx_http_cache_purge_test_sync_count() == before + 1,
+            "retirement synchronizes its preceding retained association");
+        source = file(2, "/validation-retention");
+        published = install(index, source);
+        expected =
+            ngx_http_cache_purge_native_expected(source.id, published.revision);
+        check(ngx_http_cache_rocksdb_sync(store, &error) == 0, error.message);
+        before = ngx_http_cache_purge_test_sync_count();
+        keep();
+        auto raw = ngx_http_cache_purge_native_file(source);
+        ngx_http_cache_purge_index_match_t pending{};
+        check(ngx_http_cache_purge_index_update_pending(store, &expected,
+                  ngx_http_cache_purge_native_bytes("validation-intent"),
+                  raw.tags, raw.tag_count, &pending, &error)
+                      == 0
+                  && ngx_http_cache_purge_test_sync_count() == before + 1,
+            "validation intent synchronizes its retained association");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
+}
+
+static void
+ngx_http_cache_purge_test_retention_recovery(const std::string &mode,
+    const std::string &path, const std::string &barrier)
+{
+    check(barrier == "none" || barrier == "retire" || barrier == "validate",
+        "retention recovery barrier");
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    ngx_http_cache_rocksdb_error_t error{};
+    check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
+              == 0,
+        error.message);
+    {
+        Index index(store);
+        auto source = file(1, "/retention-recovery");
+        unsigned char main[16] = { 1 }, variant[16] = { 2 };
+        ngx_http_cache_purge_retention_t times{ 10, 500, 20, 700 };
+        auto boundary = [&] {
+            for (const auto &entry : std::filesystem::directory_iterator(path))
+            {
+                if (entry.path().extension() == ".log") {
+                    std::cout << "WAL " << entry.path().string() << ' '
+                              << entry.file_size() << std::endl;
+                }
+            }
+        };
+        if (mode == "--crash-retention") {
+            auto published = install(index, source);
+            check(
+                ngx_http_cache_rocksdb_sync(store, &error) == 0, error.message);
+            if (barrier == "none") {
+                boundary();
+            }
+            auto expected = ngx_http_cache_purge_native_expected(
+                source.id, published.revision);
+            auto before = ngx_http_cache_purge_test_sync_count();
+            check(ngx_http_cache_purge_index_keep_propagation_deferred(
+                      store, &expected, main, variant, 100, &times, &error)
+                          == 0
+                      && ngx_http_cache_purge_test_sync_count() == before,
+                "retention crash fixture does not synchronize the snapshot");
+            if (barrier == "retire") {
+                auto retired = index.retire(source.id, expected.revision);
+                expected.revision = retired.revision;
+                boundary();
+                check(ngx_http_cache_purge_index_collect_deferred(
+                          store, &expected, 1, &error)
+                          == 0,
+                    error.message);
+            } else if (barrier == "validate") {
+                auto raw = ngx_http_cache_purge_native_file(source);
+                ngx_http_cache_purge_index_match_t pending{};
+                check(
+                    ngx_http_cache_purge_index_update_pending(store, &expected,
+                        ngx_http_cache_purge_native_bytes("validation-intent"),
+                        raw.tags, raw.tag_count, &pending, &error)
+                        == 0,
+                    error.message);
+                boundary();
+            }
+            index.prepare(file(9, "/unsynchronized-tail"));
+            _exit(0);
+        }
+        bool lost = mode == "--recover-retention-lost";
+        check(lost || mode == "--recover-retention", "retention recovery mode");
+        ngx_http_cache_purge_fence_t found{};
+        int rc = ngx_http_cache_purge_index_get_propagation(store,
+            ngx_http_cache_purge_native_bytes(source.key), main,
+            ngx_http_cache_purge_native_bytes(source.vary), variant, 100,
+            &found, &error);
+        if (barrier == "none" && lost) {
+            check(rc == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND,
+                "lost deferred retention leaves the durable original intact");
+        } else {
+            check(rc == 0 && found.invalidate_ms == 10 && found.delete_ms == 20,
+                "durable barriers preserve both retained propagation modes");
+        }
+        if (barrier == "retire" && !lost) {
+            fails(NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND,
+                [&] { index.get(source.id); });
+        } else {
+            auto restored = index.get(source.id);
+            check(restored.state
+                      == (barrier == "retire" ? FileState::retired :
+                                                FileState::committed),
+                "retention recovery preserves its file transaction state");
+            check(index.has_fill_intent(source.id) == (barrier == "validate"),
+                "validation remains pending until its normal recovery");
+            check(std::find(restored.tags.begin(), restored.tags.end(), "photo")
+                      != restored.tags.end(),
+                "original TAG association survives the permitted WAL cut");
+        }
+        if (lost) {
+            fails(NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND, [&] { index.get(id(9)); });
+        } else {
+            check(index.get(id(9)).state == FileState::prepared,
+                "ordinary process recovery retains unsynchronized WAL writes");
+        }
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
+    std::cout << "PASS retained association recovery " << barrier << ' ' << mode
+              << std::endl;
+}
+
+static void
 ngx_http_cache_purge_test_collect_recovery(
     const std::string &mode, const std::string &path)
 {
@@ -2390,6 +2571,20 @@ int
 main(int argc, char **argv)
 {
     try {
+        if (argc == 3 && std::string(argv[1]) == "--retention-sync") {
+            ngx_http_cache_purge_test_retention_sync(argv[2]);
+            std::cout << "PASS retained association sync barriers" << std::endl;
+            return 0;
+        }
+        if (argc == 4
+            && (std::string(argv[1]) == "--crash-retention"
+                || std::string(argv[1]) == "--recover-retention"
+                || std::string(argv[1]) == "--recover-retention-lost"))
+        {
+            ngx_http_cache_purge_test_retention_recovery(
+                argv[1], argv[2], argv[3]);
+            return 0;
+        }
         if (argc == 3 && std::string(argv[1]) == "--collect-sync") {
             ngx_http_cache_purge_test_collect_sync(argv[2]);
             std::cout << "PASS background collection sync barriers"
@@ -2425,6 +2620,8 @@ main(int argc, char **argv)
         check(mkdtemp(path) != nullptr, "test directory");
         ngx_http_cache_purge_test_tag_groups();
         ngx_http_cache_purge_test_collect_sync(std::string(path) + "-collect");
+        ngx_http_cache_purge_test_retention_sync(
+            std::string(path) + "-retention-sync");
         ngx_http_cache_purge_test_alias_snapshots(
             std::string(path) + "-aliases");
         ngx_http_cache_purge_test_native_migration(

@@ -6439,7 +6439,7 @@ ngx_http_cache_purge_keep_step(ngx_http_cache_purge_keep_t *keep)
                     main, variant, &keep->error);
             }
             if (rc == 0) {
-                rc = ngx_http_cache_purge_index_keep_propagation(
+                rc = ngx_http_cache_purge_index_keep_propagation_deferred(
                     c->operations.store, &keep->expected, main, variant,
                     p->context.now_ms, &retained, &keep->error);
             }

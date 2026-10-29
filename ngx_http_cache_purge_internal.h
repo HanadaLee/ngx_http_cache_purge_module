@@ -1090,6 +1090,14 @@ int ngx_http_cache_purge_index_keep_propagation(ngx_http_cache_rocksdb_t *store,
     const unsigned char main[16], const unsigned char variant[16], uint64_t now,
     const ngx_http_cache_purge_retention_t *retention,
     ngx_http_cache_rocksdb_error_t *error);
+/* Cached associations join the WAL group. Retirement, validation and task
+ * completion barriers cover the snapshot before releasing their proofs. */
+int ngx_http_cache_purge_index_keep_propagation_deferred(
+    ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file,
+    const unsigned char main[16], const unsigned char variant[16], uint64_t now,
+    const ngx_http_cache_purge_retention_t *retention,
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_get_propagation(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_bytes_t key, const unsigned char main[16],
     ngx_http_cache_rocksdb_bytes_t vary, const unsigned char variant[16],
