@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check native key decoding without loading the cache key module."""
+"""Check independent identity expressions with arbitrary native cache keys."""
 import argparse
 import hashlib
 import http.client
@@ -38,7 +38,7 @@ def quote(value):
 
 
 valid = [
-    [b'tenant', b'http', b'format.test', b'/plain', b'', b''],
+    [b'', b'http', b'format.test', b'/plain', b'', b''],
     [b'tenant', b'http', b'format.test', b'/escape', b'a\\b\x1fc', b'bytes=0-9'],
     [b'tenant', b'http', b'format.test', b'/literal', b'\\x1F', b''],
     [b'tenant', b'http', b'format.test', '/utf8/汉'.encode(), b'misc', b''],
@@ -73,14 +73,24 @@ threading.Thread(target=origin.serve_forever, daemon=True).start()
 with socket.socket() as reserved:
     reserved.bind(('127.0.0.1', 0))
     port = reserved.getsockname()[1]
+cases = [(fields[0], fields[1] + b'://' + fields[2] + fields[3], fields[4],
+          b'opaque/' + str(i).encode()) for i, fields in enumerate(valid)]
+cases += [(b'', b'http://format.test/arbitrary/' + str(i).encode(), b'variant', native)
+          for i, native in enumerate(invalid)]
 locations = []
-for i, key in enumerate([*(encode(fields) for fields in valid), *invalid]):
-    locations.append(f'location = /case-{i} {{ proxy_cache_key {quote(key)}; '
+for i, (namespace, url, misc, native) in enumerate(cases):
+    identity = f'cache_purge_key_url {quote(url)};'
+    if namespace: identity += f'cache_purge_key_namespace {quote(namespace)};'
+    if misc: identity += f'cache_purge_key_misc {quote(misc)};'
+    locations.append(f'location = /case-{i} {{ proxy_cache_key {quote(native)}; '
+                     f'proxy_cache_purge on; {identity}'
                      f'proxy_pass http://127.0.0.1:{origin.server_port}; }}')
+locations.append(f'location /default-off {{ proxy_cache_key $uri; '
+                 f'proxy_pass http://127.0.0.1:{origin.server_port}; }}')
 loads = ''.join(f'load_module {a.build}/objs/{name}.so;\n' for name in
                 ('ngx_http_cache_rocksdb_module', 'ngx_http_cache_purge_module')
                 if (a.build / 'objs' / (name + '.so')).exists())
-# No key-module variable or independent identity expression is configured.
+# No key-module variable, header or API is used.
 config = loads + f'''daemon off;
 master_process on;
 worker_processes 1;
@@ -198,24 +208,24 @@ try:
                                    stdout=log, stderr=subprocess.STDOUT)
         until(lambda: (run / 'index/component.sock').exists())
         until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
-        for i, fields in enumerate(valid):
+        for i, (namespace, url, misc, native) in enumerate(cases):
             path = f'/case-{i}'
             assert request(path) == (200, 'MISS', path.encode())
-            url = fields[1] + b'://' + fields[2] + fields[3]
             stored, tags, flags, components = until(lambda: record(url))
-            assert stored[:4] == [encode(fields[:5]), url, b'format.test', fields[0]]
-            # GET_FILE resolves dictionary values; it does not return the
-            # transient structured input flags or component array.
+            expected = hashlib.sha256(b'NCI1' + string(namespace) + string(url) + string(misc)).digest()
+            assert stored[:4] == [expected.hex().encode(), url, b'format.test', namespace]
+            assert stored[10] == misc and flags == bytes(2) and components == [b''] * 6
             assert tags == [b'topic']
-            assert stored[10] == fields[4]
-            until(lambda: (target := Path(os.fsdecode(stored[4])) / os.fsdecode(stored[6])).exists()
-                  and os.getxattr(target, 'user.ngx_cache_purge.id')[4:8] == b'\0\0\0\2')
+            target = Path(os.fsdecode(stored[4])) / os.fsdecode(stored[6])
+            until(lambda: target.exists() and os.getxattr(target, 'user.ngx_cache_purge.id')[4:8] == b'\0\0\0\2')
+            assert os.getxattr(target, 'user.ngx_cache_purge.id')[120:152] == expected
+            assert target.read_bytes().split(b'\nKEY: ', 1)[1].split(b'\n', 1)[0] == native
             assert request(path)[1] == 'HIT'
-            checks.append(f'case {i}: native bytes determine all fields without key-module variables or API')
-        for i in range(len(valid), len(valid) + len(invalid)):
-            for _ in range(2):
-                assert request(f'/case-{i}')[0:2] == (200, 'BYPASS')
-            checks.append(f'case {i}: malformed field count, escape or namespace cannot enter cache')
+            checks.append(f'case {i}: independent identity accepts arbitrary native key bytes and preserves the physical key')
+        assert request('/default-off')[1] == 'MISS'
+        assert request('/default-off')[1] == 'HIT'
+        assert record(b'http://format.test/default-off') is None
+        checks.append('store/state resources alone leave locations disabled; omitted namespace and misc are empty')
         payload = {'version': 'ngx-http-cache-purge/v2', 'operation_id': 'format-delete',
                    'mode': 'delete', 'selector': {'type': 'url', 'value': 'http://format.test/plain'},
                    'event': {'issuer': 'test', 'stream_id': 'format', 'sequence': '1',
@@ -241,7 +251,7 @@ logs = (run / 'error.log').read_text() + (run / 'stdout.log').read_text()
 assert not any(word in logs for word in ('[alert]', 'AddressSanitizer', 'LeakSanitizer', 'runtime error:', 'exited on signal'))
 a.output.write_text(json.dumps({'build': str(a.build), 'run': str(run), 'checks': checks,
                                'key_module_loaded': False,
-                               'transitional_identity_directives': False,
+                               'independent_identity_directives': True,
                                'binaries': {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                                             for path in [binary, *(a.build / 'objs').glob('*.so')]}}, indent=2) + '\n')
-print('PASS', len(checks), 'independent native-format checks')
+print('PASS', len(checks), 'independent identity checks')

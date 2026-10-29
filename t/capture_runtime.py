@@ -269,6 +269,12 @@ for name, server in gateways.items():
 
       {name}_pass 127.0.0.1:{server.server_address[1]};
     }}''')
+    gateway_locations.append(f'''location /{name}-off/ {{
+      {name}_cache {name}; {name}_cache_key $cache_key_full; {name}_cache_valid 200 1h;
+      {name}_cache_purge off; cache_purge_key_url $arg_missing;
+      {name}_param REQUEST_METHOD GET; {name}_param REQUEST_URI $uri;
+      {name}_pass 127.0.0.1:{server.server_address[1]};
+    }}''')
 modules = ['ngx_http_cache_rocksdb_module', 'ngx_http_cache_purge_module']
 modules.insert(len(modules) if a.key_last else 0, 'ngx_http_cache_key_module')
 loads = ''.join(f'load_module {build}/objs/{name}.so;\n' for name in modules) if a.dynamic else ''
@@ -331,6 +337,10 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
  map $arg_gate $send_host {{ default $arg_gate; "" 127.0.0.1; }}
  map $arg_z $zone {{ default a; b b; off off; }}
  cache_key_namespace tenant; cache_key_uri $uri; cache_key_misc $arg_m; cache_key_range $slice_range;
+ cache_purge_key_url $cache_key_url;
+ cache_purge_key_misc $cache_key_misc;
+ cache_purge_key_namespace $cache_key_namespace;
+ proxy_cache_purge on; fastcgi_cache_purge on; scgi_cache_purge on; uwsgi_cache_purge on;
  server {{ listen 127.0.0.1:{port};
   proxy_cache $zone; proxy_cache_key $cache_key_full;
   proxy_cache_valid 200 206 1h; proxy_cache_bypass $arg_bypass;
@@ -361,6 +371,8 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
       proxy_cache off; proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /propagation/uncached-manual {{ {propagation_manual_config}
       cache_key_namespace $arg_unused_namespace;
+      cache_purge_key_url "$scheme://$host$uri";
+      cache_purge_key_misc ""; cache_purge_key_namespace manual;
       proxy_cache off; proxy_cache_key "manual\x1fhttp\x1f$host\x1f$uri\x1f\x1f";
       proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /propagation/uncached-ignore {{ {propagation_config}
@@ -382,9 +394,14 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
   location /slice {{
                     {slice_config} proxy_set_header Range $slice_range;
                     proxy_pass http://127.0.0.1:{origin.server_port}; }}
-  location /raw {{ proxy_cache_key "rawtenant\x1fhttp\x1f$host\x1f$uri\x1f$arg_m\x1f";
+  location /raw {{ proxy_cache_key "native-format:$host|$uri|$arg_m";
+                  cache_purge_key_url "$scheme://$host$uri";
+                  cache_purge_key_misc $arg_m; cache_purge_key_namespace rawtenant;
 
                   proxy_pass http://127.0.0.1:{origin.server_port}; }}
+  location /index-off {{ proxy_cache_purge off;
+      cache_purge_key_url $arg_missing; cache_purge_key_namespace $arg_bad;
+      proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /alias/finish- {{ cache_key_uri /finish/shared;
                      proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /alias/ {{ cache_key_uri /alias/shared;
@@ -471,6 +488,20 @@ if extension and a.expr:
       proxy_cache_revalidate on;
       expr tag_policy = $arg_policy 1;
       when tag_policy {{ cache_purge_tag "$upstream_http_cache_tag, conditional"; }}
+      proxy_pass http://127.0.0.1:{origin.server_port};
+    }}
+    location /identity-when/ {{
+      cache_purge_tag identity-when;
+      expr identity_policy = $arg_managed 1;
+      when identity_policy {{
+        proxy_cache_purge on;
+        cache_purge_key_url "http://cache.test$uri";
+        cache_purge_key_misc $arg_misc;
+        cache_purge_key_namespace "";
+      }}
+      proxy_cache_purge off;
+      cache_purge_key_url $arg_missing;
+      proxy_cache_key "$uri|$arg_misc";
       proxy_pass http://127.0.0.1:{origin.server_port};
     }}
     '''
@@ -622,6 +653,9 @@ def records(path, count, host='cache.test'):
             if marker[7] != 2 or marker[8:24] != item['id']: return None
         return result
     return until(published)
+
+def identity_key(namespace, url, misc):
+    return hashlib.sha256(b'NCI1' + string(namespace) + string(url) + string(misc)).hexdigest().encode()
 
 def record(ident, optional=False):
     raw = rpc(2, ident, codes=(0, 1) if optional else (0,))
@@ -818,8 +852,6 @@ obsolete_directives = (
     'cache_purge_key $cache_key_base;', 'cache_purge_url $cache_key_url;',
     'cache_purge_tag_namespace $cache_key_namespace;',
     'cache_purge_namespace old 1m /tmp/old-state;',
-    'proxy_cache_purge on;', 'fastcgi_cache_purge on;',
-    'scgi_cache_purge on;', 'uwsgi_cache_purge on;',
     'proxy_cache_refresh old $uri;',
     'cache_purge_refresh_profile /old/ /;',
     'cache_purge_refresh_timeout 1s;',
@@ -835,7 +867,7 @@ for directive in obsolete_directives:
     tested = subprocess.run([str(build / 'objs/nginx'), '-t', '-p', str(run) + '/', '-c', str(candidate_path)],
                             env=env, capture_output=True, text=True, timeout=15)
     assert tested.returncode != 0 and ('unknown directive "' + directive.split()[0] + '"') in tested.stderr, tested.stderr
-checks.append('removed generation, inline PURGE/REFRESH and SHM queue directives fail configuration explicitly')
+checks.append('removed generation, REFRESH and SHM queue directives fail configuration explicitly')
 rogue = f'''  location = /rogue-cache {{
     proxy_pass http://127.0.0.1:{origin.server_port};
   }}
@@ -848,9 +880,26 @@ for label, candidate in (
     tested = subprocess.run([str(build / 'objs/nginx'), '-t', '-p', str(run) + '/', '-c', str(candidate_path)],
                             env=env, capture_output=True, text=True, timeout=15)
     assert tested.returncode == 0, (label, tested.stderr)
-checks.append('the store/state pair manages every cached location without per-location identity expressions')
+checks.append('protocol switches and independent identity expressions inherit into cached locations')
+for label, candidate, message in (
+        ('missing-url', config.replace('cache_purge_key_url $cache_key_url;', ''),
+         'requires cache_purge_key_url'),
+        ('empty-url', config.replace('cache_purge_key_url $cache_key_url;', 'cache_purge_key_url "";'),
+         'nonempty absolute'),
+        ('relative-url', config.replace('cache_purge_key_url $cache_key_url;', 'cache_purge_key_url /relative;'),
+         'nonempty absolute'),
+        ('invalid-namespace', config.replace('cache_purge_key_namespace $cache_key_namespace;', 'cache_purge_key_namespace "bad,name";'),
+         'printable ASCII namespace'),
+        ('invalid-switch', config.replace('proxy_cache_purge on;', 'proxy_cache_purge maybe;', 1),
+         'invalid value')):
+    candidate_path = run / (label + '.conf'); candidate_path.write_text(candidate)
+    tested = subprocess.run([str(build / 'objs/nginx'), '-t', '-p', str(run) + '/', '-c', str(candidate_path)],
+                            env=env, capture_output=True, text=True, timeout=15)
+    assert tested.returncode != 0 and message in tested.stderr, (label, tested.stderr)
+checks.append('enabled locations require an explicit URL and reject invalid static URL, namespace and switch configuration')
 legacy_config = re.sub(r'cache_purge_(?:store|state_zone)\s+[^;]+;', '', config)
 legacy_config = legacy_config.replace('cache_purge_api;', 'return 503;')
+legacy_config = re.sub(r'(proxy|fastcgi|scgi|uwsgi)_cache_purge on;', r'\1_cache_purge off;', legacy_config)
 (run / 'nginx.conf').write_text(legacy_config)
 process = start()
 try:
@@ -879,11 +928,39 @@ try:
     first = records('/asset', 1)[0]; ready_file(first)
     ledger, sequence = watermark(first)
     assert ledger != bytes(16) and sequence == 0
-    assert first['key'] == b'tenant\x1fhttp\x1fcache.test\x1f/asset\x1f'
+    assert first['key'] == identity_key('tenant', 'http://cache.test/asset', '')
     assert first['namespace'] == b'tenant' and set(first['tags']) == {b'news', b'red'}
     assert len(origin_metadata(first)) == 28
     assert get('/asset')[1] == 'HIT' and calls.count('/asset') == 1
     checks.append('real upstream fill is WAL-indexed with the native key snapshot, scoped tags and READY marker')
+    assert get('/index-off?bad=bad,namespace')[1] == 'MISS'
+    until(lambda: get('/index-off?bad=bad,namespace')[1] == 'HIT')
+    initial_requests = int.from_bytes(rpc(1)[40:48], 'big')
+    for _ in range(3):
+        assert get('/index-off?bad=bad,namespace')[1] == 'HIT'
+    final_requests = int.from_bytes(rpc(1)[40:48], 'big')
+    assert final_requests - initial_requests == 1
+    assert query('http://cache.test/index-off') == []
+    checks.append('an off protocol skips identity evaluation, indexing and all request IPC while retaining native HITs')
+    for protocol in gateways:
+        uri = '/' + protocol + '-off/item'
+        assert get(uri)[1] == 'MISS'
+        until(lambda: get(uri)[1] == 'HIT')
+        assert query('http://cache.test' + uri) == []
+    checks.append('FastCGI, SCGI and uwsgi switches independently disable capture even when other protocol switches are on')
+    if extension and a.expr:
+        uri = '/identity-when/item'
+        assert get(uri + '?misc=alpha')[1] == 'MISS'
+        until(lambda: get(uri + '?misc=alpha')[1] == 'HIT')
+        assert query('http://cache.test' + uri) == []
+        assert get(uri + '?managed=1&misc=alpha')[1] in ('MISS', 'BYPASS')
+        item = records(uri, 1)[0]
+        assert item['namespace'] == b'' and item['misc'] == b'alpha'
+        assert item['key'] == identity_key('', 'http://cache.test' + uri, 'alpha')
+        ready_file(item)
+        assert get(uri + '?managed=1&misc=alpha')[1] == 'HIT'
+        assert get(uri + '?misc=alpha')[1] == 'HIT'
+        checks.append('expr when enables capture and selects URL, misc and an empty namespace without evaluating inactive candidates')
     misc_proofs = []
     for misc in ('one', 'two'):
         assert get('/misc-proof?m=' + misc)[1] == 'MISS'
@@ -1080,7 +1157,7 @@ try:
     assert get('/alias/three') == (200, 'HIT', b'canonical-fresh')
     assert records('/alias/shared', 1)[0]['id'] == alias['id']
     checks.append('canonical URL prefix Delete and exact Invalidate preserve shared routing and 304 semantics')
-    for name, kind in (('url', 1), ('key', 0), ('url-prefix/item', 3), ('key-prefix/item', 2)):
+    for name, kind in (('url', 1), ('key', 0), ('url-prefix/item', 3)):
         uri = '/invalidate/' + name
         conditional_paths.add(uri)
         assert get(uri) == (200, 'MISS', uri.encode())
@@ -1090,7 +1167,6 @@ try:
         original_ids = {item['id'] for item in original}
         original_origins = {item['id']: watermark(item) for item in original}
         if kind == 0: value = original[0]['key']
-        elif kind == 2: value = original[0]['key'].rsplit(b'/', 1)[0] + b'/'
         elif kind == 3: value = 'http://cache.test' + uri.rsplit('/', 1)[0] + '/'
         else: value = 'http://cache.test' + uri
         fence('direct-invalidate-' + name, kind, value, mode=1)
@@ -1245,10 +1321,12 @@ try:
     checks.append('read admission inspects the selected Vary file and refills only the unmarked variant')
     assert get('/slice')[2] == slice_body
     sliced = records('/slice', 3)
-    assert len({x['key'] for x in sliced}) == 1 and len({x['range'] for x in sliced}) == 3
+    assert len({x['key'] for x in sliced}) == 1 and len({x['path'] for x in sliced}) == 3
+    assert {x['range'] for x in sliced} == {b''}
     assert get('/slice')[2] == slice_body and calls.count('/slice') == 3
     checks.append('slice subrequests publish all ranges under one base key')
-    middle = next(item for item in sliced if item['range'] == b'bytes=1024-2047')
+    middle_digest = hashlib.md5(b'tenant\x1fhttp\x1fcache.test\x1f/slice\x1f\x1fbytes=1024-2047').hexdigest().encode()
+    middle = next(item for item in sliced if item['path'].split(b'/')[-1] == middle_digest)
     os.removexattr(ready_file(middle), 'user.ngx_cache_purge.id')
     assert get('/slice')[2] == slice_body
     until(lambda: middle['id'] not in {item['id'] for item in records('/slice', 3)})
@@ -1268,9 +1346,9 @@ try:
     checks.append('BYPASS replacement captures before origin, retires the prior instance and updates scoped TAG membership')
     assert get('/raw?m=native')[1] == 'MISS'
     item = records('/raw', 1)[0]; ready_file(item)
-    assert item['key'] == b'rawtenant\x1fhttp\x1fcache.test\x1f/raw\x1fnative'
+    assert item['key'] == identity_key('rawtenant', 'http://cache.test/raw', 'native')
     assert item['namespace'] == b'rawtenant'
-    checks.append('an independent native key expression provides canonical URL, namespace and base key without key-module outputs')
+    checks.append('independent identity expressions index an arbitrary native key format without key-module outputs')
     if extension and a.expr:
         uri = '/tag-when/object'
         policies[uri] = 'when-old'
@@ -2115,7 +2193,7 @@ try:
     response = prop_get('/propagation/uncached-manual', incoming)
     assert response[0] == 200, response
     propagated(propagation_headers('/propagation/uncached-manual'), (0, incoming_time))
-    checks.append('an independent formatted uncached key does not evaluate unused key-module components')
+    checks.append('independent uncached identity expressions do not evaluate unused key-module components')
 
 finally:
     finish_release.set()

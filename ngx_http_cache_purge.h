@@ -15,6 +15,10 @@
 typedef struct ngx_http_cache_purge_client_s  ngx_http_cache_purge_client_t;
 typedef struct ngx_http_cache_purge_call_s   ngx_http_cache_purge_call_t;
 
+ngx_int_t ngx_http_cache_purge_request_identity(ngx_http_request_t *r,
+    ngx_str_t *url, ngx_str_t *misc, ngx_str_t *namespace, ngx_str_t *host,
+    ngx_str_t *key);
+
 typedef enum {
     NGX_HTTP_CACHE_PURGE_CLIENT_OK = 0,
     NGX_HTTP_CACHE_PURGE_CLIENT_IO,

@@ -273,11 +273,11 @@ preserving the independent propagation deadline.
 Indexed requests do not create memory-only entries: transport 502/504 and
 intercepted errors are excluded, while ordinary disk-backed error responses keep
 their configured cache policy. Native `error_page` conditions are not evaluated
-again by the module. Configuring `cache_purge_store` and `cache_purge_state_zone`
-enables indexing for the HTTP instance, including inherited and dynamically
-selected cache zones. Every managed native key must use the format described
-below. There is no per-location identity expression or indexing switch;
-use the native `*_cache off` directive to disable caching in a location.
+again by the module. `cache_purge_store` and `cache_purge_state_zone` configure
+shared resources. Each protocol is activated separately with its inherited
+`*_cache_purge on` switch; all four switches default to off. Disabled locations
+keep native caching without evaluating purge identity or making capture IPC
+requests. Native `*_cache off` remains a separate caching decision.
 
 Changing between indexed and unindexed mode requires a full nginx restart to
 replace legacy in-memory error state. Reload within indexed mode remains
@@ -433,33 +433,44 @@ the companion key module, worker IPC, WAL preparation, rename and READY
 publication. It also covers selected-descriptor admission, 304 commits,
 background invalidation, native-node cleanup and HTTP management requests.
 
-Configure the store and state zone together at HTTP scope. For a location using
-the independent key module, only the native key and optional TAG metadata need
-to be configured:
+Configure the store and state zone together at HTTP scope. Provide independent
+identity expressions and enable the protocol at HTTP, server or location scope:
 
 ```nginx
-proxy_cache_key $cache_key_full;
-cache_purge_tag $upstream_http_cache_tag;
+cache_purge_key_url "$scheme://$host$uri";
+cache_purge_key_misc $arg_variant;
+cache_purge_key_namespace "";
+proxy_cache_purge on;
 ```
 
-The following native-format adapter is transitional. Independent
-`cache_purge_key_url`, `cache_purge_key_misc` and `cache_purge_key_namespace`
-expressions, per-protocol `*_cache_purge` activation and PURGE handling are being
-implemented; they will not require a particular native key format or producer.
+`cache_purge_key_url` is required for an enabled location and must evaluate to
+an absolute HTTP or HTTPS URL. The module preserves that value and derives its
+host selector from the URL authority, rather than the incoming request Host.
+`cache_purge_key_misc` and `cache_purge_key_namespace` default to empty strings.
+Empty misc identifies one variant; empty namespace is a valid exact scope.
+Namespaces contain at most 255 printable ASCII bytes without spaces or commas.
+The three expressions and `proxy_cache_purge`, `fastcgi_cache_purge`,
+`scgi_cache_purge` and `uwsgi_cache_purge` support inheritance and expr `when`
+blocks. Conditions follow expr's first-match order: place conditional entries
+before an unconditional fallback in the same scope. Inactive expressions are
+not evaluated. Invalid static values fail
+configuration; missing or invalid dynamic identity prevents caching.
 
-In the current adapter, key, URL, host and namespace come from native key bytes,
-including requests that bypass cache reads. Purge uses `us-escape-v1` decoding
-and does not include the
-key module's headers, resolve its C symbols, or require its load order. The six
-fields are namespace, scheme, host, URI, misc and range. They are separated by
-byte `0x1f`; field backslashes are escaped as `\\`, and an embedded separator
-as the four printable bytes `\x1F`. Other producers can emit the same format.
-Decoding preserves component boundaries without reevaluating generator variables.
-Malformed keys skip caching. The base key excludes the final separator and range;
-the URL joins scheme, host and URI. Host selectors use the encoded host, not an
-additional request Host alias. TAG namespace comes from the encoded namespace.
-`cache_purge_key`, `cache_purge_url` and `cache_purge_tag_namespace` have been
-removed and are rejected as unknown directives.
+The module does not parse native cache-key bytes or depend on the key module's
+variables, headers, APIs, format or load order. Operators may explicitly use
+`$cache_key_url`, `$cache_key_misc` and `$cache_key_namespace` in these expressions.
+Native `*_cache_key` expressions are unchanged, including custom formats.
+Identity is captured once per cache operation. Physical main/Vary digests still
+come from nginx; range is not an identity input and is not parsed from the key.
+All physical slices and zones remain associated with their configured identity.
+
+The current index uses a bounded internal digest for the namespace/URL/misc
+identity. Its final URL-scoped misc secondary layout and request-facing key
+selector migration are still in progress. The protocol switches now control
+index capture and invalidation checks; the inline PURGE entrypoint is still
+being implemented. Existing JSON submission/status endpoints remain available.
+`cache_purge_key`, `cache_purge_url` and `cache_purge_tag_namespace` are obsolete
+and rejected as unknown directives.
 
 `cache_purge_tag` is an inherited complex value at HTTP, server or location scope.
 With the expr module it also supports `when` blocks, including selection during
@@ -741,8 +752,8 @@ database-backed raw TAG path until worker-side proof admission is integrated.
 An empty namespace is a valid exact scope, distinct from every named namespace;
 it never falls back to the request host or means all namespaces.
 
-The per-key identity row contains four unsigned 64-bit values: file count,
-URL dictionary ID, host dictionary ID and namespace dictionary ID. A fill cannot
+The per-key identity row contains five unsigned 64-bit values: file count,
+URL, host, namespace and misc dictionary IDs. A fill cannot
 change the identity of an existing key; a conflicting batch rolls back entirely.
 One URL may still select multiple misc/namespace keys, with multiple zones,
 slices and Vary files under each key. URL-to-key and host-to-key postings remain;
@@ -808,19 +819,20 @@ unavailable initial writer registration within the same three-second deadline.
 It does not send an incomplete requirement or turn a transient missing snapshot
 into an immediate request-creation error.
 
-Proxy locations in a managed HTTP instance also resolve propagation when
+Proxy locations with `proxy_cache_purge on` also resolve propagation when
 `proxy_cache` is off, a variable zone resolves to off, or the method is excluded
 from caching. They use scratch key storage and the native key builder to
 select current or retained slice/Vary associations, without opening cache files
-or publishing index records. Independent formatted key expressions do not evaluate
+or publishing index records. Independent identity expressions do not evaluate
 unused key-module components. No key-module capture API is called. When using the key
 module, use a version that confines automatic native capture to key creation
 before upstream request buffers exist; a later scratch evaluation must not
 retain a temporary cache context.
 
 An uncached proxy that handles or forwards propagation requirements also needs
-an effective native `proxy_cache_key` in the same format. Defining it at HTTP or
-server scope lets cached and uncached proxy locations inherit the same identity.
+an effective native `proxy_cache_key` for representation selection, plus the
+three independent identity expressions. These inputs can be inherited from HTTP
+or server scope. Native key serialization is unrestricted.
 
 A module-owned adapter at the existing post-create `proxy_bind` value boundary
 installs the output gate; no extra bind directive or core patch is required.
@@ -916,9 +928,8 @@ Capabilities currently report proxy propagation as unavailable.
 
 ## Usage
 
-With `ngx_http_cache_key_module` loaded, use its encoded output for native cache
-keys. Purge derives structured identity from those bytes. Configure the store
-and state zone as shown above.
+The independent key module can be wired through configuration. Configure the
+store and state zone as shown above, then reference its outputs explicitly.
 
 ```nginx
 proxy_cache_path /var/cache/nginx keys_zone=cache_zone:4m;
@@ -929,6 +940,10 @@ server {
     location / {
         proxy_cache cache_zone;
         proxy_cache_key $cache_key_full;
+        cache_purge_key_url $cache_key_url;
+        cache_purge_key_misc $cache_key_misc;
+        cache_purge_key_namespace $cache_key_namespace;
+        proxy_cache_purge on;
         proxy_pass http://origin;
     }
 
