@@ -431,10 +431,17 @@ independently. Native file-response admission consumes this table. A separate
 precontent test consumer also covers coordinator lifecycle.
 
 The module-owned fill helper uses an initial header filter and the existing
-upstream finalizer to defer publication
-until asynchronous preparation has completed. It retains the request and cache
-node through cancellation and reload, and works on unmodified nginx without a
-custom store hook. FINISH verifies the actual final file because native update
+upstream finalizer to transfer complete cache fills to bounded publication jobs.
+Each job owns copied identity data, a temporary-file descriptor, the cache-node
+reference and the origin registration. ACQUIRE, PREPARE and FINISH do not retain
+the HTTP request or delay reuse of its keepalive connection. Capacity exhaustion
+drops the cache fill; it does not wait for a publication slot. Jobs share the
+existing 64-task and 2 MiB material limits per worker, have a three-second
+deadline and keep draining workers alive until completion or cancellation.
+Native rename/stat still execute on the worker; this change removes the request
+lifetime dependency on IPC and WAL synchronization, not all filesystem latency.
+It works on unmodified nginx without a custom store hook.
+FINISH verifies the actual final file because native update
 does not return a rename result. `t/native_fill_runtime.py` covers the native
 lifecycle separately. `t/capture_runtime.py` exercises real native fills through
 the companion key module, worker IPC, WAL preparation, rename and READY

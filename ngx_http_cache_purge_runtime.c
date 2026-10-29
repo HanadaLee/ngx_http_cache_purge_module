@@ -947,6 +947,7 @@ ngx_http_cache_purge_runtime_worker_exit(ngx_cycle_t *cycle)
     main =
         ngx_http_cycle_get_module_main_conf(cycle, ngx_http_cache_purge_module);
     if (main && main->runtime) {
+        ngx_http_cache_purge_publication_stop();
         if (main->runtime->owner_event.timer_set) {
             ngx_del_timer(&main->runtime->owner_event);
         }

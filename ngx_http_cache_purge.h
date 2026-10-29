@@ -224,6 +224,8 @@ typedef ngx_int_t (*ngx_http_cache_purge_fill_step_pt)(
  * cache header construction. DECLINED means this is not a cacheable fill.
  * Complete bodies start PREPARE asynchronously after upstream finalization.
  * A step returning AGAIN must complete exactly once, including failure/timeout.
+ * PREPARE may return DONE after transferring the node reference and temporary
+ * file to an independent owner; no FINISH callback follows that handoff.
  * FINISH reconciles every attempted PREPARE. Its NGX_OK result means rename
  * was attempted, not that it succeeded: inspect the actual final instance.
  * Callbacks must not replace r->cache, finalize the request, or update/free c.
@@ -234,6 +236,7 @@ ngx_int_t ngx_http_cache_purge_fill_arm(ngx_http_request_t *r,
     void *data);
 void      ngx_http_cache_purge_fill_complete(ngx_http_cache_purge_fill_t *fill,
     ngx_int_t result);
+void ngx_http_cache_purge_publication_stop(void);
 
 
 /* Use exported core layouts where available; keep old-ABI adapters together. */
