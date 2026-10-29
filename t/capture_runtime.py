@@ -32,6 +32,7 @@ p.add_argument('--key', type=Path, required=True)
 p.add_argument('--libraries', type=Path, required=True)
 p.add_argument('--output', type=Path, required=True)
 p.add_argument('--dynamic', action='store_true')
+p.add_argument('--key-last', action='store_true', help='Configure/load the independent key producer after purge')
 p.add_argument('--sanitize', action='store_true')
 p.add_argument('--expr', type=Path)
 p.add_argument('--workers', type=int, default=2)
@@ -67,7 +68,7 @@ configure = 'auto/configure' if (build / 'auto/configure').exists() else 'config
 command = ['sh', configure, '--prefix=' + str(root / 'default'), '--with-debug', '--with-threads',
            '--with-http_slice_module']
 if a.expr: command.append('--add-module=' + str(a.expr))
-command += [option + str(key), option + str(addon)]
+command += [option + str(path) for path in ((addon, key) if a.key_last else (key, addon))]
 if a.sanitize:
     command += ['--with-cc-opt=-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize=nonnull-attribute -fno-pie',
                 '--with-ld-opt=-fsanitize=address,undefined -no-pie']
@@ -249,8 +250,9 @@ for name, server in gateways.items():
       cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
       {name}_pass 127.0.0.1:{server.server_address[1]};
     }}''')
-loads = ''.join(f'load_module {build}/objs/{name}.so;\n' for name in
-                ('ngx_http_cache_key_module', 'ngx_http_cache_rocksdb_module', 'ngx_http_cache_purge_module')) if a.dynamic else ''
+modules = ['ngx_http_cache_rocksdb_module', 'ngx_http_cache_purge_module']
+modules.insert(len(modules) if a.key_last else 0, 'ngx_http_cache_key_module')
+loads = ''.join(f'load_module {build}/objs/{name}.so;\n' for name in modules) if a.dynamic else ''
 extension = any(line.split() == ['#define', 'NGX_RESTY_EXT', '1']
                 for line in (build / 'objs/ngx_auto_config.h').read_text().splitlines())
 slice_config = 'slice on; slice_size 1024;' if extension else 'slice 1024;'
@@ -2080,7 +2082,7 @@ result = {'root': str(root), 'run': str(run), 'nginx_revision': revision,
           'core_source_files_unchanged': len(sources) if not a.core_working_tree else 0,
           'core_working_tree_files_match': len(sources) if a.core_working_tree else 0,
           'core_source_patch_sha256': hashlib.sha256(source_patch).hexdigest(),
-          'dynamic': a.dynamic, 'sanitizer': a.sanitize, 'expr': bool(a.expr), 'extension': extension,
+          'dynamic': a.dynamic, 'key_last': a.key_last, 'sanitizer': a.sanitize, 'expr': bool(a.expr), 'extension': extension,
           'sanitizer_exclusions': ['nonnull-attribute', 'alignment instrumentation for native ngx_md5.o only'] if a.sanitize else [],
           'workers': a.workers, 'checks': checks,
           'sources': {group: {str(p.relative_to(directory)): hashlib.sha256(p.read_bytes()).hexdigest() for p in directory.rglob('*') if p.is_file()}

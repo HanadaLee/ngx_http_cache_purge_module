@@ -420,8 +420,15 @@ cache_purge_tag_namespace $cache_key_namespace;
 ```
 
 Key, URL and namespace inputs are frozen after native key creation, including
-requests that bypass cache reads. Exact companion-variable references use its
-committed C snapshot and preserve component boundaries in the index. An omitted
+requests that bypass cache reads. The exact references shown above select
+`us-escape-v1` decoding of nginx's actual key bytes; purge does not include the
+key module's headers, resolve its C symbols, or require its load order. The six
+fields are namespace, scheme, host, URI, misc and range. They are separated by
+byte `0x1f`; field backslashes are escaped as `\\`, and an embedded separator
+as the four printable bytes `\x1F`. Other producers can emit the same format.
+Decoding preserves component boundaries without reevaluating those variables.
+Malformed structured keys skip caching. Independent expressions remain part
+of the current configuration interface while its migration is pending. An omitted
 URL expression uses the actual native cache-key bytes. TAG values are comma
 separated, case sensitive, trimmed and deduplicated; an empty value clears the
 new entity's TAG set. Namespace defaults to `$host`.
@@ -774,12 +781,13 @@ into an immediate request-creation error.
 
 Proxy locations configured with `cache_purge_key` also resolve propagation when
 `proxy_cache` is off, a variable zone resolves to off, or the method is excluded
-from caching. They use an explicit key capture and the native key builder to
+from caching. They use scratch key storage and the native key builder to
 select current or retained slice/Vary associations, without opening cache files
 or publishing index records. Manual key expressions do not evaluate unused
-cache-key components. This path requires the current cache-key module when that
-module is used: its explicit capture API supports a zero field mask for lazy
-collection.
+cache-key components. No key-module capture API is called. When using the key
+module, use a version that confines automatic native capture to key creation
+before upstream request buffers exist; a later scratch evaluation must not
+retain a temporary cache context.
 
 A module-owned adapter at the existing post-create `proxy_bind` value boundary
 installs the output gate; no extra bind directive or core patch is required.
@@ -875,8 +883,9 @@ Capabilities currently report proxy propagation as unavailable.
 
 ## Usage
 
-With `ngx_http_cache_key_module` loaded, use its component snapshots for cache
-identity and index selectors. Configure the store and state zone as shown above.
+With `ngx_http_cache_key_module` loaded, use its encoded output for native cache
+keys. Purge derives structured identity from those bytes. Configure the store
+and state zone as shown above.
 
 ```nginx
 proxy_cache_path /var/cache/nginx keys_zone=cache_zone:4m;
