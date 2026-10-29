@@ -1179,6 +1179,14 @@ int ngx_http_cache_purge_coordinator_object_open(
     const unsigned char main[16], ngx_http_cache_rocksdb_bytes_t headers,
     uint64_t now, ngx_http_cache_purge_object_query_t **query,
     ngx_http_cache_rocksdb_error_t *error);
+/* Read-only form: store and control reader belong to this calling thread.
+ * It reads only the serving control image, never mutable coordinator state. */
+int ngx_http_cache_purge_object_open(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_purge_control_reader_t *reader,
+    const ngx_http_cache_purge_control_context_t *request,
+    const unsigned char main[16], ngx_http_cache_rocksdb_bytes_t headers,
+    uint64_t now, ngx_http_cache_purge_object_query_t **query,
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_coordinator_object_step(
     ngx_http_cache_purge_object_query_t *query, size_t budget,
     ngx_http_cache_purge_fence_t *out, uint64_t *publication, int *done,

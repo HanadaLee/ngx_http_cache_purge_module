@@ -900,6 +900,7 @@ ngx_http_cache_purge_propagation_match(void *data,
 static ngx_int_t
 ngx_http_cache_purge_propagation_query(ngx_http_cache_purge_capture_t *ctx)
 {
+    ngx_http_cache_purge_client_t          *client;
     ngx_http_cache_purge_control_reader_t  *reader;
     ngx_http_cache_purge_control_context_t  context;
     ngx_http_cache_purge_watermark_t        watermark;
@@ -959,7 +960,7 @@ ngx_http_cache_purge_propagation_query(ngx_http_cache_purge_capture_t *ctx)
     }
     /* Discard partial matches on a TAG candidate, limit or image change.
      * Only the complete executor query may then supply local requirements. */
-    if (ngx_http_cache_purge_runtime_client(r, &ctx->client) != NGX_OK) {
+    if (ngx_http_cache_purge_runtime_read_client(r, &client) != NGX_OK) {
         return NGX_ERROR;
     }
     fields[0] = ctx->key;
@@ -1024,7 +1025,7 @@ ngx_http_cache_purge_propagation_query(ngx_http_cache_purge_capture_t *ctx)
     }
     rc = NGX_ERROR;
     if ((size_t) (p - payload.data) == size) {
-        rc = ngx_http_cache_purge_client_submit(ctx->client,
+        rc = ngx_http_cache_purge_client_submit(client,
             NGX_HTTP_CACHE_PURGE_OP_OBJECT_PROPAGATION, &payload, timeout,
             ngx_http_cache_purge_propagation_reply, ctx, &ctx->call);
     }

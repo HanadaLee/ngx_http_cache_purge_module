@@ -1,6 +1,7 @@
 #include "rocksdb/ngx_http_cache_rocksdb.h"
 #include <rocksdb/db.h>
 #include <unistd.h>
+#include <sys/wait.h>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -8,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -124,6 +126,113 @@ close(ngx_http_cache_rocksdb_t *&store)
     expect(ngx_http_cache_rocksdb_close(&store, &error),
         NGX_HTTP_CACHE_ROCKSDB_OK, "close");
     require(store == nullptr, "store handle consumed");
+}
+
+static void
+ngx_http_cache_purge_test_reader(ngx_http_cache_rocksdb_t *store)
+{
+    ngx_http_cache_rocksdb_t *reader = nullptr, *extra = nullptr;
+    expect(ngx_http_cache_rocksdb_reader_create(store, 3, &reader, &error),
+        NGX_HTTP_CACHE_ROCKSDB_INVALID, "reader cannot exceed writer budget");
+    expect(ngx_http_cache_rocksdb_reader_create(store, 2, &reader, &error),
+        0, "create read handle");
+    expect(ngx_http_cache_rocksdb_reader_create(store, 1, &extra, &error),
+        NGX_HTTP_CACHE_ROCKSDB_BUSY, "only one read handle");
+    expect(ngx_http_cache_rocksdb_close(&store, &error),
+        NGX_HTTP_CACHE_ROCKSDB_BUSY, "unattached reader pins DB lifetime");
+    ngx_http_cache_rocksdb_buffer_t buffer{nullptr, 0, 0};
+    expect(ngx_http_cache_rocksdb_get(reader, NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+               bytes("reader/key"), &buffer, &error),
+        NGX_HTTP_CACHE_ROCKSDB_OWNER, "unattached reader cannot read");
+    auto child = fork();
+    require(child >= 0, "fork reader ownership check");
+    if (child == 0) {
+        _exit(ngx_http_cache_rocksdb_reader_attach(reader, &error)
+              == NGX_HTTP_CACHE_ROCKSDB_OWNER ? 0 : 1);
+    }
+    int status = 0;
+    require(waitpid(child, &status, 0) == child && WIFEXITED(status)
+                && WEXITSTATUS(status) == 0, "reader rejects fork handoff");
+    close(reader);
+    write(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, "reader/key", "old");
+    write(store, NGX_HTTP_CACHE_ROCKSDB_TAG, "reader/key", "old");
+    expect(ngx_http_cache_rocksdb_reader_create(store, 2, &reader, &error),
+        0, "recreate reader after cancelled handoff");
+    std::promise<void> ready, changed;
+    auto resume = changed.get_future();
+    auto worker = std::async(std::launch::async, [&] {
+        ngx_http_cache_rocksdb_error_t local{};
+        ngx_http_cache_rocksdb_cursor_t *cursor = nullptr, *forked = nullptr,
+                                        *overflow = nullptr;
+        std::vector<int> results;
+        results.push_back(ngx_http_cache_rocksdb_reader_attach(reader, &local));
+        results.push_back(ngx_http_cache_rocksdb_reader_attach(reader, &local)
+                          == NGX_HTTP_CACHE_ROCKSDB_INVALID ? 0 : -1);
+        results.push_back(ngx_http_cache_rocksdb_cursor_open(reader,
+            NGX_HTTP_CACHE_ROCKSDB_DEFAULT, bytes("reader/"), bytes(""),
+            &cursor, &local));
+        results.push_back(ngx_http_cache_rocksdb_cursor_fork(cursor,
+            NGX_HTTP_CACHE_ROCKSDB_TAG, bytes("reader/"), bytes(""),
+            &forked, &local));
+        results.push_back(ngx_http_cache_rocksdb_cursor_open(reader,
+            NGX_HTTP_CACHE_ROCKSDB_URL, bytes("reader/"), bytes(""),
+            &overflow, &local) == NGX_HTTP_CACHE_ROCKSDB_LIMIT ? 0 : -1);
+        ready.set_value();
+        resume.wait();
+        unsigned char raw[16];
+        ngx_http_cache_rocksdb_buffer_t value{raw, sizeof(raw), 0};
+        results.push_back(ngx_http_cache_rocksdb_cursor_get(forked,
+            NGX_HTTP_CACHE_ROCKSDB_TAG, bytes("reader/key"), &value, &local));
+        results.push_back(value.length == 3 && !std::memcmp(raw, "old", 3)
+                          ? 0 : -1);
+        results.push_back(ngx_http_cache_rocksdb_get(reader,
+            NGX_HTTP_CACHE_ROCKSDB_TAG, bytes("reader/key"), &value, &local));
+        results.push_back(value.length == 3 && !std::memcmp(raw, "new", 3)
+                          ? 0 : -1);
+        const std::string key = "reader/key", forbidden = "forbidden";
+        auto mutation = put(NGX_HTTP_CACHE_ROCKSDB_DEFAULT, key, forbidden);
+        results.push_back(ngx_http_cache_rocksdb_write(reader, &mutation, 1,
+            nullptr, 0, &local) == NGX_HTTP_CACHE_ROCKSDB_INVALID ? 0 : -1);
+        results.push_back(ngx_http_cache_rocksdb_write_deferred(reader,
+            &mutation, 1, nullptr, 0, &local)
+            == NGX_HTTP_CACHE_ROCKSDB_INVALID ? 0 : -1);
+        results.push_back(ngx_http_cache_rocksdb_sync(reader, &local)
+                          == NGX_HTTP_CACHE_ROCKSDB_INVALID ? 0 : -1);
+        uint64_t written = 1, synced = 1;
+        results.push_back(ngx_http_cache_rocksdb_durability(reader,
+            &written, &synced, &local) == NGX_HTTP_CACHE_ROCKSDB_INVALID
+            && !written && !synced ? 0 : -1);
+        ngx_http_cache_rocksdb_t *nested = nullptr;
+        results.push_back(ngx_http_cache_rocksdb_reader_create(reader, 1,
+            &nested, &local) == NGX_HTTP_CACHE_ROCKSDB_INVALID ? 0 : -1);
+        results.push_back(ngx_http_cache_rocksdb_close(&reader, &local)
+                          == NGX_HTTP_CACHE_ROCKSDB_BUSY ? 0 : -1);
+        results.push_back(ngx_http_cache_rocksdb_cursor_close(&cursor, &local));
+        results.push_back(ngx_http_cache_rocksdb_cursor_close(&forked, &local));
+        results.push_back(ngx_http_cache_rocksdb_close(&reader, &local));
+        return results;
+    });
+    ready.get_future().wait();
+    auto blocked = ngx_http_cache_rocksdb_close(&store, &error);
+    auto wrong_thread = ngx_http_cache_rocksdb_get(reader,
+        NGX_HTTP_CACHE_ROCKSDB_DEFAULT, bytes("reader/key"), &buffer, &error);
+    const std::string key = "reader/key", replacement = "new";
+    std::array<ngx_http_cache_rocksdb_mutation_t, 2> batch{
+        put(NGX_HTTP_CACHE_ROCKSDB_DEFAULT, key, replacement),
+        put(NGX_HTTP_CACHE_ROCKSDB_TAG, key, replacement)};
+    auto updated = ngx_http_cache_rocksdb_write(store, batch.data(),
+        batch.size(), nullptr, 0, &error);
+    changed.set_value();
+    auto results = worker.get();
+    expect(blocked, NGX_HTTP_CACHE_ROCKSDB_BUSY, "reader pins writer lifetime");
+    expect(wrong_thread, NGX_HTTP_CACHE_ROCKSDB_OWNER, "reader owner enforced");
+    expect(updated, 0, "writer updates while read snapshots are open");
+    require(std::all_of(results.begin(), results.end(),
+                [](int rc) { return rc == 0; }),
+        "read-only handoff, bounds, shared snapshots and mutation rejection");
+    require(!reader, "reader closed on its owner thread");
+    require(get(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, key) == replacement,
+        "rejected reader write leaves the writer's value intact");
 }
 
 static void
@@ -427,6 +536,7 @@ main(int argc, char **argv)
         require(mkdtemp(path) != nullptr, "create test directory");
         options.max_cursors = 2;
         auto *store = open(path, options);
+        ngx_http_cache_purge_test_reader(store);
         ngx_http_cache_purge_test_cached_cursor(store);
         write(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, "C:abi", "C ABI");
         require(ngx_http_cache_purge_store_c_probe(store) == 0, "C ABI probe");

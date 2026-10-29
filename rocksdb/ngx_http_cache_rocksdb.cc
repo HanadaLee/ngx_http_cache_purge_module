@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -137,7 +138,11 @@ struct ngx_http_cache_rocksdb_s {
     pid_t pid = getpid();
     std::thread::id thread = std::this_thread::get_id();
     int lease = -1;
-    std::unique_ptr<rocksdb::DB> db;
+    std::unique_ptr<rocksdb::DB> database;
+    rocksdb::DB *db = nullptr;
+    ngx_http_cache_rocksdb_t *parent = nullptr;
+    std::atomic<unsigned> readers{0};
+    bool attached = true;
     std::array<rocksdb::ColumnFamilyHandle *, NGX_HTTP_CACHE_ROCKSDB_CF_COUNT>
         cf{};
     std::shared_ptr<rocksdb::Cache> cache;
@@ -151,16 +156,19 @@ struct ngx_http_cache_rocksdb_s {
 
     ~ngx_http_cache_rocksdb_s()
     {
-        if (db) {
+        if (database) {
             for (auto *handle : cf) {
                 if (handle) {
                     db->DestroyColumnFamilyHandle(handle);
                 }
             }
-            db.reset();
+            database.reset();
         }
         if (lease >= 0) {
             close(lease);
+        }
+        if (parent) {
+            parent->readers.fetch_sub(1);
         }
     }
 
@@ -232,7 +240,7 @@ ngx_http_cache_rocksdb_check(
         return ngx_http_cache_rocksdb_error(
             error, NGX_HTTP_CACHE_ROCKSDB_INVALID, "null cache index handle");
     }
-    if (!store->owner()) {
+    if (!store->owner() || !store->attached) {
         return ngx_http_cache_rocksdb_error(error, NGX_HTTP_CACHE_ROCKSDB_OWNER,
             "cache index process/thread owner mismatch");
     }
@@ -380,7 +388,8 @@ ngx_http_cache_rocksdb_initialize(ngx_http_cache_rocksdb_t *store,
     if (!status.ok()) {
         return ngx_http_cache_rocksdb_result(status, error);
     }
-    store->db.reset(db);
+    store->database.reset(db);
+    store->db = db;
     for (size_t i = 0; i < names.size(); ++i) {
         for (unsigned n = 0; n < NGX_HTTP_CACHE_ROCKSDB_CF_COUNT; ++n) {
             if (names[i] == ngx_http_cache_rocksdb_cf_names[n]) {
@@ -535,6 +544,65 @@ ngx_http_cache_rocksdb_open(const char *path,
 }
 
 extern "C" int
+ngx_http_cache_rocksdb_reader_create(ngx_http_cache_rocksdb_t *store,
+    uint32_t max_cursors, ngx_http_cache_rocksdb_t **output,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    if (output) {
+        *output = nullptr;
+    }
+    return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
+        int code = ngx_http_cache_rocksdb_check(store, error);
+        if (code != 0) {
+            return code;
+        }
+        if (!output || store->parent || !max_cursors
+            || max_cursors > store->options.max_cursors)
+        {
+            return ngx_http_cache_rocksdb_error(error,
+                NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid reader handle");
+        }
+        if (store->readers.load() != 0) {
+            return ngx_http_cache_rocksdb_error(error,
+                NGX_HTTP_CACHE_ROCKSDB_BUSY, "cache index reader exists");
+        }
+        auto reader = std::make_unique<ngx_http_cache_rocksdb_t>();
+        reader->options = store->options;
+        reader->options.max_cursors = max_cursors;
+        reader->cursors.reserve(max_cursors);
+        reader->db = store->db;
+        reader->cf = store->cf;
+        reader->cache = store->cache;
+        reader->buffers = store->buffers;
+        reader->attached = false;
+        store->readers.fetch_add(1);
+        reader->parent = store;
+        *output = reader.release();
+        return 0;
+    });
+}
+
+extern "C" int
+ngx_http_cache_rocksdb_reader_attach(ngx_http_cache_rocksdb_t *reader,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
+        if (!reader || !reader->parent || reader->attached) {
+            return ngx_http_cache_rocksdb_error(error,
+                NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                "reader is not awaiting handoff");
+        }
+        if (reader->pid != getpid()) {
+            return ngx_http_cache_rocksdb_error(error,
+                NGX_HTTP_CACHE_ROCKSDB_OWNER, "reader process owner mismatch");
+        }
+        reader->thread = std::this_thread::get_id();
+        reader->attached = true;
+        return 0;
+    });
+}
+
+extern "C" int
 ngx_http_cache_rocksdb_close(
     ngx_http_cache_rocksdb_t **pointer, ngx_http_cache_rocksdb_error_t *error)
 {
@@ -544,14 +612,20 @@ ngx_http_cache_rocksdb_close(
                 NGX_HTTP_CACHE_ROCKSDB_INVALID, "null cache index handle");
         }
         auto *store = *pointer;
-        int code = ngx_http_cache_rocksdb_check(store, error);
+        int code = store->parent && !store->attached && store->owner() ? 0 :
+                   ngx_http_cache_rocksdb_check(store, error);
         if (code != NGX_HTTP_CACHE_ROCKSDB_OK) {
             return code;
         }
-        if (!store->cursors.empty()) {
+        if (!store->cursors.empty() || store->readers.load() != 0) {
             return ngx_http_cache_rocksdb_error(error,
                 NGX_HTTP_CACHE_ROCKSDB_BUSY,
-                "close cache index cursors before the store");
+                "close cache index cursors and reader before the store");
+        }
+        if (store->parent) {
+            delete store;
+            *pointer = nullptr;
+            return 0;
         }
         auto status = store->pending_writes ? store->db->SyncWAL() :
                                               rocksdb::Status::OK();
@@ -595,6 +669,10 @@ ngx_http_cache_rocksdb_write_internal(ngx_http_cache_rocksdb_t *store,
         int code = ngx_http_cache_rocksdb_check(store, error);
         if (code != NGX_HTTP_CACHE_ROCKSDB_OK) {
             return code;
+        }
+        if (store->parent) {
+            return ngx_http_cache_rocksdb_error(error,
+                NGX_HTTP_CACHE_ROCKSDB_INVALID, "read-only cache index handle");
         }
         if (!count || !mutations || (condition_count && !conditions)) {
             return ngx_http_cache_rocksdb_error(error,
@@ -741,8 +819,15 @@ ngx_http_cache_rocksdb_sync(
 {
     return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
         int rc = ngx_http_cache_rocksdb_check(store, error);
-        if (rc != 0 || !store->pending_writes) {
+        if (rc != 0) {
             return rc;
+        }
+        if (store->parent) {
+            return ngx_http_cache_rocksdb_error(error,
+                NGX_HTTP_CACHE_ROCKSDB_INVALID, "read-only cache index handle");
+        }
+        if (!store->pending_writes) {
+            return 0;
         }
         auto status = store->db->SyncWAL();
         if (status.ok()) {
@@ -769,7 +854,7 @@ ngx_http_cache_rocksdb_durability(ngx_http_cache_rocksdb_t *store,
         if (rc != 0) {
             return rc;
         }
-        if (!written || !synced || written == synced) {
+        if (!written || !synced || written == synced || store->parent) {
             return ngx_http_cache_rocksdb_error(error,
                 NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid durability output");
         }

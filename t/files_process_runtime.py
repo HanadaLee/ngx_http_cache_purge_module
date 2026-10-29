@@ -506,9 +506,13 @@ def background_delete(cut):
             start()
             time.sleep(1.1)
             assert operation()['stage'] == 3 and rpc(9, string('') + b'\x01')[0] == 1
-            process.stdin.write('m\n'); process.stdin.flush()
-            assert select.select([process.stdout], [], [], 8)[0]
-            assert process.stdout.readline().split()[:2] == ['MATCH', '0']
+            def match_ready():
+                process.stdin.write('m\n'); process.stdin.flush()
+                assert select.select([process.stdout], [], [], 8)[0]
+                reply = process.stdout.readline().split()
+                assert reply[:2] in (['MATCH', '0'], ['MATCH', '6']), reply
+                return reply[:2] == ['MATCH', '0']
+            until(match_ready, 'shared match stayed busy during recovery')
             process.stdin.write('g\n'); process.stdin.flush()
             assert select.select([process.stdout], [], [], 8)[0]
             assert (guard_reply := process.stdout.readline().strip()) == 'GUARD 0', guard_reply

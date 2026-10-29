@@ -33,6 +33,7 @@ struct ngx_http_cache_purge_runtime_s {
     ngx_http_cache_purge_component_t         *component;
     ngx_http_cache_purge_control_reader_t    *reader;
     ngx_http_cache_purge_client_t            *client;
+    ngx_http_cache_purge_client_t            *read_client;
     uid_t                                     owner_uid;
     ngx_msec_t                                propagation;
     ngx_uint_t                                started;
@@ -947,6 +948,7 @@ ngx_http_cache_purge_runtime_worker_exit(ngx_cycle_t *cycle)
         }
         ngx_http_cache_purge_runtime_exit(main->runtime);
         ngx_http_cache_purge_client_stop(main->runtime->client);
+        ngx_http_cache_purge_client_stop(main->runtime->read_client);
     }
     if (main && main->runtime->reader) {
         rc = ngx_http_cache_purge_control_reader_close(&main->runtime->reader,
@@ -958,14 +960,15 @@ ngx_http_cache_purge_runtime_worker_exit(ngx_cycle_t *cycle)
     }
 }
 
-int
-ngx_http_cache_purge_runtime_client(ngx_http_request_t *r,
-    ngx_http_cache_purge_client_t **client)
+static int
+ngx_http_cache_purge_runtime_client_get(ngx_http_request_t *r,
+    ngx_http_cache_purge_client_t **client, ngx_uint_t readonly)
 {
-    ngx_http_cache_purge_main_conf_t      *main;
-    ngx_http_cache_purge_runtime_t        *rt;
-    ngx_http_cache_purge_client_options_t  options;
-    ngx_str_t                              path;
+    ngx_http_cache_purge_main_conf_t       *main;
+    ngx_http_cache_purge_runtime_t         *rt;
+    ngx_http_cache_purge_client_options_t   options;
+    ngx_http_cache_purge_client_t         **slot;
+    ngx_str_t                               path, suffix;
     u_char  socket_path[sizeof(((struct sockaddr_un *) 0)->sun_path)];
     u_char *p;
 
@@ -978,24 +981,44 @@ ngx_http_cache_purge_runtime_client(ngx_http_request_t *r,
     if (rt == NULL || rt->path == NULL) {
         return NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND;
     }
-    if (rt->client == NULL) {
-        path.len = rt->path->name.len + sizeof("/component.sock") - 1;
+    slot = readonly ? &rt->read_client : &rt->client;
+    if (*slot == NULL) {
+        if (readonly) {
+            ngx_str_set(&suffix, "/read.sock");
+        } else {
+            ngx_str_set(&suffix, "/component.sock");
+        }
+        path.len = rt->path->name.len + suffix.len;
         if (path.len >= sizeof(socket_path)) {
             return NGX_HTTP_CACHE_ROCKSDB_LIMIT;
         }
         path.data = socket_path;
         p = ngx_cpymem(path.data, rt->path->name.data, rt->path->name.len);
-        ngx_memcpy(p, "/component.sock", sizeof("/component.sock") - 1);
+        ngx_memcpy(p, suffix.data, suffix.len);
         ngx_http_cache_purge_client_options(&options);
         options.server_uid = rt->owner_uid;
-        rt->client = ngx_http_cache_purge_client_create(
+        *slot = ngx_http_cache_purge_client_create(
             ngx_cycle->pool, ngx_cycle->log, &path, &options);
-        if (rt->client == NULL) {
+        if (*slot == NULL) {
             return NGX_HTTP_CACHE_ROCKSDB_LIMIT;
         }
     }
-    *client = rt->client;
+    *client = *slot;
     return NGX_HTTP_CACHE_ROCKSDB_OK;
+}
+
+int
+ngx_http_cache_purge_runtime_client(ngx_http_request_t *r,
+    ngx_http_cache_purge_client_t **client)
+{
+    return ngx_http_cache_purge_runtime_client_get(r, client, 0);
+}
+
+int
+ngx_http_cache_purge_runtime_read_client(ngx_http_request_t *r,
+    ngx_http_cache_purge_client_t **client)
+{
+    return ngx_http_cache_purge_runtime_client_get(r, client, 1);
 }
 
 

@@ -8295,7 +8295,7 @@ ngx_http_cache_purge_index_representations_open(
     ngx_http_cache_purge_representation_query_t  *r;
     ngx_http_cache_purge_query_t                 *q;
     uint64_t                                      id;
-    int                                           ready, rc;
+    int                                           rc;
 
     if (out != NULL) {
         *out = NULL;
@@ -8305,14 +8305,6 @@ ngx_http_cache_purge_index_representations_open(
     {
         return ngx_http_cache_purge_index_error(error,
             NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid representation query");
-    }
-    rc = ngx_http_cache_purge_index_native_ready(store, key, &ready, error);
-    if (rc != 0) {
-        return rc;
-    }
-    if (!ready) {
-        return ngx_http_cache_purge_index_error(error,
-            NGX_HTTP_CACHE_ROCKSDB_BUSY, "native representations incomplete");
     }
     r = calloc(1, sizeof(*r));
     q = calloc(1, sizeof(*q));
@@ -8325,17 +8317,50 @@ ngx_http_cache_purge_index_representations_open(
     r->query = q;
     q->store = store;
     q->bytes = sizeof(*q) + sizeof(*r);
-    id = ngx_http_cache_purge_index_key_find(q, key);
-    q->empty = id == 0;
-    if (id != 0) {
-        ngx_http_cache_purge_index_row(q, &q->prefix, 'n', id);
-        ngx_http_cache_purge_index_append(q, &q->prefix, main, 16);
+    /* Identity, migration readiness and memberships must share one snapshot:
+     * a read handle may run while the writer replaces or retires a file. */
+    id = 0;
+    if (ngx_http_cache_purge_index_key_projection(q, key)) {
         ngx_http_cache_purge_index_cursor_open(q, &q->outer,
             NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
-            ngx_http_cache_purge_index_bytes(&q->prefix),
+            ngx_http_cache_purge_index_bytes(&q->key),
             ngx_http_cache_purge_op_empty, NULL);
         r->view = q->outer.handle;
         q->outer.handle = NULL;
+        if (q->status == 0
+            && ngx_http_cache_purge_index_get(q,
+                NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+                ngx_http_cache_purge_index_bytes(&q->key), r->view))
+        {
+            id = ngx_http_cache_purge_index_integer(q,
+                ngx_http_cache_purge_index_bytes(&q->scratch));
+        }
+    }
+    q->empty = id == 0;
+    if (q->status == 0 && id != 0) {
+        if (ngx_http_cache_purge_index_get(q, NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+                ngx_http_cache_purge_op_literal("M:native-cursor"), r->view))
+        {
+            ngx_http_cache_purge_index_fail(q, NGX_HTTP_CACHE_ROCKSDB_BUSY,
+                "native representations incomplete");
+        }
+        ngx_http_cache_purge_index_cursor_open(q, &q->outer,
+            NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+            ngx_http_cache_purge_index_row_key(q, 'z', id),
+            ngx_http_cache_purge_op_empty, r->view);
+        if (ngx_http_cache_purge_index_cursor_next(q, &q->outer)) {
+            if (ngx_http_cache_purge_index_require(q,
+                    q->outer.key.len == 25 && q->outer.value.len == 0,
+                    NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                    "invalid unresolved identity"))
+            {
+                ngx_http_cache_purge_index_fail(q, NGX_HTTP_CACHE_ROCKSDB_BUSY,
+                    "native representations incomplete");
+            }
+        }
+        ngx_http_cache_purge_index_cursor_close(q, &q->outer);
+        ngx_http_cache_purge_index_row(q, &q->prefix, 'n', id);
+        ngx_http_cache_purge_index_append(q, &q->prefix, main, 16);
     }
     rc = q->status;
     if (rc != 0) {

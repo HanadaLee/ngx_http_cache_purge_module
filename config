@@ -91,6 +91,9 @@ ngx_feature_libs="$CACHE_PURGE_LIBS $CACHE_ROCKSDB_LIBS"
 ngx_feature_test='ngx_http_cache_purge_component_options_t o;
                   ngx_http_cache_rocksdb_bytes_t empty = { 0, 0 };
                   ngx_http_cache_purge_component_options(&o);
+                  ngx_http_cache_rocksdb_reader_create(0, 1, 0, 0);
+                  ngx_http_cache_purge_object_open(0, 0, 0, 0, empty,
+                                                   0, 0, 0);
                   ngx_http_cache_purge_file_proof_read_selected(-1,
                                                                empty, 0, 0);
                   if (o.abi != ngx_http_cache_purge_component_abi_13()) return 1;

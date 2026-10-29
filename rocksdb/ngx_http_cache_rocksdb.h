@@ -114,7 +114,21 @@ int ngx_http_cache_rocksdb_open(const char *path,
     const ngx_http_cache_rocksdb_options_t *options,
     ngx_http_cache_rocksdb_t **store, ngx_http_cache_rocksdb_error_t *error);
 
-/* BUSY with open cursors; otherwise consumes *store even on close error. */
+/* The writer may create one bounded read-only handle sharing its DB, CFs and
+ * cache. No database reopen or second cache. Before attach, only the creator
+ * may close an abandoned handle. Hand it exclusively to the reader thread,
+ * which must attach once before get/cursor/stats/close. The writer must not
+ * touch the handed-off handle. Reader cursors have a separate budget no larger
+ * than the writer's max_cursors; snapshots retain the same lifetime bound.
+ * A reader cannot write, sync, inspect durability tickets or create readers.
+ * Join the reader before closing the writer. No handle may cross fork. */
+int ngx_http_cache_rocksdb_reader_create(ngx_http_cache_rocksdb_t *store,
+    uint32_t max_cursors, ngx_http_cache_rocksdb_t **reader,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_rocksdb_reader_attach(ngx_http_cache_rocksdb_t *reader,
+    ngx_http_cache_rocksdb_error_t *error);
+
+/* BUSY with open cursors or reader; otherwise consumes *store even on error. */
 int ngx_http_cache_rocksdb_close(ngx_http_cache_rocksdb_t **store,
     ngx_http_cache_rocksdb_error_t *error);
 

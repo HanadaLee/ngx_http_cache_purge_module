@@ -20,8 +20,9 @@ New cache-file records use atomic WAL batches with deferred synchronization.
 The existing executor checks for pending WAL data every 100 ms; 64 batches or
 one configured maximum batch of accumulated WAL bytes force an earlier sync.
 A synchronous write and graceful close also flush preceding deferred records.
-No mutation queue or extra thread is added. Ordinary process restarts recover
-the WAL. Machine power loss may lose its unsynchronized cache-record suffix;
+WAL synchronization uses the writer thread without a mutation queue. Ordinary
+process restarts recover the WAL. Machine power loss may lose its unsynchronized
+cache-record suffix;
 files without a matching index identity refill instead of serving unverified
 data. The interval is an executor scheduling target, not a hard deadline.
 Purge acceptance, invalidation requirements, final task completion, retirement
@@ -54,9 +55,10 @@ Background Invalidate persists the file requirement before advancing its task.
 or unlink. Successful 304 validation publishes the new TAG set and watermarks
 after its index transaction commits. A reader checks the exact descriptor and
 both stat snapshots; legacy, revoked, replaced or unlinked instances do not
-provide independent admission. Current HTTP HITs still use `ADMIT_FILE` while
-the worker-side proof reader is being integrated. Larger xattrs can allocate an
-extra filesystem block per object; their byte length alone is not the disk cost.
+provide independent admission. Ordinary HTTP HITs use the selected file-proof
+read pool and shared rules; `ADMIT_FILE` remains in 304 transactions. Larger xattrs
+can allocate an extra filesystem block per object; their byte length alone is
+not the disk cost.
 The WAL sync group includes both single-file/native preparation and the batch
 preparation API. Native representation bindings and their file intent remain in
 the same atomic batch. Tests count actual WAL sync calls through these entry
@@ -93,7 +95,7 @@ status queries. SCM integration and multilevel propagation remain unfinished.
 The repository now contains a bounded RocksDB storage bridge and a persistent
 URL/key/file index. They support cross-zone lookup, scoped TAG postings, full
 bytewise prefix scans, shared value storage, and batched fill/retirement records.
-The component executor hosts that index on one thread and accepts bounded local
+The component writer hosts that index on one thread and accepts bounded local
 IPC independently of nginx's event loops. It supports cancellable owner
 handoff, explicit shutdown, and paged queries without retaining server cursors
 between requests. HTTP tests cover filling, invalidation, file cleanup and
@@ -523,7 +525,7 @@ cmake --build /tmp/cache-purge-store
 ctest --test-dir /tmp/cache-purge-store --output-on-failure
 ```
 
-Its blocking APIs belong on the index component's execution thread.
+Its blocking APIs belong on the owning writer or attached read-only thread.
 They must not run on an HTTP worker's event loop.
 
 To build the runtime into nginx, supply the directory containing
@@ -564,14 +566,17 @@ The persistent runtime also requires Linux and
 `master_process on`. It uses standard worker initialization, timers, and exit
 callbacks. It does
 not require privileged-agent support or an additional nginx core patch. Only
-worker 0 starts the component executor; all workers access it through bounded
-asynchronous IPC. The executor shares that worker's address space and failure
-domain. Database handles and threads are never created before fork.
+worker 0 starts the component writer and one read-only executor; all workers use
+bounded asynchronous IPC. Both share that worker's address space, failure domain
+and the same RocksDB instance, CF handles, block cache and write-buffer manager.
+No second DB is opened. Database handles and threads are never created before
+fork.
 
 On graceful reload, the old worker requests asynchronous executor shutdown so
 long-lived HTTP responses do not keep the database owner indefinitely. Its
-executor finishes the current operation and closes the DB before the replacement
-opens it. The old worker can continue sending its response and joins the stopped
+writer finishes the current operation, stops and joins its reader, then closes
+the DB before the replacement opens it. The old worker can continue sending its
+response and joins the stopped
 executor when it exits. The component C ABI is 13 and the internal IPC version
 is 2; rebuild its archives together with the addon. Upgrading from an earlier
 component ABI or shared-control ABI 5
@@ -886,17 +891,30 @@ partial results and uses the complete object query.
 The gate rechecks the accepted sequence before sending request bytes and
 preserves incoming requirements. This does not bypass local cache admission:
 ordinary HITs use file proofs and shared rules through the selected read pool.
-Retained TAG queries, fill transactions and durable 304 validation still use
-the executor, so complete foreground database isolation remains unfinished.
+Retained TAG queries use the read-only executor. Fill transactions and durable
+304 validation still use the writer, so complete foreground isolation remains
+unfinished.
 
 When a lookup is needed, one IPC request holds its bounded input until completion,
-disconnect or the original deadline. The executor admits at most four object
+disconnect or the original deadline. The read endpoint admits at most four object
 queries and advances eight steps per dispatch, allowing other peers to run.
 Between batches each object retains one snapshot cursor and releases its
 traversal cursors. Resumption seeks past the last returned row using the same
-snapshot and deadline. Four interleaved objects therefore leave room for
-background TAG enumeration within the default eight-cursor budget, without
-raising the handle limit or loading all associations into memory.
+snapshot and deadline. Identity lookup and native-readiness checks use that same
+snapshot, including while the writer replaces files. Each reader/writer handle
+has up to eight cursors with the existing one-second lifetime; these are separate
+budgets, at most sixteen handles with defaults. No full association index is
+loaded into memory.
+The read endpoint has at most eight connections, 128 KiB per request and 512 KiB
+of connection buffers. Its single thread has a 256 KiB stack. Each of four
+queries retains at most the existing 1 MiB index-query budget. These are bounded
+allocations, not a statement of total RSS. Workers lazily create a separate read
+IPC client with the existing 64-call/512 KiB client limit. `read.sock` accepts
+only object propagation and diagnostic PING; mutation commands are rejected.
+The read-only bridge cannot write, sync, inspect writer tickets or create other
+readers. The writer cannot close while its reader exists. Disk read latency and
+shared CPU/cache/I/O contention remain possible, but background file sync does
+not hold the read dispatch queue.
 Workers retry transient failures within the existing three-second deadline;
 unresolved failures return 503 rather than treating missing results as empty.
 

@@ -609,9 +609,9 @@ class Decode:
     def number(self, n): return int.from_bytes(self.take(n), 'big')
     def string(self): return self.take(self.number(4))
     def end(self): assert self.at == len(self.data)
-def rpc(op, payload=b'', fds=(), receive_fd=False, codes=(0,)):
+def rpc(op, payload=b'', fds=(), receive_fd=False, codes=(0,), endpoint='component.sock'):
     with socket.socket(socket.AF_UNIX) as s:
-        s.settimeout(8); s.connect(str(run / 'index/component.sock'))
+        s.settimeout(8); s.connect(str(run / 'index' / endpoint))
         packet = struct.pack('>4sHHQII', b'NCP1', 2, op, 1, len(payload), 0) + payload
         if fds:
             assert s.sendmsg([packet[:1]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', fds))]) == 1
@@ -2218,11 +2218,14 @@ try:
 
     def direct_requests(path, expected):
         initial = int.from_bytes(rpc(1)[40:48], 'big')
+        initial_reads = int.from_bytes(rpc(1, endpoint='read.sock')[40:48], 'big')
         for _ in range(10):
             assert get(path, {'Host': direct_host}) == (200, None, path.encode())
             propagated(propagation_headers(path), expected)
         final = int.from_bytes(rpc(1)[40:48], 'big')
+        final_reads = int.from_bytes(rpc(1, endpoint='read.sock')[40:48], 'big')
         assert final - initial == 1, ('direct propagation IPC', initial, final)
+        assert final_reads - initial_reads == 1, ('direct propagation read IPC', initial_reads, final_reads)
 
     tag_push('direct-unrelated-scope', 'direct-unrelated-tag')
     until(lambda: api('/__purge/v2/operations/direct-unrelated-scope')[2]['cleanup']['state'] == 'done')
@@ -2273,13 +2276,16 @@ try:
     response = prop_get(uri)
     assert response == (200, 'HIT', uri.encode()), response
     initial_requests = int.from_bytes(rpc(1)[40:48], 'big')
+    initial_reads = int.from_bytes(rpc(1, endpoint='read.sock')[40:48], 'big')
     initial_origins = calls.count(uri)
     for _ in range(10):
         assert prop_get(uri) == (200, 'HIT', uri.encode())
     final_requests = int.from_bytes(rpc(1)[40:48], 'big')
+    final_reads = int.from_bytes(rpc(1, endpoint='read.sock')[40:48], 'big')
     hit_query_budget = {'hits': 10, 'component_requests': final_requests - initial_requests,
                         'maximum_requests_including_final_ping': 1}
     assert hit_query_budget['component_requests'] == 1, hit_query_budget
+    assert final_reads - initial_reads == 1, (initial_reads, final_reads)
     assert calls.count(uri) == initial_origins
     checks.append('HITs do not query the representation index before cache lookup while an unrelated TAG propagation window remains active')
 
@@ -2342,8 +2348,12 @@ try:
     uri = '/propagation/groups/object'
     policies[uri] = 'many-keys'
     variants = [uri + '?m=' + str(number) for number in range(97)]
-    for target in variants:
+    for number, target in enumerate(variants, 1):
         assert prop_get(target) == (200, 'MISS', uri.encode())
+        # Establish the 97-member fixture without depending on foreground
+        # queries to pace asynchronous file publication through the writer.
+        if number % 16 == 0:
+            prop_records(uri, number)
     original = prop_records(uri, 97)
     assert len({item['key'] for item in original}) == 97
     deleted_at = tag_push('prop-many-keys', 'many-keys')
