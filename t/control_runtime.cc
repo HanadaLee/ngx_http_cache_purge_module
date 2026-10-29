@@ -82,6 +82,41 @@ struct Context {
     }
 };
 using Matches = std::map<uint64_t, uint32_t>;
+static Context
+digest_context(const Context &source)
+{
+    Context result = source;
+    for (auto &tag : result.tags) {
+        unsigned char digest[NGX_HTTP_CACHE_PURGE_TAG_DIGEST_SIZE];
+        expect(ngx_http_cache_purge_tag_digest(bytes(tag), digest, &error), 0,
+            "derive stable TAG digest");
+        tag.assign(reinterpret_cast<const char *>(digest), sizeof(digest));
+    }
+    return result;
+}
+
+static void
+digest_tests()
+{
+    const unsigned char expected[] = { 0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01,
+        0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23 };
+    unsigned char actual[NGX_HTTP_CACHE_PURGE_TAG_DIGEST_SIZE];
+    expect(ngx_http_cache_purge_tag_digest(bytes("abc"), actual, &error), 0,
+        "SHA-256 prefix known vector");
+    check(std::memcmp(actual, expected, sizeof(actual)) == 0,
+        "digest encoding is the first sixteen SHA-256 bytes");
+    expect(ngx_http_cache_purge_tag_digest(bytes("abc"), nullptr, &error),
+        NGX_HTTP_CACHE_ROCKSDB_INVALID, "missing digest output rejected");
+    expect(ngx_http_cache_purge_tag_digest({ nullptr, 1 }, actual, &error),
+        NGX_HTTP_CACHE_ROCKSDB_INVALID, "missing TAG bytes rejected");
+    expect(ngx_http_cache_purge_tag_digest(bytes(std::string(1024, 'x')),
+               actual, &error),
+        0, "maximum TAG length hashes");
+    expect(ngx_http_cache_purge_tag_digest(bytes(std::string(1025, 'x')),
+               actual, &error),
+        NGX_HTTP_CACHE_ROCKSDB_INVALID, "oversized TAG rejected");
+}
+
 static int
 collect(void *data, const ngx_http_cache_purge_control_match_t *m)
 {
@@ -99,11 +134,13 @@ ignore(void *, const ngx_http_cache_purge_control_match_t *)
 }
 static Matches
 lookup(ngx_http_cache_purge_control_reader_t *reader, Context &context,
-    bool proxy = true, uint64_t now = 5000)
+    bool proxy = true, uint64_t now = 5000, bool digests = false)
 {
     Matches found;
     uint64_t version = 0;
-    expect(ngx_http_cache_purge_control_match(reader, context.get(proxy, now),
+    auto match = digests ? ngx_http_cache_purge_control_match_digests :
+                          ngx_http_cache_purge_control_match;
+    expect(match(reader, context.get(proxy, now),
                65536, 8 * 1024 * 1024, collect, &found, &version, &error),
         0, "control lookup");
     check(version != 0, "lookup returns publication");
@@ -456,6 +493,20 @@ propagation_tests()
                              watermark.ledger, ledger.native()->ledger, 16)
                              == 0,
                 "requirements and ledger are from one publication");
+            auto digest = digest_context(c);
+            Matches found;
+            expect(ngx_http_cache_purge_control_propagation_digests(reader,
+                       digest.get(proxy, now), 65536, 8 * 1024 * 1024,
+                       collect, &found, &watermark, &publication, &error),
+                0, "known digest propagation snapshot");
+            check(found == propagation_reference(ops, c, true, proxy, now),
+                "digest propagation matches independent raw selectors");
+            check(publication == coordinator.publication()
+                      && watermark.sequence == ops.size(),
+                "digest propagation preserves the publication watermark");
+            check(lookup(reader, digest, proxy, now, true)
+                      == reference(ops, c, proxy, now),
+                "digest local matching covers every selector family");
         }
         c = Context{};
         c.ns = "scope-0";
@@ -569,6 +620,7 @@ int
 main()
 {
     try {
+        digest_tests();
         propagation_needed_tests();
         propagation_tests();
         size_t size = ngx_http_cache_purge_control_size(2 * 1024 * 1024, 32);
@@ -581,6 +633,18 @@ main()
         ngx_http_cache_purge_control_writer_t *writer = nullptr,
                                               *contender = nullptr;
         ngx_http_cache_purge_control_reader_t *reader = nullptr;
+        uint32_t prior_abi = 5, current_abi = 0;
+        auto abi_field = static_cast<unsigned char *>(memory)
+                         + 12 * sizeof(uint64_t);
+        std::memcpy(&current_abi, abi_field, sizeof(current_abi));
+        check(current_abi == 6 && ngx_http_cache_purge_control_abi_6() == 6,
+            "TAG digest shared format has an explicit compatibility marker");
+        std::memcpy(abi_field, &prior_abi, sizeof(prior_abi));
+        expect(ngx_http_cache_purge_control_reader_open(
+                   memory, size, &reader, &error),
+            NGX_HTTP_CACHE_ROCKSDB_SCHEMA, "old raw-only control ABI rejected");
+        check(reader == nullptr, "rejected ABI creates no reader");
+        std::memcpy(abi_field, &current_abi, sizeof(current_abi));
         expect(ngx_http_cache_purge_control_writer_open(
                    memory, size, &writer, &error),
             0, "claim publisher");
@@ -594,7 +658,8 @@ main()
         const char binary_key[] = "team\x1fhttps\x1fhost\x1f/a\\b\0z";
         context.key.assign(binary_key, sizeof(binary_key) - 1);
         context.url = "https://cache.test/a/b";
-        context.tags = { "photo", "photo", "other" };
+        const std::string binary_tag("photo\0tail", 10);
+        context.tags = { "photo", "photo", "other", binary_tag };
         uint64_t version = 0;
         expect(ngx_http_cache_purge_control_match(reader, context.get(), 10,
                    4096, ignore, nullptr, &version, &error),
@@ -615,7 +680,10 @@ main()
             operation(12, SelectorKind::host_tags,
                 tag_group({ "other", "photo" }), context.host),
             operation(13, SelectorKind::namespace_tags,
-                tag_group({ "other", "photo" }), "wrong-namespace") };
+                tag_group({ "other", "photo" }), "wrong-namespace"),
+            operation(14, SelectorKind::namespace_tag, binary_tag, context.ns),
+            operation(15, SelectorKind::host_tag,
+                std::string("photo\0other", 11), context.host) };
         ops[1].stage = OperationStage::materialized;
         ops[4].stage = OperationStage::preparing;
         ops[4].propagate = false;
@@ -635,6 +703,33 @@ main()
         check(lookup(reader, context, true, 302000)
                   == reference(ops, context, true, 302000),
             "window expiry does not clear FENCE");
+        auto digested = digest_context(context);
+        check(lookup(reader, digested, true, 5000, true)
+                  == reference(ops, context, true, 5000),
+            "TAG digests preserve scopes, groups and duplicate inputs");
+        check(lookup(reader, digested) == reference(ops, digested, true, 5000),
+            "raw API does not interpret sixteen-byte TAGs as digests");
+        auto malformed = *digested.get();
+        auto tag = digested.tag_bytes.front();
+        malformed.tags = &tag;
+        malformed.tag_count = 1;
+        for (size_t length : { 0U, 15U, 17U }) {
+            tag.len = length;
+            version = 99;
+            expect(ngx_http_cache_purge_control_match_digests(reader,
+                       &malformed, 64, 65536, ignore, nullptr,
+                       &version, &error),
+                NGX_HTTP_CACHE_ROCKSDB_INVALID, "malformed digest rejected");
+            check(version == 0, "invalid digest publishes no admission stamp");
+        }
+        tag = { nullptr, NGX_HTTP_CACHE_PURGE_TAG_DIGEST_SIZE };
+        expect(ngx_http_cache_purge_control_match_digests(reader, &malformed,
+                   64, 65536, ignore, nullptr, &version, &error),
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "missing digest bytes rejected");
+        malformed.tag_count = 65;
+        expect(ngx_http_cache_purge_control_match_digests(reader, &malformed,
+                   64, 65536, ignore, nullptr, &version, &error),
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "oversized digest set rejected");
         std::vector<std::string> members;
         for (unsigned n = 100; n < 164; n++) {
             members.push_back("tag-" + std::to_string(n));
@@ -653,6 +748,13 @@ main()
                    collect, &emitted, &version, &error),
             0, "64 matched members consume exactly one operation budget");
         check(emitted.size() == 1, "group callback emitted once");
+        auto many_digests = digest_context(many);
+        emitted.clear();
+        expect(ngx_http_cache_purge_control_match_digests(reader,
+                   many_digests.get(), 1, 65536, collect, &emitted,
+                   &version, &error),
+            0, "64 TAG digests share one group operation budget");
+        check(emitted.size() == 1, "digest group callback emitted once");
         auto complete = [](void *data,
                             const ngx_http_cache_purge_control_match_t *match) {
             auto &op = *static_cast<const Operation *>(data);
@@ -668,6 +770,10 @@ main()
             ngx_http_cache_purge_control_match(reader, many.get(), 1, 65536,
                 complete, const_cast<Operation *>(&grouped), &version, &error),
             0, "complete group callback");
+        expect(ngx_http_cache_purge_control_match_digests(reader,
+                   many_digests.get(), 1, 65536, complete,
+                   const_cast<Operation *>(&grouped), &version, &error),
+            0, "digest callback keeps the original canonical TAG operation");
         for (const auto &bad : { tag_group({ "b", "a" }),
                  tag_group({ "a", "a" }), tag_group({ "a" }) })
         {

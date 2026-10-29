@@ -215,7 +215,7 @@ int ngx_http_cache_purge_component_stop(
 extern "C" {
 #endif
 
-#define NGX_HTTP_CACHE_PURGE_CONTROL_ABI 5
+#define NGX_HTTP_CACHE_PURGE_CONTROL_ABI 6
 #define NGX_HTTP_CACHE_PURGE_CONTROL_FENCE 1
 #define NGX_HTTP_CACHE_PURGE_CONTROL_PROPAGATE 2
 #define NGX_HTTP_CACHE_PURGE_CONTROL_PREPARING 4
@@ -233,6 +233,17 @@ typedef struct {
 
 #define NGX_HTTP_CACHE_PURGE_WATERMARK_SIZE 28
 #define NGX_HTTP_CACHE_PURGE_VARIANT_SIZE 64
+#define NGX_HTTP_CACHE_PURGE_TAG_DIGEST_SIZE 16
+
+typedef unsigned char
+    ngx_http_cache_purge_tag_digest_t[NGX_HTTP_CACHE_PURGE_TAG_DIGEST_SIZE];
+
+/* Stable SHA-256 prefix for bounded cache-side TAG material. This is an
+ * identity digest, not authentication. Binary TAGs up to 1024 bytes are valid.
+ * A digest collision can only broaden matching; raw input remains exact. */
+int ngx_http_cache_purge_tag_digest(ngx_http_cache_rocksdb_bytes_t tag,
+    unsigned char digest[NGX_HTTP_CACHE_PURGE_TAG_DIGEST_SIZE],
+    ngx_http_cache_rocksdb_error_t *error);
 
 typedef struct {
     ngx_http_cache_rocksdb_bytes_t        key, url, host, tag_namespace;
@@ -256,6 +267,7 @@ typedef int (*ngx_http_cache_purge_control_visit_pt)(
     void *data, const ngx_http_cache_purge_control_match_t *match);
 
 size_t ngx_http_cache_purge_control_size(size_t bank_bytes, uint32_t readers);
+unsigned ngx_http_cache_purge_control_abi_6(void);
 /* The caller owns shared mmap/SHM storage and must initialize it exactly once,
  * before concurrent attachment. The address must be 64-byte aligned. */
 int ngx_http_cache_purge_control_init(void *memory, size_t bytes,
@@ -271,6 +283,15 @@ int ngx_http_cache_purge_control_match(
     const ngx_http_cache_purge_control_context_t *context, size_t max_matches,
     size_t max_bytes, ngx_http_cache_purge_control_visit_pt visit, void *data,
     uint64_t *publication, ngx_http_cache_rocksdb_error_t *error);
+/* Same selectors, callbacks and budgets, with context.tags containing only
+ * fixed-size tag_digest() results. No raw TAG digest calculation or database
+ * lookup occurs. Other fields remain raw. Partial matches grant no admission.
+ */
+int ngx_http_cache_purge_control_match_digests(
+    ngx_http_cache_purge_control_reader_t *reader,
+    const ngx_http_cache_purge_control_context_t *context, size_t max_matches,
+    size_t max_bytes, ngx_http_cache_purge_control_visit_pt visit, void *data,
+    uint64_t *publication, ngx_http_cache_rocksdb_error_t *error);
 /* Local outgoing requirements and their ledger come from one pinned image.
  * Published PREPARING fences also propagate before their first activation
  * starts the local window. This does not reopen an expired active window.
@@ -282,6 +303,15 @@ int ngx_http_cache_purge_control_match(
 int ngx_http_cache_purge_control_propagation(
     ngx_http_cache_purge_control_reader_t *reader,
     const ngx_http_cache_purge_control_context_t *context, int tags_known,
+    size_t max_matches, size_t max_bytes,
+    ngx_http_cache_purge_control_visit_pt visit, void *data,
+    ngx_http_cache_purge_watermark_t *watermark, uint64_t *publication,
+    ngx_http_cache_rocksdb_error_t *error);
+/* Known TAG digests only; an unknown set must use the raw candidate API.
+ * As with propagation(), this never authorizes local cache admission. */
+int ngx_http_cache_purge_control_propagation_digests(
+    ngx_http_cache_purge_control_reader_t *reader,
+    const ngx_http_cache_purge_control_context_t *context,
     size_t max_matches, size_t max_bytes,
     ngx_http_cache_purge_control_visit_pt visit, void *data,
     ngx_http_cache_purge_watermark_t *watermark, uint64_t *publication,

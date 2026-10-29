@@ -24,6 +24,7 @@ check(bool ok)
 struct Request {
     std::string key, url, host, ns = "team", tag;
     ngx_http_cache_rocksdb_bytes_t tags[1];
+    ngx_http_cache_purge_tag_digest_t digest;
     ngx_http_cache_purge_control_context_t context;
     explicit Request(unsigned n)
     {
@@ -33,9 +34,15 @@ struct Request {
         key = "team\x1f" + url;
     }
     void
-    bind()
+    bind(bool digests)
     {
         tags[0] = bytes(tag);
+        if (digests) {
+            ngx_http_cache_rocksdb_error_t error;
+            check(ngx_http_cache_purge_tag_digest(tags[0], digest, &error)
+                  == 0);
+            tags[0] = { digest, sizeof(digest) };
+        }
         context = { bytes(key), bytes(url), bytes(host), bytes(ns), tags, 1,
             5000, 1 };
     }
@@ -52,7 +59,7 @@ struct Result {
 };
 static Result
 workload(void *memory, size_t size, std::vector<Request> &requests,
-    unsigned iterations)
+    unsigned iterations, bool digests)
 {
     ngx_http_cache_purge_control_reader_t *reader = nullptr;
     ngx_http_cache_rocksdb_error_t error;
@@ -66,9 +73,11 @@ workload(void *memory, size_t size, std::vector<Request> &requests,
     } while (rc == NGX_HTTP_CACHE_ROCKSDB_BUSY);
     check(rc == 0);
     uint64_t count = 0, version;
+    auto match = digests ? ngx_http_cache_purge_control_match_digests :
+                          ngx_http_cache_purge_control_match;
     auto begin = Clock::now();
     for (unsigned i = 0; i < iterations; ++i) {
-        check(ngx_http_cache_purge_control_match(reader,
+        check(match(reader,
                   &requests[i % requests.size()].context, 8, 4096, visit,
                   &count, &version, &error)
               == 0);
@@ -78,7 +87,7 @@ workload(void *memory, size_t size, std::vector<Request> &requests,
     samples.reserve(2000);
     for (unsigned i = 0; i != 2000; ++i) {
         auto before = Clock::now();
-        check(ngx_http_cache_purge_control_match(reader,
+        check(match(reader,
                   &requests[i % requests.size()].context, 8, 4096, visit,
                   &count, &version, &error)
               == 0);
@@ -102,12 +111,19 @@ workload(void *memory, size_t size, std::vector<Request> &requests,
 int
 main(int argc, char **argv)
 {
-    bool groups = argc == 2
-                  && (std::string(argv[1]) == "--tag-groups"
-                      || std::string(argv[1]) == "--tag-groups-64");
-    unsigned members =
-        argc == 2 && std::string(argv[1]) == "--tag-groups-64" ? 64 : 2;
-    check(argc == 1 || groups);
+    bool groups = false, digests = false;
+    unsigned members = 2;
+    for (int i = 1; i < argc; i++) {
+        std::string option(argv[i]);
+        if (option == "--digests") {
+            digests = true;
+        } else if (option == "--tag-groups" || option == "--tag-groups-64") {
+            groups = true;
+            members = option == "--tag-groups-64" ? 64 : 2;
+        } else {
+            check(false);
+        }
+    }
     size_t size = ngx_http_cache_purge_control_size(8 * 1024 * 1024, 32);
     void *memory = mmap(nullptr, size, PROT_READ | PROT_WRITE,
         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
@@ -120,11 +136,13 @@ main(int argc, char **argv)
     check(
         ngx_http_cache_purge_control_writer_open(memory, size, &writer, &error)
         == 0);
-    std::printf("{\"tag_groups\":%s,\"members_per_group\":%u,"
+    std::printf("{\"tag_groups\":%s,\"tag_digests\":%s,"
+                "\"members_per_group\":%u,"
                 "\"reserved_shm_bytes\":%zu,\"iterations_"
                 "per_worker\":200000,"
                 "\"scenarios\":[",
-        groups ? "true" : "false", groups ? members : 0, size);
+        groups ? "true" : "false", digests ? "true" : "false",
+        groups ? members : 0, size);
     bool first = true;
     for (unsigned count : { 0, 16, 256, 4096 }) {
         std::vector<Operation> operations;
@@ -184,7 +202,7 @@ main(int argc, char **argv)
             requests.emplace_back(count ? (i * 997) % count : 0);
         }
         for (auto &r : requests) {
-            r.bind();
+            r.bind(digests);
         }
         auto before = Clock::now();
         auto prepared = prepare_controls(writer, operations);
@@ -198,7 +216,7 @@ main(int argc, char **argv)
             std::chrono::duration<double, std::micro>(Clock::now() - before)
                 .count();
         check(ngx_http_cache_purge_control_gate_open(writer, &error) == 0);
-        Result single = workload(memory, size, requests, 200000);
+        Result single = workload(memory, size, requests, 200000, digests);
         check(single.matches == (count ? 202000U : 0U));
         int channel[2];
         check(pipe(channel) == 0);
@@ -208,7 +226,7 @@ main(int argc, char **argv)
             pid_t child = fork();
             check(child >= 0);
             if (!child) {
-                auto result = workload(memory, size, requests, 200000);
+                auto result = workload(memory, size, requests, 200000, digests);
                 check(write(channel[1], &result, sizeof(result))
                       == sizeof(result));
                 _exit(0);

@@ -225,7 +225,7 @@ Reload preserves old-worker registrations; only proven-dead processes are
 reclaimed. The executor can query pre-operation writer registrations through
 bounded IPC. A zero count alone does not permit FENCE removal: queued IPC,
 unfinished durable transactions and physical processing still need closure.
-The internal shared-control ABI is 5; nginx-ext ABI remains 1.
+The internal shared-control ABI is 6; nginx-ext ABI remains 1.
 
 Native file responses still use `ADMIT_FILE` to verify the selected descriptor
 and require its exact key, URL and host. Admission does not add associations or
@@ -525,7 +525,7 @@ long-lived HTTP responses do not keep the database owner indefinitely. Its
 executor finishes the current operation and closes the DB before the replacement
 opens it. The old worker can continue sending its response and joins the stopped
 executor when it exits. The component C ABI is 11; rebuild its archives together
-with the addon. Upgrading from an earlier component ABI or shared-control ABI 4
+with the addon. Upgrading from an earlier component ABI or shared-control ABI 5
 or earlier requires a full nginx restart; persisted cache files and indexes are
 retained. An old executor cannot serve the new object-query opcode during a
 mixed-version reload. nginx-ext ABI remains 1.
@@ -701,6 +701,15 @@ selected memberships in bounded steps. It selects native Vary hashes from a tran
 proxy request headers, preserving duplicate-header order and nginx's Accept-*
 normalization. Headers are neither logged nor persisted. A control publication
 change or expired snapshot discards the partial result and requires a retry.
+
+Shared controls support both exact raw TAG input and fixed 16-byte SHA-256
+prefixes. Each TAG membership has separate raw and digest lookup entries built
+by the publisher; neither request lookup computes SHA-256. Both retain the same
+namespace/host scope, group deduplication, output budgets and original operation
+callbacks. Added entries and digest bytes count against the existing shared-bank
+limit. Digests are internal matching material, not authentication or L2 headers.
+The digest entry point is groundwork for cache-side admission proof; current
+HTTP HITs still use the database-backed raw TAG path.
 
 The per-key identity row contains four unsigned 64-bit values: file count,
 URL dictionary ID, host dictionary ID and namespace dictionary ID. A fill cannot

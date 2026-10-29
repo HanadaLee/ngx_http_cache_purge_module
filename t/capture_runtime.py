@@ -1831,7 +1831,9 @@ try:
     ready_file(prop_records(uri, 1)[0])
     tag_push('entry-unrelated', 'entry-unrelated-tag')
     until(lambda: api('/__purge/v2/operations/entry-unrelated')[2]['cleanup']['state'] == 'done')
-    assert prop_get(uri) == (200, 'HIT', uri.encode())
+    until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
+    response = prop_get(uri)
+    assert response == (200, 'HIT', uri.encode()), response
     initial_requests = int.from_bytes(rpc(1)[40:48], 'big')
     initial_origins = calls.count(uri)
     for _ in range(10):
