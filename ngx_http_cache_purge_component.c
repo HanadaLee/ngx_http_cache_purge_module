@@ -157,6 +157,9 @@ static int ngx_http_cache_purge_component_validation_finish_guard(void *data,
 static int ngx_http_cache_purge_component_publication_guard(void *data,
     const ngx_http_cache_purge_index_file_t *file,
     ngx_http_cache_rocksdb_error_t *error);
+static int ngx_http_cache_purge_component_collect_ack(
+    ngx_http_cache_purge_component_t *component,
+    ngx_http_cache_rocksdb_error_t *error);
 static int ngx_http_cache_purge_component_read_stamp(
     ngx_http_cache_purge_coordinator_t *coordinator,
     const ngx_http_cache_purge_index_file_t *file, uint64_t *publication,
@@ -2443,6 +2446,22 @@ ngx_http_cache_purge_component_process_file(ngx_http_cache_purge_component_t *c,
         }
         rc = ngx_http_cache_purge_component_error(error, c->cleanup_result,
             c->cleanup_result == 0 ? "" : "native cache node is not drained");
+        if (rc == 0) {
+            /*
+             * Release this task's pin before collecting the retired record.
+             * File removal and native cleanup are already complete, and the
+             * original lease remains held through collection. Other task
+             * pins retain the record for the normal background retry.
+             */
+            rc = ngx_http_cache_purge_component_checkpoint(c, op, NULL,
+                cursor, 0, 1, 0, now, "", error);
+            if (rc == 0) {
+                return ngx_http_cache_purge_component_collect_ack(c, error);
+            }
+            ngx_http_cache_purge_component_close(&c->cleanup_lease);
+            ngx_http_cache_purge_component_store32(&c->cleanup_state, 0);
+            return rc;
+        }
         ngx_http_cache_purge_component_close(&c->cleanup_lease);
         ngx_http_cache_purge_component_store32(&c->cleanup_state, 0);
         goto done;

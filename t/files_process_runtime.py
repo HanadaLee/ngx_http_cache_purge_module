@@ -248,12 +248,12 @@ def background_delete(cut):
     log = (root / 'component.log').open('w')
     process = None
 
-    def until(test):
+    def until(test, message='background progress deadline'):
         deadline = time.monotonic() + 12
         while True:
             result = test()
             if result: return result
-            assert process.poll() is None and time.monotonic() < deadline
+            assert process.poll() is None and time.monotonic() < deadline, message
             time.sleep(.02)
 
     def start():
@@ -290,8 +290,9 @@ def background_delete(cut):
                 return data
             magic, version, echoed, request, size, result = struct.unpack('>4sHHQII', read(24))
             data = read(size)
-            assert (magic, version, echoed, request, result) == (b'NCP1', 1, opcode, 1, code), data
-            return data
+            assert (magic, version, echoed, request) == (b'NCP1', 1, opcode, 1), data
+            assert code is None or result == code, (result, data)
+            return (result, data) if code is None else data
 
     def operation(name='background'):
         raw = rpc(15, struct.pack('>I', len(name)) + name.encode())
@@ -404,11 +405,22 @@ def background_delete(cut):
             ack('x')
             # A busy consumer releases its file lease and retries; the exact
             # retired instance remains in the durable task checkpoint.
+            # Retire an unrelated file to exercise standalone collection and
+            # its crash recovery alongside task-owned cleanup acknowledgements.
+            raw = rpc(2, (4).to_bytes(16, 'big'))
+            target = root / 'cache/a/outside'
+            offset = int.from_bytes(hashlib.sha256(str(target).encode()).digest()[16:24], 'big') & 0x3fffffffffffffff
+            with (root / 'db/file.leases').open('r+b') as standalone:
+                fcntl.fcntl(standalone.fileno(), fcntl.F_OFD_SETLK,
+                            struct.pack('hhqqi', fcntl.F_WRLCK, os.SEEK_SET, offset, 1, 0) + b'\0' * 4)
+                removed = rpc(24, (4).to_bytes(16, 'big') + raw[1:9], (standalone.fileno(),))
+                assert len(removed) == 29 and removed[:4] == b'\0\0\0\1'
             completed = 0
             seen = {}
             restarted_collection = False
+            restarted_ack = False
             task_streak = 0
-            expected_paths = {'a/first': 1, 'a/second': 2, 'a/other': 6}
+            expected_paths = {'a/first': 1, 'a/second': 2, 'a/other': 6, 'a/outside': 4}
             if cut == 'native-many':
                 expected_paths.update({f'a/bulk-{n}': n for n in range(10, 50)})
             draining = time.monotonic()
@@ -424,26 +436,34 @@ def background_delete(cut):
                 number = expected_paths[request[5]]
                 raw = rpc(2, number.to_bytes(16, 'big'))
                 rpc(7, b'\x01' + number.to_bytes(16, 'big') + raw[1:9], code=4)
-                if seen.get(request[5], 0) == 1 and not restarted_collection:
+                if number == 4 and not restarted_collection:
                     if cut == 'native-many':
                         assert len(seen) <= 8, ('collection starved behind task removals', len(seen))
-                    # The task checkpoint has released this ID; the retired
-                    # queue alone must recover an unacknowledged GC removal.
+                    # No task owns this ID; the retired queue alone must
+                    # recover an unacknowledged GC removal.
                     assert raw[0] == 3
                     stop(kill=True)
                     start()
                     assert rpc(2, number.to_bytes(16, 'big'))[0] == 3
                     restarted_collection = True
                     continue
-                task_streak = 0 if seen.get(request[5], 0) else task_streak + 1
+                task_streak = 0 if number == 4 else task_streak + 1
                 if cut == 'native-many':
-                    assert task_streak <= 8, ('collection starved behind task removals', task_streak, seen)
+                    assert restarted_collection or task_streak <= 8, ('collection starved behind task removals', task_streak, seen)
                 seen[request[5]] = seen.get(request[5], 0) + 1
+                assert seen[request[5]] == 1, ('duplicate cleanup after successful acknowledgement', request[5])
                 ack('y')
+                until(lambda: rpc(2, number.to_bytes(16, 'big'), code=None)[0] == 1,
+                      'acknowledged record requires duplicate filesystem/native cleanup')
+                if number != 4 and not restarted_ack:
+                    stop(kill=True)
+                    start()
+                    rpc(2, number.to_bytes(16, 'big'), code=1)
+                    restarted_ack = True
                 completed += 1
-                assert completed <= len(expected_paths) * 2
+                assert completed <= len(expected_paths)
             timings[cut] = time.monotonic() - draining
-            assert completed == len(expected_paths) * 2 and set(seen.values()) == {2} and restarted_collection, seen
+            assert completed == len(expected_paths) and set(seen.values()) == {1} and restarted_collection and restarted_ack, seen
             assert not first.exists() and not (root / 'cache-b/a/second').exists()
             assert (root / 'cache/a/fresh').exists()
             stop()
@@ -551,7 +571,7 @@ def background_delete(cut):
     diagnostics = (root / 'component.log').read_text()
     assert not any(word in diagnostics for word in ('AddressSanitizer', 'LeakSanitizer', 'runtime error:')), diagnostics
     checks.append('304 recovery retains old TAG membership, rechecks old/new rules before header mutation and atomically publishes new TAGs: ' + cut if validation_case else
-                  'native cleanup alternates task removal and collection without draining a 43-file task first' if cut == 'native-many' else
+                  'native task cleanup collects acknowledged records once and allows standalone collection during a 43-file task' if cut == 'native-many' else
                   'native cleanup notification survives owner death, rejects stale replies, retries busy consumers and preserves durable per-file progress' if cut == 'native' else
                   'background Invalidate waits for origins and durable intents, resumes after owner death, retires FENCE while retaining PROPAGATE and rejects delayed old writes' if cut == 'invalidate' else
                   'background Delete survives ' + cut + ' restart, handles both zones, preserves new entities and retires the FENCE')

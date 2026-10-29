@@ -101,6 +101,10 @@ entities fetched after the operation are preserved, including replacements.
 For native nginx roots, background Delete now hands node accounting back to the
 owning worker through one bounded notification slot. The executor retains the
 path lease until the worker acknowledges the exact inode and physical key.
+After a successful acknowledgement, the executor releases the task's record
+reference and collects the retired metadata under the same lease. Other task
+references defer collection. This avoids repeating file and node cleanup during
+normal task completion; interrupted collection remains replayable on restart.
 The event handler uses a try-lock and bounded tree lookup, without database or
 filesystem I/O. It preserves replacements, retries nodes still in use or being
 loaded/deleted, and subtracts the old node's block count once. Task progress is
