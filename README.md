@@ -260,6 +260,15 @@ diagnostic. Retained TAG lookup on MISS uses the separate read executor. Full
 cache fills and 304 updates use bounded background jobs; foreground file reads
 and end-to-end latency still require performance validation.
 
+Configured workers reserve Linux file-descriptor table capacity during startup
+for twice `worker_connections` plus 512 internal descriptors, capped by the
+existing soft `RLIMIT_NOFILE`. The temporary descriptor is immediately closed;
+the module neither raises that limit nor keeps dummy files open. This avoids
+RCU waits when request-side descriptor duplication first expands a table shared
+with background threads. The kernel rounds capacity upward; 1,024 entries need
+about 8 KiB for file pointers plus bitmaps and allocator overhead per worker.
+Other modules or workloads exceeding the reserved budget can still expand it.
+
 The RocksDB bridge exposes owner-local batch durability tickets. Reading them
 only inspects counters and never synchronizes the WAL. A later deferred batch
 does not revoke an earlier synchronized ticket. Tickets reset on reopen and are

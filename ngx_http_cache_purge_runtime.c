@@ -58,6 +58,7 @@ ngx_http_cache_purge_runtime_paths(ngx_http_cache_purge_runtime_t *rt,
 static void ngx_http_cache_purge_runtime_notify(ngx_event_t *event);
 static void ngx_http_cache_purge_runtime_unlisten(
     ngx_http_cache_purge_runtime_t *rt);
+static ngx_int_t ngx_http_cache_purge_runtime_files(ngx_cycle_t *cycle);
 
 ngx_flag_t
 ngx_http_cache_purge_runtime_configured(ngx_conf_t *cf)
@@ -861,12 +862,18 @@ ngx_http_cache_purge_runtime_process_init(ngx_cycle_t *cycle)
 {
     ngx_http_cache_purge_main_conf_t  *main;
     ngx_http_cache_purge_runtime_t    *rt;
-    if (ngx_process != NGX_PROCESS_WORKER || ngx_worker != 0) {
+    if (ngx_process != NGX_PROCESS_WORKER) {
         return NGX_OK;
     }
     main =
         ngx_http_cycle_get_module_main_conf(cycle, ngx_http_cache_purge_module);
     if (main == NULL || main->runtime->path == NULL) {
+        return NGX_OK;
+    }
+    if (ngx_http_cache_purge_runtime_files(cycle) != NGX_OK) {
+        return NGX_ERROR;
+    }
+    if (ngx_worker != 0) {
         return NGX_OK;
     }
     rt = main->runtime;
@@ -876,6 +883,48 @@ ngx_http_cache_purge_runtime_process_init(ngx_cycle_t *cycle)
     /* Later init_process failures must not leave a running DB thread. */
     rt->owner_event.cancelable = 1;
     ngx_add_timer(&rt->owner_event, 0);
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_cache_purge_runtime_files(ngx_cycle_t *cycle)
+{
+    struct rlimit  limit;
+    rlim_t         count;
+    ngx_fd_t       fd, reserved;
+    ngx_err_t      err;
+
+    if (getrlimit(RLIMIT_NOFILE, &limit) == -1) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
+                      "getrlimit(RLIMIT_NOFILE) failed");
+        return NGX_ERROR;
+    }
+    /* Network connections plus their cache files, with bounded publication,
+     * proof, IPC and database headroom. Never reserve the entire hard limit. */
+    count = cycle->connection_n;
+    count = count > (NGX_MAX_INT32_VALUE - 512) / 2
+            ? NGX_MAX_INT32_VALUE : count * 2 + 512;
+    count = ngx_min(count, limit.rlim_cur);
+    if (count == 0) {
+        return NGX_ERROR;
+    }
+    fd = ngx_open_file("/dev/null", NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
+    if (fd == NGX_INVALID_FILE) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
+                      ngx_open_file_n " \"/dev/null\" failed");
+        return NGX_ERROR;
+    }
+    /* Expanding a shared Linux fdtable can wait for RCU readers. Pay that
+     * cost during worker initialization, not in request-side dup/open. */
+    reserved = fcntl(fd, F_DUPFD_CLOEXEC, (int) count - 1);
+    err = ngx_errno;
+    ngx_close_file(fd);
+    if (reserved == NGX_INVALID_FILE) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, err,
+                      "cache purge file table reservation failed");
+        return NGX_ERROR;
+    }
+    ngx_close_file(reserved);
     return NGX_OK;
 }
 
