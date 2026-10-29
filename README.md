@@ -243,8 +243,10 @@ operation. PREPARE, uncommitted FINISH/recovery and new 304 validation writes
 reject origins below that floor even after the rule leaves the resident table.
 Committed files and completed validation receipts are not invalidated by this
 check. A 304 request carries its own origin boundary separately from the stored
-entity's watermark. The native physical-work coordinator does not yet invoke
-materialization: these write guards do not establish complete FENCE retirement.
+entity's watermark. The native coordinator materializes a drained operation only
+after checking old origin registrations and the pending file-intent catalog in
+the same executor step. It then republishes controls with FENCE removed while
+preserving the independent propagation deadline.
 
 Indexed requests do not create memory-only entries: transport 502/504 and
 intercepted errors are excluded, while ordinary disk-backed error responses keep
