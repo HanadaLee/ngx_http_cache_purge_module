@@ -339,11 +339,67 @@ def run_client_cases(Run, root, checks):
             assert pending.result()[2] == b'queue-cancel' and count(100) == sent
         checks.append('cancelling a queued request neither sends it nor interrupts the active frame')
 
+        saved_socket = path.with_name('peer-handoff.sock')
+        for unavailable in ('missing', 'refused', 'backlog'):
+            assert rpc('/rpc-fake/?op=108', b'close-before-handoff')[0] == 503
+            path.rename(saved_socket)
+            listener, filler = None, None
+            if unavailable != 'missing':
+                listener = socket.socket(socket.AF_UNIX)
+                listener.bind(str(path))
+                if unavailable == 'backlog':
+                    listener.listen(0)
+                    filler = socket.socket(socket.AF_UNIX)
+                    filler.connect(str(path))  # Fill the Linux Unix backlog.
+            sent = count(100)
+            try:
+                with concurrent.futures.ThreadPoolExecutor(1) as pool:
+                    pending = pool.submit(rpc, '/rpc-fake/?op=100&timeout=1500', b'handoff')
+                    until(lambda: pending.done() or stats()['pending'] == 1)
+                    time.sleep(.08)
+                    assert not pending.done() and count(100) == sent
+                    assert case.get('/other')[:2] == (200, 'HIT')
+                    path.unlink(missing_ok=True)
+                    saved_socket.rename(path)
+                    value = pending.result()
+                    assert value[0] == 200 and value[2] == b'handoff'
+                    assert count(100) == sent + 1
+            finally:
+                if filler is not None:
+                    filler.close()
+                if listener is not None:
+                    listener.close()
+                if saved_socket.exists():
+                    path.unlink(missing_ok=True)
+                    saved_socket.rename(path)
+        checks.append('missing, refused and full-backlog rendezvous connections wait without blocking HTTP and send exactly once after handoff')
+
+        assert rpc('/rpc-fake/?op=108', b'close-before-deadline')[0] == 503
+        path.rename(saved_socket)
+        sent = count(100)
+        try:
+            started = time.monotonic()
+            value = rpc('/rpc-fake/?op=100&timeout=80', b'expired-before-connect')
+            assert value[0] == 504 and value[1]['X-IPC-Ambiguous'] == '0'
+            assert .05 <= time.monotonic() - started < .6 and count(100) == sent
+            before = stats()['cancelled']
+            raw = socket.create_connection(('127.0.0.1', case.port))
+            raw.sendall(b'GET /rpc-fake/?op=100 HTTP/1.1\r\nHost: probe.test\r\n\r\n')
+            until(lambda: stats()['pending'] == 1)
+            raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+            raw.close()
+            until(lambda: stats()['cancelled'] == before + 1)
+            assert stats()['pending'] == 0 and count(100) == sent
+        finally:
+            saved_socket.rename(path)
+        assert rpc('/rpc-fake/?op=100', b'after-handoff-cancel')[2] == b'after-handoff-cancel'
+        checks.append('rendezvous retries preserve the original deadline and cancellation removes unsent work')
+
         value = rpc('/rpc-wrong/?op=100', b'wrong-owner')
         assert value[0] == 503 and value[1]['X-IPC-Transport'] == '5' and value[1]['X-IPC-Ambiguous'] == '0'
-        value = rpc('/rpc-missing/')
-        assert value[0] == 503 and value[1]['X-IPC-Ambiguous'] == '0'
-        checks.append('wrong peer UID and connect failure fail before sending a frame')
+        value = rpc('/rpc-missing/?timeout=80')
+        assert value[0] == 504 and value[1]['X-IPC-Ambiguous'] == '0'
+        checks.append('wrong peer UID fails immediately and a missing peer expires before sending a frame')
 
         old_connections = stats()['connections']
         time.sleep(1.1)
@@ -391,6 +447,24 @@ def run_client_cases(Run, root, checks):
         owner = case.ready(owner)
         assert rpc('/rpc/?op=15', text('worker-client-op'))[2] == receipt[2]
         checks.append('HUP drains the old worker call and new workers reconnect to the replacement owner')
+
+        assert rpc('/rpc-fake/?op=108', b'close-before-stop')[0] == 503
+        path.rename(saved_socket)
+        sent = count(100)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(1) as pool:
+                pending = pool.submit(rpc, '/rpc-fake/?op=100', b'stop-reconnect')
+                until(lambda: stats()['pending'] == 1)
+                assert rpc('/rpc-fake/?stop=1')[2] == b'stopped'
+                value = pending.result()
+                assert value[1]['X-IPC-Transport'] == '6' and value[1]['X-IPC-Ambiguous'] == '0'
+            time.sleep(.05)
+            stopped = stats()
+            assert stopped['pending'] == stopped['request_bytes'] == stopped['response_bytes'] == 0
+            assert count(100) == sent
+        finally:
+            saved_socket.rename(path)
+        checks.append('stopping a reconnect wait cancels its timer and releases unsent buffers')
     finally:
         gate.set()
         case.stop()
@@ -401,7 +475,8 @@ def run_client_cases(Run, root, checks):
     expected = f'worker process {killed_owner} exited on signal 9'
     assert logs.count(expected) == 1
     unexpected = '\n'.join(line for line in logs.splitlines() if expected not in line)
-    assert '[alert]' not in unexpected and 'AddressSanitizer' not in unexpected and 'runtime error:' not in unexpected, case.path
+    assert '[alert]' not in unexpected and '[crit]' not in unexpected, case.path
+    assert 'AddressSanitizer' not in unexpected and 'runtime error:' not in unexpected, case.path
     return {'runtime_path': str(case.path), 'final_stats_before_reload': final,
             'fixture_pending_limit': 4, 'request_byte_limit': 524312,
             'response_byte_limit': 524288}

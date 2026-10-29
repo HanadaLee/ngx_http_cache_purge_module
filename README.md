@@ -127,6 +127,13 @@ Graceful executor shutdown releases the pending lease before DB ownership moves
 to a new worker. No nginx request or cache-node pointers cross into the database
 thread.
 
+An unsent IPC call waits through a missing, refused, or full Unix socket during
+executor handoff. Reconnect attempts use a 10 ms timer and keep the original call
+deadline and queue budgets. Cancellation and worker shutdown release queued
+descriptors and buffers. Calls that have sent any bytes are never automatically
+replayed; a lost response remains ambiguous. Unexpected connection failures and
+peer UID mismatches still fail explicitly.
+
 Background scans yield after at most 32 cursor advances, including retired rows
 and empty URL/key branches. Every yield releases its snapshot and saves a resume
 position; it does not retain all matching files in memory. These are work-unit

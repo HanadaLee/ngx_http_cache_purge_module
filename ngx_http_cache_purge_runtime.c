@@ -1024,7 +1024,6 @@ struct ngx_http_cache_purge_client_s {
     struct sockaddr_un                     address;
     socklen_t                              address_len;
     ngx_str_t                              name;
-    ngx_peer_connection_t                  peer;
     ngx_connection_t                      *connection;
     ngx_queue_t                            queue;
     ngx_http_cache_purge_call_t           *current;
@@ -1331,6 +1330,82 @@ ngx_http_cache_purge_client_connected(ngx_http_cache_purge_client_t *client)
     return NGX_HTTP_CACHE_PURGE_CLIENT_OK;
 }
 
+static ngx_int_t
+ngx_http_cache_purge_client_connect(ngx_http_cache_purge_client_t *client)
+{
+    ngx_connection_t  *c;
+    ngx_socket_t       s;
+    ngx_err_t          err;
+    int                rc;
+
+    s = ngx_socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (s == (ngx_socket_t) -1) {
+        ngx_log_error(NGX_LOG_ALERT, client->log, ngx_socket_errno,
+                      "cache purge " ngx_socket_n " failed");
+        return NGX_ERROR;
+    }
+
+    rc = connect(s, (struct sockaddr *) &client->address, client->address_len);
+    if (rc == -1) {
+        err = ngx_socket_errno;
+        if (err != NGX_EINPROGRESS) {
+            ngx_close_socket(s);
+            if (err == NGX_ENOENT || err == NGX_ECONNREFUSED
+                || err == NGX_EAGAIN || err == NGX_EINTR)
+            {
+                /*
+                 * No frame was sent; the original call deadline still applies.
+                 */
+                ngx_log_debug1(NGX_LOG_DEBUG_EVENT, client->log, err,
+                               "cache purge component unavailable: %V",
+                               &client->name);
+                return NGX_BUSY;
+            }
+            ngx_log_error(NGX_LOG_ERR, client->log, err,
+                          "cache purge connect() to %V failed", &client->name);
+            return NGX_ERROR;
+        }
+    }
+
+    c = ngx_get_connection(s, client->log);
+    if (c == NULL) {
+        ngx_close_socket(s);
+        return NGX_ERROR;
+    }
+    client->connection = c;
+    c->type = SOCK_STREAM;
+    c->recv = ngx_recv;
+    c->send = ngx_send;
+    c->log_error = NGX_ERROR_ERR;
+    c->number = ngx_atomic_fetch_add(ngx_connection_counter, 1);
+    c->start_time = ngx_current_msec;
+    c->data = client;
+    c->read->log = client->log;
+    c->write->log = client->log;
+    c->read->handler = ngx_http_cache_purge_client_read;
+    c->write->handler = ngx_http_cache_purge_client_write;
+    client->connecting = 1;
+
+    if (ngx_add_conn) {
+        if (ngx_add_conn(c) != NGX_OK) {
+            goto failed;
+        }
+    } else if (rc == -1 && ngx_handle_write_event(c->write, 0) != NGX_OK) {
+        goto failed;
+    }
+    client->stats.connections++;
+    if (rc == -1) {
+        return NGX_AGAIN;
+    }
+    c->write->ready = 1;
+    return NGX_OK;
+
+failed:
+
+    ngx_http_cache_purge_client_close(client);
+    return NGX_ERROR;
+}
+
 static void
 ngx_http_cache_purge_client_pump(ngx_event_t *ev)
 {
@@ -1338,7 +1413,9 @@ ngx_http_cache_purge_client_pump(ngx_event_t *ev)
     ngx_connection_t               *c;
     ngx_int_t                       rc;
 
-    if (client->stopped || client->current || ngx_queue_empty(&client->queue)) {
+    if (client->stopped || client->current || ev->timer_set
+        || ngx_queue_empty(&client->queue))
+    {
         return;
     }
     if (client->idle.timer_set) {
@@ -1352,29 +1429,21 @@ ngx_http_cache_purge_client_pump(ngx_event_t *ev)
     client->current = ngx_queue_data(ngx_queue_head(&client->queue),
                                      ngx_http_cache_purge_call_t, queue);
     if (c == NULL) {
-        ngx_memzero(&client->peer, sizeof(client->peer));
-        client->peer.sockaddr = (struct sockaddr *) &client->address;
-        client->peer.socklen = client->address_len;
-        client->peer.name = &client->name;
-        client->peer.get = ngx_event_get_peer;
-        client->peer.log = client->log;
-        client->peer.log_error = NGX_ERROR_ERR;
-        client->peer.type = SOCK_STREAM;
-        rc = ngx_event_connect_peer(&client->peer);
-        client->connection = c = client->peer.connection;
-        if (rc == NGX_ERROR || rc == NGX_DECLINED || rc == NGX_BUSY) {
+        rc = ngx_http_cache_purge_client_connect(client);
+        if (rc == NGX_BUSY) {
+            client->current = NULL;
+            ngx_add_timer(&client->pump, 10);
+            return;
+        }
+        if (rc == NGX_ERROR) {
             ngx_http_cache_purge_client_finish(
                 client->current, NGX_HTTP_CACHE_PURGE_CLIENT_IO, 1);
             return;
         }
-        client->stats.connections++;
-        c->data = client;
-        c->read->handler = ngx_http_cache_purge_client_read;
-        c->write->handler = ngx_http_cache_purge_client_write;
-        client->connecting = 1;
         if (rc == NGX_AGAIN) {
             return;
         }
+        c = client->connection;
     }
     ngx_reusable_connection(c, 0);
     c->idle = 0;
@@ -1699,6 +1768,9 @@ ngx_http_cache_purge_client_stop(ngx_http_cache_purge_client_t *client)
         return;
     }
     client->stopped = 1;
+    if (client->pump.timer_set) {
+        ngx_del_timer(&client->pump);
+    }
     if (client->pump.posted) {
         ngx_delete_posted_event(&client->pump);
     }
