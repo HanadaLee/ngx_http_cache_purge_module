@@ -2074,6 +2074,27 @@ ngx_http_cache_purge_component_write(ngx_http_cache_purge_component_t *c,
 }
 
 static int
+ngx_http_cache_purge_component_flush(ngx_http_cache_purge_component_t *c,
+    ngx_http_cache_purge_component_peer_t *p)
+{
+    size_t    before;
+    unsigned  attempts;
+
+    /* A descriptor uses one byte before the ordinary reply body. */
+    attempts = p->output_lease >= 0 ? 2 : 1;
+    while (attempts-- && p->output.len != 0) {
+        before = p->output_used;
+        if (!ngx_http_cache_purge_component_write(c, p)) {
+            return 0;
+        }
+        if (p->output.len != 0 && p->output_used == before) {
+            break;
+        }
+    }
+    return 1;
+}
+
+static int
 ngx_http_cache_purge_component_recover(ngx_http_cache_purge_component_t *c,
     ngx_http_cache_rocksdb_t *store, ngx_http_cache_rocksdb_error_t *error)
 {
@@ -3285,7 +3306,7 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
                 continue;
             }
             if (event & POLLOUT) {
-                if (!ngx_http_cache_purge_component_write(c, p)) {
+                if (!ngx_http_cache_purge_component_flush(c, p)) {
                     ngx_http_cache_purge_component_drop(c, i);
                 }
                 continue;
@@ -3305,6 +3326,11 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
                 if (rc == 0) {
                     executed = 1;
                     c->next_peer = (i + 1) % c->options.max_connections;
+                    if (p->output.len != 0
+                        && !ngx_http_cache_purge_component_flush(c, p))
+                    {
+                        ngx_http_cache_purge_component_drop(c, i);
+                    }
                 }
             }
             if (rc != 0) {

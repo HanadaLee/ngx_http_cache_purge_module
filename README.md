@@ -11,6 +11,11 @@ implementation. Test-only C++ adapters and wire encoders live under `t/`.
 Production code is organized into 11 source/header files across the two modules;
 new behavior is added within these responsibility boundaries.
 
+The executor attempts a bounded nonblocking send as soon as an IPC reply is
+ready. Descriptor replies can send their one-byte rights envelope and ordinary
+body in the same turn. Short writes and EAGAIN retain the remaining frame for
+POLLOUT; ready replies do not wait behind the next background maintenance pass.
+
 New cache-file records use atomic WAL batches with deferred synchronization.
 The existing executor checks for pending WAL data every 100 ms; 64 batches or
 one configured maximum batch of accumulated WAL bytes force an earlier sync.

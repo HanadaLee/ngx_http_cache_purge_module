@@ -39,7 +39,7 @@ def wait_for(function, timeout=10):
 
 
 class Component:
-    def __init__(self, path, connections=8, timeout=3000, budget=1100000, payload=512 * 1024, shared=None, roots=None, seed=False):
+    def __init__(self, path, connections=8, timeout=3000, budget=1100000, payload=512 * 1024, shared=None, roots=None, seed=False, reply_gate=None, reply_mode='plain'):
         self.path = path
         path.mkdir(exist_ok=True)
         self.stderr = (root / f'stderr-{len(processes)}.log').open('w')
@@ -50,6 +50,9 @@ class Component:
         env.pop('CACHE_PURGE_TEST_CACHE_ROOT', None)
         env.pop('CACHE_PURGE_TEST_TEMP_ROOT', None)
         env.pop('CACHE_PURGE_TEST_CACHE_ZONE', None)
+        if reply_gate is not None:
+            env['CACHE_PURGE_TEST_REPLY_GATE'] = str(reply_gate)
+            env['CACHE_PURGE_TEST_REPLY_MODE'] = reply_mode
         if seed:
             # Preparing 2,048 durable aliases is fixture setup, not startup.
             subprocess.run([str(args.binary), str(path), '--seed'], env=env,
@@ -267,7 +270,71 @@ class Client:
         return [int.from_bytes(rest[n:n + 16], 'big') for n in range(0, len(rest), 25)], done, bookmark
 
 
+def reply_before_poll(label, mode, operation):
+    gate = root / ('reply-gate-' + label)
+    gate.mkdir()
+    component = Component(root / ('reply-component-' + label), reply_gate=gate, reply_mode=mode)
+    component.opened()
+    client = Client(component.path)
+    rights = array.array('i')
+    try:
+        address = '/cache/fixture/reply-order'
+        payload = string(address) if operation == 17 else b''
+        client.socket.sendall(client.packet(operation, payload))
+        wait_for(lambda: (gate / 'paused').exists())
+        ready = bool(select.select([client.socket], [], [], .1)[0])
+        first = b''
+        if mode == 'plain':
+            check(ready, 'ready reply must not wait for the next executor poll: ' + label)
+            first, control, flags, _ = client.socket.recvmsg(1, socket.CMSG_SPACE(8), socket.MSG_CMSG_CLOEXEC)
+            assert not flags & socket.MSG_CTRUNC
+            for level, kind, data in control:
+                assert (level, kind) == (socket.SOL_SOCKET, socket.SCM_RIGHTS)
+                rights.frombytes(data)
+            # The FD's one byte and its ordinary body must both be queued.
+            header = first + client.read(23)
+        elif mode == 'partial':
+            check(ready, 'partial reply sends available bytes before yielding')
+            first = client.socket.recv(4096)
+            assert len(first) == 7
+            assert not select.select([client.socket], [], [], .05)[0]
+            (gate / 'release').touch()
+            header = first + client.read(24 - len(first))
+        else:
+            check(not ready, mode + ' yields without spinning or fabricating a send')
+            (gate / 'release').touch()
+            first, control, flags, _ = client.socket.recvmsg(1, socket.CMSG_SPACE(8), socket.MSG_CMSG_CLOEXEC)
+            assert not flags & socket.MSG_CTRUNC
+            for level, kind, data in control:
+                assert (level, kind) == (socket.SOL_SOCKET, socket.SCM_RIGHTS)
+                rights.frombytes(data)
+            header = first + client.read(23)
+        magic, version, op, request, size, result = struct.unpack('>4sHHQII', header)
+        body = client.read(size)
+        assert (magic, version, op, request, result) == (b'NCP1', 1, operation, client.counter, 0)
+        assert len(rights) == (1 if operation == 17 else 0)
+        if operation == 17:
+            digest = hashlib.sha256(address.encode()).digest()
+            assert body == digest[:16] + struct.pack('>Q', int.from_bytes(digest[16:24], 'big') & 0x3fffffffffffffff)
+            assert fcntl.fcntl(rights[0], fcntl.F_GETFD) & fcntl.FD_CLOEXEC
+        else:
+            assert len(body) == 72
+        (gate / 'release').touch()
+        assert len(client.call(1)) == 72
+        check(True, 'reply drain preserves framing, descriptor ownership and connection reuse: ' + label)
+    finally:
+        (gate / 'release').touch()
+        for fd in rights:
+            os.close(fd)
+        client.close()
+    component.stop()
+
+
 try:
+    for label, mode, operation in [('plain', 'plain', 1), ('lease', 'plain', 17),
+                                   ('again', 'again', 1), ('again-lease', 'again', 17),
+                                   ('interrupted', 'interrupted', 1), ('partial', 'partial', 1)]:
+        reply_before_poll(label, mode, operation)
     cache_root, temp_root = root / 'cache', root / 'temp'
     cache_root.mkdir(); temp_root.mkdir()
     publisher = Component(root / 'publication', roots=(cache_root, temp_root))
