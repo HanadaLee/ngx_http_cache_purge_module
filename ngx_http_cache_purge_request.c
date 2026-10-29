@@ -4765,7 +4765,7 @@ ngx_http_cache_purge_capture_step(ngx_http_request_t *r,
     /* New FileIds start at revision 1. It also identifies a PREPARE whose
      * reply was lost; FINISH then observes NOT_FOUND or retires its intent. */
     ctx->revision = 1;
-    if (ngx_http_cache_purge_runtime_client(r, &ctx->client) != 0
+    if (ngx_http_cache_purge_runtime_publish_client(r, &ctx->client) != 0
         || getrandom(ctx->id, sizeof(ctx->id), GRND_NONBLOCK)
                != (ssize_t) sizeof(ctx->id))
     {

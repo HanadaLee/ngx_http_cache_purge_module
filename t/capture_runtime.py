@@ -2203,7 +2203,12 @@ try:
     def prop_records(path, count):
         found = until(lambda: (v if len(v := query('http://prop.test' + path)) == count
                                and all(item[2] == 2 for item in v) else None))
-        return [record(item[0]) for item in found]
+        result = [record(item[0]) for item in found]
+        # These fixtures require existing cache entities, not merely index
+        # commits that still await their WAL group's READY publication.
+        for item in result:
+            ready_file(item)
+        return result
 
     direct_host = 'direct-only.test'
     direct_path = '/propagation/uncached-manual/direct'
@@ -2348,12 +2353,8 @@ try:
     uri = '/propagation/groups/object'
     policies[uri] = 'many-keys'
     variants = [uri + '?m=' + str(number) for number in range(97)]
-    for number, target in enumerate(variants, 1):
+    for target in variants:
         assert prop_get(target) == (200, 'MISS', uri.encode())
-        # Establish the 97-member fixture without depending on foreground
-        # queries to pace asynchronous file publication through the writer.
-        if number % 16 == 0:
-            prop_records(uri, number)
     original = prop_records(uri, 97)
     assert len({item['key'] for item in original}) == 97
     deleted_at = tag_push('prop-many-keys', 'many-keys')

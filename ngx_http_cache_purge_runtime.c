@@ -12,6 +12,7 @@
 
 #define NGX_HTTP_CACHE_PURGE_RUNTIME_READERS  1024
 #define NGX_HTTP_CACHE_PURGE_RUNTIME_VERSION 2
+#define NGX_HTTP_CACHE_PURGE_PUBLISH_CLIENTS 4
 
 typedef struct {
     ngx_uint_t  version;
@@ -34,6 +35,8 @@ struct ngx_http_cache_purge_runtime_s {
     ngx_http_cache_purge_control_reader_t    *reader;
     ngx_http_cache_purge_client_t            *client;
     ngx_http_cache_purge_client_t            *read_client;
+    ngx_http_cache_purge_client_t
+        *publish_client[NGX_HTTP_CACHE_PURGE_PUBLISH_CLIENTS];
     uid_t                                     owner_uid;
     ngx_msec_t                                propagation;
     ngx_uint_t                                started;
@@ -934,6 +937,7 @@ ngx_http_cache_purge_runtime_worker_exit(ngx_cycle_t *cycle)
 {
     ngx_http_cache_purge_main_conf_t  *main;
     ngx_http_cache_rocksdb_error_t     error;
+    ngx_uint_t                         i;
     int                                rc;
 
 
@@ -949,6 +953,9 @@ ngx_http_cache_purge_runtime_worker_exit(ngx_cycle_t *cycle)
         ngx_http_cache_purge_runtime_exit(main->runtime);
         ngx_http_cache_purge_client_stop(main->runtime->client);
         ngx_http_cache_purge_client_stop(main->runtime->read_client);
+        for (i = 0; i < NGX_HTTP_CACHE_PURGE_PUBLISH_CLIENTS; i++) {
+            ngx_http_cache_purge_client_stop(main->runtime->publish_client[i]);
+        }
     }
     if (main && main->runtime->reader) {
         rc = ngx_http_cache_purge_control_reader_close(&main->runtime->reader,
@@ -962,12 +969,15 @@ ngx_http_cache_purge_runtime_worker_exit(ngx_cycle_t *cycle)
 
 static int
 ngx_http_cache_purge_runtime_client_get(ngx_http_request_t *r,
-    ngx_http_cache_purge_client_t **client, ngx_uint_t readonly)
+    ngx_http_cache_purge_client_t **client, ngx_uint_t kind)
 {
     ngx_http_cache_purge_main_conf_t       *main;
     ngx_http_cache_purge_runtime_t         *rt;
     ngx_http_cache_purge_client_options_t   options;
+    ngx_http_cache_purge_client_stats_t     stats;
     ngx_http_cache_purge_client_t         **slot;
+    ngx_core_conf_t                        *core;
+    ngx_uint_t                              i, limit, pending;
     ngx_str_t                               path, suffix;
     u_char  socket_path[sizeof(((struct sockaddr_un *) 0)->sun_path)];
     u_char *p;
@@ -981,9 +991,35 @@ ngx_http_cache_purge_runtime_client_get(ngx_http_request_t *r,
     if (rt == NULL || rt->path == NULL) {
         return NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND;
     }
-    slot = readonly ? &rt->read_client : &rt->client;
+    limit = 1;
+    slot = kind == 1 ? &rt->read_client : &rt->client;
+    if (kind == 2) {
+        core = (ngx_core_conf_t *) ngx_get_conf(ngx_cycle->conf_ctx,
+                                               ngx_core_module);
+        limit = rt->options.max_connections / core->worker_processes;
+        if (limit <= 1) {
+            /* No spare connection share: retain the original single client. */
+            return ngx_http_cache_purge_runtime_client_get(r, client, 0);
+        }
+        limit = ngx_min(limit - 1, NGX_HTTP_CACHE_PURGE_PUBLISH_CLIENTS);
+        pending = NGX_MAX_UINT32_VALUE;
+        for (i = 0; i < limit; i++) {
+            if (rt->publish_client[i] == NULL) {
+                slot = &rt->publish_client[i];
+                break;
+            }
+            ngx_http_cache_purge_client_stats(rt->publish_client[i], &stats);
+            if (stats.pending < pending) {
+                slot = &rt->publish_client[i];
+                pending = stats.pending;
+                if (pending == 0) {
+                    break;
+                }
+            }
+        }
+    }
     if (*slot == NULL) {
-        if (readonly) {
+        if (kind == 1) {
             ngx_str_set(&suffix, "/read.sock");
         } else {
             ngx_str_set(&suffix, "/component.sock");
@@ -996,6 +1032,13 @@ ngx_http_cache_purge_runtime_client_get(ngx_http_request_t *r,
         p = ngx_cpymem(path.data, rt->path->name.data, rt->path->name.len);
         ngx_memcpy(p, suffix.data, suffix.len);
         ngx_http_cache_purge_client_options(&options);
+        if (kind == 2) {
+            /* The 64 publication slots bound all these queues together.
+             * Divide the byte budget; never multiply it per connection. */
+            options.max_payload = 128 * 1024;
+            options.request_bytes = 512 * 1024 / limit
+                                    + NGX_HTTP_CACHE_PURGE_FRAME_SIZE;
+        }
         options.server_uid = rt->owner_uid;
         *slot = ngx_http_cache_purge_client_create(
             ngx_cycle->pool, ngx_cycle->log, &path, &options);
@@ -1019,6 +1062,13 @@ ngx_http_cache_purge_runtime_read_client(ngx_http_request_t *r,
     ngx_http_cache_purge_client_t **client)
 {
     return ngx_http_cache_purge_runtime_client_get(r, client, 1);
+}
+
+int
+ngx_http_cache_purge_runtime_publish_client(ngx_http_request_t *r,
+    ngx_http_cache_purge_client_t **client)
+{
+    return ngx_http_cache_purge_runtime_client_get(r, client, 2);
 }
 
 

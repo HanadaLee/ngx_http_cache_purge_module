@@ -170,6 +170,10 @@ int ngx_http_cache_purge_runtime_client(ngx_http_request_t *r,
     ngx_http_cache_purge_client_t **client);
 int ngx_http_cache_purge_runtime_read_client(ngx_http_request_t *r,
     ngx_http_cache_purge_client_t **client);
+/* Called only after acquiring a bounded publication slot. One publication
+ * keeps its selected client through ACQUIRE/PREPARE/FINISH and retries. */
+int ngx_http_cache_purge_runtime_publish_client(ngx_http_request_t *r,
+    ngx_http_cache_purge_client_t **client);
 
 
 extern ngx_module_t  ngx_http_cache_purge_module;

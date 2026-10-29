@@ -492,6 +492,20 @@ budget per worker, with a three-second overall IPC deadline. The limits apply
 after the response body is complete and do not turn normal HITs into origin
 requests. Request inputs and each publication payload are separately bounded
 to 128 KiB; these limits exclude allocator overhead and native nginx buffers.
+Cache-file publication uses up to four reusable IPC clients per worker. It
+selects the least busy client after a publication slot is admitted, and keeps
+that client for ACQUIRE/PREPARE/FINISH and retries. The existing component
+connection budget and worker count can reduce the pool size. Its approximately
+512 KiB request-byte budget is divided across the pool, and the existing 64
+publication slots bound aggregate pending work. Management/304 calls and object
+reads retain their separate clients when a publication connection share is
+available; otherwise publication reuses the original control client. This lets
+other publications progress
+while one FINISH waits for WAL synchronization without adding threads, polling
+or a weaker READY condition. Idle publication connections close after one second.
+This does not yet release the HTTP request before publication completes:
+HTTP/1 keepalive reuse can still wait after a MISS body has been sent. That
+lifecycle dependency and writer-side file I/O remain performance work in progress.
 Generation namespaces, legacy zone/key PURGE syntax, REFRESH handlers, directory
 walks and the old shared-memory task queue have been removed; obsolete directives
 are rejected rather than silently ignored. New captures do not add arbitrary
