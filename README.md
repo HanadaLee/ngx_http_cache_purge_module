@@ -205,8 +205,8 @@ host, namespace and actual TAG membership without an alias scan.
 `INSPECT_FILE` checks the actual cache descriptor on the executor through bounded
 IPC. It requires a READY marker, a committed current index record with no pending
 intent, and matching root/zone/path and same-filesystem publication identity.
-Reads wait only while a matching publication intent can still complete. A
-PREPARED marker left by an aborted, detached or superseded transaction is
+Executor inspection returns BUSY while a matching publication intent can still
+complete. A PREPARED marker left by an aborted or superseded transaction is
 rejected immediately instead of consuming the inspection timeout. READY files
 under conditional validation still wait for that transaction to finish.
 Unknown, changed, replaced and evicted instances are rejected without repairing
@@ -250,10 +250,13 @@ thread pool, then match shared rules in the worker. They do not query RocksDB or
 use executor IPC. The proof binds the configured namespace/URL/misc identity,
 physical file, TAG digests, ledger and entity/validation requirements. The reader
 also compares the selected native cache header inside the file-stat interval.
-Shared-control publication changes force a reread before admission. Unknown or
-revoked proofs cause a refill; unfinished publication waits within the request
-deadline. No shared guard spans file I/O. `ADMIT_FILE` remains in the durable 304
-transaction path; `INSPECT_FILE` remains diagnostic. Retained TAG lookup on MISS
+Shared-control publication changes force a reread before admission. Unknown,
+revoked, PREPARED and STAGED proofs cause an unconditional refill. Ordinary
+requests do not poll unfinished files or wait for their publication/WAL sync;
+only the background publisher can make them READY. A refill may increase origin
+traffic while publication is pending. No shared guard spans file I/O.
+`ADMIT_FILE` remains in the durable 304 transaction path; `INSPECT_FILE` remains
+diagnostic. Retained TAG lookup on MISS
 and cache-fill transactions still use the executor, so whole-path foreground
 isolation remains unfinished.
 
@@ -296,8 +299,8 @@ location dispatch. Ignored redirects retain their ordinary cached-body behavior.
 No new nginx core hook or private protocol configuration layout is used.
 
 Read checks are bounded to 64 concurrent waits per worker, with a three-second
-admission deadline. A PREPARED marker can wait for publication within that
-deadline. Running file syscalls cannot be cancelled; their request pool and
+admission deadline. Pending publication is rejected after one proof read, without
+a retry timer. Running file syscalls cannot be cancelled; their request pool and
 descriptor remain alive until completion, including during disconnect/reload.
 An expired decision cannot admit an entity. Queue overflow fails closed.
 No complete file index is loaded into worker memory. Successful upstream 304

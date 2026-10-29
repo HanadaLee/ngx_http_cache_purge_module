@@ -4169,14 +4169,14 @@ ngx_http_cache_purge_proof_done(ngx_event_t *event)
     }
     allowed = NGX_HTTP_CACHE_PURGE_ADMIT_ERROR;
     if ((ngx_msec_int_t) (ctx->deadline - ngx_current_msec) > 0) {
-        if (task->result == NGX_HTTP_CACHE_ROCKSDB_BUSY) {
-            ngx_add_timer(&ctx->read_event, 5);
-            return;
-        } else if (task->result == 0) {
+        if (task->result == 0) {
             allowed = ngx_http_cache_purge_proof_admit(task);
-        } else if (task->result == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND
+        } else if (task->result == NGX_HTTP_CACHE_ROCKSDB_BUSY
+                   || task->result == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND
                    || task->result == NGX_HTTP_CACHE_ROCKSDB_CONFLICT)
         {
+            /* Pending publication is a miss, not a foreground WAL wait.
+             * The independent publisher alone may make the file READY. */
             allowed = NGX_HTTP_CACHE_PURGE_ADMIT_DENY;
         }
     }

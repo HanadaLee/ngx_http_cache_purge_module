@@ -799,7 +799,7 @@ def watermark(item):
     return value[4:20], int.from_bytes(value[20:28], 'big')
 
 @contextlib.contextmanager
-def prepared_replacement(item):
+def prepared_replacement(item, allow_retired=False):
     target = ready_file(item)
     address = b''.join(string(item[name]) for name in ('root', 'zone', 'path'))
     acquired, lease = rpc(20, address, receive_fd=True)
@@ -826,8 +826,12 @@ def prepared_replacement(item):
 
         def finish():
             result = rpc(19, ident + struct.pack('>Q', 1), (lease,))
-            assert result == ident + struct.pack('>QB', 2, 2), result
-            ready_file(record(ident))
+            assert result == ident + struct.pack('>QB', 2, 2) or (allow_retired and result == ident + struct.pack('>QB', 2, 3)), result
+            if result[-1] == 2:
+                ready_file(record(ident))
+            else:
+                assert retired(ident)
+            return ident
 
         yield finish
     finally:
@@ -1482,32 +1486,43 @@ try:
     missing_index_read()
     assert get('/read-wait')[1] == 'MISS'
     with prepared_replacement(records('/read-wait', 1)[0]) as finish:
+        fresh_bodies['/read-wait'] = b'fresh-before-file-finish'
         with socket.create_connection(('127.0.0.1', port), timeout=5) as held:
             held.sendall(b'GET /read-wait HTTP/1.1\r\nHost: cache.test\r\nConnection: close\r\n\r\n')
-            held.settimeout(.05)
-            try:
-                early = held.recv(1)
-                raise AssertionError(('unverified response bytes escaped', early))
-            except socket.timeout: pass
-            finish()
-            held.settimeout(5)
+            held.settimeout(.5)
             response = http.client.HTTPResponse(held); response.begin()
-            assert response.status == 200 and response.getheader('X-Status') == 'HIT'
-            assert response.read() == b'/read-wait'
-    assert calls.count('/read-wait') == 1
-    checks.append('reads of a real PREPARE_FILE transaction wait asynchronously until FINISH_FILE without exposing bytes or fetching a new entity')
+            assert response.status == 200 and response.getheader('X-Status') == 'BYPASS'
+            assert response.read() == fresh_bodies['/read-wait']
+            # FINISH has not been called: these must be new origin bytes.
+            assert calls.count('/read-wait') == 2
+        prepared_id = finish()
+    until(lambda: records('/read-wait', 1)[0]['id'] != prepared_id)
+    assert get('/read-wait') == (200, 'HIT', fresh_bodies['/read-wait'])
+    checks.append('a real unfinished PREPARE_FILE transaction causes immediate unconditional refill before FINISH, followed by a verified replacement HIT')
     with prepared_replacement(records('/read-wait', 1)[0]) as finish:
         with socket.create_connection(('127.0.0.1', port), timeout=5) as abandoned:
             abandoned.sendall(b'GET /read-wait HTTP/1.1\r\nHost: cache.test\r\nConnection: close\r\n\r\n')
-            abandoned.settimeout(.05)
-            try:
-                early = abandoned.recv(1)
-                raise AssertionError(('unverified response bytes escaped', early))
-            except socket.timeout: pass
+            abandoned.settimeout(.5)
+            response = http.client.HTTPResponse(abandoned); response.begin()
+            assert response.status == 200 and response.getheader('X-Status') == 'BYPASS'
+            # Close after refetch headers while publication is still leased.
+            response.close()
         finish()
-    assert get('/read-wait') == (200, 'HIT', b'/read-wait')
-    assert calls.count('/read-wait') == 1
-    checks.append('client abandonment during descriptor inspection drains without losing later HITs')
+    until(lambda: pending() == 0)
+    assert get('/read-wait') == (200, 'HIT', fresh_bodies['/read-wait'])
+    assert calls.count('/read-wait') == 3
+    checks.append('client close after an unready-file refetch drains without losing later verified HITs')
+    unready_error = '/invalidate/unready-error'
+    assert get(unready_error)[1] == 'MISS'
+    with prepared_replacement(records(unready_error, 1)[0]) as finish:
+        origin_failures.add(unready_error)
+        try:
+            assert get(unready_error) == (500, 'BYPASS', b'')
+        finally:
+            origin_failures.remove(unready_error)
+        finish()
+    assert get(unready_error) == (200, 'HIT', unready_error.encode())
+    checks.append('unfinished publication cannot be served as failure stale even when the location permits stale on 500')
     assert get('/asset?z=b')[1] == 'MISS'
     both = records('/asset', 2)
     assert {x['zone'] for x in both} == {b'a', b'b'}
