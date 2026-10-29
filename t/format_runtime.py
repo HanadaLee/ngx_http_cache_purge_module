@@ -94,6 +94,7 @@ loads = ''.join(f'load_module {a.build}/objs/{name}.so;\n' for name in
 config = loads + f'''daemon off;
 master_process on;
 worker_processes 1;
+thread_pool proof threads=1 max_queue=64;
 pid {run}/nginx.pid;
 error_log {run}/error.log info;
 events {{ worker_connections 64; }}
@@ -102,6 +103,7 @@ http {{
     proxy_cache_path {run}/cache keys_zone=cache:1m levels=1:2;
     cache_purge_store {run}/index cache=8m write_buffer=2m;
     cache_purge_state_zone control 2m;
+    cache_purge_read_pool proof;
     cache_purge_tag topic;
     server {{
         listen 127.0.0.1:{port};

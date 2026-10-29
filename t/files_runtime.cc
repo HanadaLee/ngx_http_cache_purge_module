@@ -1352,6 +1352,11 @@ ngx_http_cache_purge_test_file_proof()
     check(ngx_http_cache_purge_file_marker_prepare(fd.fd, identity.data(),
               input.marker.address, 1, &error) == 0, "prepare proof instance");
     check(ngx_http_cache_purge_file_proof_read(fd.fd, &output, &error)
+              == NGX_HTTP_CACHE_ROCKSDB_BUSY && output.marker.state == 0,
+        "pending publication waits without admitting an entity");
+    check(ngx_http_cache_purge_file_marker_publish(fd.fd, identity.data(),
+              input.marker.address, 1, &error) == 0, "publish legacy instance");
+    check(ngx_http_cache_purge_file_proof_read(fd.fd, &output, &error)
               == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND,
         "legacy marker is never an independent proof");
     std::vector<unsigned char> raw(NGX_HTTP_CACHE_PURGE_FILE_PROOF_SIZE);
@@ -1376,6 +1381,30 @@ ngx_http_cache_purge_test_file_proof()
                   && std::memcmp(output.tags, input.tags, 16 * count) == 0,
             "proof carries exact TAGs and validation state");
         intact(fd.fd);
+    }
+    std::string selected(8, '\0');
+    check(pread(fd.fd, selected.data(), selected.size(), 0)
+              == static_cast<ssize_t>(selected.size()),
+        "capture selected native header");
+    error.code = NGX_HTTP_CACHE_ROCKSDB_IO;
+    check(ngx_http_cache_purge_file_proof_read_selected(fd.fd, bytes(selected),
+              &output, &error) == 0 && output.validated == 12
+              && error.code == 0,
+        "unchanged selected header admits the current proof");
+    selected[0] ^= 1;
+    check(ngx_http_cache_purge_file_proof_read_selected(fd.fd, bytes(selected),
+              &output, &error) == NGX_HTTP_CACHE_ROCKSDB_CONFLICT
+              && output.marker.state == 0 && output.tag_count == 0,
+        "old selected header cannot admit an updated entity");
+    const ngx_http_cache_rocksdb_bytes_t invalid_headers[] = {
+        { nullptr, 1 }, { nullptr, NGX_HTTP_CACHE_PURGE_FILE_PROOF_SIZE + 1 }
+    };
+    for (const auto &header : invalid_headers) {
+        output.tag_count = 99;
+        check(ngx_http_cache_purge_file_proof_read_selected(fd.fd, header,
+                  &output, &error) == NGX_HTTP_CACHE_ROCKSDB_INVALID
+                  && output.marker.state == 0 && output.tag_count == 0,
+            "invalid selected header clears the output");
     }
     auto restore = [&] {
         check(fsetxattr(fd.fd, "user.ngx_cache_purge.id", raw.data(),

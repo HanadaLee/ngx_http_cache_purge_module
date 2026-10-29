@@ -423,6 +423,7 @@ ngx_http_cache_purge_probe_rpc_prepare_body(
         p = ngx_http_cache_purge_probe_rpc_string(p, fields[i]);
     }
     p = ngx_http_cache_purge_probe_rpc_string(p, metadata);
+    p = ngx_http_cache_purge_probe_rpc_string(p, empty);
     *p++ = 0;
     *p++ = 0;
     *p++ = 0;

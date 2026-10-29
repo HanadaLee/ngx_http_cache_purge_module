@@ -7,6 +7,11 @@ if [ "$HTTP" = NO ] || [ "$HTTP_CACHE" = NO ]; then
     exit 1
 fi
 
+if [ "$USE_THREADS" != YES ]; then
+    echo "ngx_http_cache_purge_module requires --with-threads for file proof reads"
+    exit 1
+fi
+
 if [ -z "$CACHE_PURGE_ROCKSDB_LIB_DIR" ]; then
     echo "ngx_http_cache_purge_module requires CACHE_PURGE_ROCKSDB_LIB_DIR"
     echo "build the RocksDB and purge archives with CMake before configuring nginx"
@@ -84,7 +89,10 @@ ngx_feature_incs='#include "ngx_http_cache_purge_internal.h"
 ngx_feature_path="src/core src/event src/event/modules src/os/unix $NGX_OBJS $ngx_addon_dir"
 ngx_feature_libs="$CACHE_PURGE_LIBS $CACHE_ROCKSDB_LIBS"
 ngx_feature_test='ngx_http_cache_purge_component_options_t o;
+                  ngx_http_cache_rocksdb_bytes_t empty = { 0, 0 };
                   ngx_http_cache_purge_component_options(&o);
+                  ngx_http_cache_purge_file_proof_read_selected(-1,
+                                                               empty, 0, 0);
                   if (o.abi != ngx_http_cache_purge_component_abi_13()) return 1;
                   if (ngx_http_cache_purge_index_schema_12() != 12) return 1;
                   if (ngx_http_cache_purge_control_abi_6() != 6) return 1;'

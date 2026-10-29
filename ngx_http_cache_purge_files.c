@@ -21,6 +21,8 @@ static uint64_t ngx_http_cache_purge_publication_number(const unsigned char *p,
     unsigned n);
 static unsigned char *ngx_http_cache_purge_publication_encode(
     unsigned char *p, uint64_t value, unsigned n);
+static int ngx_http_cache_purge_native_read(int fd, void *buffer, size_t length,
+    off_t offset, ngx_http_cache_rocksdb_error_t *error);
 static int
 ngx_http_cache_purge_result(ngx_http_cache_rocksdb_error_t *error, int code,
     const char *message)
@@ -410,7 +412,8 @@ ngx_http_cache_purge_file_proof_same(
 }
 
 int
-ngx_http_cache_purge_file_proof_read(int fd,
+ngx_http_cache_purge_file_proof_read_selected(int fd,
+    ngx_http_cache_rocksdb_bytes_t header,
     ngx_http_cache_purge_file_proof_t *proof,
     ngx_http_cache_rocksdb_error_t *error)
 {
@@ -425,10 +428,12 @@ ngx_http_cache_purge_file_proof_read(int fd,
             "missing file proof output");
     }
     memset(proof, 0, sizeof(*proof));
-    if (fd < 0) {
+    if (fd < 0 || header.len > sizeof(raw)
+        || (header.len != 0 && header.data == NULL))
+    {
         return ngx_http_cache_purge_result(error,
             NGX_HTTP_CACHE_ROCKSDB_INVALID,
-            "invalid file proof descriptor");
+            "invalid file proof descriptor or selected header");
     }
     if (fstat(fd, &before) != 0) {
         return ngx_http_cache_purge_io(error, "inspect file proof descriptor");
@@ -438,10 +443,25 @@ ngx_http_cache_purge_file_proof_read(int fd,
         rc = ngx_http_cache_purge_file_marker_decode(raw, size, &proof->marker,
                                                    proof, error);
     }
+    if (rc == 0
+        && (proof->marker.state == NGX_HTTP_CACHE_PURGE_FILE_PREPARED
+            || proof->marker.state == NGX_HTTP_CACHE_PURGE_FILE_STAGED))
+    {
+        rc = ngx_http_cache_purge_result(error, NGX_HTTP_CACHE_ROCKSDB_BUSY,
+            "file publication is pending");
+    }
     if (rc == 0 && raw[3] != '2') {
         rc = ngx_http_cache_purge_result(error,
             NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND,
             "file has no independent admission proof");
+    }
+    if (rc == 0 && header.len) {
+        rc = ngx_http_cache_purge_native_read(fd, raw, header.len, 0, error);
+        if (rc == 0 && memcmp(raw, header.data, header.len) != 0) {
+            rc = ngx_http_cache_purge_result(error,
+                NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+                "native cache header changed after selection");
+        }
     }
     if (rc == 0 && fstat(fd, &after) != 0) {
         rc = ngx_http_cache_purge_io(error, "recheck file proof descriptor");
@@ -456,6 +476,17 @@ ngx_http_cache_purge_file_proof_read(int fd,
         memset(proof, 0, sizeof(*proof));
     }
     return rc;
+}
+
+int
+ngx_http_cache_purge_file_proof_read(int fd,
+    ngx_http_cache_purge_file_proof_t *proof,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_rocksdb_bytes_t  header = { NULL, 0 };
+
+    return ngx_http_cache_purge_file_proof_read_selected(fd, header, proof,
+                                                       error);
 }
 
 int

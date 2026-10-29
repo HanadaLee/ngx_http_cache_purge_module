@@ -81,7 +81,7 @@ def run_client_cases(Run, root, checks):
                         waiting.set()
                         assert gate.wait(5)
                     response = struct.pack('>4sHHQII', b'FAIL' if op == 102 else magic,
-                        2 if op == 104 else version, op + 1 if op == 105 else op,
+                        version + 1 if op == 104 else version, op + 1 if op == 105 else op,
                         label + 1 if op == 103 else label, 524289 if op == 106 else len(data), 0)
                     if op == 17 or (op == 111):
                         if data == b'error-fd':

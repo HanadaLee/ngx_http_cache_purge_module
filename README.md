@@ -243,22 +243,25 @@ bounded IPC. A zero count alone does not permit FENCE removal: queued IPC,
 unfinished durable transactions and physical processing still need closure.
 The internal shared-control ABI is 6; nginx-ext ABI remains 1.
 
-Native file responses still use `ADMIT_FILE` to verify the selected descriptor
-and require its exact key, URL and host. Admission does not add associations or
-write observation metadata. The executor checks the fixed identity and actual
-TAGs against resident and persistent requirements, returning a publication stamp
-and the highest unsatisfied Invalidate sequence with the record. The worker
-requires the same publication at final admission. Physical `INSPECT_FILE` remains
-a diagnostic operation. Normal HITs still wait for this database/IPC path;
-foreground isolation is unfinished.
+Normal cached responses read the selected file's NCF2 proof on a separate nginx
+thread pool, then match shared rules in the worker. They do not query RocksDB or
+use executor IPC. The proof binds the configured namespace/URL/misc identity,
+physical file, TAG digests, ledger and entity/validation requirements. The reader
+also compares the selected native cache header inside the file-stat interval.
+Shared-control publication changes force a reread before admission. Unknown or
+revoked proofs cause a refill; unfinished publication waits within the request
+deadline. No shared guard spans file I/O. `ADMIT_FILE` remains in the durable 304
+transaction path; `INSPECT_FILE` remains diagnostic. Retained TAG lookup on MISS
+and cache-fill transactions still use the executor, so whole-path foreground
+isolation remains unfinished.
 
 The RocksDB bridge exposes owner-local batch durability tickets. Reading them
 only inspects counters and never synchronizes the WAL. A later deferred batch
 does not revoke an earlier synchronized ticket. Tickets reset on reopen and are
 not persistent cache identities or worker-visible admission proofs. Opening the
 store synchronizes its recovered WAL prefix before exposing the handle. File
-publication uses these tickets; `ADMIT_FILE` remains until the cache-side proof
-also covers TAGs, invalidation state and representation validation.
+publication uses these tickets and publishes NCF2 only after its index batch is
+durable. Ordinary HITs use that file-side proof without reading the tickets.
 
 The operation ledger also persists a monotonic write floor with each materialized
 operation. PREPARE, uncommitted FINISH/recovery and new 304 validation writes
@@ -291,7 +294,10 @@ location dispatch. Ignored redirects retain their ordinary cached-body behavior.
 No new nginx core hook or private protocol configuration layout is used.
 
 Read checks are bounded to 64 concurrent waits per worker, with a three-second
-overall deadline. A PREPARED marker can wait for publication within that deadline.
+admission deadline. A PREPARED marker can wait for publication within that
+deadline. Running file syscalls cannot be cancelled; their request pool and
+descriptor remain alive until completion, including during disconnect/reload.
+An expired decision cannot admit an entity. Queue overflow fails closed.
 No complete file index is loaded into worker memory. Successful upstream 304
 responses capture TTL and TAG metadata before native cached-header parsing,
 persist the validation transaction, and pass final FENCE admission before
@@ -312,8 +318,9 @@ The shared node bit does not replace persistent operation ordering: an older
 Without the macro, native configured stale fallback remains available.
 
 File admission supports this behavior for current URL/key/prefix/host selectors,
-TAGs and the fixed key identity. Background Invalidate now writes a sparse
-per-instance validation requirement to RocksDB, without rewriting cache files.
+TAGs and the fixed key identity. Background Invalidate writes a sparse
+per-instance validation requirement to RocksDB and persists it in the file proof
+before advancing its checkpoint. It does not rewrite the native cache header.
 The existing worker executor resumes the bounded scan from durable checkpoints.
 Admission checks that requirement even when no resident rule remains; successful
 conditional validation satisfies it without replacing the entity. Requirements
@@ -339,8 +346,9 @@ before mutation, while retaining existing TAGs needs only a one-byte marker.
 Persistent selector requirements also survive resident-rule retirement. The
 operation ledger retains the latest Invalidate and Delete sequence independently
 for each selector. Ordered predecessor seeks find matching bytewise prefixes
-without scanning unrelated operation history. File admission uses these records
-to protect older entities after resident FENCE retirement, across native zones.
+without scanning unrelated operation history. Publication and 304 validation use
+these records to protect older entities after resident FENCE retirement, across
+native zones. File admission reads the materialized per-file requirement.
 Full entities fetched after the latest accepted operation skip this historical
 lookup. Ledger schema 4 adds canonical TAG-set records on top of schema 3's
 sparse activation queue. Schemas 2 and 3 upgrade by changing their marker;
@@ -356,22 +364,16 @@ TAG membership links, so overlapping members emit the operation once. Matching
 does not allocate memory or access RocksDB. The public API accepts up to 64 TAGs,
 sorts and deduplicates them, and uses one durable submission and effective time.
 
-Business `$host` is separate from `$cache_key_host`. The index records observed
-host-to-key relationships, shared across every slice, Vary file and zone of the
-key. File admission observes the current host and URL atomically before checking
-their persisted relationships. A host or host+TAG operation can therefore affect
-other business hosts sharing that key. Namespace+TAG remains explicitly scoped.
+The host identity is parsed from `cache_purge_key_url`. It is fixed together with
+URL, misc and namespace for every slice, Vary file and zone of that key. File
+admission does not record aliases or infer a host from the native cache key.
+Namespace+TAG remains explicitly scoped.
 Host+TAG enumeration chooses between host-to-key traversal and TAG postings,
 using dictionary reference counts as a bounded heuristic; bookmarks preserve the
 chosen plan. Associations are reclaimed when the key loses its last file.
 
-The schema upgrade resumes bounded batches from a durable cursor and does not
-read or rewrite native cache files. Legacy records only recover the host they
-actually stored; missing historical business hosts cannot be inferred from a
-canonical cache host. Subsequent requests register their actual business hosts,
-including checks against persistent requirements after resident-rule retirement.
-Completed upgrades do not replay on restart. This internal storage schema change
-does not change nginx-ext ABI, which remains 1.
+Schema 12 requires the fixed identity described above; older prototype indexes
+are rejected without changing their data. nginx-ext ABI remains 1.
 
 Memory-only errors do not receive separate index records. Initial internal
 receipts remain PREPARING until activation; the HTTP API waits for activation
@@ -524,7 +526,8 @@ the CMake archives when configuring the addon:
 
 ```sh
 CACHE_PURGE_ROCKSDB_LIB_DIR=/tmp/cache-purge-store \
-    ./configure --add-module=/path/to/ngx_http_cache_key_module \
+    ./configure --with-threads \
+                --add-module=/path/to/ngx_http_cache_key_module \
                 --add-module=/path/to/ngx_http_cache_purge
 make
 ```
@@ -539,8 +542,9 @@ load_module modules/ngx_http_cache_rocksdb_module.so;
 load_module modules/ngx_http_cache_purge_module.so;
 ```
 
-The key addon is optional: another producer can supply the same native byte
-format. Purge has no dependency on its C API or relative load order.
+The key addon is optional: native keys may use any format. Purge reads its
+separate identity expressions and has no dependency on the key addon's C API
+or relative load order.
 
 Register the persistent purge addon after other header-filter addons, or load its
 dynamic module last among them. Its admission filter must run before slice and
@@ -550,7 +554,7 @@ filter order when the store/state pair is configured.
 The module requires nginx 1.31.7 or newer for complex-value script status
 propagation. Older nginx versions are rejected at configure time; loading a
 module alone cannot prove that its cache-admission guards work. HTTP cache
-support is required; configure rejects builds with HTTP or HTTP cache disabled.
+support and `--with-threads` are required; configure rejects builds without them.
 The persistent runtime also requires Linux and
 `master_process on`. It uses standard worker initialization, timers, and exit
 callbacks. It does
@@ -578,12 +582,23 @@ nginx module must be built with PIC.
 The implemented resource directives are:
 
 ```nginx
+thread_pool cache_proof threads=1 max_queue=64;
+
 http {
     cache_purge_store /var/lib/nginx/cache-index cache=16m write_buffer=4m;
     cache_purge_state_zone purge_control 16m;
+    cache_purge_read_pool cache_proof;
     cache_purge_propagation_timeout 120s;
 }
 ```
+
+`cache_purge_read_pool` selects an nginx-managed pool for file proof reads and
+is required when a cached location enables capture. Keep this pool separate from
+other blocking work. The example creates one thread per HTTP worker; its memory
+and stack are additional to the database budget. Management-only configurations
+do not need it. The module does not implicitly create nginx's default 32-thread
+pool. Request-dependent directives support expr `when`; this HTTP-wide resource
+selection is resolved at configuration time.
 
 `cache` is the shared database cache budget, including the write-buffer charge;
 it is not a process RSS limit. The database directory must be outside cache-file

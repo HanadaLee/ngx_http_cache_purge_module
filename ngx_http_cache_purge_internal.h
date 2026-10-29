@@ -441,6 +441,12 @@ int ngx_http_cache_purge_file_marker_publish(int fd, const unsigned char id[16],
 int ngx_http_cache_purge_file_proof_read(int fd,
     ngx_http_cache_purge_file_proof_t *proof,
     ngx_http_cache_rocksdb_error_t *error);
+/* Also compare the already-selected native header inside the stat interval.
+ * Empty expected header is equivalent to proof_read(). This performs I/O. */
+int ngx_http_cache_purge_file_proof_read_selected(int fd,
+    ngx_http_cache_rocksdb_bytes_t header,
+    ngx_http_cache_purge_file_proof_t *proof,
+    ngx_http_cache_rocksdb_error_t *error);
 /* Caller holds the path lease and has durably committed the exact file.
  * publish captures physical stat fields; input supplies identity, ledger,
  * sequences and TAG digests. require/revoke persist before returning. */

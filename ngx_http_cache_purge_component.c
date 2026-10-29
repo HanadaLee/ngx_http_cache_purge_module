@@ -891,6 +891,10 @@ ngx_http_cache_purge_component_retire_selected(
         rc = ngx_http_cache_purge_component_preserve(c, &file, error);
     }
     if (rc == 0) {
+        rc = ngx_http_cache_purge_file_proof_revoke(fd, file.id, digest,
+                                                    error);
+    }
+    if (rc == 0) {
         memcpy(expected.id, file.id, 16);
         expected.revision = file.revision;
         rc = ngx_http_cache_purge_index_apply(c->operations.store,

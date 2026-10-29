@@ -104,7 +104,7 @@ else:
     configure = 'auto/configure' if (build / 'auto/configure').exists() else 'configure'
     module_option = '--add-dynamic-module=' if a.dynamic else '--add-module='
     args = ['sh', configure, '--prefix=' + str(root / 'run'), '--without-http_rewrite_module',
-            '--without-http_gzip_module', module_option + str(addon), module_option + str(probe)]
+            '--without-http_gzip_module', '--with-threads', module_option + str(addon), module_option + str(probe)]
     if not a.sanitize:
         args += ['--with-cc-opt=-O2']
     if a.sanitize:

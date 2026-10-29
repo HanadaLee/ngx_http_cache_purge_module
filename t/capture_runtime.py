@@ -331,10 +331,12 @@ threading.Thread(target=dns_server.serve_forever, daemon=True).start()
 config = loads + f'''daemon off; master_process on; worker_processes {a.workers};
 pid {run}/pid; error_log {run}/error.log debug;
 thread_pool default threads=2;
+thread_pool proof threads=1 max_queue=64;
 events {{ worker_connections 256; }}
 http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/temp;
  cache_purge_store {run}/index cache=8m write_buffer=2m;
  cache_purge_state_zone capture 4m;
+ cache_purge_read_pool proof;
  proxy_cache_path {run}/cache-a levels=1:2 keys_zone=a:1m;
  proxy_cache_path {run}/cache-b levels=1:2 keys_zone=b:1m;
  {' '.join(gateway_paths)}
@@ -993,7 +995,7 @@ def inline_purge_cases():
     policies[uri] = 'inline-host-tag'
     for host in ('inline-host.test', 'other-inline.test'):
         assert get(uri, {'Host': host})[1] == 'MISS'
-        ready_file(record(until(lambda: (items[0][0] if (items := query('http://' + host + uri)) else None))))
+        ready_file(records(uri, 1, host=host)[0])
     accepted('/push/host-tag', {'Host': 'purge.test', 'X-Target': 'http://inline-host.test/unused',
              'X-Cache-Purge-Type': 'host-tag', 'X-Cache-Purge-Tags': 'inline-host-tag'})
     deleted_response(uri, uri.encode(), {'Host': 'inline-host.test'})
@@ -1080,6 +1082,10 @@ for label, candidate in (
     assert tested.returncode == 0, (label, tested.stderr)
 checks.append('protocol switches and independent identity expressions inherit into cached locations')
 for label, candidate, message in (
+        ('missing-read-pool', config.replace('cache_purge_read_pool proof;', ''),
+         'require cache_purge_read_pool'),
+        ('unknown-read-pool', config.replace('cache_purge_read_pool proof;', 'cache_purge_read_pool missing;'),
+         'unknown thread pool'),
         ('missing-url', config.replace('cache_purge_key_url $cache_key_url;', ''),
          'requires cache_purge_key_url'),
         ('empty-url', config.replace('cache_purge_key_url $cache_key_url;', 'cache_purge_key_url "";'),
@@ -2023,6 +2029,9 @@ try:
     assert get(group_a)[1] == 'HIT'
     grouped = api('/__purge/v2/operations', group_input, headers=scope_headers)
     assert grouped[0] == 202 and grouped[2]['selector']['values'] == ['multi-blue', 'multi-red'], grouped
+    # Count selector deduplication without concurrent 304 leases: visits also
+    # counts retry attempts, so validating during the scan makes it nondeterministic.
+    until(lambda: api('/__purge/v2/operations/api-tag-group')[2]['cleanup']['scan_done'])
     for path in (group_a, group_a + '?z=b', group_b):
         reply = get(path)
         assert reply[0] == 200 and reply[1] == 'REVALIDATED', reply
@@ -2207,8 +2216,8 @@ try:
         assert prop_get(uri) == (200, 'HIT', uri.encode())
     final_requests = int.from_bytes(rpc(1)[40:48], 'big')
     hit_query_budget = {'hits': 10, 'component_requests': final_requests - initial_requests,
-                        'maximum_requests_including_final_ping': 11}
-    assert hit_query_budget['component_requests'] <= 11, hit_query_budget
+                        'maximum_requests_including_final_ping': 1}
+    assert hit_query_budget['component_requests'] == 1, hit_query_budget
     assert calls.count(uri) == initial_origins
     checks.append('HITs do not query the representation index before cache lookup while an unrelated TAG propagation window remains active')
 
