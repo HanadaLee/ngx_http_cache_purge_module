@@ -359,6 +359,7 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
   cache_purge_tag $upstream_http_cache_tag;
 
   add_header X-Status $upstream_cache_status always;
+  location = /__test/ping {{ return 200 ok; }}
   {' '.join(gateway_locations)}
   location /__purge/v2/ {{ cache_purge_api; proxy_cache off;
       allow 127.0.0.1; deny all; }}
@@ -697,6 +698,17 @@ def records(path, count, host='cache.test'):
         return result
     return until(published)
 
+def validated(item):
+    """Wait for this known 304's durable update, outside response timing."""
+    def committed():
+        current = record(item['id'])
+        assert current['revision'] <= item['revision'] + 2, (item, current)
+        return current if current['state'] == 2 and current['revision'] == item['revision'] + 2 else None
+    current = until(committed)
+    ready_file(current)
+    return current
+
+
 def identity_key(namespace, url, misc):
     return hashlib.sha256(b'NCI1' + string(namespace) + string(url) + string(misc)).hexdigest().encode()
 
@@ -983,7 +995,9 @@ def inline_purge_cases():
     assert pushed['selector']['values'] == ['inline-blue', 'inline-red']
     assert pushed['tag_namespace'] == 'tenant'
     for path in tagged:
+        original = records(path, 1)[0]
         assert get(path) == (200, 'REVALIDATED', path.encode())
+        validated(original)
         assert get(path)[1] == 'HIT'
     assert get('/raw/inline-tag')[1] == 'HIT'
     accepted('/push-custom/tag', {'X-Test-Type': 'tag', 'X-Test-Tags': 'inline-red',
@@ -1207,6 +1221,7 @@ try:
           scope='', mode=1)
     empty_reply = get('/empty-namespace')
     assert empty_reply == (200, 'REVALIDATED', b'/empty-namespace'), empty_reply
+    validated(empty_namespace)
     assert get('/asset') == (200, 'HIT', b'/asset') and calls.count('/asset') == 1
     checks.append('TAG lookup and invalidation isolate the empty namespace from named namespaces')
     assert get('/asset', method='HEAD') == (200, 'HIT', b'')
@@ -1275,8 +1290,9 @@ try:
     until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
     assert all(Path(path).read_bytes() == contents for path, contents in materialized_contents.items())
     assert get('/asset')[1] == 'HIT'
-    for target in materialized_targets[:2]:
+    for target, original in zip(materialized_targets[:2], sorted(materialized[:2], key=lambda item: item['zone'])):
         assert get(target) == (200, 'REVALIDATED', materialized_uri.encode())
+        validated(original)
         assert get(target) == (200, 'HIT', materialized_uri.encode())
     assert {item['id'] for item in records(materialized_uri, 2)} == {item['id'] for item in materialized[:2]}
     origin_failures.add(materialized_failure)
@@ -1285,6 +1301,7 @@ try:
     origin_failures.remove(materialized_failure)
     conditional_paths.add(materialized_failure)
     assert get(materialized_failure) == (200, 'REVALIDATED', materialized_failure.encode())
+    validated(materialized[2])
     assert get(materialized_failure) == (200, 'HIT', materialized_failure.encode())
     checks.append('background Invalidate automatically retires its FENCE after persisting three requirements across two zones; after restart, unchanged fresh native headers still require validation')
     checks.append('persistent per-file Invalidate keeps strict failure handling and plain stale downgrade after all resident rules are removed')
@@ -1316,6 +1333,8 @@ try:
                 assert get(uri + query_suffix, {'Host': request_host}) == (200, 'REVALIDATED', body)
             else:
                 deleted_response(uri + query_suffix, body, {'Host': request_host})
+        if mode == 1:
+            for item in files: validated(item)
         current_ids = {item['id'] for item in records(uri, 2, canonical)}
         assert current_ids == original_ids if mode == 1 else current_ids.isdisjoint(original_ids)
         assert get(uri + suffix, {'Host': request_host}) == (200, 'HIT', body)
@@ -1323,12 +1342,13 @@ try:
         checks.append(f'canonical host identity: kind={kind}, mode={mode} covers both zones without observing request Host aliases')
     assert get('/invalidate/background-native')[1] == 'MISS'
     assert get('/invalidate/background-native?z=b')[1] == 'MISS'
-    for item in records('/invalidate/background-native', 2): ready_file(item)
+    background_before = records('/invalidate/background-native', 2)
+    for item in background_before: ready_file(item)
     conditional_paths.add('/invalidate/background-native')
     fence('before-background-delete', 1, 'http://cache.test/invalidate/background-native', mode=1)
     assert (reply := get('/invalidate/background-native')) == (200, 'REVALIDATED', b'/invalidate/background-native'), reply
     assert (reply := get('/invalidate/background-native?z=b')) == (200, 'REVALIDATED', b'/invalidate/background-native'), reply
-    background_files = records('/invalidate/background-native', 2)
+    background_files = [validated(item) for item in background_before]
     assert all(item['metadata'].startswith(b'NFR1') for item in background_files), background_files
     background_paths = [ready_file(item) for item in background_files]
     background_inodes = {path.stat().st_ino for path in background_paths}
@@ -1375,6 +1395,7 @@ try:
     conditional_paths.add('/alias/one')
     fence('canonical-url-invalidate', 1, 'http://cache.test/alias/shared', mode=1)
     assert get('/alias/one') == (200, 'REVALIDATED', b'canonical-fresh')
+    alias = validated(alias)
     assert get('/alias/three') == (200, 'HIT', b'canonical-fresh')
     assert records('/alias/shared', 1)[0]['id'] == alias['id']
     checks.append('canonical URL prefix Delete and exact Invalidate preserve shared routing and 304 semantics')
@@ -1393,7 +1414,7 @@ try:
         fence('direct-invalidate-' + name, kind, value, mode=1)
         for variant in variants:
             assert get(variant) == (200, 'REVALIDATED', uri.encode()), variant
-        after = records(uri, len(variants))
+        after = [validated(item) for item in original]
         assert {item['id'] for item in after} == original_ids
         assert all(watermark(item) == original_origins[item['id']] for item in after)
         for variant in variants:
@@ -1408,7 +1429,7 @@ try:
     fence('force-invalidate-304', 5, 'invalidate-304', 'tenant', mode=1)
     result = get('/invalidate/304')
     assert result == (200, 'REVALIDATED', b'/invalidate/304'), result
-    refreshed = records('/invalidate/304', 1)[0]
+    refreshed = validated(invalidated)
     assert refreshed['id'] == invalidated['id'] and refreshed['revision'] == invalidated['revision'] + 2
     assert target.stat().st_ino == old_inode and watermark(refreshed) == old_full
     assert conditional_calls.count('/invalidate/304') == 1
@@ -1442,6 +1463,7 @@ try:
     checks.append('NGX_RESTY_EXT Invalidate suppresses configured failure stale while plain nginx retains the agreed stale downgrade without validating the old entity')
     conditional_paths.add('/invalidate/failure')
     assert get('/invalidate/failure') == (200, 'REVALIDATED', b'/invalidate/failure')
+    validated(failed_original)
     assert records('/invalidate/failure', 1)[0]['id'] == failed_original['id']
     assert get('/invalidate/failure') == (200, 'HIT', b'/invalidate/failure')
     checks.append('a failed Invalidate attempt still requires successful validation before the old entity can HIT again')
@@ -1466,9 +1488,10 @@ try:
     conditional_paths.add('/invalidate/policy')
     conditional_policies['/invalidate/policy'] = 'max-age=1, must-revalidate'
     policies['/invalidate/policy'] = 'invalidate-policy'
-    assert get('/invalidate/policy')[1] == 'MISS'; records('/invalidate/policy', 1)
+    assert get('/invalidate/policy')[1] == 'MISS'; policy_before = records('/invalidate/policy', 1)[0]
     fence('force-invalidate-policy', 5, 'invalidate-policy', 'tenant', mode=1)
     assert get('/invalidate/policy') == (200, 'REVALIDATED', b'/invalidate/policy')
+    validated(policy_before)
     origin_failures.add('/invalidate/policy')
     time.sleep(2.1)
     result = get('/invalidate/policy')
@@ -1592,6 +1615,7 @@ try:
             validation_tags[uri] = tag
             fence('conditional-tag-' + str(selected), 1, 'http://cache.test' + uri, mode=1)
             assert get(uri + '?policy=' + str(selected)) == (200, 'REVALIDATED', uri.encode())
+            item = validated(item)
             expected = {tag.encode()} | ({b'conditional'} if selected else set())
             until(lambda: set(record(item['id'])['tags']) == expected)
         checks.append('TAG when selection and inherited fallback apply on fill and on successful 304 replacement')
@@ -1652,6 +1676,7 @@ try:
     checks.append('full nginx restart reuses persisted file relations without rebuilding the index')
     assert restart_path.read_bytes() == restart_contents
     assert get('/invalidate/restart') == (200, 'REVALIDATED', b'/invalidate/restart')
+    validated(restart_file)
     assert records('/invalidate/restart', 1)[0]['id'] == restart_file['id']
     assert get('/invalidate/restart') == (200, 'HIT', b'/invalidate/restart')
     checks.append('persistent invalidation survives a full restart without writing a purge marker into the native cache file')
@@ -1679,9 +1704,29 @@ try:
         validation_files[path] = item, target, target.stat().st_ino, target.read_bytes()
     time.sleep(2.1)
     for path, (original, target, inode, contents) in validation_files.items():
-        result = get(path)
+        if path == '/revalidate-retain':
+            address = b''.join(string(original[name]) for name in ('root', 'zone', 'path'))
+            acquired, lease = rpc(20, address, receive_fd=True)
+            client = http.client.HTTPConnection('127.0.0.1', port, timeout=1)
+            try:
+                client.request('GET', path, headers={'Host': 'cache.test'})
+                response = client.getresponse()
+                result = response.status, response.getheader('X-Status'), response.read()
+                connection = client.sock
+                client.request('GET', '/__test/ping', headers={'Host': 'cache.test'})
+                response = client.getresponse()
+                assert (response.status, response.read()) == (200, b'ok')
+                assert connection is not None and client.sock is connection
+                assert target.read_bytes() == contents
+                assert record(original['id'])['revision'] == original['revision']
+            finally:
+                client.close()
+                os.close(lease)
+            checks.append('304 response and the next request on the same connection complete while a held lease prevents its durable cache update')
+        else:
+            result = get(path)
         assert result == (200, 'REVALIDATED', path.encode()), (path, result)
-        item = records(path, 1)[0]
+        item = validated(original)
         assert item['id'] == original['id'] and item['revision'] == original['revision'] + 2
         assert item['metadata'].startswith(b'NFR1') and target.stat().st_ino == inode
         header_size = contents.index(b'\nKEY:')
@@ -1692,7 +1737,7 @@ try:
         assert get(path) == (200, 'HIT', path.encode()) and calls.count(path) == 2
     checks.append('304 validation preserves the file/entity, durably refreshes TTL and handles absent, replaced, empty and expression TAGs')
     assert get('/revalidate-vary', {'Accept-Language': 'en'}) == (200, 'REVALIDATED', b'/revalidate-varyen')
-    varying_after = records('/revalidate-vary', 1)[0]
+    varying_after = validated(varying_validation)
     assert varying_after['id'] == varying_validation['id']
     assert variant_hashes(varying_after, 'en') == varying_hashes
     checks.append('304 keeps native Vary hashes alongside the refreshed conditional watermark')
@@ -1800,6 +1845,7 @@ try:
     covered = watermark(current)
     time.sleep(2.1)
     assert get('/revalidate-covered') == (200, 'REVALIDATED', b'/revalidate-covered')
+    validated(current)
     assert watermark(records('/revalidate-covered', 1)[0]) == covered
     assert get('/revalidate-covered')[1] == 'HIT' and calls.count('/revalidate-covered') == 3
     checks.append('ordinary 304 validation preserves prior durable coverage while its already-satisfied TAG FENCE remains active')
@@ -1864,8 +1910,10 @@ try:
     assert get('/redirect-stale') == (200, 'STALE', b'redirect-old')
     assert calls.count('/redirect-stale') == 2
     checks.append('cached redirect admission safely closes a failed origin attempt before resuming native stale redirect behavior')
+    redirect_before = records('/redirect-revalidated', 1)[0]
     result = get('/redirect-revalidated')
     assert result == (200, 'REVALIDATED', b'redirect-old'), result
+    validated(redirect_before)
     assert get('/redirect-revalidated') == (200, 'HIT', b'redirect-old')
     assert calls.count('/redirect-revalidated') == 2
     checks.append('durable 304 validation reuses the verified cached redirect and later serves HIT without an extra origin fetch')
@@ -1891,7 +1939,7 @@ try:
     host_before = records(uri, 1)[0]
     fence('direct-invalidate-host', 4, 'cache.test', mode=1)
     assert get(uri) == (200, 'REVALIDATED', uri.encode())
-    host_after = records(uri, 1)[0]
+    host_after = validated(host_before)
     assert host_before['id'] == host_after['id'] and watermark(host_before) == watermark(host_after)
     assert get(uri) == (200, 'HIT', uri.encode())
     checks.append('current host Invalidate conditionally validates without replacing the entity or repeatedly bypassing its covered file')
@@ -1959,6 +2007,7 @@ try:
     assert [path.read_bytes() for path in paths] == original_contents
     assert get(uri) == (200, 'REVALIDATED', uri.encode())
     assert get(uri + '?z=b') == (200, 'REVALIDATED', uri.encode())
+    for item in files: validated(item)
     readback = api(receipt['status_url'])[2]
     replay = api('/__purge/v2/operations', raw=json.dumps(request_body, sort_keys=True, indent=2).encode())[2]
     for name in ('accepted_at', 'effective_at', 'propagation_until', 'sequence', 'request_digest'):
@@ -2062,6 +2111,7 @@ try:
     for path in (group_a, group_a + '?z=b', group_b):
         reply = get(path)
         assert reply[0] == 200 and reply[1] == 'REVALIDATED', reply
+    for item in group_files: validated(item)
     assert get(group_other)[1] == 'HIT'
     retry = dict(group_input, selector={'type': 'tag', 'values': ['multi-blue', 'multi-red']})
     repeated = api('/__purge/v2/operations', retry, headers=scope_headers)
@@ -2353,6 +2403,7 @@ try:
     response = prop_get(uri)
     assert response == (200, 'REVALIDATED', uri.encode()), response
     propagated(propagation_headers(uri), (invalidated_at, 0))
+    validated(original)
     until(lambda: record(original['id'])['tags'] == [b'validate-new'])
     assert prop_get(uri + '?bypass=1')[0] == 200
     propagated(propagation_headers(uri), (invalidated_at, 0))
@@ -2395,6 +2446,7 @@ try:
     assert api('/__purge/v2/operations', operation)[0] == 202
     response = prop_get(variants[-1])
     assert response == (200, 'REVALIDATED', uri.encode()), response
+    validated(current)
     until(lambda: record(current['id'])['tags'] == [b'group-new'])
     assert prop_get(variants[-1]) == (200, 'HIT', uri.encode())
     checks.append('URL Invalidate validates the selected misc key with 304 and replaces its TAGs')

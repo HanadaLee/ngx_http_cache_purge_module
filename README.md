@@ -255,10 +255,10 @@ revoked, PREPARED and STAGED proofs cause an unconditional refill. Ordinary
 requests do not poll unfinished files or wait for their publication/WAL sync;
 only the background publisher can make them READY. A refill may increase origin
 traffic while publication is pending. No shared guard spans file I/O.
-`ADMIT_FILE` remains in the durable 304 transaction path; `INSPECT_FILE` remains
-diagnostic. Retained TAG lookup on MISS
-and cache-fill transactions still use the executor, so whole-path foreground
-isolation remains unfinished.
+`ADMIT_FILE` remains in the background 304 transaction; `INSPECT_FILE` remains
+diagnostic. Retained TAG lookup on MISS uses the separate read executor. Full
+cache fills and 304 updates use bounded background jobs; foreground file reads
+and end-to-end latency still require performance validation.
 
 The RocksDB bridge exposes owner-local batch durability tickets. Reading them
 only inspects counters and never synchronizes the WAL. A later deferred batch
@@ -305,17 +305,21 @@ descriptor remain alive until completion, including during disconnect/reload.
 An expired decision cannot admit an entity. Queue overflow fails closed.
 No complete file index is loaded into worker memory. Successful upstream 304
 responses capture TTL and TAG metadata before native cached-header parsing,
-persist the validation transaction, and pass final FENCE admission before
-reusing the entity. An absent direct upstream TAG header retains the old set;
+verify the selected file proof, and match shared rules against both the old and
+replacement TAG sets before reusing the entity. The response does not wait for
+the writer: a separate bounded job persists the validation with its own file
+descriptor, node reference and copied inputs. Capacity exhaustion or update
+failure leaves the persistent cache unrenewed, so another access may need to
+validate again. An absent direct upstream TAG header retains the old set;
 a present empty header clears it. General expressions replace the set. A durable
 304 preserves the full entity's original watermark and records a separate
 conditional-validation boundary. That boundary satisfies Invalidate only; Delete
 still requires a new entity. Repeated 304 transactions replace the conditional
-proof without nesting it. Validation receipts carry the publication and any
-remaining Invalidate requirement; stamp zero cannot authorize response reuse.
+proof without nesting it. The background transaction rechecks its revision,
+native header and accepted requirements before publishing READY.
 Under `NGX_RESTY_EXT`, a forced Invalidate sets the existing request `purged`
-flag to prevent stale fallback and clears it after durable validation and
-admission. Origin `must_revalidate` remains an independent boolean. `purged`
+flag to prevent stale fallback and clears it after successful origin validation
+and admission. Origin `must_revalidate` remains an independent boolean. `purged`
 is request state only; invalidation recovery uses the persistent index and
 operation ledger, with no purge bit stored in the native cache file header.
 The shared node bit does not replace persistent operation ordering: an older
@@ -469,6 +473,7 @@ an absolute HTTP or HTTPS URL. The module preserves that value and derives its
 host selector from the URL authority, rather than the incoming request Host.
 `cache_purge_key_misc` and `cache_purge_key_namespace` default to empty strings.
 Empty misc identifies one variant; empty namespace is a valid exact scope.
+It never falls back to Host or matches every namespace.
 Namespaces contain at most 255 printable ASCII bytes without spaces or commas.
 The three expressions and `proxy_cache_purge`, `fastcgi_cache_purge`,
 `scgi_cache_purge` and `uwsgi_cache_purge` support inheritance and expr `when`
@@ -510,15 +515,16 @@ selects the least busy client after a publication slot is admitted, and keeps
 that client for ACQUIRE/PREPARE/FINISH and retries. The existing component
 connection budget and worker count can reduce the pool size. Its approximately
 512 KiB request-byte budget is divided across the pool, and the existing 64
-publication slots bound aggregate pending work. Management/304 calls and object
-reads retain their separate clients when a publication connection share is
-available; otherwise publication reuses the original control client. This lets
-other publications progress
-while one FINISH waits for WAL synchronization without adding threads, polling
+publication slots bound aggregate pending work, including detached 304 jobs.
+Management calls and object reads retain their separate clients when a
+publication connection share is available; otherwise publication reuses the
+original control client. This lets other publications progress while one FINISH
+waits for WAL synchronization without adding threads, polling
 or a weaker READY condition. Idle publication connections close after one second.
-This does not yet release the HTTP request before publication completes:
-HTTP/1 keepalive reuse can still wait after a MISS body has been sent. That
-lifecycle dependency and writer-side file I/O remain performance work in progress.
+The jobs do not retain the HTTP request, so keepalive reuse does not wait for
+publication or 304 persistence. Adopted publication rename/stat and cleanup run
+on the configured publication thread pool; native cleanup of rejected fills and
+end-to-end performance remain separate validation work.
 Generation namespaces, legacy zone/key PURGE syntax, REFRESH handlers, directory
 walks and the old shared-memory task queue have been removed; obsolete directives
 are rejected rather than silently ignored. New captures do not add arbitrary
@@ -924,8 +930,8 @@ The gate rechecks the accepted sequence before sending request bytes and
 preserves incoming requirements. This does not bypass local cache admission:
 ordinary HITs use file proofs and shared rules through the selected read pool.
 Retained TAG queries use the read-only executor. Fill transactions and durable
-304 validation still use the writer, so complete foreground isolation remains
-unfinished.
+304 validation use the writer through independent background jobs. Complete
+foreground performance acceptance still requires mixed-load measurements.
 
 When a lookup is needed, one IPC request holds its bounded input until completion,
 disconnect or the original deadline. The read endpoint admits at most four object
