@@ -26,7 +26,16 @@ its preceding instance reservation, and completion flushes all prior progress
 before removing FENCE. Power loss can replay intermediate work, but cannot lose
 an accepted task or turn incomplete work into a completed receipt. The explicit
 checkpoint API remains synchronous, including replay of a deferred checkpoint.
-File and directory fsync ordering is retained.
+New entities synchronize their completed data and STAGED identity once in
+FINISH. Target and source directories are synchronized before COMMIT_PENDING;
+READY is then written before the index publication intent is removed. PREPARE
+does not synchronize an unpublished file. A power loss that loses only READY
+causes a MISS. In-place 304 validation and physical deletion retain their syncs.
+STAGED is a new state in the module's existing 40-byte xattr marker; it does not
+change the native nginx cache format. Older module readers reject STAGED, while
+both versions accept completed READY markers. Before reverting to an older
+module, drain unfinished STAGED fills with this version: older versions reject
+them safely but may leave their publication intents pending.
 The WAL sync group includes both single-file/native preparation and the batch
 preparation API. Native representation bindings and their file intent remain in
 the same atomic batch. Tests count actual WAL sync calls through these entry
@@ -70,9 +79,11 @@ immediate invalidation.
 The executor automatically revisits unfinished native file publications in
 bounded background steps, including after owner restart or a lost reply. It
 first acquires an independent OFD lease, so active writers remain protected.
-Verified renamed files become READY; abandoned preparations are retired without
-deleting unrelated files. Changed identities and inaccessible roots remain
-pending. Recovery and response admission have independent responsibilities.
+Abandoned PREPARED records are retired because size and mtime cannot prove that
+their data survived a power loss. COMMITTED intents have crossed the file and
+directory barriers and can complete after identity and rule checks. Unrelated
+files are preserved; inaccessible roots remain pending. Recovery and response
+admission have independent responsibilities.
 
 The executor can physically remove one indexed file under its exclusive path
 lease. It durably retires the record before unlinking, checks the instance marker
@@ -178,7 +189,8 @@ sequence observed before origin dispatch. File admission can recognize rules
 already covered by that entity, allowing HIT under an existing TAG FENCE.
 Publication and automatic recovery check both the candidate and its predecessor,
 including old TAGs and watermark regression, before committing a replacement.
-Conflicting late candidates are retired without being stamped READY. This local
+Conflicting late candidates are retired and cannot be admitted, including after
+a marker write interrupted an earlier publication attempt. This local
 watermark neither changes the cache key nor proves upstream CDN freshness.
 Current selectors use the file's proof for Invalidate and Delete; already-covered
 entities can HIT while their rules remain resident. An origin request started

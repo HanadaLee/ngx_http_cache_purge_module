@@ -285,7 +285,7 @@ try:
     prepared = client.prepare_file(payload, [lease, temporary])
     assert prepared == identity(401) + struct.pack('>QB', 1, 1)
     marker = os.getxattr(temporary, 'user.ngx_cache_purge.id')
-    assert marker == b'NCF1\0\0\0\1' + identity(401) + hashlib.sha256(str(target).encode()).digest()[:16]
+    assert marker == b'NCF1\0\0\0\3' + identity(401) + hashlib.sha256(str(target).encode()).digest()[:16]
     assert temp.read_bytes() == b'complete cached entity'
     assert client.prepare_file(payload, [lease, temporary]) == prepared
     client.call(4, batch([(401, 1)]), code=4)
@@ -432,7 +432,7 @@ try:
             source.write_bytes(b'content changed after prepare')
             source.rename(destination)
             client.finish_file(number, lease, code=7)
-            assert os.getxattr(destination, 'user.ngx_cache_purge.id')[7] == 1
+            assert os.getxattr(destination, 'user.ngx_cache_purge.id')[7] == 3
             destination.unlink()  # Test-owned damaged candidate; FINISH itself never unlinks it.
         result = client.finish_file(number, lease)
         assert result[-1] == 3 and client.finish_file(number, lease) == result
@@ -462,7 +462,7 @@ try:
                                                      array.array('i', [lease, temporary]))]) == 1
             recovery_client.socket.sendall(packet[1:])
             wait_for(lambda: 'user.ngx_cache_purge.id' in os.listxattr(temporary))
-            recovery_client.close()  # Drop the unread reply after durable preparation.
+            recovery_client.close()  # Drop the unread reply after preparation.
             recovery_client = Client(recovering.path)
         else:
             recovery_client.prepare_file(prepare_data, [lease, temporary])
@@ -475,7 +475,7 @@ try:
             recovering.opened(); recovery_client = Client(recovering.path)
         time.sleep(1.2)
         assert recovery_client.call(2, identity(number))[0] == 1
-        assert os.getxattr(temporary, 'user.ngx_cache_purge.id')[7] == 1
+        assert os.getxattr(temporary, 'user.ngx_cache_purge.id')[7] == 3
         check(True, f'background recovery does not advance a live OFD-held {scenario} publication')
         if scenario == 'renamed':
             retained = os.dup(lease)
@@ -486,22 +486,22 @@ try:
         if scenario == 'damaged':
             os.setxattr(temporary, 'user.ngx_cache_purge.id', b'broken-marker')
         os.close(temporary); os.close(lease)
-        if scenario == 'damaged':
-            time.sleep(1.2)
-            assert recovery_client.call(2, identity(number))[0] == 1
-            assert os.getxattr(destination, 'user.ngx_cache_purge.id') == b'broken-marker'
-            assert recovery_client.call(9, string('') + b'\x20')[0] == 1
-            check(True, 'background recovery retains a malformed candidate without stamping it READY')
-            destination.unlink()  # Remove only this test-owned damaged candidate.
-        expected = 3 if scenario in ('missing', 'damaged', 'lost-prepare') else 2
-        wait_for(lambda: recovery_client.call(2, identity(number))[0] == expected)
+        wait_for(lambda: recovery_client.call(2, identity(number))[0] == 3)
         wait_for(lambda: recovery_client.call(9, string('') + b'\x20')[0] == 0)
-        if expected == 2:
-            assert os.getxattr(destination, 'user.ngx_cache_purge.id')[7] == 2
+        if destination.exists():
+            marker = os.getxattr(destination, 'user.ngx_cache_purge.id')
+            if scenario == 'damaged':
+                assert marker == b'broken-marker'
+            else:
+                assert marker[7] == 3
             assert destination.read_bytes() == b'complete recovery entity'
+            with destination.open('rb') as selected:
+                recovery_client.inspect_file(
+                    [str(recovery_cache), 'zone-a', f'a/00/{number}'],
+                    selected.fileno(), code=7)
         else:
-            assert not destination.exists()
-        check(True, f'background recovery completes abandoned {scenario} publication without a FINISH RPC')
+            assert scenario in ('missing', 'lost-prepare')
+        check(True, f'background recovery retires abandoned {scenario} PREPARED data and refuses admission')
     recovery_client.close(); recovering.stop()
 
     lease_component = Component(root / 'leases')
@@ -1045,7 +1045,7 @@ try:
     source.rename(target)
     retired = v.finish_file(631, lease)
     assert retired[-1] == 3 and v.call(2, identity(631))[0] == 3
-    assert os.getxattr(target, 'user.ngx_cache_purge.id')[7] == 1
+    assert os.getxattr(target, 'user.ngx_cache_purge.id')[7] == 3
     v.inspect_file((str(validation_cache), 'zone-a', 'a/00/630'), fd, code=7)
     v.admit_file((str(validation_cache), 'zone-a', 'a/00/630'),
                  'team\x1fhttps\x1fa.test\x1f/late-tag\x1f', 'https://a.test/late-tag', fd, code=7)
@@ -1072,7 +1072,7 @@ try:
     v.prepare_file(payload[:-16] + identity(632) + string(str(source)), [lease, fd])
     source.rename(target)
     assert v.finish_file(634, lease)[-1] == 3
-    assert os.getxattr(target, 'user.ngx_cache_purge.id')[7] == 1
+    assert os.getxattr(target, 'user.ngx_cache_purge.id')[7] == 3
     os.close(fd)
     check(True, 'a late fill cannot regress its predecessor watermark even when its current TAGs do not match a newer rule')
 

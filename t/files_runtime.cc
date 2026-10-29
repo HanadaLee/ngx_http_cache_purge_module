@@ -15,6 +15,11 @@
 #include <unistd.h>
 
 using namespace ngx_http_cache_purge;
+extern "C" int ngx_http_cache_purge_test_watch_file(
+    int, unsigned, void (*)(int, void *), void *);
+extern "C" unsigned ngx_http_cache_purge_test_file_sync_count(void);
+extern "C" void ngx_http_cache_purge_test_watch_marker(
+    unsigned, void (*)(int, void *));
 static unsigned assertions;
 static ngx_http_cache_rocksdb_error_t error;
 static void
@@ -120,7 +125,7 @@ publication(const std::string &mode, const std::string &path)
                           anchor.fd, lease.fd, fd.fd, getuid())
                       .state
                   == FileState::prepared,
-            "durable intent and temporary identity");
+            "recorded intent and temporary identity");
         if (mode == "--crash-prepared") {
             _exit(0);
         }
@@ -132,6 +137,7 @@ publication(const std::string &mode, const std::string &path)
         if (mode == "--crash-rename") {
             _exit(0);
         }
+        check(fsync(fd.fd) == 0, "sync complete entity before commit proof");
         index.commit_pending(file.id, 1);
         if (mode == "--crash-marker") {
             check(ngx_http_cache_purge_file_marker_publish(
@@ -154,8 +160,10 @@ publication(const std::string &mode, const std::string &path)
                   && !pending->next(match),
             "only unfinished publication recovered");
         pending.reset();
-        auto finished = publications.finish(
-            index, file.id, 1, anchor.fd, lease.fd, getuid());
+        auto finished = match.state == FileState::prepared ?
+                            index.abort_prepare(file.id, match.revision) :
+                            publications.finish(index, file.id, 1, anchor.fd,
+                                lease.fd, getuid());
         if (finished.state == FileState::retired) {
             check(!index.current(file.root, file.path),
                 "missing publication cannot be admitted");
@@ -1088,6 +1096,215 @@ removal(const std::string &mode, const std::string &path)
     return 0;
 }
 
+static int ngx_http_cache_purge_test_sync_guard(void *data,
+    const ngx_http_cache_purge_index_file_t *,
+    ngx_http_cache_rocksdb_error_t *e);
+
+struct ngx_http_cache_purge_test_sync_context_t {
+    ngx_http_cache_purge_publications_t *publications;
+    ngx_http_cache_rocksdb_t *store;
+    File file;
+    int fd, decision = 0;
+    unsigned guards = 0, observations = 0;
+    bool prepared = true, pending = true, blocked = true, crash = false;
+};
+
+static void
+ngx_http_cache_purge_test_sync_observe(int, void *data)
+{
+    auto *c = static_cast<ngx_http_cache_purge_test_sync_context_t *>(data);
+    ngx_http_cache_purge_file_marker_t marker{};
+    ngx_http_cache_purge_index_file_t inspected{};
+    ngx_http_cache_rocksdb_error_t local{};
+    int pending = 0;
+    c->observations++;
+    c->prepared &=
+        ngx_http_cache_purge_file_marker_read(c->fd, &marker, &local) == 0
+        && marker.state != NGX_HTTP_CACHE_PURGE_FILE_READY;
+    c->pending &= ngx_http_cache_purge_index_has_intent(
+                      c->store, c->file.id.data(), &pending, &local)
+                      == 0
+                  && pending;
+    c->blocked &= ngx_http_cache_purge_publications_inspect(c->publications,
+                      c->store, bytes(c->file.root), bytes(c->file.zone),
+                      bytes(c->file.path), c->fd, getuid(), &inspected, &local)
+                  == NGX_HTTP_CACHE_ROCKSDB_BUSY;
+    ngx_http_cache_purge_index_file_free(&inspected);
+    if (c->crash) {
+        _exit(c->prepared && c->pending && c->blocked ? 0 : 90);
+    }
+}
+
+static int
+ngx_http_cache_purge_test_sync_guard(void *data,
+    const ngx_http_cache_purge_index_file_t *,
+    ngx_http_cache_rocksdb_error_t *e)
+{
+    auto *c = static_cast<ngx_http_cache_purge_test_sync_context_t *>(data);
+    c->guards++;
+    if (c->decision != 0) {
+        e->code = c->decision;
+        std::strcpy(e->message, "test publication guard");
+    }
+    return c->decision;
+}
+
+static void
+ngx_http_cache_purge_test_publication_sync_case(
+    const std::string &path, unsigned scenario, bool recover = false)
+{
+    std::filesystem::create_directories(path + "/cache");
+    std::filesystem::create_directories(path + "/db");
+    int anchor_fd, lease_fd;
+    check(ngx_http_cache_purge_file_locks_open(
+              (path + "/locks").c_str(), getuid(), 1, &anchor_fd, &error)
+              == 0,
+        "publication sync lease anchor");
+    Descriptor anchor(anchor_fd);
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    check(ngx_http_cache_rocksdb_open(
+              (path + "/db").c_str(), &options, &store, &error)
+              == 0,
+        "publication sync database");
+    {
+        Index index(store);
+        Publications publications(
+            { { path + "/cache", "cache", NGX_HTTP_CACHE_PURGE_ROOT_CACHE } },
+            path + "/db");
+        File file;
+        file.id = id(1);
+        file.key = "publication-sync";
+        file.url = "https://example.test/sync";
+        file.host = "example.test";
+        file.tag_namespace = "tenant";
+        file.root = path + "/cache";
+        file.zone = "cache";
+        file.path = "file";
+        auto target = file.root + '/' + file.path;
+        auto temporary = file.root + "/temporary";
+        unsigned char digest[16];
+        uint64_t offset;
+        check(ngx_http_cache_purge_file_address(
+                  bytes(target), digest, &offset, &error)
+                      == 0
+                  && ngx_http_cache_purge_file_lease_acquire(
+                         (path + "/locks").c_str(), anchor.fd, offset,
+                         &lease_fd, &error)
+                         == 0,
+            "publication sync lease");
+        Descriptor lease(lease_fd);
+        Descriptor fd(open((recover ? target : temporary).c_str(),
+            recover ? O_RDWR | O_CLOEXEC :
+                      O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC,
+            0600));
+        Descriptor directory(
+            open(file.root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        ngx_http_cache_purge_test_sync_context_t context{ publications.native(),
+            store, file, fd.fd };
+        check(ngx_http_cache_purge_test_watch_file(
+                  fd.fd, 0, ngx_http_cache_purge_test_sync_observe, &context)
+                  == 0,
+            "watch publication inode sync calls");
+        if (!recover) {
+            body(fd.fd);
+            publications.prepare(index, { file, {} }, temporary, anchor.fd,
+                lease.fd, fd.fd, getuid());
+            check(ngx_http_cache_purge_test_file_sync_count() == 0,
+                "PREPARE must not synchronize an unpublishable file");
+            ngx_http_cache_purge_file_marker_t staged{};
+            check(ngx_http_cache_purge_file_marker_read(fd.fd, &staged, &error)
+                          == 0
+                      && staged.state == NGX_HTTP_CACHE_PURGE_FILE_STAGED,
+                "unsynchronized preparation uses a distinct marker state");
+            check(rename(temporary.c_str(), target.c_str()) == 0,
+                "rename sync fixture");
+        }
+        bool failure = !recover && scenario >= 1 && scenario <= 3;
+        bool marker_failure = !recover && scenario == 5;
+        bool dir = !recover && (scenario == 3 || scenario == 7);
+        context.crash = !recover && scenario >= 6;
+        context.decision =
+            !recover && scenario == 4 ? NGX_HTTP_CACHE_ROCKSDB_BUSY : 0;
+        check(ngx_http_cache_purge_test_watch_file(dir ? directory.fd : fd.fd,
+                  failure ? 1 : 0,
+                  context.crash && scenario == 8 ?
+                      nullptr :
+                      ngx_http_cache_purge_test_sync_observe,
+                  &context)
+                  == 0,
+            "arm publication sync observation");
+        ngx_http_cache_purge_test_watch_marker(
+            marker_failure, context.crash && scenario == 8 ?
+                                ngx_http_cache_purge_test_sync_observe :
+                                nullptr);
+        ngx_http_cache_purge_index_match_t result{};
+        auto finish = [&] {
+            return ngx_http_cache_purge_publications_finish_checked(
+                publications.native(), store, file.id.data(), 1, anchor.fd,
+                lease.fd, getuid(), ngx_http_cache_purge_test_sync_guard,
+                &context, &result, &error);
+        };
+        int rc = finish();
+        if (failure || marker_failure) {
+            check(rc == NGX_HTTP_CACHE_ROCKSDB_IO
+                      && index.has_fill_intent(file.id) && context.prepared
+                      && context.pending && context.blocked,
+                "failed sync/marker write leaves an unpublished intent");
+            if (marker_failure) {
+                check(index.get(file.id).state == FileState::committed,
+                    "marker failure follows the durable data commit point");
+            }
+            context.decision =
+                scenario >= 2 ? NGX_HTTP_CACHE_ROCKSDB_CONFLICT : 0;
+        } else if (!recover && scenario == 4) {
+            check(rc == NGX_HTTP_CACHE_ROCKSDB_BUSY
+                      && ngx_http_cache_purge_test_file_sync_count() == 0,
+                "pending guard does not repeat file synchronization");
+            context.decision = 0;
+        }
+        if (failure || marker_failure || (!recover && scenario == 4)) {
+            check(ngx_http_cache_purge_test_watch_file(fd.fd, 0,
+                      ngx_http_cache_purge_test_sync_observe, &context)
+                      == 0,
+                "retry publication synchronization");
+            rc = finish();
+            check(context.guards == 2,
+                "a retried committed intent rechecks current rules");
+        }
+        bool rejected = (failure && scenario >= 2) || marker_failure
+                        || (recover && scenario != 8);
+        check(rc == 0 && !index.has_fill_intent(file.id),
+            "finish resolves its publication intent");
+        if (rejected) {
+            check(result.state == NGX_HTTP_CACHE_PURGE_INDEX_RETIRED
+                      && ngx_http_cache_purge_test_file_sync_count() == 0,
+                "new veto or lost marker cannot publish the old result");
+        } else {
+            check(result.state == NGX_HTTP_CACHE_PURGE_INDEX_COMMITTED
+                      && ngx_http_cache_purge_test_file_sync_count()
+                             == (recover ? 0 : 1)
+                      && (recover || context.observations) && context.prepared
+                      && context.pending && context.blocked,
+                "completed data is synchronized before READY publication");
+            ngx_http_cache_purge_index_file_t inspected{};
+            check(
+                ngx_http_cache_purge_publications_inspect(publications.native(),
+                    store, bytes(file.root), bytes(file.zone), bytes(file.path),
+                    fd.fd, getuid(), &inspected, &error)
+                    == 0,
+                "completed synchronization permits admission");
+            ngx_http_cache_purge_index_file_free(&inspected);
+        }
+        check(
+            ngx_http_cache_purge_test_watch_file(-1, 0, nullptr, nullptr) == 0,
+            "release file sync observation");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
+        "close publication sync database");
+}
+
 static int
 ngx_http_cache_purge_test_collection_replacement(
     const std::string &mode, const std::string &path)
@@ -1201,6 +1418,27 @@ int
 main(int argc, char **argv)
 {
     try {
+        if (argc == 3 && std::string(argv[1]) == "--publication-sync") {
+            for (unsigned scenario = 0; scenario < 6; scenario++) {
+                ngx_http_cache_purge_test_publication_sync_case(
+                    std::string(argv[2]) + '/' + std::to_string(scenario),
+                    scenario);
+            }
+            std::cout << "PASS publication synchronization and retry guards"
+                      << std::endl;
+            return 0;
+        }
+        if (argc == 4
+            && (std::string(argv[1]) == "--publication-sync-crash"
+                || std::string(argv[1]) == "--publication-sync-recover"))
+        {
+            ngx_http_cache_purge_test_publication_sync_case(argv[2],
+                std::stoul(argv[3]),
+                std::string(argv[1]) == "--publication-sync-recover");
+            std::cout << "PASS publication sync recovery " << argv[3]
+                      << std::endl;
+            return 0;
+        }
         if (argc == 3 && std::string(argv[1]).find("--gc-replacement-") == 0) {
             return ngx_http_cache_purge_test_collection_replacement(
                 argv[1], argv[2]);
@@ -1231,6 +1469,13 @@ main(int argc, char **argv)
                        publication(argv[1], argv[2]);
         }
         ngx_http_cache_purge_test_pending_inspection();
+        char sync_root[] = "/tmp/cache-purge-sync-test-XXXXXX";
+        check(mkdtemp(sync_root) != nullptr, "file sync test directory");
+        for (unsigned scenario = 0; scenario < 6; scenario++) {
+            ngx_http_cache_purge_test_publication_sync_case(
+                std::string(sync_root) + '/' + std::to_string(scenario),
+                scenario);
+        }
         char root[] = "/tmp/cache-purge-files-XXXXXX";
         check(mkdtemp(root) != nullptr, "temporary directory");
         std::string path(root), target = path + "/final";

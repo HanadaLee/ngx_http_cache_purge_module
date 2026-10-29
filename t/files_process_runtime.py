@@ -20,6 +20,74 @@ a = p.parse_args()
 checks = []
 roots = []
 timings = {}
+
+
+def recover_publication(root, expected_state):
+    environment = os.environ.copy()
+    environment.update(CACHE_PURGE_TEST_CACHE_ROOT=str(root / 'cache'),
+                       CACHE_PURGE_TEST_TEMP_ROOT=str(root / 'cache'),
+                       CACHE_PURGE_TEST_CACHE_ZONE='cache')
+    with (root / 'sync-recovery.log').open('w') as log:
+        process = subprocess.Popen([str(a.component), str(root / 'db'), '8',
+                                    '3000', '1100000', '524288'],
+                                   env=environment, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=log,
+                                   text=True, bufsize=1)
+        def rpc(opcode, payload):
+            with socket.socket(socket.AF_UNIX) as client:
+                client.settimeout(4)
+                client.connect(str(root / 'db/component.sock'))
+                client.sendall(struct.pack('>4sHHQII', b'NCP1', 1, opcode, 1,
+                                           len(payload), 0) + payload)
+                def read(size):
+                    data = b''
+                    while len(data) < size:
+                        part = client.recv(size - len(data))
+                        assert part
+                        data += part
+                    return data
+                magic, version, op, ident, size, code = struct.unpack('>4sHHQII', read(24))
+                assert (magic, version, op, ident, code) == (b'NCP1', 1, opcode, 1, 0)
+                return read(size)
+        try:
+            assert select.select([process.stdout], [], [], 8)[0]
+            assert process.stdout.readline().strip() == 'STARTED'
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                assert process.poll() is None
+                try:
+                    if (rpc(2, (1).to_bytes(16, 'big'))[0] == expected_state
+                            and rpc(9, b'\0' * 4 + b'\x01')[0] == 0):
+                        break
+                except OSError:
+                    pass
+                time.sleep(.02)
+            else:
+                raise AssertionError('orphan publication did not recover')
+            process.stdin.write('q\n')
+            process.stdin.flush()
+            assert select.select([process.stdout], [], [], 8)[0]
+            assert process.stdout.readline().strip() == 'STOP 0 1'
+            assert process.wait(timeout=8) == 0
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+    diagnostics = (root / 'sync-recovery.log').read_text()
+    assert not any(word in diagnostics for word in ('AddressSanitizer', 'runtime error:', 'LeakSanitizer'))
+
+
+for scenario in ((6, 7, 8, 9) if a.component else ()):
+    root = Path(tempfile.mkdtemp(prefix='cache-purge-sync-cut-', dir='/tmp'))
+    roots.append(str(root))
+    subprocess.check_call([str(a.binary), '--publication-sync-crash',
+                           str(root), str(scenario)], timeout=30)
+    if scenario == 9:
+        os.removexattr(root / 'cache/file', 'user.ngx_cache_purge.id')
+    recover_publication(root, 2 if scenario == 8 else 3)
+    checks.append(subprocess.check_output(
+        [str(a.binary), '--publication-sync-recover', str(root), str(scenario)],
+        text=True, timeout=30).strip())
 for truncate in (False, True):
     root = Path(tempfile.mkdtemp(prefix='cache-purge-gc-replacement-', dir='/tmp'))
     roots.append(str(root))

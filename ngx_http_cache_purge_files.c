@@ -205,7 +205,10 @@ ngx_http_cache_purge_file_marker_read(int fd,
         return ngx_http_cache_purge_io(error, "read file marker");
     }
     if (n != (ssize_t) sizeof(raw) || memcmp(raw, "NCF1", 4) || raw[4] || raw[5]
-        || raw[6] || (raw[7] != 1 && raw[7] != 2)
+        || raw[6]
+        || (raw[7] != NGX_HTTP_CACHE_PURGE_FILE_PREPARED
+            && raw[7] != NGX_HTTP_CACHE_PURGE_FILE_READY
+            && raw[7] != NGX_HTTP_CACHE_PURGE_FILE_STAGED)
         || ngx_http_cache_purge_zero(raw + 8))
     {
         return ngx_http_cache_purge_result(error,
@@ -237,7 +240,8 @@ ngx_http_cache_purge_file_marker_prepare(int fd, const unsigned char id[16],
     }
     rc = ngx_http_cache_purge_file_marker_read(fd, &current, error);
     if (rc == NGX_HTTP_CACHE_ROCKSDB_OK) {
-        if (current.state != NGX_HTTP_CACHE_PURGE_FILE_PREPARED
+        if ((current.state != NGX_HTTP_CACHE_PURGE_FILE_PREPARED
+             && current.state != NGX_HTTP_CACHE_PURGE_FILE_STAGED)
             || memcmp(current.id, id, 16)
             || memcmp(current.address, address, 16))
         {
@@ -250,8 +254,10 @@ ngx_http_cache_purge_file_marker_prepare(int fd, const unsigned char id[16],
     if (rc != NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) {
         return rc;
     }
+    /* Older readers reject STAGED rather than assuming durable preparation. */
     ngx_http_cache_purge_encode(raw, id, address,
-                                NGX_HTTP_CACHE_PURGE_FILE_PREPARED);
+        durable ? NGX_HTTP_CACHE_PURGE_FILE_PREPARED
+                : NGX_HTTP_CACHE_PURGE_FILE_STAGED);
     if (fsetxattr(fd, ngx_http_cache_purge_attribute, raw, sizeof(raw),
                   XATTR_CREATE)
         != 0)
@@ -1973,7 +1979,7 @@ ngx_http_cache_purge_publications_inspect(
     }
     if ((file.state != NGX_HTTP_CACHE_PURGE_INDEX_COMMITTED
          && !(file.state == NGX_HTTP_CACHE_PURGE_INDEX_PREPARED
-              && marker.state == NGX_HTTP_CACHE_PURGE_FILE_PREPARED))
+              && marker.state != NGX_HTTP_CACHE_PURGE_FILE_READY))
         || !ngx_http_cache_purge_publication_equal(
             file.root, ngx_http_cache_purge_publication_bytes(target->path))
         || !ngx_http_cache_purge_publication_equal(file.zone, zone)
@@ -1986,7 +1992,7 @@ ngx_http_cache_purge_publications_inspect(
     if (rc != 0) {
         goto done;
     }
-    if (marker.state == NGX_HTTP_CACHE_PURGE_FILE_PREPARED && !intent) {
+    if (marker.state != NGX_HTTP_CACHE_PURGE_FILE_READY && !intent) {
         goto mismatch;
     }
     if (file.state == NGX_HTTP_CACHE_PURGE_INDEX_COMMITTED) {
@@ -2052,7 +2058,7 @@ ngx_http_cache_purge_publications_inspect(
     {
         goto mismatch;
     }
-    if (marker.state == NGX_HTTP_CACHE_PURGE_FILE_PREPARED) {
+    if (marker.state != NGX_HTTP_CACHE_PURGE_FILE_READY) {
         rc = ngx_http_cache_purge_result(error, NGX_HTTP_CACHE_ROCKSDB_BUSY,
             "cache file publication is pending");
         goto done;
@@ -2250,7 +2256,8 @@ ngx_http_cache_purge_publications_prepare(
         if (rc != 0) {
             goto done;
         }
-        if (marker.state != NGX_HTTP_CACHE_PURGE_FILE_PREPARED
+        if ((marker.state != NGX_HTTP_CACHE_PURGE_FILE_PREPARED
+             && marker.state != NGX_HTTP_CACHE_PURGE_FILE_STAGED)
             || memcmp(marker.id, file.id, 16)
             || memcmp(marker.address, digest, 16))
         {
@@ -2295,7 +2302,8 @@ ngx_http_cache_purge_publications_prepare(
     file.metadata.len = size;
 
     /*
-     * Persist intent before writing the marker; errors never authorize rename.
+     * Record intent before the marker. FINISH persists the completed file;
+     * an abandoned PREPARED record cannot prove its data reached storage.
      */
     if (target->configured.kind == NGX_HTTP_CACHE_PURGE_ROOT_PROXY) {
         rc = ngx_http_cache_purge_publication_native(&file, main, variant,
@@ -2317,7 +2325,7 @@ ngx_http_cache_purge_publications_prepare(
         goto done;
     }
     rc = ngx_http_cache_purge_file_marker_prepare(temporary_fd, file.id, digest,
-                                                  1, error);
+                                                  0, error);
     if (rc != 0) {
         goto done;
     }
@@ -2331,7 +2339,7 @@ ngx_http_cache_purge_publications_prepare(
     {
         rc = ngx_http_cache_purge_result(
             error, NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
-            "temporary file changed during durable preparation");
+            "temporary file changed during preparation");
         goto done;
     }
     *out = match;
@@ -2524,6 +2532,15 @@ ngx_http_cache_purge_publications_finish_checked(
             "publication file changed while opening");
         goto done;
     }
+    if (guard != NULL) {
+        rc = guard(data, &file, error);
+        if (rc == NGX_HTTP_CACHE_ROCKSDB_CONFLICT) {
+            goto abandon;
+        }
+        if (rc != 0) {
+            goto done;
+        }
+    }
     if (fsync(fd) != 0) {
         rc = ngx_http_cache_purge_io(error, "sync final cache file");
         goto done;
@@ -2543,21 +2560,14 @@ ngx_http_cache_purge_publications_finish_checked(
     result.revision = file.revision;
     result.state = file.state;
     if (file.state == NGX_HTTP_CACHE_PURGE_INDEX_PREPARED) {
-        if (guard != NULL) {
-            rc = guard(data, &file, error);
-            if (rc == NGX_HTTP_CACHE_ROCKSDB_CONFLICT) {
-                goto abandon;
-            }
-            if (rc != 0) {
-                goto done;
-            }
-        }
         rc = ngx_http_cache_purge_publication_apply(
             store, NGX_HTTP_CACHE_PURGE_INDEX_COMMIT_PENDING, id, file.revision,
             &result, error);
     }
     if (rc == 0) {
-        rc = ngx_http_cache_purge_file_marker_publish(fd, id, digest, 1, error);
+        /* Data and the prepared identity are durable before this transition.
+         * Losing only READY after publication causes a MISS, never a HIT. */
+        rc = ngx_http_cache_purge_file_marker_publish(fd, id, digest, 0, error);
     }
     if (rc == 0) {
         rc = ngx_http_cache_purge_publication_beneath(target->fd, file.path, 1,

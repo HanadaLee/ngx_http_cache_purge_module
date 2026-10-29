@@ -465,8 +465,8 @@ ngx_http_cache_purge_test_publication(void)
         "C PREPARE keeps borrowed input unchanged");
     ngx_http_cache_purge_test_check(
         ngx_http_cache_purge_file_marker_read(fd, &marker, error) == 0
-            && marker.state == NGX_HTTP_CACHE_PURGE_FILE_PREPARED,
-        "C durable intent precedes marker");
+            && marker.state == NGX_HTTP_CACHE_PURGE_FILE_STAGED,
+        "C recorded intent precedes staged marker");
     ngx_http_cache_purge_test_check(rename(temporary, final) == 0,
                                     "native rename before C FINISH");
     rc = ngx_http_cache_purge_publications_finish(

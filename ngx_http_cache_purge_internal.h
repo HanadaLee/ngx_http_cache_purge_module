@@ -352,6 +352,7 @@ extern "C" {
 #define NGX_HTTP_CACHE_PURGE_FILES_ABI 2
 #define NGX_HTTP_CACHE_PURGE_FILE_PREPARED 1
 #define NGX_HTTP_CACHE_PURGE_FILE_READY 2
+#define NGX_HTTP_CACHE_PURGE_FILE_STAGED 3
 #define NGX_HTTP_CACHE_PURGE_FILE_MARKER_SIZE 40
 
 typedef struct {
@@ -1268,6 +1269,8 @@ int ngx_http_cache_purge_publications_finish(
 typedef int (*ngx_http_cache_purge_publication_guard_pt)(void *data,
     const ngx_http_cache_purge_index_file_t *file,
     ngx_http_cache_rocksdb_error_t *error);
+/* A live publisher retains its original lease. Recovery aborts orphan
+ * PREPARED records; COMMITTED intents follow completed file/directory syncs. */
 int ngx_http_cache_purge_publications_finish_checked(
     ngx_http_cache_purge_publications_t *publications,
     ngx_http_cache_rocksdb_t *store, const unsigned char id[16],

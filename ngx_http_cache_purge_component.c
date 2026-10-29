@@ -2077,6 +2077,7 @@ ngx_http_cache_purge_component_recover(ngx_http_cache_purge_component_t *c,
     ngx_http_cache_purge_query_t              *query;
     ngx_http_cache_purge_index_match_t         match;
     ngx_http_cache_purge_index_file_t          file;
+    ngx_http_cache_purge_index_expected_t      expected;
     ngx_http_cache_purge_publication_target_t  target;
     ngx_http_cache_rocksdb_bytes_t             bookmark;
     unsigned char                              digest[16];
@@ -2199,6 +2200,13 @@ ngx_http_cache_purge_component_recover(ngx_http_cache_purge_component_t *c,
                     ngx_http_cache_purge_component_validation_finish_guard :
                     NULL,
                 c, &match, error);
+        } else if (file.state == NGX_HTTP_CACHE_PURGE_INDEX_PREPARED) {
+            /* The original writer is gone. Size/mtime and PREPARED alone
+             * cannot prove the entity survived a power loss intact. */
+            memcpy(expected.id, file.id, 16);
+            expected.revision = file.revision;
+            rc = ngx_http_cache_purge_index_apply(store,
+                NGX_HTTP_CACHE_PURGE_INDEX_ABORT, &expected, 1, &match, error);
         } else {
             rc = ngx_http_cache_purge_publications_finish_checked(
                 c->publications, store, file.id, file.revision, c->lease_anchor,

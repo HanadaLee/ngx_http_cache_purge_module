@@ -61,7 +61,7 @@ if(CACHE_PURGE_STORE_TESTS)
     ${CMAKE_CURRENT_SOURCE_DIR}/t/index_process_runtime.py
     --binary $<TARGET_FILE:cache_purge_index_test>
     --output ${CMAKE_CURRENT_BINARY_DIR}/index-process-results.json)
-  add_executable(cache_purge_files_test t/files_runtime.cc)
+  add_executable(cache_purge_files_test t/files_runtime.cc t/ngx_http_cache_purge_store_c_api.c)
   target_link_libraries(cache_purge_files_test PRIVATE ngx_http_cache_purge_component)
   target_compile_options(cache_purge_files_test PRIVATE -Wall -Wextra -Werror)
   add_test(NAME files_runtime COMMAND cache_purge_files_test)
