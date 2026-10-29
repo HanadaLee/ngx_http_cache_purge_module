@@ -13,6 +13,7 @@ import io
 import json
 import os
 import re
+import shlex
 from pathlib import Path
 import signal
 import socket
@@ -37,27 +38,38 @@ p.add_argument('--sanitize', action='store_true')
 p.add_argument('--expr', type=Path)
 p.add_argument('--workers', type=int, default=2)
 p.add_argument('--capacity', action='store_true')
+p.add_argument('--reuse-build', type=Path, help='Reuse matching compiled sources after test-only edits')
 a = p.parse_args()
 repo = Path(__file__).resolve().parents[1]
-root = Path(tempfile.mkdtemp(prefix='ncp-capture-'))
+root = a.reuse_build or Path(tempfile.mkdtemp(prefix='ncp-capture-'))
 build, addon, key = root / 'nginx', root / 'addon', root / 'key'
-for directory in (build, addon, key): directory.mkdir()
+for directory in (build, addon, key): directory.mkdir(exist_ok=bool(a.reuse_build))
 for source, destination in [(repo, addon), (a.key, key)]:
     for path in [source / 'config', *source.glob('*.c'), *source.glob('*.h')]:
-        (destination / path.name).write_bytes(path.read_bytes().replace(b'\r\n', b'\n'))
-(addon / 'rocksdb').mkdir()
+        data = path.read_bytes().replace(b'\r\n', b'\n')
+        if a.reuse_build:
+            assert (destination / path.name).read_bytes() == data, ('stale source', path)
+        else:
+            (destination / path.name).write_bytes(data)
+(addon / 'rocksdb').mkdir(exist_ok=bool(a.reuse_build))
 for path in (repo / 'rocksdb').iterdir():
     if path.suffix in ('.c', '.h'):
-        (addon / 'rocksdb' / path.name).write_bytes(path.read_bytes().replace(b'\r\n', b'\n'))
+        data = path.read_bytes().replace(b'\r\n', b'\n')
+        if a.reuse_build:
+            assert (addon / 'rocksdb' / path.name).read_bytes() == data, ('stale provider', path)
+        else:
+            (addon / 'rocksdb' / path.name).write_bytes(data)
 git = ['git', '-c', 'safe.directory=' + str(a.nginx), '-C', str(a.nginx)]
 revision = subprocess.check_output(git + ['rev-parse', a.nginx_ref], text=True).strip()
 archive = subprocess.check_output(git + ['-c', 'core.autocrlf=false', 'archive', revision])
-subprocess.run(['tar', '-xf', '-', '-C', str(build)], input=archive, check=True)
+if not a.reuse_build:
+    subprocess.run(['tar', '-xf', '-', '-C', str(build)], input=archive, check=True)
 source_patch = b''
 if a.core_working_tree:
     source_patch = subprocess.check_output(['git', '-c', 'core.autocrlf=true', '-c', 'core.safecrlf=false',
                                            '-C', str(a.nginx), 'diff', a.nginx_ref, '--', 'src'])
-    subprocess.run(['git', 'apply', '-'], cwd=build, input=source_patch, check=True)
+    if not a.reuse_build:
+        subprocess.run(['git', 'apply', '-'], cwd=build, input=source_patch, check=True)
 env = os.environ.copy()
 env['CACHE_PURGE_ROCKSDB_LIB_DIR'] = str(a.libraries)
 engine = '-lrocksdb' if a.dynamic else str(Path(subprocess.check_output(
@@ -73,9 +85,15 @@ if a.sanitize:
     command += ['--with-cc-opt=-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize=nonnull-attribute -fno-pie',
                 '--with-ld-opt=-fsanitize=address,undefined -no-pie']
 print('BUILD', root, flush=True)
-with (root / 'build.log').open('w') as log:
-    subprocess.run(command, cwd=build, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
-    if a.sanitize:
+with (root / 'build.log').open('a' if a.reuse_build else 'w') as log:
+    if a.reuse_build:
+        version = subprocess.check_output([str(build / 'objs/nginx'), '-V'], stderr=subprocess.STDOUT, text=True)
+        assert shlex.split(version.split('configure arguments: ', 1)[1]) == command[2:]
+        for library in a.libraries.glob('libngx_http_cache_*.a'):
+            assert library.stat().st_mtime <= (build / 'objs/nginx').stat().st_mtime, ('newer library', library)
+    else:
+        subprocess.run(command, cwd=build, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
+    if a.sanitize and not a.reuse_build:
         # Native x86 MD5 intentionally reads unaligned words. Do not disable
         # alignment checks for request code, the backend, or other core files.
         makefile = build / 'objs/Makefile'
@@ -89,7 +107,8 @@ with (root / 'build.log').open('w') as log:
                                 '$(CC) -c $(CFLAGS) -fno-sanitize=alignment')
             makefile.write_text(text[:begin] + rule + text[end:])
             (build / 'objs/src/core/ngx_md5.o').unlink(missing_ok=True)
-    subprocess.run(['make', '-j2'], cwd=build, stdout=log, stderr=subprocess.STDOUT, check=True)
+    if not a.reuse_build:
+        subprocess.run(['make', '-j2'], cwd=build, stdout=log, stderr=subprocess.STDOUT, check=True)
 with tarfile.open(fileobj=io.BytesIO(archive)) as source:
     sources = [m for m in source if m.isfile() and m.name.startswith('src/')]
     for member in sources:
@@ -237,7 +256,7 @@ for name in ('fastcgi', 'scgi', 'uwsgi'):
     server.daemon_threads = True; server.protocol = name; gateways[name] = server
     threading.Thread(target=server.serve_forever, daemon=True).start()
 with socket.socket() as s: s.bind(('127.0.0.1', 0)); port = s.getsockname()[1]
-run = root / 'run'; run.mkdir(); (run / 'logs').mkdir()
+run = root / (f'run-{time.time_ns()}' if a.reuse_build else 'run'); run.mkdir(); (run / 'logs').mkdir()
 for directory in ('cache-a', 'cache-b', 'index'): (run / directory).mkdir()
 (run / 'index').chmod(0o700)
 gateway_paths, gateway_locations = [], []
@@ -247,7 +266,7 @@ for name, server in gateways.items():
     gateway_locations.append(f'''location /{name}/ {{
       {name}_cache {name}; {name}_cache_key $cache_key_full; {name}_cache_valid 200 1h;
       {name}_param REQUEST_METHOD GET; {name}_param REQUEST_URI $uri;
-      cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+
       {name}_pass 127.0.0.1:{server.server_address[1]};
     }}''')
 modules = ['ngx_http_cache_rocksdb_module', 'ngx_http_cache_purge_module']
@@ -257,23 +276,17 @@ extension = any(line.split() == ['#define', 'NGX_RESTY_EXT', '1']
                 for line in (build / 'objs/ngx_auto_config.h').read_text().splitlines())
 slice_config = 'slice on; slice_size 1024;' if extension else 'slice 1024;'
 propagation_config = '''cache_key_namespace prop;
-  cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
-  cache_purge_tag_namespace $cache_key_namespace;
+
+
   cache_purge_propagation on;
   proxy_set_header Host $host;
   proxy_set_header X-Cache-Purge-Time $cache_purge_propagation_time;
   proxy_set_header X-Cache-Purge-Mode $cache_purge_propagation_mode;
   proxy_set_header X-Cache-Purge-Fence $cache_purge_propagation_fence;
   proxy_set_header X-Cache-Purge-Namespace "";'''
-propagation_alias_config = propagation_config.replace(
-    'cache_purge_url $cache_key_url;', 'cache_purge_url "$scheme://$host$uri";')
 propagation_off_config = propagation_config.replace('cache_purge_propagation on;',
                                                     'cache_purge_propagation off;')
-propagation_manual_config = propagation_config.replace(
-    'cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;',
-    'cache_purge_key $uri; cache_purge_url "$scheme://$host$uri";').replace(
-    'cache_purge_tag_namespace $cache_key_namespace;', 'cache_purge_tag_namespace manual;').replace(
-    'cache_key_namespace prop;', '')
+propagation_manual_config = propagation_config.replace('cache_key_namespace prop;', '')
 
 dns_holds = {}
 class DNS(socketserver.BaseRequestHandler):
@@ -323,7 +336,7 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
   proxy_cache_valid 200 206 1h; proxy_cache_bypass $arg_bypass;
   proxy_buffers 8 4k; proxy_buffer_size 4k;
   cache_purge_tag $upstream_http_cache_tag;
-  cache_purge_tag_namespace $cache_key_namespace;
+
   add_header X-Status $upstream_cache_status always;
   {' '.join(gateway_locations)}
   location /__purge/v2/ {{ cache_purge_api; proxy_cache off;
@@ -348,7 +361,7 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
       proxy_cache off; proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /propagation/uncached-manual {{ {propagation_manual_config}
       cache_key_namespace $arg_unused_namespace;
-      proxy_cache off; proxy_cache_key $uri;
+      proxy_cache off; proxy_cache_key "manual\x1fhttp\x1f$host\x1f$uri\x1f\x1f";
       proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /propagation/uncached-ignore {{ {propagation_config}
       cache_purge_ignore_propagation on;
@@ -356,80 +369,82 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
   location /propagation/slice {{ {propagation_config}
       {slice_config} proxy_set_header Range $slice_range;
       proxy_pass http://127.0.0.1:{origin.server_port}; }}
-  location /propagation/aliases/ {{ {propagation_alias_config}
-      cache_key_uri /propagation/aliases/shared;
+  location /propagation/groups/ {{ {propagation_config}
+
       proxy_cache_revalidate on;
       proxy_pass http://127.0.0.1:{origin.server_port}; }}
-  location / {{ cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+  location / {{
                 proxy_pass http://127.0.0.1:{origin.server_port}; }}
-  location /large {{ cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+  location /large {{
                      aio threads; aio_write on; proxy_pass http://127.0.0.1:{origin.server_port}; }}
-  location /slice {{ cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+  location /slice {{
                     {slice_config} proxy_set_header Range $slice_range;
                     proxy_pass http://127.0.0.1:{origin.server_port}; }}
-  location /raw {{ proxy_cache_key "$uri|$arg_m"; cache_purge_key $uri;
-                  cache_purge_tag_namespace rawtenant;
+  location /raw {{ proxy_cache_key "rawtenant\x1fhttp\x1f$host\x1f$uri\x1f$arg_m\x1f";
+
                   proxy_pass http://127.0.0.1:{origin.server_port}; }}
+  location /alias/finish- {{ cache_key_uri /finish/shared;
+                     proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /alias/ {{ cache_key_uri /alias/shared;
                      proxy_cache_revalidate on;
-                     cache_purge_key $cache_key_base;
-                     cache_purge_url "$scheme://$host$uri";
+
+
                      proxy_pass http://127.0.0.1:{origin.server_port}; }}
-  location /host-shared/ {{ cache_key_host cache.test;
-                           cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+  location /host-shared/ {{ cache_key_host $arg_cache_host;
+
                            proxy_cache_revalidate on;
                            proxy_pass http://127.0.0.1:{origin.server_port}; }}
-  location /invalidate/ {{ cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+  location /invalidate/ {{
                           proxy_cache_revalidate on;
                           proxy_cache_use_stale error timeout http_500 updating;
                           proxy_pass http://127.0.0.1:{origin.server_port}; }}
-  location /revalidate- {{ cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+  location /revalidate- {{
                           proxy_cache_revalidate on; proxy_pass http://127.0.0.1:{origin.server_port}; }}
-  location /revalidate-expression {{ cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+  location /revalidate-expression {{
                           cache_purge_tag "$upstream_http_cache_tag, expression";
                           proxy_cache_revalidate on; proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location = /negative-cache {{
-      cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+
       proxy_cache_valid 502 1h; error_page 502 = /negative-error;
       proxy_pass http://127.0.0.1:{origin.server_port};
   }}
   location = /negative-error {{ return 200 "negative-old"; }}
   location = /negative-timeout {{
-      cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+
       proxy_cache_valid 504 1h; error_page 504 = /negative-error;
       proxy_read_timeout 50ms;
       proxy_pass http://127.0.0.1:{origin.server_port};
   }}
   location = /error-no-store {{
-      cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+
       proxy_intercept_errors on; error_page 404 = /negative-error;
       proxy_cache_valid 500 1h;
       proxy_pass http://127.0.0.1:{origin.server_port};
   }}
   location = /error-memory {{
-      cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+
       proxy_intercept_errors on; error_page 500 = /negative-error;
       proxy_cache_valid 500 1h;
       proxy_pass http://127.0.0.1:{origin.server_port};
   }}
   location = /error-disk {{
-      cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+
       proxy_cache_valid 500 1h;
       proxy_pass http://127.0.0.1:{origin.server_port};
   }}
   location = /error-disk-unmatched {{
-      cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+
       proxy_intercept_errors on; error_page 404 = /negative-error;
       proxy_cache_valid 500 1h;
       proxy_pass http://127.0.0.1:{origin.server_port};
   }}
   location /error-disk- {{
-      cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+
       proxy_cache_valid 500 502 504 1h;
       proxy_pass http://127.0.0.1:{origin.server_port};
   }}
   location ~ ^/redirect-(cache|tag|unknown|named|stale|revalidated)$ {{
-      cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+
       proxy_ignore_headers X-Accel-Redirect;
       proxy_cache_revalidate on;
       proxy_cache_use_stale error timeout http_500 updating;
@@ -443,11 +458,17 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
 '''
 if extension and a.expr:
     error_when = f'''location /error-when/ {{
-      cache_purge_key $cache_key_base; cache_purge_url $cache_key_url;
+
       proxy_intercept_errors on;
       expr intercept_error = $arg_intercept 1;
       when intercept_error {{ error_page 500 = /negative-error; }}
       proxy_cache_valid 500 1h;
+      proxy_pass http://127.0.0.1:{origin.server_port};
+    }}
+    location /tag-when/ {{
+      proxy_cache_revalidate on;
+      expr tag_policy = $arg_policy 1;
+      when tag_policy {{ cache_purge_tag "$upstream_http_cache_tag, conditional"; }}
       proxy_pass http://127.0.0.1:{origin.server_port};
     }}
     '''
@@ -558,15 +579,21 @@ def physical_remove(item, outcome=1, collected=False):
     finally:
         os.close(lease)
 def query(value, kind=1, scope=''):
-    d = Decode(rpc(8, bytes([kind]) + string(value) + string(scope) + string('') + bytes([32])))
-    count, done = d.number(1), d.number(1); d.string()
-    found = [(d.take(16), d.number(8), d.number(1)) for _ in range(count)]
-    d.end(); assert done
-    return found
-def records(path, count):
-    found = until(lambda: (v if len(v := query('http://cache.test' + path)) == count
+    found, cursor = [], b''
+    while True:
+        d = Decode(rpc(8, bytes([kind]) + string(value) + string(scope) + string(cursor) + bytes([32])))
+        count, done = d.number(1), d.number(1)
+        next_cursor = d.string()
+        found.extend((d.take(16), d.number(8), d.number(1)) for _ in range(count))
+        d.end()
+        if done: return found
+        assert next_cursor and next_cursor != cursor and len(found) < 1000
+        cursor = next_cursor
+def records(path, count, host='cache.test'):
+    found = until(lambda: (v if len(v := query('http://' + host + path)) == count
                            and all(item[2] == 2 for item in v) else None))
     return [record(item[0]) for item in found]
+
 def record(ident, optional=False):
     raw = rpc(2, ident, codes=(0, 1) if optional else (0,))
     if raw is None: return None
@@ -713,9 +740,7 @@ def missing_index_read():
 def finish_busy_retries():
     suffix = '?m=finish-retry'
     assert get('/alias/finish-0' + suffix) == (200, 'MISS', b'/alias/finish-0')
-    original = records('/alias/finish-0', 1)[0]
-    for number in range(1, 65):
-        assert get('/alias/finish-' + str(number) + suffix) == (200, 'HIT', b'/alias/finish-0')
+    original = records('/finish/shared', 1)[0]
     before = (run / 'error.log').read_text().count('publication stage 2 failed:')
     with concurrent.futures.ThreadPoolExecutor(1) as pool:
         held = pool.submit(get, '/alias/finish-wait' + suffix + '&bypass=1')
@@ -725,12 +750,13 @@ def finish_busy_retries():
         finally:
             finish_release.set()
         assert held.result(timeout=10) == (200, 'BYPASS', b'finish-retry-entity')
-    ready_file(records('/alias/finish-wait', 1)[0])
-    assert records('/alias/finish-wait', 1)[0]['id'] != original['id']
+    replacement = until(lambda: (item if (item := records('/finish/shared', 1)[0])['id']
+                                 != original['id'] else None))
+    ready_file(replacement)
     assert get('/alias/finish-wait' + suffix) == (200, 'HIT', b'finish-retry-entity')
     assert calls.count('/alias/finish-wait') == 1
     assert (run / 'error.log').read_text().count('publication stage 2 failed:') == before
-    checks.append('FINISH retries a real paged alias guard after an unrelated push without dropping its lease or refetching the entity')
+    checks.append('an unrelated push during a real fill does not drop its publication lease or refetch the entity')
 
 
 def variant_hashes(item, language):
@@ -746,6 +772,8 @@ def variant_hashes(item, language):
 
 checks = []
 obsolete_directives = (
+    'cache_purge_key $cache_key_base;', 'cache_purge_url $cache_key_url;',
+    'cache_purge_tag_namespace $cache_key_namespace;',
     'cache_purge_namespace old 1m /tmp/old-state;',
     'proxy_cache_purge on;', 'fastcgi_cache_purge on;',
     'scgi_cache_purge on;', 'uwsgi_cache_purge on;',
@@ -770,29 +798,32 @@ rogue = f'''  location = /rogue-cache {{
   }}
 '''
 mixed = config.replace('  location / {', rogue + '  location / {', 1)
-for label, candidate, valid in (
-        ('mixed', mixed, False),
-        ('disabled', mixed.replace('location = /rogue-cache {', 'location = /rogue-cache { proxy_cache off;'), True),
-        ('inherited', mixed.replace('  proxy_cache $zone;',
-            '  cache_purge_key $cache_key_base; cache_purge_url $cache_key_url; proxy_cache $zone;'), True)):
+for label, candidate in (
+        ('inherited', mixed),
+        ('disabled', mixed.replace('location = /rogue-cache {', 'location = /rogue-cache { proxy_cache off;'))):
     candidate_path = run / (label + '.conf'); candidate_path.write_text(candidate)
     tested = subprocess.run([str(build / 'objs/nginx'), '-t', '-p', str(run) + '/', '-c', str(candidate_path)],
                             env=env, capture_output=True, text=True, timeout=15)
-    assert (tested.returncode == 0) == valid, (label, tested.stderr)
-    if not valid: assert 'has upstream caching without cache_purge_key' in tested.stderr
-checks.append('persistent indexing rejects an uncovered cache location and accepts inherited keys or explicitly disabled caching')
-legacy_config = re.sub(r'cache_purge_key\s+[^;]+;', '', config)
+    assert tested.returncode == 0, (label, tested.stderr)
+checks.append('the store/state pair manages every cached location without per-location identity expressions')
+legacy_config = re.sub(r'cache_purge_(?:store|state_zone)\s+[^;]+;', '', config)
+legacy_config = legacy_config.replace('cache_purge_api;', 'return 503;')
 (run / 'nginx.conf').write_text(legacy_config)
 process = start()
 try:
-    until(lambda: (run / 'index/component.sock').exists())
-    until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
+    def listening():
+        try:
+            with socket.create_connection(('127.0.0.1', port), timeout=.1):
+                return True
+        except OSError:
+            return False
+    until(listening)
     assert get('/negative-cache') == (200, 'MISS', b'negative-old')
     assert get('/negative-cache') == (200, 'HIT', b'negative-old')
     assert calls.count('/negative-cache') == 1
     (run / 'nginx.conf').write_text(config)
     process.send_signal(signal.SIGHUP)
-    until(lambda: 'enabling/disabling cache_purge_key indexing requires a full restart' in (run / 'error.log').read_text())
+    until(lambda: 'enabling/disabling cache purge indexing requires a full restart' in (run / 'error.log').read_text())
     assert get('/negative-cache') == (200, 'HIT', b'negative-old')
     assert calls.count('/negative-cache') == 1
     stop(process)
@@ -890,114 +921,38 @@ try:
     checks.append('background Invalidate automatically retires its FENCE after persisting three requirements across two zones; after restart, unchanged fresh native headers still require validation')
     checks.append('persistent per-file Invalidate keeps strict failure handling and plain stale downgrade after all resident rules are removed')
     host_cases = []
-    late_host_cases = []
     for number, (kind, mode) in enumerate(((4, 1), (4, 2), (6, 1), (6, 2))):
-        uri = '/host-shared/observed-' + str(number)
-        first_host, second_host, alias_host = (f'first-{number}.test', f'second-{number}.test', f'alias-{number}.test')
+        uri = '/host-shared/object-' + str(number)
+        canonical = f'canonical-{number}.test'
+        request_host = f'request-{number}.test'
+        suffix = '?cache_host=' + canonical
         tag = 'host-tag-' + str(number)
         policies[uri] = tag
-        assert get(uri, {'Host': first_host}) == (200, 'MISS', uri.encode())
-        assert get(uri + '?z=b', {'Host': second_host}) == (200, 'MISS', uri.encode())
-        files = records(uri, 2)
-        assert {item['host'] for item in files} == {first_host.encode(), second_host.encode()}, files
-        assert all(item['key'].split(b'\x1f')[2] == b'cache.test' for item in files), files
+        for query_suffix in (suffix, suffix + '&z=b'):
+            assert get(uri + query_suffix, {'Host': request_host}) == (200, 'MISS', uri.encode())
+        files = records(uri, 2, canonical)
+        assert {item['host'] for item in files} == {canonical.encode()}
         original_ids = {item['id'] for item in files}
-        assert (observed_reply := get(uri, {'Host': alias_host})) == (200, 'HIT', uri.encode()), observed_reply
-        assert {item[0] for item in query(alias_host, kind=4)} == original_ids
-        assert {item[0] for item in query(tag, kind=6, scope=alias_host)} == original_ids
+        assert get(uri + suffix, {'Host': 'another-request.test'}) == (200, 'HIT', uri.encode())
+        assert not query(request_host, kind=4)
+        assert not query(tag, kind=6, scope=request_host)
+        assert {item[0] for item in query(canonical, kind=4)} == original_ids
+        assert {item[0] for item in query(tag, kind=6, scope=canonical)} == original_ids
         conditional_paths.add(uri)
-        fence('shared-host-' + str(number), kind, alias_host if kind == 4 else tag,
-              scope='' if kind == 4 else alias_host, mode=mode)
-        if mode == 1:
-            body = uri.encode()
-            assert get(uri, {'Host': first_host}) == (200, 'REVALIDATED', body)
-            assert get(uri + '?z=b', {'Host': second_host}) == (200, 'REVALIDATED', body)
-            assert {item['id'] for item in records(uri, 2)} == original_ids
-        else:
-            body = ('fresh-host-' + str(number)).encode()
-            fresh_bodies[uri] = body
-            deleted_response(uri, body, {'Host': first_host})
-            deleted_response(uri + '?z=b', body, {'Host': second_host})
-            until(lambda: {item['id'] for item in records(uri, 2)}.isdisjoint(original_ids))
-            assert uri not in conditional_calls
-        assert get(uri, {'Host': alias_host}) == (200, 'HIT', body)
-        assert get(uri + '?z=b', {'Host': alias_host}) == (200, 'HIT', body)
-        host_cases.append((uri, alias_host, body))
-        checks.append(f'business host differs from cache-key host: kind={kind}, mode={mode} covers both zones and observed host aliases')
-
-        uri = '/host-shared/late-' + str(number)
-        first_host, late_host = f'old-{number}.test', f'late-{number}.test'
-        tag = 'late-host-tag-' + str(number)
-        policies[uri] = tag
-        assert get(uri, {'Host': first_host}) == (200, 'MISS', uri.encode())
-        assert get(uri + '?z=b', {'Host': first_host}) == (200, 'MISS', uri.encode())
-        original_ids = {item['id'] for item in records(uri, 2)}
-        name = 'retired-late-host-' + str(number)
-        assert not query(late_host, kind=4)
-        fence(name, kind, late_host if kind == 4 else tag,
-              scope='' if kind == 4 else late_host, mode=mode, activate=False)
-        late_host_cases.append((name, mode, uri, first_host, late_host, kind, original_ids))
-
-    late_alias_cases = []
-    for number, (kind, mode) in enumerate(((1, 1), (1, 2), (3, 1), (3, 2))):
-        source_uri = '/alias/source-' + str(number)
-        target_uri = '/alias/late-' + str(number) + '/new'
-        suffix = '?m=history-' + str(number)
-        assert get(source_uri + suffix) == (200, 'MISS', source_uri.encode())
-        assert get(source_uri + suffix + '&z=b') == (200, 'MISS', source_uri.encode())
-        original_ids = {item['id'] for item in records(source_uri, 2)}
-        name = 'retired-late-alias-' + str(number)
-        value = 'http://cache.test' + (target_uri if kind == 1 else target_uri.rsplit('/', 1)[0] + '/')
-        assert not query('http://cache.test' + target_uri)
-        fence(name, kind, value, mode=mode, activate=False)
-        late_alias_cases.append((name, mode, source_uri, target_uri, suffix, original_ids))
-    stop(process)
-    for name, *_ in late_alias_cases + late_host_cases:
-        subprocess.run([str(a.libraries / 'cache_purge_files_test'), '--activate-background',
-                        str(run / 'index'), name], check=True, timeout=15, stdout=subprocess.DEVNULL)
-    process = start()
-    until(lambda: (run / 'index/component.sock').exists())
-    until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
-    for name, mode, *_ in late_alias_cases + late_host_cases:
-        until(lambda name=name: materialization_done(name, 0, 4))
-    stop(process)
-    process = start()
-    until(lambda: (run / 'index/component.sock').exists())
-    until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
-    for name, mode, source_uri, target_uri, suffix, original_ids in late_alias_cases:
-        conditional_paths.add(target_uri); conditional_paths.add(source_uri)
-        if mode == 1:
-            body = source_uri.encode()
-            assert get(target_uri + suffix) == (200, 'REVALIDATED', body)
-            assert get(source_uri + suffix + '&z=b') == (200, 'REVALIDATED', body)
-            assert {item['id'] for item in records(source_uri, 2)} == original_ids
-        else:
-            body = ('new-' + name).encode()
-            fresh_bodies[target_uri] = body; fresh_bodies[source_uri] = body
-            assert get(target_uri + suffix) == (200, 'BYPASS', body)
-            assert get(source_uri + suffix + '&z=b') == (200, 'BYPASS', body)
-            until(lambda: {item['id'] for item in records(source_uri, 2)}.isdisjoint(original_ids))
-            assert target_uri not in conditional_calls and source_uri not in conditional_calls
-        assert get(target_uri + suffix) == (200, 'HIT', body)
-        assert get(target_uri + suffix + '&z=b') == (200, 'HIT', body)
-        checks.append(name + ': a URL first observed after empty-scan retirement still enforces the durable exact/prefix rule across both zones')
-    for name, mode, uri, first_host, late_host, kind, original_ids in late_host_cases:
-        conditional_paths.add(uri)
-        if mode == 1:
-            body = uri.encode()
-            assert get(uri, {'Host': late_host}) == (200, 'REVALIDATED', body)
-            assert get(uri + '?z=b', {'Host': first_host}) == (200, 'REVALIDATED', body)
-            assert {item['id'] for item in records(uri, 2)} == original_ids
-        else:
-            body = ('new-' + name).encode()
-            fresh_bodies[uri] = body
-            assert get(uri, {'Host': late_host}) == (200, 'BYPASS', body)
-            assert get(uri + '?z=b', {'Host': first_host}) == (200, 'BYPASS', body)
-            until(lambda: {item['id'] for item in records(uri, 2)}.isdisjoint(original_ids))
-            assert uri not in conditional_calls
-        assert get(uri, {'Host': first_host}) == (200, 'HIT', body)
-        assert get(uri + '?z=b', {'Host': late_host}) == (200, 'HIT', body)
-        checks.append(name + ': a business host first observed after controlled rule retirement enforces host/host-tag history across two zones')
+        fence('canonical-host-' + str(number), kind, canonical if kind == 4 else tag,
+              scope='' if kind == 4 else canonical, mode=mode)
+        body = uri.encode() if mode == 1 else ('fresh-host-' + str(number)).encode()
+        if mode == 2: fresh_bodies[uri] = body
+        for query_suffix in (suffix, suffix + '&z=b'):
+            if mode == 1:
+                assert get(uri + query_suffix, {'Host': request_host}) == (200, 'REVALIDATED', body)
+            else:
+                deleted_response(uri + query_suffix, body, {'Host': request_host})
+        current_ids = {item['id'] for item in records(uri, 2, canonical)}
+        assert current_ids == original_ids if mode == 1 else current_ids.isdisjoint(original_ids)
+        assert get(uri + suffix, {'Host': request_host}) == (200, 'HIT', body)
+        host_cases.append((uri, canonical, request_host, body))
+        checks.append(f'canonical host identity: kind={kind}, mode={mode} covers both zones without observing request Host aliases')
     assert get('/invalidate/background-native')[1] == 'MISS'
     assert get('/invalidate/background-native?z=b')[1] == 'MISS'
     for item in records('/invalidate/background-native', 2): ready_file(item)
@@ -1037,38 +992,24 @@ try:
         {item['id'] for item in background_files})
     checks.append('durable submission autonomously activates Delete in the running worker; both hot zone instances are removed and their native size accounting is acknowledged before enumeration completes')
     assert get('/alias/one') == (200, 'MISS', b'/alias/one')
-    alias = records('/alias/one', 1)[0]; ready_file(alias)
+    alias = records('/alias/shared', 1)[0]; ready_file(alias)
     assert get('/alias/two') == (200, 'HIT', b'/alias/one')
+    assert not query('http://cache.test/alias/one') and not query('http://cache.test/alias/two')
+    fence('unmapped-request-url', 1, 'http://cache.test/alias/two')
     assert get('/alias/three') == (200, 'HIT', b'/alias/one')
-    assert records('/alias/two', 1)[0]['id'] == alias['id'] == records('/alias/three', 1)[0]['id']
-    assert calls.count('/alias/two') == calls.count('/alias/three') == 0
-    checks.append('native HITs register distinct observed URL aliases for one key without issuing extra origin requests')
-    fence('read-discovered-alias', 1, 'http://cache.test/alias/two')
-    fresh_bodies['/alias/one'] = b'fresh-alias-entity'
-    deleted_response('/alias/one', b'fresh-alias-entity')
-    old_alias = alias['id']
-    alias = until(lambda: (item if (item := records('/alias/one', 1)[0])['id'] != old_alias else None))
+    checks.append('different raw request paths share only their configured canonical URL; raw paths are not indexed as aliases')
+    fence('canonical-url-prefix', 3, 'http://cache.test/alias/sh')
+    fresh_bodies['/alias/one'] = b'canonical-fresh'
+    deleted_response('/alias/one', b'canonical-fresh')
+    original_id = alias['id']
+    alias = until(lambda: (item if (item := records('/alias/shared', 1)[0])['id'] != original_id else None))
     ready_file(alias)
-    assert records('/alias/two', 1)[0]['id'] == alias['id']
-    assert get('/alias/three') == (200, 'HIT', b'fresh-alias-entity')
-    checks.append('a URL FENCE on a persisted third-party alias invalidates another request URL while a post-push entity can HIT under that FENCE')
-    fence('read-discovered-alias-prefix', 3, 'http://cache.test/alias/tw')
-    fresh_bodies['/alias/one'] = b'prefix-fresh-alias'
-    deleted_response('/alias/one', b'prefix-fresh-alias')
-    old_alias = alias['id']
-    alias = until(lambda: (item if (item := records('/alias/one', 1)[0])['id'] != old_alias else None))
-    ready_file(alias)
-    assert get('/alias/three') == (200, 'HIT', b'prefix-fresh-alias')
-    checks.append('bytewise URL prefix FENCEs cover persisted aliases even when neither the current nor the original stored URL matches')
     conditional_paths.add('/alias/one')
-    original_alias = alias
-    fence('invalidate-discovered-alias', 1, 'http://cache.test/alias/two', mode=1)
-    assert get('/alias/one') == (200, 'REVALIDATED', b'prefix-fresh-alias')
-    alias = records('/alias/one', 1)[0]
-    assert alias['id'] == original_alias['id'] and alias['revision'] == original_alias['revision'] + 2
-    assert watermark(alias) == watermark(original_alias)
-    assert get('/alias/three') == (200, 'HIT', b'prefix-fresh-alias')
-    checks.append('Invalidate on another persisted URL alias supports conditional 304 without replacing the shared entity')
+    fence('canonical-url-invalidate', 1, 'http://cache.test/alias/shared', mode=1)
+    assert get('/alias/one') == (200, 'REVALIDATED', b'canonical-fresh')
+    assert get('/alias/three') == (200, 'HIT', b'canonical-fresh')
+    assert records('/alias/shared', 1)[0]['id'] == alias['id']
+    checks.append('canonical URL prefix Delete and exact Invalidate preserve shared routing and 304 semantics')
     for name, kind in (('url', 1), ('key', 0), ('url-prefix/item', 3), ('key-prefix/item', 2)):
         uri = '/invalidate/' + name
         conditional_paths.add(uri)
@@ -1256,10 +1197,24 @@ try:
     assert not query('blue', kind=5, scope='another-tenant')
     checks.append('BYPASS replacement captures before origin, retires the prior instance and updates scoped TAG membership')
     assert get('/raw?m=native')[1] == 'MISS'
-    raw = until(lambda: (v if (v := query('/raw|native')) and all(item[2] == 2 for item in v) else None))
-    item = record(raw[0][0]); ready_file(item)
-    assert item['key'] == b'/raw' and item['namespace'] == b'rawtenant'
-    checks.append('ordinary expressions work without a companion snapshot; default URL follows the actual native key bytes')
+    item = records('/raw', 1)[0]; ready_file(item)
+    assert item['key'] == b'rawtenant\x1fhttp\x1fcache.test\x1f/raw\x1fnative'
+    assert item['namespace'] == b'rawtenant'
+    checks.append('an independent native key expression provides canonical URL, namespace and base key without key-module outputs')
+    if extension and a.expr:
+        uri = '/tag-when/object'
+        policies[uri] = 'when-old'
+        assert get(uri + '?policy=1')[1] == 'MISS'
+        item = records(uri, 1)[0]
+        assert set(item['tags']) == {b'when-old', b'conditional'}
+        conditional_paths.add(uri)
+        for selected, tag in ((0, 'when-new'), (1, 'when-last')):
+            validation_tags[uri] = tag
+            fence('conditional-tag-' + str(selected), 1, 'http://cache.test' + uri, mode=1)
+            assert get(uri + '?policy=' + str(selected)) == (200, 'REVALIDATED', uri.encode())
+            expected = {tag.encode()} | ({b'conditional'} if selected else set())
+            until(lambda: set(record(item['id'])['tags']) == expected)
+        checks.append('TAG when selection and inherited fallback apply on fill and on successful 304 replacement')
     policies['/tag-limit'] = ','.join('tag' + str(i) for i in range(65))
     assert get('/tag-limit')[1] == 'MISS'
     time.sleep(.1)
@@ -1320,15 +1275,16 @@ try:
     assert records('/invalidate/restart', 1)[0]['id'] == restart_file['id']
     assert get('/invalidate/restart') == (200, 'HIT', b'/invalidate/restart')
     checks.append('persistent invalidation survives a full restart without writing a purge marker into the native cache file')
-    assert get('/alias/three') == (200, 'HIT', b'prefix-fresh-alias')
-    assert records('/alias/two', 1)[0]['id'] == alias['id']
-    assert calls.count('/alias/three') == 0
-    checks.append('HIT-discovered aliases and their satisfied FENCE coverage survive a full nginx restart without index rebuilding')
-    for uri, alias_host, body in host_cases:
-        assert get(uri, {'Host': alias_host}) == (200, 'HIT', body)
-        assert get(uri + '?z=b', {'Host': alias_host}) == (200, 'HIT', body)
-        assert len(query(alias_host, kind=4)) == 2
-    checks.append('business host/key relations survive full restart and satisfied host rules do not force repeated origin requests')
+    assert get('/alias/three') == (200, 'HIT', b'canonical-fresh')
+    assert records('/alias/shared', 1)[0]['id'] == alias['id']
+    assert not query('http://cache.test/alias/two')
+    checks.append('restart preserves the canonical identity without discovering request-path aliases')
+    for uri, canonical, request_host, body in host_cases:
+        suffix = '?cache_host=' + canonical
+        assert get(uri + suffix, {'Host': request_host}) == (200, 'HIT', body)
+        assert get(uri + suffix + '&z=b', {'Host': request_host}) == (200, 'HIT', body)
+        assert len(query(canonical, kind=4)) == 2 and not query(request_host, kind=4)
+    checks.append('canonical host identity and satisfied host rules survive restart')
     validation_files = {}
     assert get('/revalidate-vary', {'Accept-Language': 'en'}) == (200, 'MISS', b'/revalidate-varyen')
     varying_validation = records('/revalidate-vary', 1)[0]
@@ -1562,7 +1518,7 @@ try:
     fence('read-host', 4, 'cache.test')
     deleted_response('/asset', b'/asset')
     checks.append('native read admission applies effective host FENCEs before background file processing')
-    marker = 'enabling/disabling cache_purge_key indexing requires a full restart'
+    marker = 'changing/removing cache purge store or state zone requires a full restart'
     rejected = (run / 'error.log').read_text().count(marker)
     (run / 'nginx.conf').write_text(legacy_config)
     process.send_signal(signal.SIGHUP)
@@ -1925,33 +1881,31 @@ try:
     propagated(propagation_headers(uri, span='bytes=2048-3071'))
     checks.append('known TAG propagation respects native slice identities instead of expanding a match to all files with the same key')
 
-    uri = '/propagation/aliases/source'
-    policies[uri] = 'many-aliases'
-    assert prop_get(uri) == (200, 'MISS', uri.encode())
-    original = prop_records(uri, 1)[0]
-    for number in range(96):
-        alias_uri = '/propagation/aliases/observed-' + str(number)
-        response = prop_get(alias_uri)
-        assert response == (200, 'HIT', uri.encode()), (alias_uri, response)
-        prop_records(alias_uri, 1)
-    deleted_at = tag_push('prop-many-aliases', 'many-aliases')
-    until(lambda: record(original['id'], optional=True) is None)
-    policies[alias_uri] = 'alias-old'
-    assert prop_get(alias_uri)[0] == 200
-    propagated(propagation_headers(alias_uri), (0, deleted_at))
-    checks.append('background Delete preserves TAG associations across more than 64 URL aliases and later requests still propagate the original requirement')
+    uri = '/propagation/groups/object'
+    policies[uri] = 'many-keys'
+    variants = [uri + '?m=' + str(number) for number in range(97)]
+    for target in variants:
+        assert prop_get(target) == (200, 'MISS', uri.encode())
+    original = prop_records(uri, 97)
+    assert len({item['key'] for item in original}) == 97
+    deleted_at = tag_push('prop-many-keys', 'many-keys')
+    until(lambda: all(record(item['id'], optional=True) is None for item in original), timeout=20)
+    policies[uri] = 'group-old'
+    assert prop_get(variants[-1])[0] == 200
+    propagated(propagation_headers(uri), (0, deleted_at))
+    checks.append('background TAG Delete preserves known propagation for 97 misc keys of one canonical URL')
 
     current = prop_records(uri, 1)[0]
-    conditional_paths.add(alias_uri)
-    validation_tags[alias_uri] = 'alias-new'
-    operation = api_input('prop-alias-invalidate',
+    conditional_paths.add(uri)
+    validation_tags[uri] = 'group-new'
+    operation = api_input('prop-group-invalidate',
                          {'type': 'url', 'value': 'http://prop.test' + uri}, 'invalidate')
     assert api('/__purge/v2/operations', operation)[0] == 202
-    response = prop_get(alias_uri)
-    assert response == (200, 'REVALIDATED', alias_uri.encode()), response
-    until(lambda: record(current['id'])['tags'] == [b'alias-new'])
-    assert prop_get(alias_uri) == (200, 'HIT', alias_uri.encode())
-    checks.append('Invalidate on one of 97 persisted aliases validates the selected file with 304, replaces TAGs and later HITs without a fixed alias limit')
+    response = prop_get(variants[-1])
+    assert response == (200, 'REVALIDATED', uri.encode()), response
+    until(lambda: record(current['id'])['tags'] == [b'group-new'])
+    assert prop_get(variants[-1]) == (200, 'HIT', uri.encode())
+    checks.append('URL Invalidate validates the selected misc key with 304 and replaces its TAGs')
     for number, overlap in enumerate((False, True)):
         uri = '/propagation/send-race-' + str(number)
         tag = 'send-race-tag-' + str(number)
@@ -2061,7 +2015,7 @@ try:
     response = prop_get('/propagation/uncached-manual', incoming)
     assert response[0] == 200, response
     propagated(propagation_headers('/propagation/uncached-manual'), (0, incoming_time))
-    checks.append('manual uncached key and selector expressions do not evaluate unused cache-key module components')
+    checks.append('an independent formatted uncached key does not evaluate unused key-module components')
 
 finally:
     finish_release.set()

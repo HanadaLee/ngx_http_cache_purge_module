@@ -251,11 +251,11 @@ preserving the independent propagation deadline.
 Indexed requests do not create memory-only entries: transport 502/504 and
 intercepted errors are excluded, while ordinary disk-backed error responses keep
 their configured cache policy. Native `error_page` conditions are not evaluated
-again by the module. Enabling indexing requires every location with a content
-handler and enabled upstream cache settings to inherit or configure
-`cache_purge_key`; alternatively, disable its upstream cache. Parent contexts
-also receive a runtime guard, so a dynamically selected cache path without an
-index key cannot read or write an unindexed entry.
+again by the module. Configuring `cache_purge_store` and `cache_purge_state_zone`
+enables indexing for the HTTP instance, including inherited and dynamically
+selected cache zones. Every managed native key must use the format described
+below. There is no per-location identity expression or indexing switch;
+use the native `*_cache off` directive to disable caching in a location.
 
 Changing between indexed and unindexed mode requires a full nginx restart to
 replace legacy in-memory error state. Reload within indexed mode remains
@@ -405,43 +405,45 @@ the companion key module, worker IPC, WAL preparation, rename and READY
 publication. It also covers selected-descriptor admission, 304 commits,
 background invalidation, native-node cleanup and HTTP management requests.
 
-The persistent build provides `cache_purge_key`, `cache_purge_url`,
-`cache_purge_tag`, and `cache_purge_tag_namespace` as independently inherited
-complex values. Configuring `cache_purge_key` enables capture for that cached
-location and requires `cache_purge_store` and `cache_purge_state_zone`.
-For a location using the companion key module:
+Configure the store and state zone together at HTTP scope. For a location using
+the independent key module, only the native key and optional TAG metadata need
+to be configured:
 
 ```nginx
 proxy_cache_key $cache_key_full;
-cache_purge_key $cache_key_base;
-cache_purge_url $cache_key_url;
 cache_purge_tag $upstream_http_cache_tag;
-cache_purge_tag_namespace $cache_key_namespace;
 ```
 
-Key, URL and namespace inputs are frozen after native key creation, including
-requests that bypass cache reads. The exact references shown above select
-`us-escape-v1` decoding of nginx's actual key bytes; purge does not include the
+Key, URL, host and namespace are derived from nginx's actual native key bytes,
+including requests that bypass cache reads. Purge uses `us-escape-v1` decoding
+and does not include the
 key module's headers, resolve its C symbols, or require its load order. The six
 fields are namespace, scheme, host, URI, misc and range. They are separated by
 byte `0x1f`; field backslashes are escaped as `\\`, and an embedded separator
 as the four printable bytes `\x1F`. Other producers can emit the same format.
-Decoding preserves component boundaries without reevaluating those variables.
-Malformed structured keys skip caching. Independent expressions remain part
-of the current configuration interface while its migration is pending. An omitted
-URL expression uses the actual native cache-key bytes. TAG values are comma
-separated, case sensitive, trimmed and deduplicated; an empty value clears the
-new entity's TAG set. Namespace defaults to `$host`.
+Decoding preserves component boundaries without reevaluating generator variables.
+Malformed keys skip caching. The base key excludes the final separator and range;
+the URL joins scheme, host and URI. Host selectors use the encoded host, not an
+additional request Host alias. TAG namespace comes from the encoded namespace.
+`cache_purge_key`, `cache_purge_url` and `cache_purge_tag_namespace` have been
+removed and are rejected as unknown directives.
+
+`cache_purge_tag` is an inherited complex value at HTTP, server or location scope.
+With the expr module it also supports `when` blocks, including selection during
+successful 304 updates. TAG values are comma separated, case sensitive, trimmed
+and deduplicated; an empty value clears the new entity's TAG set. A normal HIT
+retains the selected representation's recorded TAGs.
 
 Publication is limited to 64 concurrent transactions and a 2 MiB logical buffer
 budget per worker, with a three-second overall IPC deadline. The limits apply
 after the response body is complete and do not turn normal HITs into origin
 requests. Request inputs and each publication payload are separately bounded
 to 128 KiB; these limits exclude allocator overhead and native nginx buffers.
-`cache_purge_key` takes one index expression. Generation namespaces, inline
-PURGE/REFRESH handlers, directory walks and the old shared-memory task queue
-have been removed; their directives are rejected rather than silently ignored. Observed URL aliases are persisted during
-file-response admission and survive restarts without index rebuilding.
+Generation namespaces, inline PURGE/REFRESH handlers, directory walks and the old
+shared-memory task queue have been removed; their directives are rejected rather
+than silently ignored. New captures do not add arbitrary request URL/Host aliases.
+The backend still contains its earlier alias machinery pending removal; this
+configuration change does not complete the foreground database-isolation work.
 
 ## Current features
 
@@ -491,13 +493,13 @@ load_module modules/ngx_http_cache_rocksdb_module.so;
 load_module modules/ngx_http_cache_purge_module.so;
 ```
 
-The key addon can be omitted when index expressions do not use its outputs.
-Loading it later does not enable a purge binary compiled without its API.
+The key addon is optional: another producer can supply the same native byte
+format. Purge has no dependency on its C API or relative load order.
 
 Register the persistent purge addon after other header-filter addons, or load its
 dynamic module last among them. Its admission filter must run before slice and
 other filters modify response state. Startup and `nginx -t` reject an unsafe
-filter order when `cache_purge_key` is configured.
+filter order when the store/state pair is configured.
 
 The module requires nginx 1.31.7 or newer for complex-value script status
 propagation. Older nginx versions are rejected at configure time; loading a
@@ -779,15 +781,19 @@ unavailable initial writer registration within the same three-second deadline.
 It does not send an incomplete requirement or turn a transient missing snapshot
 into an immediate request-creation error.
 
-Proxy locations configured with `cache_purge_key` also resolve propagation when
+Proxy locations in a managed HTTP instance also resolve propagation when
 `proxy_cache` is off, a variable zone resolves to off, or the method is excluded
 from caching. They use scratch key storage and the native key builder to
 select current or retained slice/Vary associations, without opening cache files
-or publishing index records. Manual key expressions do not evaluate unused
-cache-key components. No key-module capture API is called. When using the key
+or publishing index records. Independent formatted key expressions do not evaluate
+unused key-module components. No key-module capture API is called. When using the key
 module, use a version that confines automatic native capture to key creation
 before upstream request buffers exist; a later scratch evaluation must not
 retain a temporary cache context.
+
+An uncached proxy that handles or forwards propagation requirements also needs
+an effective native `proxy_cache_key` in the same format. Defining it at HTTP or
+server scope lets cached and uncached proxy locations inherit the same identity.
 
 A module-owned adapter at the existing post-create `proxy_bind` value boundary
 installs the output gate; no extra bind directive or core patch is required.
@@ -896,8 +902,6 @@ server {
     location / {
         proxy_cache cache_zone;
         proxy_cache_key $cache_key_full;
-        cache_purge_key $cache_key_base;
-        cache_purge_url $cache_key_url;
         proxy_pass http://origin;
     }
 

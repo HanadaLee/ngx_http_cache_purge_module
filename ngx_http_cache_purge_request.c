@@ -267,7 +267,7 @@ ngx_http_cache_purge_fill_complete(ngx_http_cache_purge_fill_t *f, ngx_int_t rc)
 #include <ngx_http_proxy_filter_module.h>
 #endif
 
-#if (NGX_RESTY_EXT && NGX_EXPR)
+#if (NGX_EXPR)
 #include <ngx_http_expr_module.h>
 #endif
 
@@ -279,13 +279,6 @@ ngx_http_cache_purge_fill_complete(ngx_http_cache_purge_fill_t *f, ngx_int_t rc)
 #define NGX_HTTP_CACHE_PURGE_RETIRE_BYTES (256 * 1024)
 #define NGX_HTTP_CACHE_PURGE_RETIRE_COUNT 32
 
-enum {
-    NGX_HTTP_CACHE_PURGE_FIELD_KEY,
-    NGX_HTTP_CACHE_PURGE_FIELD_URL,
-    NGX_HTTP_CACHE_PURGE_FIELD_TAG,
-    NGX_HTTP_CACHE_PURGE_FIELD_NAMESPACE,
-    NGX_HTTP_CACHE_PURGE_FIELD_COUNT
-};
 enum {
     NGX_HTTP_CACHE_PURGE_RPC_ACQUIRE,
     NGX_HTTP_CACHE_PURGE_RPC_PREPARE,
@@ -309,12 +302,15 @@ enum {
     NGX_HTTP_CACHE_PURGE_ADMIT_ERROR
 };
 typedef struct {
-    ngx_http_complex_value_t  *field[NGX_HTTP_CACHE_PURGE_FIELD_COUNT];
+#if (NGX_EXPR)
+    ngx_array_t               *tag;
+#else
+    ngx_http_complex_value_t  *tag;
+#endif
     ngx_array_t               *proxy_headers;
 } ngx_http_cache_purge_capture_conf_t;
 typedef struct {
     ngx_array_t  locations;
-    ngx_int_t    host_index;
     ngx_flag_t   enabled;
 } ngx_http_cache_purge_capture_main_t;
 
@@ -529,25 +525,25 @@ static ngx_int_t ngx_http_cache_purge_propagation_filter(ngx_http_request_t *r,
     ngx_http_proxy_filter_ctx_t *filter);
 #endif
 
-#define ngx_http_cache_purge_capture_directive(name, field) \
-    {ngx_string(name),                                                        \
-        NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,\
-     ngx_http_set_complex_value_slot, NGX_HTTP_LOC_CONF_OFFSET,               \
-     offsetof(ngx_http_cache_purge_capture_conf_t, field) , NULL}
-/* Explicit offsets keep these four independent, inheritable inputs. */
 static ngx_command_t  ngx_http_cache_purge_capture_commands[] = {
 
-    ngx_http_cache_purge_capture_directive(
-        "cache_purge_key", field[NGX_HTTP_CACHE_PURGE_FIELD_KEY]),
-    ngx_http_cache_purge_capture_directive(
-        "cache_purge_url", field[NGX_HTTP_CACHE_PURGE_FIELD_URL]),
-    ngx_http_cache_purge_capture_directive(
-        "cache_purge_tag", field[NGX_HTTP_CACHE_PURGE_FIELD_TAG]),
-    ngx_http_cache_purge_capture_directive(
-        "cache_purge_tag_namespace",
-        field[NGX_HTTP_CACHE_PURGE_FIELD_NAMESPACE]),
+    { ngx_string("cache_purge_tag"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF
+#if (NGX_EXPR)
+      |NGX_HTTP_MAIN_WHEN_CONF|NGX_HTTP_SRV_WHEN_CONF|NGX_HTTP_LOC_WHEN_CONF
+#endif
+      |NGX_CONF_TAKE1,
+#if (NGX_EXPR)
+      ngx_http_set_expr_complex_value_slot,
+#else
+      ngx_http_set_complex_value_slot,
+#endif
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_purge_capture_conf_t, tag), NULL },
+
       ngx_null_command
 };
+
 static ngx_http_module_t  ngx_http_cache_purge_capture_context = {
     ngx_http_cache_purge_propagation_variables,
     ngx_http_cache_purge_capture_post,
@@ -2550,8 +2546,15 @@ ngx_http_cache_purge_capture_identity(ngx_http_cache_purge_capture_t *ctx)
         }
     }
 
+    ctx->host = ctx->components[2];
     ctx->namespace = ctx->components[0];
-    if (ctx->namespace.len == 0 || ctx->namespace.len > 255) {
+    ctx->structured_key = 1;
+    ctx->structured_url = 1;
+
+    if (ctx->components[1].len == 0 || ctx->host.len == 0
+        || ctx->components[3].len == 0
+        || ctx->namespace.len == 0 || ctx->namespace.len > 255)
+    {
         return NGX_ERROR;
     }
     for (i = 0; i < ctx->namespace.len; i++) {
@@ -2586,110 +2589,16 @@ ngx_http_cache_purge_capture_identity(ngx_http_cache_purge_capture_t *ctx)
     return NGX_OK;
 }
 
-static ngx_int_t
-ngx_http_cache_purge_capture_values(ngx_http_cache_purge_capture_t *ctx)
-{
-    ngx_http_request_t                   *r;
-    ngx_http_cache_purge_capture_conf_t  *conf;
-    ngx_http_cache_purge_capture_main_t  *main;
-    ngx_http_variable_value_t            *host;
-    ngx_str_t                            value, *out;
-    ngx_uint_t                           i;
-
-    ngx_flag_t  structured[NGX_HTTP_CACHE_PURGE_FIELD_COUNT];
-
-    r = ctx->request;
-    conf = ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_index_module);
-    main = ngx_http_get_module_main_conf(r, ngx_http_cache_purge_index_module);
-
-    ngx_memzero(structured, sizeof(structured));
-    structured[NGX_HTTP_CACHE_PURGE_FIELD_KEY] =
-        conf->field[NGX_HTTP_CACHE_PURGE_FIELD_KEY]
-        && ngx_http_cache_purge_capture_equal(
-            conf->field[NGX_HTTP_CACHE_PURGE_FIELD_KEY]->value,
-            "$cache_key_base");
-    structured[NGX_HTTP_CACHE_PURGE_FIELD_URL] =
-        conf->field[NGX_HTTP_CACHE_PURGE_FIELD_URL]
-        && ngx_http_cache_purge_capture_equal(
-            conf->field[NGX_HTTP_CACHE_PURGE_FIELD_URL]->value,
-            "$cache_key_url");
-    structured[NGX_HTTP_CACHE_PURGE_FIELD_NAMESPACE] =
-        conf->field[NGX_HTTP_CACHE_PURGE_FIELD_NAMESPACE]
-        && ngx_http_cache_purge_capture_equal(
-            conf->field[NGX_HTTP_CACHE_PURGE_FIELD_NAMESPACE]->value,
-            "$cache_key_namespace");
-
-    if ((structured[NGX_HTTP_CACHE_PURGE_FIELD_KEY]
-         || structured[NGX_HTTP_CACHE_PURGE_FIELD_URL]
-         || structured[NGX_HTTP_CACHE_PURGE_FIELD_NAMESPACE])
-        && ngx_http_cache_purge_capture_identity(ctx) != NGX_OK)
-    {
-        return NGX_ERROR;
-    }
-
-    for (i = NGX_HTTP_CACHE_PURGE_FIELD_KEY;
-         i < NGX_HTTP_CACHE_PURGE_FIELD_COUNT; i++)
-    {
-        if (i == NGX_HTTP_CACHE_PURGE_FIELD_TAG) {
-            continue;
-        }
-
-        out = i == NGX_HTTP_CACHE_PURGE_FIELD_KEY ? &ctx->key :
-              i == NGX_HTTP_CACHE_PURGE_FIELD_URL ? &ctx->url :
-                                                   &ctx->namespace;
-
-        if (structured[i]) {
-            continue;
-        }
-
-        if (conf->field[i] == NULL) {
-            if (ngx_http_cache_purge_capture_native_key(ctx, out) != NGX_OK) {
-                return NGX_ERROR;
-            }
-            continue;
-        }
-
-        if (ngx_http_complex_value(r, conf->field[i], &value) != NGX_OK
-            || ngx_http_cache_purge_capture_borrow(ctx, out, value) != NGX_OK)
-        {
-            return NGX_ERROR;
-        }
-    }
-
-    ctx->structured_key = structured[NGX_HTTP_CACHE_PURGE_FIELD_KEY];
-    ctx->structured_url = structured[NGX_HTTP_CACHE_PURGE_FIELD_URL];
-
-    host = ngx_http_get_flushed_variable(r, main->host_index);
-    if (host == NULL || host->not_found) {
-        return NGX_ERROR;
-    }
-    value.data = host->data;
-    value.len = host->len;
-    if (ngx_http_cache_purge_capture_borrow(ctx, &ctx->host, value) != NGX_OK
-        || ctx->host.len == 0 || ctx->key.len == 0 || ctx->url.len == 0
-        || ctx->namespace.len == 0 || ctx->namespace.len > 255)
-    {
-        return NGX_ERROR;
-    }
-    for (i = 0; i < ctx->namespace.len; i++) {
-        if (ctx->namespace.data[i] <= 0x20 || ctx->namespace.data[i] >= 0x7f
-            || ctx->namespace.data[i] == ',')
-        {
-            return NGX_ERROR;
-        }
-    }
-    return NGX_OK;
-}
 
 static ngx_int_t
 ngx_http_cache_purge_capture(ngx_http_request_t *r)
 {
-    ngx_http_cache_purge_capture_conf_t *conf =
-        ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_index_module);
+    ngx_http_cache_purge_capture_main_t *main =
+        ngx_http_get_module_main_conf(r, ngx_http_cache_purge_index_module);
     ngx_http_cache_purge_capture_t  *ctx;
     ngx_pool_cleanup_t              *cln;
 
-    if (conf->field[NGX_HTTP_CACHE_PURGE_FIELD_KEY] == NULL) {
+    if (!main->enabled) {
         return NGX_DECLINED;
     }
     if (r->cache == NULL) {
@@ -2731,7 +2640,7 @@ ngx_http_cache_purge_capture(ngx_http_request_t *r)
     r->upstream->finalize_request = ngx_http_cache_purge_error_finalize;
 
     ngx_memcpy(ctx->native_main, ctx->cache->main, 16);
-    if (ngx_http_cache_purge_capture_values(ctx) != NGX_OK) {
+    if (ngx_http_cache_purge_capture_identity(ctx) != NGX_OK) {
         return NGX_ERROR;
     }
     if (ctx->create_request
@@ -2794,7 +2703,7 @@ ngx_http_cache_purge_detached_key(ngx_http_cache_purge_capture_t *ctx)
         if (rc == NGX_OK && size) {
             ngx_md5_final(ctx->native_main, &md5);
             ctx->cache = &cache;
-            rc = ngx_http_cache_purge_capture_values(ctx);
+            rc = ngx_http_cache_purge_capture_identity(ctx);
             ctx->cache = NULL;
         } else {
             rc = NGX_ERROR;
@@ -3145,14 +3054,28 @@ ngx_http_cache_purge_capture_tags(ngx_http_cache_purge_capture_t *ctx,
     return NGX_OK;
 }
 
+static ngx_http_complex_value_t *
+ngx_http_cache_purge_tag_expression(ngx_http_request_t *r)
+{
+    ngx_http_cache_purge_capture_conf_t  *conf;
+
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_index_module);
+#if (NGX_EXPR)
+    return ngx_http_get_expr_ptr_value(r, conf->tag);
+#else
+    return conf->tag;
+#endif
+}
+
 static ngx_int_t
 ngx_http_cache_purge_capture_header(ngx_http_request_t *r)
 {
-    ngx_http_cache_purge_capture_t *ctx =
-        ngx_http_get_module_ctx(r, ngx_http_cache_purge_index_module);
-    ngx_http_cache_purge_capture_conf_t  *conf;
-    ngx_str_t                             value;
-    ngx_int_t                             rc;
+    ngx_http_cache_purge_capture_t  *ctx;
+    ngx_http_complex_value_t        *expression;
+    ngx_str_t                        value;
+    ngx_int_t                        rc;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_cache_purge_index_module);
     if (ctx && ctx->error_held && ctx->cache == r->cache
         && ctx->read_upstream == r->upstream && r->upstream->cleanup != NULL)
     {
@@ -3170,12 +3093,11 @@ ngx_http_cache_purge_capture_header(ngx_http_request_t *r)
     if (ctx && !ctx->detached && !ctx->failed
         && ctx->cache == r->cache && !r->cached)
     {
-        conf =
-            ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_index_module);
+        expression = ngx_http_cache_purge_tag_expression(r);
         rc = NGX_ERROR;
-        if (conf->field[NGX_HTTP_CACHE_PURGE_FIELD_TAG] == NULL
+        if (expression == NULL
             || (ngx_http_complex_value(r,
-                    conf->field[NGX_HTTP_CACHE_PURGE_FIELD_TAG], &value)
+                    expression, &value)
                 == NGX_OK
                 && ngx_http_cache_purge_capture_tags(ctx, value) == NGX_OK))
         {
@@ -3224,7 +3146,6 @@ static void
 ngx_http_cache_purge_read_validation_capture(
     ngx_http_cache_purge_capture_t *ctx)
 {
-    ngx_http_cache_purge_capture_conf_t  *conf;
     ngx_http_cache_purge_revalidation_t  *v;
     ngx_http_variable_value_t            *variable;
     ngx_http_complex_value_t             *expression;
@@ -3281,8 +3202,7 @@ ngx_http_cache_purge_read_validation_capture(
         v->after.valid_msec |= NGX_HTTP_CACHE_MUST_REVALIDATE;
     }
 #endif
-    conf = ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_index_module);
-    expression = conf->field[NGX_HTTP_CACHE_PURGE_FIELD_TAG];
+    expression = ngx_http_cache_purge_tag_expression(r);
     if (expression != NULL) {
         name = expression->value;
         direct = name.len > prefix.len
@@ -4620,47 +4540,36 @@ ngx_http_cache_purge_capture_create_main(ngx_conf_t *cf)
 static void *
 ngx_http_cache_purge_capture_create_conf(ngx_conf_t *cf)
 {
-    return ngx_pcalloc(cf->pool, sizeof(ngx_http_cache_purge_capture_conf_t));
+    ngx_http_cache_purge_capture_conf_t  *conf;
+
+    conf = ngx_pcalloc(cf->pool, sizeof(*conf));
+    if (conf == NULL) {
+        return NULL;
+    }
+    conf->tag = NGX_CONF_UNSET_PTR;
+    return conf;
 }
+
 static char *
 ngx_http_cache_purge_capture_merge(ngx_conf_t *cf, void *parent, void *child)
 {
-    ngx_http_cache_purge_capture_conf_t  *p = parent, *c = child;
+    ngx_http_cache_purge_capture_conf_t  *prev = parent;
+    ngx_http_cache_purge_capture_conf_t  *conf = child;
     ngx_http_cache_purge_capture_main_t  *main;
-    ngx_http_compile_complex_value_t      compile;
-    ngx_str_t                            host = ngx_string("$host");
-    void     ***location;
-    ngx_uint_t  i;
-    for (i = 0; i < NGX_HTTP_CACHE_PURGE_FIELD_COUNT; i++) {
-        if (c->field[i] == NULL) {
-            c->field[i] = p->field[i];
-        }
-    }
-    if (c->field[NGX_HTTP_CACHE_PURGE_FIELD_NAMESPACE] == NULL) {
-        c->field[NGX_HTTP_CACHE_PURGE_FIELD_NAMESPACE] =
-            ngx_pcalloc(cf->pool, sizeof(ngx_http_complex_value_t));
-        if (c->field[NGX_HTTP_CACHE_PURGE_FIELD_NAMESPACE] == NULL) {
-            return NGX_CONF_ERROR;
-        }
-        ngx_memzero(&compile, sizeof(compile));
-        compile.cf = cf;
-        compile.value = &host;
-        compile.complex_value = c->field[NGX_HTTP_CACHE_PURGE_FIELD_NAMESPACE];
-        if (ngx_http_compile_complex_value(&compile) != NGX_OK) {
-            return NGX_CONF_ERROR;
-        }
-    }
-    if (c->field[NGX_HTTP_CACHE_PURGE_FIELD_KEY]
-        && ngx_http_cache_purge_capture_equal(
-            c->field[NGX_HTTP_CACHE_PURGE_FIELD_KEY]->value, "$cache_key_full"))
+    void                               ***location;
+
+#if (NGX_EXPR)
+    if (ngx_conf_merge_expr_ptr_value(cf, &conf->tag, prev->tag, NULL)
+        != NGX_OK)
     {
-        ngx_conf_log_error(
-            NGX_LOG_EMERG, cf, 0,
-            "cache_purge_key must exclude range; use $cache_key_base");
         return NGX_CONF_ERROR;
     }
-    main = ngx_http_conf_get_module_main_conf(
-        cf, ngx_http_cache_purge_index_module);
+#else
+    ngx_conf_merge_ptr_value(conf->tag, prev->tag, NULL);
+#endif
+
+    main = ngx_http_conf_get_module_main_conf(cf,
+                                             ngx_http_cache_purge_index_module);
     location = ngx_array_push(&main->locations);
     if (location == NULL) {
         return NGX_CONF_ERROR;
@@ -4687,7 +4596,6 @@ ngx_http_cache_purge_capture_post(ngx_conf_t *cf)
                                            ngx_http_cache_purge_index_module);
     ngx_http_cache_purge_capture_conf_t  *conf;
     ngx_http_cache_purge_capture_main_t  *old;
-    ngx_http_core_loc_conf_t             *core;
     ngx_module_t                         *module;
     ngx_command_t                        *cmd;
     ngx_array_t                         **slot, *array;
@@ -4698,29 +4606,11 @@ ngx_http_cache_purge_capture_post(ngx_conf_t *cf)
     ngx_http_upstream_local_t           **local_slot, *local;
     void                               ***locations = main->locations.elts;
     ngx_uint_t                            i, j, k;
-    ngx_str_t                            host = ngx_string("host");
 #if (NGX_RESTY_EXT && NGX_HTTP_PROXY_FILTER)
     ngx_http_proxy_filter_main_conf_t  *filters;
     ngx_http_proxy_filter_pt           *handler;
 #endif
-    main->host_index = ngx_http_get_variable_index(cf, &host);
-    if (main->host_index == NGX_ERROR) {
-        return NGX_ERROR;
-    }
-    for (k = 0; k < main->locations.nelts; k++) {
-        conf = locations[k][ngx_http_cache_purge_index_module.ctx_index];
-        if (conf->field[NGX_HTTP_CACHE_PURGE_FIELD_KEY] == NULL) {
-            continue;
-        }
-        main->enabled = 1;
-        if (!ngx_http_cache_purge_runtime_configured(cf)) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "cache_purge_key requires cache_purge_store and "
-                               "cache_purge_state_zone");
-            return NGX_ERROR;
-        }
-
-    }
+    main->enabled = ngx_http_cache_purge_runtime_configured(cf);
     if (cf->cycle->old_cycle && cf->cycle->old_cycle->conf_ctx
         && cf->cycle->old_cycle->conf_ctx[ngx_http_module.index])
     {
@@ -4736,11 +4626,15 @@ ngx_http_cache_purge_capture_post(ngx_conf_t *cf)
         }
         if ((old ? old->enabled : 0) != main->enabled) {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                "enabling/disabling cache_purge_key indexing requires a full "
+                "enabling/disabling cache purge indexing requires a full "
                 "restart to replace memory-only cache error state");
             return NGX_ERROR;
         }
     }
+    if (!main->enabled) {
+        return NGX_OK;
+    }
+
     for (i = 0; cf->cycle->modules[i]; i++) {
         module = cf->cycle->modules[i];
         if (module->type != NGX_HTTP_MODULE || module->commands == NULL) {
@@ -4754,10 +4648,7 @@ ngx_http_cache_purge_capture_post(ngx_conf_t *cf)
                     return NGX_ERROR;
                 }
                 for (k = 0; k < main->locations.nelts; k++) {
-                    conf = locations[k][
-                        ngx_http_cache_purge_index_module.ctx_index];
-                    if (conf->field[NGX_HTTP_CACHE_PURGE_FIELD_KEY] == NULL
-                        || locations[k][module->ctx_index] == NULL)
+                    if (locations[k][module->ctx_index] == NULL)
                     {
                         continue;
                     }
@@ -4817,8 +4708,6 @@ ngx_http_cache_purge_capture_post(ngx_conf_t *cf)
                 return NGX_ERROR;
             }
             for (k = 0; k < main->locations.nelts; k++) {
-                conf =
-                    locations[k][ngx_http_cache_purge_index_module.ctx_index];
                 if (locations[k][module->ctx_index] == NULL)
                 {
                     continue;
@@ -4833,19 +4722,6 @@ ngx_http_cache_purge_capture_post(ngx_conf_t *cf)
                                                       cache_bypass));
                 if (upstream->cache <= 0) {
                     continue;
-                }
-                if (conf->field[NGX_HTTP_CACHE_PURGE_FIELD_KEY] == NULL) {
-                    core = locations[k][ngx_http_core_module.ctx_index];
-                    if (main->enabled && core->handler != NULL) {
-                        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                            "location \"%V\" has upstream caching without "
-                            "cache_purge_key; inherit or configure an index "
-                            "key, or disable its upstream cache", &core->name);
-                        return NGX_ERROR;
-                    }
-                    if (!main->enabled) {
-                        continue;
-                    }
                 }
                 if (*slot && *slot != NGX_CONF_UNSET_PTR && (*slot)->nelts) {
                     value = (*slot)->elts;

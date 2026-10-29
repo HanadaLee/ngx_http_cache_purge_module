@@ -51,6 +51,7 @@ invalid = [
     encode([b'bad name', *valid[0][1:]]),
     encode([b'bad,name', *valid[0][1:]]),
     encode([b'n' * 256, *valid[0][1:]]),
+    *(encode([*valid[0][:i], b'', *valid[0][i + 1:]]) for i in (1, 2, 3)),
 ]
 
 
@@ -79,8 +80,7 @@ for i, key in enumerate([*(encode(fields) for fields in valid), *invalid]):
 loads = ''.join(f'load_module {a.build}/objs/{name}.so;\n' for name in
                 ('ngx_http_cache_rocksdb_module', 'ngx_http_cache_purge_module')
                 if (a.build / 'objs' / (name + '.so')).exists())
-# These variables only satisfy the transitional capture directive syntax.
-# Their values are deliberately wrong: identity must come from native bytes.
+# No key-module variable or independent identity expression is configured.
 config = loads + f'''daemon off;
 master_process on;
 worker_processes 1;
@@ -89,15 +89,9 @@ error_log {run}/error.log info;
 events {{ worker_connections 64; }}
 http {{
     access_log off;
-    map $host $cache_key_base {{ default wrong-key; }}
-    map $host $cache_key_url {{ default wrong-url; }}
-    map $host $cache_key_namespace {{ default wrong-namespace; }}
     proxy_cache_path {run}/cache keys_zone=cache:1m levels=1:2;
     cache_purge_store {run}/index cache=8m write_buffer=2m;
     cache_purge_state_zone control 2m;
-    cache_purge_key $cache_key_base;
-    cache_purge_url $cache_key_url;
-    cache_purge_tag_namespace $cache_key_namespace;
     cache_purge_tag topic;
     server {{
         listen 127.0.0.1:{port};
@@ -117,7 +111,7 @@ def request(path, payload=None):
     try:
         conn.request('POST' if payload is not None else 'GET', path,
                      json.dumps(payload) if payload is not None else None,
-                     {'Host': 'format.test', 'Content-Type': 'application/json'})
+                     {'Host': 'request-host.test', 'Content-Type': 'application/json'})
         reply = conn.getresponse()
         return reply.status, reply.getheader('X-Cache-Status'), reply.read()
     finally:
@@ -246,7 +240,7 @@ logs = (run / 'error.log').read_text() + (run / 'stdout.log').read_text()
 assert not any(word in logs for word in ('[alert]', 'AddressSanitizer', 'LeakSanitizer', 'runtime error:', 'exited on signal'))
 a.output.write_text(json.dumps({'build': str(a.build), 'run': str(run), 'checks': checks,
                                'key_module_loaded': False,
-                               'transitional_identity_directives': True,
+                               'transitional_identity_directives': False,
                                'binaries': {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                                             for path in [binary, *(a.build / 'objs').glob('*.so')]}}, indent=2) + '\n')
 print('PASS', len(checks), 'independent native-format checks')

@@ -73,8 +73,6 @@ http {{
         location / {{
             proxy_cache release;
             proxy_cache_key $cache_key_full;
-            cache_purge_key $cache_key_base;
-            cache_purge_url $cache_key_url;
             add_header X-Test-Cache $upstream_cache_status always;
             proxy_pass http://127.0.0.1:{origin.server_port};
         }}

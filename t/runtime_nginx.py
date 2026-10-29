@@ -251,11 +251,11 @@ proxy_cache_path {self.path}/cache-b keys_zone=b:1m;
 server {{ listen 127.0.0.1:{self.port};
 {rpc_locations}
 location /hold/ {{ proxy_pass http://127.0.0.1:{origin.server_port}; proxy_buffering off; }}
-location /cache/a {{ cache_purge_test_reader on; proxy_cache a; proxy_cache_key $uri;
+location /cache/a {{ cache_purge_test_reader on; proxy_cache a; proxy_cache_key "tenant\x1fhttp\x1fexample.test\x1f$uri\x1f\x1f";
 proxy_pass http://127.0.0.1:{origin.server_port}; add_header X-Cache $upstream_cache_status always; }}
-location /cache/b {{ cache_purge_test_reader on; proxy_cache b; proxy_cache_key $uri;
+location /cache/b {{ cache_purge_test_reader on; proxy_cache b; proxy_cache_key "tenant\x1fhttp\x1fexample.test\x1f$uri\x1f\x1f";
 proxy_pass http://127.0.0.1:{origin.server_port}; add_header X-Cache $upstream_cache_status always; }}
-location /other {{ cache_purge_test_reader on; proxy_cache a; proxy_cache_key $uri;
+location /other {{ cache_purge_test_reader on; proxy_cache a; proxy_cache_key "tenant\x1fhttp\x1fexample.test\x1f$uri\x1f\x1f";
 proxy_pass http://127.0.0.1:{origin.server_port}; add_header X-Cache $upstream_cache_status always; }}
 }} }}'''
         if not enabled:
@@ -326,7 +326,7 @@ def process_memory(master):
 def warm(case, path):
     assert case.get(path)[:2] == (200, 'MISS')
     zone = 'cache-b' if path == '/cache/b' else 'cache-a'
-    until(lambda: (case.path / zone / hashlib.md5(path.encode()).hexdigest()).is_file())
+    until(lambda: (case.path / zone / hashlib.md5(b'tenant\x1fhttp\x1fexample.test\x1f' + path.encode() + b'\x1f\x1f').hexdigest()).is_file())
     assert case.get(path)[:2] == (200, 'HIT')
 
 memory = {}
