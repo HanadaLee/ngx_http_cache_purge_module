@@ -803,8 +803,9 @@ replacement or a successfully revalidated instance. Submission is bounded to
 32 jobs and 256 KiB per worker, with a five-second retry deadline. Once retired,
 normal persistent collection continues across executor restarts.
 
-The executor resolves propagation through the asynchronous request object
-query, using native representation identity and current or retained membership.
+Shared rules resolve direct propagation requirements. Scoped TAG candidates
+use the asynchronous request object query, with native representation identity
+and current or retained membership.
 The earlier file-only and history-only coordinator queries have been removed.
 Their internal IPC opcode 31 is retired and rejected; opcode 32 remains the
 request object query. Propagation results never grant cache admission.
@@ -876,11 +877,17 @@ Managed proxy requests resolve propagation associations only at the first-send
 gate. A HIT does not query the representation index before reading its cache
 file. When the serving control image has no outgoing requirements, the send gate
 also skips the object lookup. Each reader retains only the image version and
-latest propagation deadline. PREPARING rules still require a lookup before
-dispatch. The gate rechecks the accepted sequence before sending request bytes
-and preserves incoming requirements. This does not bypass local cache admission:
-HITs still use `ADMIT_FILE`, so complete foreground database isolation remains
-unfinished.
+latest propagation deadline. Active and PREPARING key, URL, prefix and host
+rules are matched in shared memory before allocating an IPC payload. A complete
+match with no relevant TAG candidate skips the executor, including when TAG
+rules exist only in other namespaces or hosts. Matching is bounded to 64
+results and 64 KiB; a relevant TAG candidate, limit or image change discards
+partial results and uses the complete object query.
+The gate rechecks the accepted sequence before sending request bytes and
+preserves incoming requirements. This does not bypass local cache admission:
+ordinary HITs use file proofs and shared rules through the selected read pool.
+Retained TAG queries, fill transactions and durable 304 validation still use
+the executor, so complete foreground database isolation remains unfinished.
 
 When a lookup is needed, one IPC request holds its bounded input until completion,
 disconnect or the original deadline. The executor admits at most four object

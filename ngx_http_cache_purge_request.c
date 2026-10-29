@@ -880,11 +880,30 @@ ngx_http_cache_purge_propagation_reply(ngx_http_cache_purge_call_t *call,
     ngx_post_event(&ctx->read_event, &ngx_posted_events);
 }
 
+static int
+ngx_http_cache_purge_propagation_match(void *data,
+    const ngx_http_cache_purge_control_match_t *match)
+{
+    ngx_http_cache_purge_fence_t  *fence = data;
+    uint64_t                      *cutoff;
+
+    if (match->flags & NGX_HTTP_CACHE_PURGE_CONTROL_TAG_CANDIDATE) {
+        /* The shared image cannot resolve this representation's TAGs. */
+        return NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND;
+    }
+    cutoff = match->mode == NGX_HTTP_CACHE_PURGE_INVALIDATE
+             ? &fence->invalidate_ms : &fence->delete_ms;
+    *cutoff = ngx_max(*cutoff, match->issued_at_ms);
+    return 0;
+}
+
 static ngx_int_t
 ngx_http_cache_purge_propagation_query(ngx_http_cache_purge_capture_t *ctx)
 {
     ngx_http_cache_purge_control_reader_t  *reader;
+    ngx_http_cache_purge_control_context_t  context;
     ngx_http_cache_purge_watermark_t        watermark;
+    ngx_http_cache_purge_fence_t            fence;
     ngx_http_cache_rocksdb_error_t          error;
     ngx_http_request_t                     *r;
     ngx_list_part_t                        *part;
@@ -901,26 +920,47 @@ ngx_http_cache_purge_propagation_query(ngx_http_cache_purge_capture_t *ctx)
 
     r = ctx->request;
     timeout = ctx->deadline - ngx_current_msec;
-    if (r->main->terminated || (ngx_msec_int_t) timeout <= 0
-        || ngx_http_cache_purge_runtime_client(r, &ctx->client) != NGX_OK)
-    {
+    if (r->main->terminated || (ngx_msec_int_t) timeout <= 0) {
         return NGX_ERROR;
     }
     now = ngx_timeofday();
-    if (ngx_http_cache_purge_runtime_reader(r, &reader, &error) == 0
-        && ngx_http_cache_purge_control_propagation_needed(reader,
-               (uint64_t) now->sec * 1000 + now->msec, &needed,
-               &watermark, &publication, &error) == 0
-        && !needed)
-    {
+    ngx_memzero(&fence, sizeof(fence));
+    rc = ngx_http_cache_purge_runtime_reader(r, &reader, &error);
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_control_propagation_needed(reader,
+            (uint64_t) now->sec * 1000 + now->msec, &needed,
+            &watermark, &publication, &error);
+        if (rc == 0 && needed) {
+            ngx_memzero(&context, sizeof(context));
+            context.key.data = ctx->key.data;
+            context.key.len = ctx->key.len;
+            context.url.data = ctx->url.data;
+            context.url.len = ctx->url.len;
+            context.host.data = ctx->host.data;
+            context.host.len = ctx->host.len;
+            context.tag_namespace.data = ctx->namespace.data;
+            context.tag_namespace.len = ctx->namespace.len;
+            context.now_ms = (uint64_t) now->sec * 1000 + now->msec;
+            context.proxy = 1;
+            rc = ngx_http_cache_purge_control_propagation(reader, &context,
+                0, 64, 65536, ngx_http_cache_purge_propagation_match, &fence,
+                &watermark, &publication, &error);
+        }
+    }
+    if (rc == 0) {
         /* Local admission and incoming requirements remain independent. A
          * new accepted sequence is checked again before the first send. */
-        ngx_memzero(&ctx->local_fence, sizeof(ctx->local_fence));
+        ctx->local_fence = fence;
         ctx->local_watermark = watermark;
         ctx->local_publication = publication;
         ctx->local_ready = 1;
         ngx_post_event(&ctx->read_event, &ngx_posted_events);
         return NGX_OK;
+    }
+    /* Discard partial matches on a TAG candidate, limit or image change.
+     * Only the complete executor query may then supply local requirements. */
+    if (ngx_http_cache_purge_runtime_client(r, &ctx->client) != NGX_OK) {
+        return NGX_ERROR;
     }
     fields[0] = ctx->key;
     fields[1] = ctx->url;

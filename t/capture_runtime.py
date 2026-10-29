@@ -404,6 +404,10 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
       cache_purge_key_misc ""; cache_purge_key_namespace manual;
       proxy_cache off; proxy_cache_key "manual\x1fhttp\x1f$host\x1f$uri\x1f\x1f";
       proxy_pass http://127.0.0.1:{origin.server_port}; }}
+  location /propagation/direct-race {{ {propagation_manual_config}
+      cache_purge_key_url "$scheme://$host$uri";
+      cache_purge_key_misc ""; cache_purge_key_namespace direct-race;
+      proxy_cache off; proxy_pass http://$send_host:{origin.server_port}; }}
   location /propagation/uncached-ignore {{ {propagation_config}
       cache_purge_ignore_propagation on;
       proxy_cache off; proxy_pass http://127.0.0.1:{origin.server_port}; }}
@@ -2200,6 +2204,64 @@ try:
         found = until(lambda: (v if len(v := query('http://prop.test' + path)) == count
                                and all(item[2] == 2 for item in v) else None))
         return [record(item[0]) for item in found]
+
+    direct_host = 'direct-only.test'
+    direct_path = '/propagation/uncached-manual/direct'
+
+    def direct_push(name, selector, mode='delete'):
+        operation = api_input(name, selector, mode)
+        response = api('/__purge/v2/operations', operation)
+        assert response[0] == 202 and response[2]['effective'], response
+        until(lambda: api('/__purge/v2/operations/' + name)[2]['cleanup']['state'] == 'done')
+        until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
+        return calendar.timegm(time.strptime(operation['event']['issued_at'], '%Y-%m-%dT%H:%M:%SZ')) * 1000
+
+    def direct_requests(path, expected):
+        initial = int.from_bytes(rpc(1)[40:48], 'big')
+        for _ in range(10):
+            assert get(path, {'Host': direct_host}) == (200, None, path.encode())
+            propagated(propagation_headers(path), expected)
+        final = int.from_bytes(rpc(1)[40:48], 'big')
+        assert final - initial == 1, ('direct propagation IPC', initial, final)
+
+    tag_push('direct-unrelated-scope', 'direct-unrelated-tag')
+    until(lambda: api('/__purge/v2/operations/direct-unrelated-scope')[2]['cleanup']['state'] == 'done')
+    until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
+    direct_requests(direct_path, None)
+    checks.append('uncached proxy skips executor IPC when active TAG rules have a different namespace and host')
+
+    invalidated = direct_push('direct-url', {'type': 'url', 'value': 'http://' + direct_host + direct_path}, 'invalidate')
+    deleted = int(time.time() * 1000)
+    response = get('/push/direct', {'X-Target': 'http://' + direct_host + direct_path,
+                   'X-Namespace': 'manual', 'X-Cache-Purge-Type': 'key',
+                   'X-Cache-Purge-Operation-Id': 'direct-key',
+                   'X-Cache-Purge-Issued-At': str(deleted)}, method='PURGE')
+    assert response[0] == 202, response
+    until(lambda: api('/__purge/v2/operations/direct-key')[2]['cleanup']['state'] == 'done')
+    until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
+    direct_requests(direct_path, (invalidated, deleted))
+    prefix = direct_path + '-prefix/'
+    deleted = direct_push('direct-prefix', {'type': 'prefix', 'field': 'url', 'value': 'http://' + direct_host + prefix})
+    direct_requests(prefix + 'leaf', (0, deleted))
+    deleted = direct_push('direct-host', {'type': 'host', 'value': direct_host})
+    direct_requests(direct_path + '-host', (0, deleted))
+    checks.append('direct URL, key, prefix and host propagation uses shared rules with zero executor IPC')
+
+    uri = '/propagation/direct-race'
+    gate_host = 'direct-held.send.test'
+    arrived, release = threading.Event(), threading.Event()
+    dns_holds[gate_host] = arrived, release
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(get, uri + '?gate=' + gate_host, {'Host': 'race-only.test'})
+        try:
+            assert arrived.wait(5), 'proxy did not reach DNS after direct lookup'
+            deleted = direct_push('direct-send-race', {'type': 'url', 'value': 'http://race-only.test' + uri})
+        finally:
+            release.set()
+        response = future.result(timeout=12)
+    assert response == (200, None, uri.encode()), response
+    propagated(propagation_headers(uri), (0, deleted))
+    checks.append('a direct rule accepted during DNS wait refreshes the shared-memory result before the first send')
 
     uri = '/propagation/entry-hit'
     policies[uri] = 'entry-hit-tag'
