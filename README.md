@@ -42,11 +42,21 @@ the publisher rechecks file identity and current rules before becoming readable.
 Disconnects and timeouts leave the committed intent for bounded recovery. PREPARE
 does not synchronize an unpublished file. A power loss that loses only READY
 causes a MISS. In-place 304 validation and physical deletion retain their syncs.
-STAGED is a new state in the module's existing 40-byte xattr marker; it does not
-change the native nginx cache format. Older module readers reject STAGED, while
-both versions accept completed READY markers. Before reverting to an older
-module, drain unfinished STAGED fills with this version: older versions reject
-them safely but may leave their publication intents pending.
+STAGED keeps the 40-byte NCF1 marker. Ledger-backed READY files use NCF2 in the
+same xattr: a 152-byte header plus 16 bytes per TAG, at most 1,176 bytes. It binds
+the instance, physical stat, configured identity digest, entity/validation
+watermarks and persistent Invalidate requirement. Native nginx cache bytes are
+unchanged. Older module readers reject NCF2; a binary upgrade requires a full
+restart, and downgrading is not a transparent reuse of these markers.
+
+Background Invalidate persists the file requirement before advancing its task.
+304 preparation and Delete durably revoke the old proof before header mutation
+or unlink. Successful 304 validation publishes the new TAG set and watermarks
+after its index transaction commits. A reader checks the exact descriptor and
+both stat snapshots; legacy, revoked, replaced or unlinked instances do not
+provide independent admission. Current HTTP HITs still use `ADMIT_FILE` while
+the worker-side proof reader is being integrated. Larger xattrs can allocate an
+extra filesystem block per object; their byte length alone is not the disk cost.
 The WAL sync group includes both single-file/native preparation and the batch
 preparation API. Native representation bindings and their file intent remain in
 the same atomic batch. Tests count actual WAL sync calls through these entry
@@ -429,7 +439,12 @@ proxy_cache_key $cache_key_full;
 cache_purge_tag $upstream_http_cache_tag;
 ```
 
-Key, URL, host and namespace are derived from nginx's actual native key bytes,
+The following native-format adapter is transitional. Independent
+`cache_purge_key_url`, `cache_purge_key_misc` and `cache_purge_key_namespace`
+expressions, per-protocol `*_cache_purge` activation and PURGE handling are being
+implemented; they will not require a particular native key format or producer.
+
+In the current adapter, key, URL, host and namespace come from native key bytes,
 including requests that bypass cache reads. Purge uses `us-escape-v1` decoding
 and does not include the
 key module's headers, resolve its C symbols, or require its load order. The six
@@ -532,7 +547,7 @@ On graceful reload, the old worker requests asynchronous executor shutdown so
 long-lived HTTP responses do not keep the database owner indefinitely. Its
 executor finishes the current operation and closes the DB before the replacement
 opens it. The old worker can continue sending its response and joins the stopped
-executor when it exits. The component C ABI is 11; rebuild its archives together
+executor when it exits. The component C ABI is 12; rebuild its archives together
 with the addon. Upgrading from an earlier component ABI or shared-control ABI 5
 or earlier requires a full nginx restart; persisted cache files and indexes are
 retained. An old executor cannot serve the new object-query opcode during a
@@ -716,8 +731,10 @@ by the publisher; neither request lookup computes SHA-256. Both retain the same
 namespace/host scope, group deduplication, output budgets and original operation
 callbacks. Added entries and digest bytes count against the existing shared-bank
 limit. Digests are internal matching material, not authentication or L2 headers.
-The digest entry point is groundwork for cache-side admission proof; current
-HTTP HITs still use the database-backed raw TAG path.
+NCF2 files carry these TAG digests. Current HTTP HITs still use the
+database-backed raw TAG path until worker-side proof admission is integrated.
+An empty namespace is a valid exact scope, distinct from every named namespace;
+it never falls back to the request host or means all namespaces.
 
 The per-key identity row contains four unsigned 64-bit values: file count,
 URL dictionary ID, host dictionary ID and namespace dictionary ID. A fill cannot

@@ -375,6 +375,8 @@ http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/
       proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location / {{
                 proxy_pass http://127.0.0.1:{origin.server_port}; }}
+  location /empty-namespace {{ cache_key_namespace ""; proxy_cache_revalidate on;
+      proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /large {{
                      aio threads; aio_write on; proxy_pass http://127.0.0.1:{origin.server_port}; }}
   location /slice {{
@@ -591,6 +593,18 @@ def query(value, kind=1, scope=''):
         if done: return found
         assert next_cursor and next_cursor != cursor and len(found) < 1000
         cursor = next_cursor
+def checked_marker(path):
+    marker = os.getxattr(path, 'user.ngx_cache_purge.id')
+    assert len(marker) >= 40 and marker[4:7] == b'\0\0\0'
+    if marker[:4] == b'NCF1':
+        assert len(marker) == 40 and marker[7] in (1, 2, 3, 4)
+    else:
+        assert marker[:4] == b'NCF2' and len(marker) >= 152 and marker[7] == 2
+        count = int.from_bytes(marker[76:80], 'big')
+        assert count <= 64 and len(marker) == 152 + 16 * count
+    return marker
+
+
 def records(path, count, host='cache.test'):
     # Fixture setup requires published files. query()/record() remain available
     # for tests that intentionally observe an intermediate index transaction.
@@ -601,11 +615,10 @@ def records(path, count, host='cache.test'):
         for item in result:
             target = Path(os.fsdecode(item['root'])) / os.fsdecode(item['path'])
             try:
-                marker = os.getxattr(target, 'user.ngx_cache_purge.id')
+                marker = checked_marker(target)
             except OSError as error:
                 if error.errno in (2, 61): return None  # ENOENT / ENODATA
                 raise
-            assert len(marker) == 40 and marker[:7] == b'NCF1\0\0\0' and marker[7] in (1, 2, 3)
             if marker[7] != 2 or marker[8:24] != item['id']: return None
         return result
     return until(published)
@@ -667,8 +680,8 @@ def writers(sequence):
 def ready_file(item):
     path = Path(os.fsdecode(item['root'])) / os.fsdecode(item['path'])
     def published():
-        marker = os.getxattr(path, 'user.ngx_cache_purge.id')
-        assert len(marker) == 40 and marker[:7] == b'NCF1\0\0\0' and marker[7] in (1, 2, 3) and marker[8:24] == item['id'], (path, marker.hex(), item['id'].hex())
+        marker = checked_marker(path)
+        assert marker[8:24] == item['id'], (path, marker.hex(), item['id'].hex())
         return marker[7] == 2
     # COMMITTED retains its intent while the WAL group awaits durability.
     # An admitted file requires the separate READY publication as well.
@@ -678,6 +691,13 @@ def ready_file(item):
         assert int.from_bytes(metadata[60:64], 'big') == len(metadata) - 64
         metadata = metadata[64:]
     assert item['state'] == 2 and metadata.startswith(b'NFP1')
+    marker = checked_marker(path)
+    assert marker[:4] == b'NCF2'
+    identity = b'NCI1' + b''.join(string(value) for value in
+        (item['namespace'], item['url'], item['components'][4]))
+    assert marker[120:152] == hashlib.sha256(identity).digest()
+    assert marker[152:] == b''.join(hashlib.sha256(tag).digest()[:16]
+                                   for tag in item['tags'])
     return path
 
 def origin_metadata(item):
@@ -743,11 +763,12 @@ def missing_index_read():
     original = records('/lost-index', 1)[0]
     path = ready_file(original)
     marker = os.getxattr(path, 'user.ngx_cache_purge.id')
-    # Model a persisted replacement whose new ID was in the lost WAL tail.
-    # Its old catalogue record and the target path still exist.
+    # A legacy publisher could persist READY before its lost WAL suffix.
+    # NCF2 publication now waits for its index batch, so use the legacy marker
+    # to model this recoverable upgrade case rather than forge a new proof.
     missing = os.urandom(16)
     assert record(missing, optional=True) is None
-    os.setxattr(path, 'user.ngx_cache_purge.id', marker[:8] + missing + marker[24:])
+    os.setxattr(path, 'user.ngx_cache_purge.id', b'NCF1\0\0\0\2' + missing + marker[24:40])
     fresh_bodies['/lost-index'] = b'refilled-after-lost-index'
     assert get('/lost-index') == (200, 'BYPASS', b'refilled-after-lost-index')
     replacement = until(lambda: (item if (item := records('/lost-index', 1)[0])['id']
@@ -862,6 +883,20 @@ try:
     assert len(origin_metadata(first)) == 28
     assert get('/asset')[1] == 'HIT' and calls.count('/asset') == 1
     checks.append('real upstream fill is WAL-indexed with the native key snapshot, scoped tags and READY marker')
+    conditional_paths.add('/empty-namespace')
+    assert get('/empty-namespace') == (200, 'MISS', b'/empty-namespace')
+    empty_namespace = records('/empty-namespace', 1)[0]
+    assert empty_namespace['namespace'] == b''
+    ready_file(empty_namespace)
+    assert get('/empty-namespace') == (200, 'HIT', b'/empty-namespace')
+    checks.append('an empty namespace remains empty in the index and file proof and reuses HIT')
+    assert query('news', kind=5, scope='') == [(empty_namespace['id'], 2, 2)]
+    fence('empty-namespace-tag', 7, tag_group('news', 'empty-absent'),
+          scope='', mode=1)
+    empty_reply = get('/empty-namespace')
+    assert empty_reply == (200, 'REVALIDATED', b'/empty-namespace'), empty_reply
+    assert get('/asset') == (200, 'HIT', b'/asset') and calls.count('/asset') == 1
+    checks.append('TAG lookup and invalidation isolate the empty namespace from named namespaces')
     assert get('/asset', method='HEAD') == (200, 'HIT', b'')
     assert get('/asset', {'Range': 'bytes=1-3'}) == (206, 'HIT', b'ass')
     assert get('/asset', {'If-None-Match': '"capture-v1"'}) == (304, 'HIT', b'')
@@ -1657,6 +1692,16 @@ try:
     reply = api('/__purge/v2/operations', operation, headers={'X-Cache-Purge-Namespace': 'cache.test'})
     assert reply[0] == 202 and reply[2]['tag_host'] == 'cache.test'
     checks.append('HTTP namespace/host TAG scope uses the configured control header, and header renaming does not change semantic idempotency')
+    empty_scope = api_input('api-empty-scope', {'type': 'tag',
+        'values': ['empty-scope-absent'], 'scope': 'namespace'})
+    empty_scope_reply = api('/__purge/v2/operations', empty_scope,
+                            headers={'X-Cache-Purge-Namespace': ''})
+    assert empty_scope_reply[0] == 202 and empty_scope_reply[2]['tag_namespace'] == ''
+    empty_host = api_input('api-empty-host', {'type': 'tag',
+        'values': ['empty-scope-absent'], 'scope': 'host'})
+    assert api('/__purge/v2/operations', empty_host,
+               headers={'X-Cache-Purge-Namespace': ''})[0] == 400
+    checks.append('HTTP accepts an explicit empty namespace and still rejects an empty host scope')
 
     group_a, group_b = '/invalidate/api-group-a', '/invalidate/api-group-b'
     group_other = '/api-group-unrelated'

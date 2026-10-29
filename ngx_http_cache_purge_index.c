@@ -413,7 +413,7 @@ ngx_http_cache_purge_op_validate(ngx_http_cache_purge_op_tx_t *tx,
     ngx_http_cache_rocksdb_bytes_t  tags[64];
     size_t                          count;
     uint32_t                        kind;
-    int                             code, tag;
+    int                             code, tag, scope_valid;
 
     code = stored ? NGX_HTTP_CACHE_ROCKSDB_CORRUPT :
                     NGX_HTTP_CACHE_ROCKSDB_INVALID;
@@ -425,6 +425,11 @@ ngx_http_cache_purge_op_validate(ngx_http_cache_purge_op_tx_t *tx,
     }
     kind = input->selector.kind;
     tag = kind >= NGX_HTTP_CACHE_PURGE_NAMESPACE_TAG;
+    scope_valid = tag
+        ? (kind == NGX_HTTP_CACHE_PURGE_NAMESPACE_TAG
+           || kind == NGX_HTTP_CACHE_PURGE_NAMESPACE_TAGS
+           || input->selector.scope.len != 0)
+        : input->selector.scope.len == 0;
     if (!ngx_http_cache_purge_op_require(
             tx,
             input->mode == NGX_HTTP_CACHE_PURGE_INVALIDATE
@@ -454,11 +459,8 @@ ngx_http_cache_purge_op_validate(ngx_http_cache_purge_op_tx_t *tx,
             stored ? NGX_HTTP_CACHE_ROCKSDB_CORRUPT :
                      NGX_HTTP_CACHE_ROCKSDB_LIMIT,
             "operation selector exceeds limit")
-        || !ngx_http_cache_purge_op_require(tx,
-                                            tag ?
-                                                input->selector.scope.len != 0 :
-                                                input->selector.scope.len == 0,
-                                            code, "invalid selector scope")
+        || !ngx_http_cache_purge_op_require(tx, scope_valid, code,
+                                            "invalid selector scope")
         || !ngx_http_cache_purge_op_require(
             tx,
             input->selector.value.len != 0
@@ -3430,7 +3432,8 @@ ngx_http_cache_purge_index_select(ngx_http_cache_purge_query_t *q,
             || !ngx_http_cache_purge_index_require(
                 q,
                 (!tagged || selector->value.len <= 1024)
-                    && (tagged ? selector->scope.len != 0 :
+                    && (tagged ? (q->kind == NGX_HTTP_CACHE_PURGE_NAMESPACE_TAG
+                                   || selector->scope.len != 0) :
                                  selector->scope.len == 0)
                     && (selector->value.len != 0
                         || q->kind == NGX_HTTP_CACHE_PURGE_KEY_PREFIX
@@ -3668,7 +3671,8 @@ ngx_http_cache_purge_index_group_open(ngx_http_cache_purge_query_t *q,
 
     if (!ngx_http_cache_purge_index_require(q,
             selector->kind <= NGX_HTTP_CACHE_PURGE_HOST_TAGS
-                && selector->scope.len != 0
+                && (selector->kind == NGX_HTTP_CACHE_PURGE_NAMESPACE_TAGS
+                    || selector->scope.len != 0)
                 && ngx_http_cache_purge_op_bytes_valid(selector->scope, 32768)
                 && ngx_http_cache_purge_tags_decode(selector->value,
                                                        tags, &count) == 0,
@@ -3694,7 +3698,10 @@ ngx_http_cache_purge_index_group_open(ngx_http_cache_purge_query_t *q,
     memcpy(group->storage, selector->value.data, value.len);
     group->scope.data = group->storage + value.len;
     group->scope.len = selector->scope.len;
-    memcpy(group->storage + value.len, selector->scope.data, group->scope.len);
+    if (group->scope.len) {
+        memcpy(group->storage + value.len, selector->scope.data,
+               group->scope.len);
+    }
     (void) ngx_http_cache_purge_tags_decode(value, group->tags, &group->count);
     kind = (unsigned char) selector->kind;
     ngx_http_cache_purge_index_append(q, &q->key, &kind, 1);
@@ -5513,7 +5520,7 @@ ngx_http_cache_purge_index_fingerprint(ngx_http_cache_purge_query_t *q,
         || !ngx_http_cache_purge_index_require(
             q,
             file->key.len && file->url.len && file->host.len
-                && file->tag_namespace.len && file->zone.len && file->root.len
+                && file->zone.len && file->root.len
                 && file->root.data[0] == '/'
                 && memchr(file->root.data, 0, file->root.len) == NULL
                 && ngx_http_cache_purge_index_relative(file->path),

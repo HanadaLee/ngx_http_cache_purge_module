@@ -496,6 +496,7 @@ ngx_http_cache_purge_test_requirements()
         query(ops, { SelectorKind::host, "a.test", "" });
         query(ops, { SelectorKind::namespace_tag, "tag", "one" });
         query(ops, { SelectorKind::namespace_tag, "tag", "two" });
+        query(ops, { SelectorKind::namespace_tag, "tag", "" });
         query(ops, { SelectorKind::host_tag, "tag", "a.test" });
         query(ops, { SelectorKind::host_tag, "tag", "other.test" });
     };
@@ -524,6 +525,7 @@ ngx_http_cache_purge_test_requirements()
         add(SelectorKind::key_prefix, std::string("k\0", 2), PurgeMode::remove);
         add(SelectorKind::host, "a.test", PurgeMode::invalidate);
         add(SelectorKind::namespace_tag, "tag", PurgeMode::remove, "one");
+        add(SelectorKind::namespace_tag, "tag", PurgeMode::invalidate, "");
         add(SelectorKind::host_tag, "tag", PurgeMode::invalidate, "a.test");
         auto before = writes(store);
         verify(ops);
@@ -740,6 +742,7 @@ main(int argc, char **argv)
             fails(NGX_HTTP_CACHE_ROCKSDB_INVALID,
                 [&] { ops.accept(invalid, 1000); });
             invalid = input("bad");
+            invalid.selector.kind = SelectorKind::host_tag;
             invalid.selector.scope.clear();
             fails(NGX_HTTP_CACHE_ROCKSDB_INVALID,
                 [&] { ops.accept(invalid, 1000); });

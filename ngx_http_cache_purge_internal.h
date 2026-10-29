@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define NGX_HTTP_CACHE_PURGE_COMPONENT_ABI 11
+#define NGX_HTTP_CACHE_PURGE_COMPONENT_ABI 12
 #define NGX_HTTP_CACHE_PURGE_PROTOCOL_VERSION 1
 #define NGX_HTTP_CACHE_PURGE_FRAME_SIZE 24
 
@@ -158,7 +158,7 @@ typedef struct {
 void ngx_http_cache_purge_component_options(
     ngx_http_cache_purge_component_options_t *options);
 /* Link-time header/archive compatibility marker. */
-uint32_t ngx_http_cache_purge_component_abi_11(void);
+uint32_t ngx_http_cache_purge_component_abi_12(void);
 
 /* Only start after fork in the selected nginx worker, never while parsing
  * configuration or in master. Copies its inputs and starts one executor thread.
@@ -234,6 +234,7 @@ typedef struct {
 #define NGX_HTTP_CACHE_PURGE_WATERMARK_SIZE 28
 #define NGX_HTTP_CACHE_PURGE_VARIANT_SIZE 64
 #define NGX_HTTP_CACHE_PURGE_TAG_DIGEST_SIZE 16
+#define NGX_HTTP_CACHE_PURGE_IDENTITY_DIGEST_SIZE 32
 
 typedef unsigned char
     ngx_http_cache_purge_tag_digest_t[NGX_HTTP_CACHE_PURGE_TAG_DIGEST_SIZE];
@@ -243,6 +244,13 @@ typedef unsigned char
  * A digest collision can only broaden matching; raw input remains exact. */
 int ngx_http_cache_purge_tag_digest(ngx_http_cache_rocksdb_bytes_t tag,
     unsigned char digest[NGX_HTTP_CACHE_PURGE_TAG_DIGEST_SIZE],
+    ngx_http_cache_rocksdb_error_t *error);
+/* Configuration identity only: namespace, URL and misc are framed separately.
+ * No native key parsing, producer API or native key format is involved. */
+int ngx_http_cache_purge_identity_digest(ngx_http_cache_rocksdb_bytes_t url,
+    ngx_http_cache_rocksdb_bytes_t tag_namespace,
+    ngx_http_cache_rocksdb_bytes_t misc,
+    unsigned char digest[NGX_HTTP_CACHE_PURGE_IDENTITY_DIGEST_SIZE],
     ngx_http_cache_rocksdb_error_t *error);
 
 typedef struct {
@@ -383,13 +391,28 @@ extern "C" {
 #define NGX_HTTP_CACHE_PURGE_FILE_PREPARED 1
 #define NGX_HTTP_CACHE_PURGE_FILE_READY 2
 #define NGX_HTTP_CACHE_PURGE_FILE_STAGED 3
+#define NGX_HTTP_CACHE_PURGE_FILE_REVOKED 4
 #define NGX_HTTP_CACHE_PURGE_FILE_MARKER_SIZE 40
+#define NGX_HTTP_CACHE_PURGE_FILE_PROOF_HEADER 152
+#define NGX_HTTP_CACHE_PURGE_FILE_PROOF_SIZE \
+    (NGX_HTTP_CACHE_PURGE_FILE_PROOF_HEADER                                   \
+     + 64 * NGX_HTTP_CACHE_PURGE_TAG_DIGEST_SIZE)
 
 typedef struct {
     unsigned char  id[16];
     unsigned char  address[16];
     uint32_t       state;
 } ngx_http_cache_purge_file_marker_t;
+
+typedef struct {
+    ngx_http_cache_purge_file_marker_t  marker;
+    uint64_t                             device, inode, size, seconds;
+    uint32_t                             nanoseconds, tag_count;
+    unsigned char                        ledger[16];
+    uint64_t                             entity, validated, required;
+    unsigned char                        identity[32];
+    ngx_http_cache_purge_tag_digest_t    tags[64];
+} ngx_http_cache_purge_file_proof_t;
 
 /* The address is a canonical absolute cache filename, not a zone name or key.
  * Lock collisions only serialize unrelated files; marker matching compares
@@ -410,6 +433,26 @@ int ngx_http_cache_purge_file_marker_prepare(int fd, const unsigned char id[16],
 int ngx_http_cache_purge_file_marker_publish(int fd, const unsigned char id[16],
     const unsigned char address[16], int durable,
     ngx_http_cache_rocksdb_error_t *error);
+
+/* NCF2 extends the same xattr with bounded admission material. NCF1 remains
+ * an instance marker only. Reads verify both stat snapshots against the proof;
+ * NOT_FOUND means no independent proof, never permission to serve the file.
+ * These operations may block and must not run under a shared-control pin. */
+int ngx_http_cache_purge_file_proof_read(int fd,
+    ngx_http_cache_purge_file_proof_t *proof,
+    ngx_http_cache_rocksdb_error_t *error);
+/* Caller holds the path lease and has durably committed the exact file.
+ * publish captures physical stat fields; input supplies identity, ledger,
+ * sequences and TAG digests. require/revoke persist before returning. */
+int ngx_http_cache_purge_file_proof_publish(int fd,
+    const ngx_http_cache_purge_file_proof_t *proof, int durable,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_file_proof_require(int fd, const unsigned char id[16],
+    const unsigned char address[16],
+    const ngx_http_cache_purge_watermark_t *required,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_file_proof_revoke(int fd, const unsigned char id[16],
+    const unsigned char address[16], ngx_http_cache_rocksdb_error_t *error);
 
 /* The lock file is persistent and must never be replaced/unlinked while any
  * worker can hold it. Only a newly created file may be chowned. The caller
@@ -1320,6 +1363,16 @@ int ngx_http_cache_purge_publications_remove_checked(
     int anchor_fd, int lease_fd, uint32_t peer_uid,
     ngx_http_cache_purge_publication_guard_pt guard, void *data,
     uint32_t *outcome, ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+
+/* Persist a materialized Invalidate requirement in the selected native file.
+ * The caller first persists its index requirement and holds the path lease.
+ * A missing/replaced file or legacy marker has no independent HIT proof. */
+int ngx_http_cache_purge_publications_require(
+    ngx_http_cache_purge_publications_t *publications,
+    const ngx_http_cache_purge_index_file_t *file,
+    const ngx_http_cache_purge_watermark_t *required,
+    int anchor_fd, int lease_fd, uint32_t peer_uid,
     ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_publication_inode(
     ngx_http_cache_rocksdb_bytes_t metadata, uint64_t *inode,

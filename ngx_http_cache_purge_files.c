@@ -17,6 +17,10 @@
 static const char ngx_http_cache_purge_attribute[] = "user.ngx_cache_purge.id";
 static const uint64_t ngx_http_cache_purge_last_offset =
     UINT64_C(0x3fffffffffffffff);
+static uint64_t ngx_http_cache_purge_publication_number(const unsigned char *p,
+    unsigned n);
+static unsigned char *ngx_http_cache_purge_publication_encode(
+    unsigned char *p, uint64_t value, unsigned n);
 static int
 ngx_http_cache_purge_result(ngx_http_cache_rocksdb_error_t *error, int code,
     const char *message)
@@ -177,20 +181,15 @@ ngx_http_cache_purge_file_address(ngx_http_cache_rocksdb_bytes_t address,
     return ngx_http_cache_purge_result(error, NGX_HTTP_CACHE_ROCKSDB_OK, "");
 }
 
-int
-ngx_http_cache_purge_file_marker_read(int fd,
-    ngx_http_cache_purge_file_marker_t *marker,
+static int
+ngx_http_cache_purge_file_marker_load(int fd, unsigned char *raw, size_t *size,
     ngx_http_cache_rocksdb_error_t *error)
 {
-    ssize_t        n;
-    unsigned char  raw[NGX_HTTP_CACHE_PURGE_FILE_MARKER_SIZE];
+    ssize_t  n;
 
-    if (fd < 0 || !marker) {
-        return ngx_http_cache_purge_result(
-            error, NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid file marker input");
-    }
-    memset(marker, 0, sizeof(*marker));
-    n = fgetxattr(fd, ngx_http_cache_purge_attribute, raw, sizeof(raw));
+    *size = 0;
+    n = fgetxattr(fd, ngx_http_cache_purge_attribute, raw,
+                 NGX_HTTP_CACHE_PURGE_FILE_PROOF_SIZE);
     if (n < 0) {
         if (errno == ENODATA) {
             return ngx_http_cache_purge_result(error,
@@ -204,21 +203,102 @@ ngx_http_cache_purge_file_marker_read(int fd,
         }
         return ngx_http_cache_purge_io(error, "read file marker");
     }
-    if (n != (ssize_t) sizeof(raw) || memcmp(raw, "NCF1", 4) || raw[4] || raw[5]
-        || raw[6]
+    *size = (size_t) n;
+    return 0;
+}
+
+static int
+ngx_http_cache_purge_file_marker_decode(const unsigned char *raw, size_t size,
+    ngx_http_cache_purge_file_marker_t *marker,
+    ngx_http_cache_purge_file_proof_t *proof,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    uint32_t  count, nanoseconds;
+    uint64_t  entity, validated;
+
+    if (size < NGX_HTTP_CACHE_PURGE_FILE_MARKER_SIZE
+        || (memcmp(raw, "NCF1", 4) && memcmp(raw, "NCF2", 4))
+        || raw[4] || raw[5] || raw[6]
         || (raw[7] != NGX_HTTP_CACHE_PURGE_FILE_PREPARED
             && raw[7] != NGX_HTTP_CACHE_PURGE_FILE_READY
-            && raw[7] != NGX_HTTP_CACHE_PURGE_FILE_STAGED)
+            && raw[7] != NGX_HTTP_CACHE_PURGE_FILE_STAGED
+            && raw[7] != NGX_HTTP_CACHE_PURGE_FILE_REVOKED)
         || ngx_http_cache_purge_zero(raw + 8))
     {
-        return ngx_http_cache_purge_result(error,
-                                           NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
-                                           "unknown or malformed file marker");
+        goto invalid;
+    }
+    if (raw[3] == '1') {
+        if (size != NGX_HTTP_CACHE_PURGE_FILE_MARKER_SIZE) {
+            goto invalid;
+        }
+    } else {
+        if (size < NGX_HTTP_CACHE_PURGE_FILE_PROOF_HEADER
+            || raw[7] != NGX_HTTP_CACHE_PURGE_FILE_READY)
+        {
+            goto invalid;
+        }
+        nanoseconds = (uint32_t) ngx_http_cache_purge_publication_number(
+            raw + 72, 4);
+        count = (uint32_t) ngx_http_cache_purge_publication_number(raw + 76, 4);
+        entity = ngx_http_cache_purge_publication_number(raw + 96, 8);
+        validated = ngx_http_cache_purge_publication_number(raw + 104, 8);
+        if (count > 64 || nanoseconds >= 1000000000
+            || size != NGX_HTTP_CACHE_PURGE_FILE_PROOF_HEADER
+                       + count * NGX_HTTP_CACHE_PURGE_TAG_DIGEST_SIZE
+            || ngx_http_cache_purge_zero(raw + 80) || entity > validated)
+        {
+            goto invalid;
+        }
+        if (proof != NULL) {
+            proof->device =
+                ngx_http_cache_purge_publication_number(raw + 40, 8);
+            proof->inode = ngx_http_cache_purge_publication_number(raw + 48, 8);
+            proof->size = ngx_http_cache_purge_publication_number(raw + 56, 8);
+            proof->seconds =
+                ngx_http_cache_purge_publication_number(raw + 64, 8);
+            proof->nanoseconds = nanoseconds;
+            proof->tag_count = count;
+            memcpy(proof->ledger, raw + 80, 16);
+            proof->entity = entity;
+            proof->validated = validated;
+            proof->required = ngx_http_cache_purge_publication_number(raw + 112,
+                                                                    8);
+            memcpy(proof->identity, raw + 120, 32);
+            memcpy(proof->tags, raw + NGX_HTTP_CACHE_PURGE_FILE_PROOF_HEADER,
+                   count * NGX_HTTP_CACHE_PURGE_TAG_DIGEST_SIZE);
+        }
     }
     marker->state = raw[7];
     memcpy(marker->id, raw + 8, 16);
     memcpy(marker->address, raw + 24, 16);
     return ngx_http_cache_purge_result(error, NGX_HTTP_CACHE_ROCKSDB_OK, "");
+
+invalid:
+    return ngx_http_cache_purge_result(error, NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+        "unknown or malformed file marker");
+}
+
+int
+ngx_http_cache_purge_file_marker_read(int fd,
+    ngx_http_cache_purge_file_marker_t *marker,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    unsigned char  raw[NGX_HTTP_CACHE_PURGE_FILE_PROOF_SIZE];
+    size_t         size;
+    int            rc;
+
+    if (fd < 0 || marker == NULL) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID,
+            "invalid file marker input");
+    }
+    memset(marker, 0, sizeof(*marker));
+    rc = ngx_http_cache_purge_file_marker_load(fd, raw, &size, error);
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_file_marker_decode(raw, size, marker, NULL,
+                                                   error);
+    }
+    return rc;
 }
 
 int
@@ -315,6 +395,205 @@ ngx_http_cache_purge_file_marker_publish(int fd, const unsigned char id[16],
         return ngx_http_cache_purge_io(error, "publish file marker");
     }
     return ngx_http_cache_purge_sync_file(fd, durable, error);
+}
+
+static int
+ngx_http_cache_purge_file_proof_same(
+    const ngx_http_cache_purge_file_proof_t *proof, const struct stat *st)
+{
+    return S_ISREG(st->st_mode) && st->st_nlink == 1
+           && proof->device == (uint64_t) st->st_dev
+           && proof->inode == (uint64_t) st->st_ino
+           && proof->size == (uint64_t) st->st_size
+           && proof->seconds == (uint64_t) st->st_mtim.tv_sec
+           && proof->nanoseconds == (uint32_t) st->st_mtim.tv_nsec;
+}
+
+int
+ngx_http_cache_purge_file_proof_read(int fd,
+    ngx_http_cache_purge_file_proof_t *proof,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    unsigned char  raw[NGX_HTTP_CACHE_PURGE_FILE_PROOF_SIZE];
+    struct stat    before, after;
+    size_t         size;
+    int            rc;
+
+    if (proof == NULL) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID,
+            "missing file proof output");
+    }
+    memset(proof, 0, sizeof(*proof));
+    if (fd < 0) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID,
+            "invalid file proof descriptor");
+    }
+    if (fstat(fd, &before) != 0) {
+        return ngx_http_cache_purge_io(error, "inspect file proof descriptor");
+    }
+    rc = ngx_http_cache_purge_file_marker_load(fd, raw, &size, error);
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_file_marker_decode(raw, size, &proof->marker,
+                                                   proof, error);
+    }
+    if (rc == 0 && raw[3] != '2') {
+        rc = ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND,
+            "file has no independent admission proof");
+    }
+    if (rc == 0 && fstat(fd, &after) != 0) {
+        rc = ngx_http_cache_purge_io(error, "recheck file proof descriptor");
+    }
+    if (rc == 0 && (!ngx_http_cache_purge_file_proof_same(proof, &before)
+                   || !ngx_http_cache_purge_file_proof_same(proof, &after)))
+    {
+        rc = ngx_http_cache_purge_result(error, NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "file differs from its admission proof");
+    }
+    if (rc != 0) {
+        memset(proof, 0, sizeof(*proof));
+    }
+    return rc;
+}
+
+int
+ngx_http_cache_purge_file_proof_publish(int fd,
+    const ngx_http_cache_purge_file_proof_t *proof, int durable,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_file_marker_t  marker;
+
+    unsigned char  raw[NGX_HTTP_CACHE_PURGE_FILE_PROOF_SIZE];
+    struct stat    st;
+    size_t         size;
+    int            rc;
+
+    if (fd < 0 || proof == NULL || (durable != 0 && durable != 1)
+        || proof->tag_count > 64 || ngx_http_cache_purge_zero(proof->ledger)
+        || proof->entity > proof->validated)
+    {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID,
+            "invalid file admission proof");
+    }
+    rc = ngx_http_cache_purge_file_marker_read(fd, &marker, error);
+    if (rc != 0) {
+        return rc;
+    }
+    if (memcmp(marker.id, proof->marker.id, 16)
+        || memcmp(marker.address, proof->marker.address, 16))
+    {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "file admission identity changed");
+    }
+    if (fstat(fd, &st) != 0) {
+        return ngx_http_cache_purge_io(error, "inspect proof publication");
+    }
+    if (!S_ISREG(st.st_mode) || st.st_nlink != 1) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "proof publication requires one regular file instance");
+    }
+    ngx_http_cache_purge_encode(raw, marker.id, marker.address,
+                                NGX_HTTP_CACHE_PURGE_FILE_READY);
+    raw[3] = '2';
+    ngx_http_cache_purge_publication_encode(raw + 40, st.st_dev, 8);
+    ngx_http_cache_purge_publication_encode(raw + 48, st.st_ino, 8);
+    ngx_http_cache_purge_publication_encode(raw + 56, st.st_size, 8);
+    ngx_http_cache_purge_publication_encode(raw + 64, st.st_mtim.tv_sec, 8);
+    ngx_http_cache_purge_publication_encode(raw + 72, st.st_mtim.tv_nsec, 4);
+    ngx_http_cache_purge_publication_encode(raw + 76, proof->tag_count, 4);
+    memcpy(raw + 80, proof->ledger, 16);
+    ngx_http_cache_purge_publication_encode(raw + 96, proof->entity, 8);
+    ngx_http_cache_purge_publication_encode(raw + 104, proof->validated, 8);
+    ngx_http_cache_purge_publication_encode(raw + 112, proof->required, 8);
+    memcpy(raw + 120, proof->identity, 32);
+    size = proof->tag_count * NGX_HTTP_CACHE_PURGE_TAG_DIGEST_SIZE;
+    memcpy(raw + NGX_HTTP_CACHE_PURGE_FILE_PROOF_HEADER, proof->tags, size);
+    size += NGX_HTTP_CACHE_PURGE_FILE_PROOF_HEADER;
+    if (fsetxattr(fd, ngx_http_cache_purge_attribute, raw, size,
+                 XATTR_REPLACE) != 0)
+    {
+        return ngx_http_cache_purge_io(error, "publish file admission proof");
+    }
+    return ngx_http_cache_purge_sync_file(fd, durable, error);
+}
+
+int
+ngx_http_cache_purge_file_proof_require(int fd, const unsigned char id[16],
+    const unsigned char address[16],
+    const ngx_http_cache_purge_watermark_t *required,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_file_proof_t  proof;
+    int                                rc;
+
+    if (id == NULL || address == NULL || required == NULL
+        || required->sequence == 0)
+    {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID,
+            "invalid file validation requirement");
+    }
+    rc = ngx_http_cache_purge_file_proof_read(fd, &proof, error);
+    if (rc != 0) {
+        return rc;
+    }
+    if (memcmp(proof.marker.id, id, 16)
+        || memcmp(proof.marker.address, address, 16)
+        || memcmp(proof.ledger, required->ledger, 16))
+    {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "file validation proof identity changed");
+    }
+    if (required->sequence > proof.required
+        && required->sequence > proof.validated)
+    {
+        proof.required = required->sequence;
+        return ngx_http_cache_purge_file_proof_publish(fd, &proof, 1, error);
+    }
+    /* A prior attempt may have written the attribute but failed its sync. */
+    return ngx_http_cache_purge_sync_file(fd, 1, error);
+}
+
+int
+ngx_http_cache_purge_file_proof_revoke(int fd, const unsigned char id[16],
+    const unsigned char address[16], ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_file_marker_t  marker;
+
+    unsigned char  raw[NGX_HTTP_CACHE_PURGE_FILE_MARKER_SIZE];
+    int            rc;
+
+    if (fd < 0 || id == NULL || address == NULL) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID,
+            "invalid proof revocation input");
+    }
+    rc = ngx_http_cache_purge_file_marker_read(fd, &marker, error);
+    if (rc != 0) {
+        return rc;
+    }
+    if (memcmp(marker.id, id, 16) || memcmp(marker.address, address, 16)) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "proof revocation identity changed");
+    }
+    if (marker.state != NGX_HTTP_CACHE_PURGE_FILE_REVOKED) {
+        ngx_http_cache_purge_encode(raw, id, address,
+                                    NGX_HTTP_CACHE_PURGE_FILE_REVOKED);
+        if (fsetxattr(fd, ngx_http_cache_purge_attribute, raw, sizeof(raw),
+                     XATTR_REPLACE) != 0)
+        {
+            return ngx_http_cache_purge_io(error,
+                                          "revoke file admission proof");
+        }
+    }
+    return ngx_http_cache_purge_sync_file(fd, 1, error);
 }
 
 int
@@ -625,6 +904,79 @@ ngx_http_cache_purge_publication_valid(ngx_http_cache_rocksdb_bytes_t value,
     size_t limit)
 {
     return value.len <= limit && (value.len == 0 || value.data != NULL);
+}
+
+int
+ngx_http_cache_purge_identity_digest(ngx_http_cache_rocksdb_bytes_t url,
+    ngx_http_cache_rocksdb_bytes_t tag_namespace,
+    ngx_http_cache_rocksdb_bytes_t misc,
+    unsigned char digest[NGX_HTTP_CACHE_PURGE_IDENTITY_DIGEST_SIZE],
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    EVP_MD_CTX                     *ctx;
+    ngx_http_cache_rocksdb_bytes_t   fields[3];
+    unsigned char                    length[4];
+    unsigned                         size;
+    size_t                           i;
+    int                              ok;
+
+    if (digest == NULL || !ngx_http_cache_purge_publication_valid(url, 32768)
+        || !ngx_http_cache_purge_publication_valid(tag_namespace, 32768)
+        || !ngx_http_cache_purge_publication_valid(misc, 32768))
+    {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID,
+            "invalid configured cache identity");
+    }
+    fields[0] = tag_namespace;
+    fields[1] = url;
+    fields[2] = misc;
+    ctx = EVP_MD_CTX_new();
+    if (ctx == NULL) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "identity digest allocation failed");
+    }
+    ok = EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1
+         && EVP_DigestUpdate(ctx, "NCI1", 4) == 1;
+    for (i = 0; ok && i < 3; i++) {
+        ngx_http_cache_purge_publication_encode(length, fields[i].len, 4);
+        ok = EVP_DigestUpdate(ctx, length, sizeof(length)) == 1;
+        if (ok && fields[i].len) {
+            ok = EVP_DigestUpdate(ctx, fields[i].data, fields[i].len) == 1;
+        }
+    }
+    if (ok) {
+        ok = EVP_DigestFinal_ex(ctx, digest, &size) == 1
+             && size == NGX_HTTP_CACHE_PURGE_IDENTITY_DIGEST_SIZE;
+    }
+    EVP_MD_CTX_free(ctx);
+    if (!ok) {
+        memset(digest, 0, NGX_HTTP_CACHE_PURGE_IDENTITY_DIGEST_SIZE);
+        return ngx_http_cache_purge_result(error, NGX_HTTP_CACHE_ROCKSDB_IO,
+            "configured cache identity digest failed");
+    }
+    return ngx_http_cache_purge_result(error, 0, "");
+}
+
+int
+ngx_http_cache_purge_tag_digest(ngx_http_cache_rocksdb_bytes_t tag,
+    unsigned char digest[NGX_HTTP_CACHE_PURGE_TAG_DIGEST_SIZE],
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    unsigned char  hash[SHA256_DIGEST_LENGTH];
+
+    if (digest == NULL || !ngx_http_cache_purge_publication_valid(tag, 1024)) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid TAG digest input");
+    }
+    if (SHA256(tag.len ? tag.data : (const unsigned char *) "", tag.len,
+               hash) == NULL)
+    {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_IO, "TAG digest failed");
+    }
+    memcpy(digest, hash, NGX_HTTP_CACHE_PURGE_TAG_DIGEST_SIZE);
+    return ngx_http_cache_purge_result(error, 0, "");
 }
 
 static int
@@ -1418,6 +1770,93 @@ ngx_http_cache_purge_publication_watermarks(
         origin, validated, error) : rc;
 }
 
+static int
+ngx_http_cache_purge_publication_publish(ngx_http_cache_rocksdb_t *store,
+    const unsigned char id[16], const unsigned char address[16], int fd,
+    int durable, ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_index_file_t      file;
+    ngx_http_cache_purge_index_expected_t  expected;
+    ngx_http_cache_purge_file_proof_t      proof;
+    ngx_http_cache_purge_watermark_t       origin, validated, required, removed;
+    size_t                                  i;
+    int                                     rc;
+
+    rc = ngx_http_cache_purge_index_get_file(store, id, &file, error);
+    if (rc != 0) {
+        return rc;
+    }
+    rc = ngx_http_cache_purge_publication_watermarks(file.metadata, &origin,
+                                                      &validated, error);
+    if (rc == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) {
+        /* Legacy callers have no ledger proof and remain independently
+         * unreadable even when their physical marker becomes READY. */
+        rc = ngx_http_cache_purge_file_marker_publish(fd, id, address, durable,
+                                                      error);
+        goto done;
+    }
+    if (rc != 0) {
+        goto done;
+    }
+    if (origin.sequence == 0 && ngx_http_cache_purge_zero(origin.ledger)) {
+        /* A validated legacy entity predates the ledger; it covers no Delete.
+         * Its successful validation still belongs to the current ledger. */
+        memcpy(origin.ledger, validated.ledger, 16);
+    }
+    if (file.state != NGX_HTTP_CACHE_PURGE_INDEX_COMMITTED
+        || memcmp(origin.ledger, validated.ledger, 16))
+    {
+        rc = ngx_http_cache_purge_result(error, NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "file has no committed single-ledger proof");
+        goto done;
+    }
+    memcpy(expected.id, id, 16);
+    expected.revision = file.revision;
+    rc = ngx_http_cache_purge_index_validation_requirement(store, &expected,
+                                                            &required, error);
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_index_delete_requirement(store, &expected,
+                                                            &removed, error);
+    }
+    if (rc != 0) {
+        goto done;
+    }
+    if ((required.sequence && memcmp(required.ledger, origin.ledger, 16))
+        || (removed.sequence
+            && (memcmp(removed.ledger, origin.ledger, 16)
+                || removed.sequence > origin.sequence)))
+    {
+        rc = ngx_http_cache_purge_result(error, NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "file proof has an incompatible persistent requirement");
+        goto done;
+    }
+    memset(&proof, 0, sizeof(proof));
+    memcpy(proof.marker.id, id, 16);
+    memcpy(proof.marker.address, address, 16);
+    memcpy(proof.ledger, origin.ledger, 16);
+    proof.entity = origin.sequence;
+    proof.validated = validated.sequence;
+    proof.required = required.sequence;
+    proof.tag_count = (uint32_t) file.tag_count;
+    rc = ngx_http_cache_purge_identity_digest(file.url, file.tag_namespace,
+        file.components[4], proof.identity, error);
+    if (rc != 0) {
+        goto done;
+    }
+    for (i = 0; i < file.tag_count; i++) {
+        rc = ngx_http_cache_purge_tag_digest(file.tags[i], proof.tags[i],
+                                             error);
+        if (rc != 0) {
+            goto done;
+        }
+    }
+    rc = ngx_http_cache_purge_file_proof_publish(fd, &proof, durable, error);
+
+done:
+    ngx_http_cache_purge_index_file_free(&file);
+    return rc;
+}
+
 int
 ngx_http_cache_purge_publication_variant(
     ngx_http_cache_rocksdb_bytes_t metadata, unsigned char main[16],
@@ -2030,7 +2469,9 @@ ngx_http_cache_purge_publications_inspect(
      * Only a live intent for the selected instance can justify waiting.
      * Validation may be rewriting the header of an existing READY file.
      */
-    if (intent && marker.state == NGX_HTTP_CACHE_PURGE_FILE_READY) {
+    if (intent && (marker.state == NGX_HTTP_CACHE_PURGE_FILE_READY
+                   || marker.state == NGX_HTTP_CACHE_PURGE_FILE_REVOKED))
+    {
         rc = ngx_http_cache_purge_result(error, NGX_HTTP_CACHE_ROCKSDB_BUSY,
             "cache index publication is pending");
         goto done;
@@ -2617,7 +3058,8 @@ ngx_http_cache_purge_publications_finish_run(
     if (rc == 0) {
         /* Data, identity and index commit are durable before this transition.
          * Losing only READY after publication causes a MISS, never a HIT. */
-        rc = ngx_http_cache_purge_file_marker_publish(fd, id, digest, 0, error);
+        rc = ngx_http_cache_purge_publication_publish(store, id, digest, fd, 0,
+                                                      error);
     }
     if (rc == 0) {
         rc = ngx_http_cache_purge_publication_beneath(target->fd, file.path, 1,
@@ -2844,6 +3286,95 @@ ngx_http_cache_purge_publication_inode(ngx_http_cache_rocksdb_bytes_t metadata,
 }
 
 int
+ngx_http_cache_purge_publications_require(
+    ngx_http_cache_purge_publications_t *p,
+    const ngx_http_cache_purge_index_file_t *file,
+    const ngx_http_cache_purge_watermark_t *required,
+    int anchor, int lease, uint32_t uid,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_publication_root_t  *root;
+    ngx_http_cache_rocksdb_bytes_t            address;
+    ngx_http_cache_purge_file_marker_t        marker;
+    unsigned char                             identity[16];
+    uint64_t                                  offset;
+    struct stat                               st;
+    int            fd, rc;
+
+    if (file == NULL || required == NULL || required->sequence == 0) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID,
+            "invalid native validation requirement");
+    }
+    rc = ngx_http_cache_purge_publication_owner(p, error);
+    if (rc != 0) {
+        return rc;
+    }
+    root = ngx_http_cache_purge_publication_find(p, file->root, file->zone, 1);
+    if (root == NULL) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID,
+            "unregistered validation requirement root/zone");
+    }
+    memset(&address, 0, sizeof(address));
+    fd = -1;
+    rc = ngx_http_cache_purge_publication_verify(root, error);
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_publication_address(root, file->path,
+                                                       &address, error);
+    }
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_file_address(address, identity, &offset,
+                                                error);
+    }
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_file_lease_adopt(anchor, lease, offset,
+                                                   error);
+    }
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_publication_beneath(root->fd, file->path,
+                                                      1, 0, &fd, error);
+    }
+    if (rc != 0 || fd < 0) {
+        goto done;
+    }
+    if (fstat(fd, &st) != 0) {
+        rc = ngx_http_cache_purge_io(error, "inspect requirement target");
+        goto done;
+    }
+    if (!S_ISREG(st.st_mode) || st.st_uid != uid || st.st_nlink != 1) {
+        rc = ngx_http_cache_purge_result(error, NGX_HTTP_CACHE_ROCKSDB_INVALID,
+            "requirement file type/owner/link mismatch");
+        goto done;
+    }
+    rc = ngx_http_cache_purge_file_marker_read(fd, &marker, error);
+    if (rc == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) {
+        rc = ngx_http_cache_purge_result(error, 0, "");
+        goto done;
+    }
+    if (rc != 0) {
+        goto done;
+    }
+    if (memcmp(marker.id, file->id, 16)
+        || memcmp(marker.address, identity, 16))
+    {
+        goto done;
+    }
+    rc = ngx_http_cache_purge_file_proof_require(fd, file->id, identity,
+                                                required, error);
+    if (rc == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) {
+        rc = ngx_http_cache_purge_result(error, 0, "");
+    }
+
+done:
+    if (fd >= 0) {
+        close(fd);
+    }
+    free((void *) address.data);
+    return rc;
+}
+
+int
 ngx_http_cache_purge_publications_remove_checked(
     ngx_http_cache_purge_publications_t *p,
     ngx_http_cache_rocksdb_t *store,
@@ -3041,6 +3572,11 @@ ngx_http_cache_purge_publications_remove_checked(
     }
     filesystem = 1;
     if (result == NGX_HTTP_CACHE_PURGE_REMOVED) {
+        rc = ngx_http_cache_purge_file_proof_revoke(fd, file.id, identity,
+                                                    error);
+        if (rc != 0) {
+            goto done;
+        }
         /* Managed writers cannot rename while this lease is held. The native
          * cache manager can only unlink, which is an idempotent missing result.
          */
@@ -3426,7 +3962,10 @@ ngx_http_cache_purge_publications_validate_prepare(
     if (rc != 0) {
         goto done;
     }
-    if (marker.state != NGX_HTTP_CACHE_PURGE_FILE_READY
+    if ((marker.state != NGX_HTTP_CACHE_PURGE_FILE_READY
+         && !(marker.state == NGX_HTTP_CACHE_PURGE_FILE_REVOKED
+              && plan.transaction
+              && memcmp(plan.transaction, input->transaction, 16) == 0))
         || memcmp(marker.id, input->file.id, 16)
         || memcmp(marker.address, identity, 16))
     {
@@ -3454,6 +3993,12 @@ ngx_http_cache_purge_publications_validate_prepare(
             rc = ngx_http_cache_purge_publications_inspect(p, store,
                 file.root, file.zone, file.path, selected_fd, uid, &checked,
                 error);
+            if (rc != 0) {
+                goto done;
+            }
+        } else {
+            rc = ngx_http_cache_purge_file_proof_revoke(selected_fd, file.id,
+                                                        identity, error);
             if (rc != 0) {
                 goto done;
             }
@@ -3553,6 +4098,10 @@ ngx_http_cache_purge_publications_validate_prepare(
     metadata.len = size;
     rc = ngx_http_cache_purge_index_update_pending(store, &input->file,
         metadata, file.tags, file.tag_count, out, error);
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_file_proof_revoke(selected_fd, file.id,
+                                                    identity, error);
+    }
     goto done;
 
 conflict:
@@ -3698,12 +4247,29 @@ ngx_http_cache_purge_publications_validate_finish_checked(
     if (memcmp(marker.id, id, 16) || memcmp(marker.address, identity, 16)) {
         goto discarded;
     }
-    if (marker.state != NGX_HTTP_CACHE_PURGE_FILE_READY
+    if ((marker.state != NGX_HTTP_CACHE_PURGE_FILE_READY
+         && marker.state != NGX_HTTP_CACHE_PURGE_FILE_REVOKED)
         || (uint64_t) st.st_size != proof.size)
     {
         goto conflict;
     }
     if (!plan.pending) {
+        if (marker.state == NGX_HTTP_CACHE_PURGE_FILE_REVOKED) {
+            if (!ngx_http_cache_purge_publication_same(&proof, &st)) {
+                goto conflict;
+            }
+            if (guard != NULL) {
+                rc = guard(guard_data, &file, error);
+                if (rc != 0) {
+                    goto done;
+                }
+            }
+            rc = ngx_http_cache_purge_publication_publish(store, id, identity,
+                                                          fd, 0, error);
+            if (rc != 0) {
+                goto done;
+            }
+        }
         rc = ngx_http_cache_purge_publications_inspect(p, store, file.root,
             file.zone, file.path, fd, uid, &checked, error);
         if (rc == 0) {
@@ -3790,6 +4356,10 @@ ngx_http_cache_purge_publications_validate_finish_checked(
         }
     }
     if (memcmp(prefix, plan.after.data, plan.after.len)) {
+        rc = ngx_http_cache_purge_file_proof_revoke(fd, id, identity, error);
+        if (rc != 0) {
+            goto done;
+        }
         memcpy(prefix, plan.after.data, plan.after.len);
         rc = ngx_http_cache_purge_validation_io(fd, prefix, plan.after.len, 1,
                                                  error);
@@ -3837,6 +4407,10 @@ ngx_http_cache_purge_publications_validate_finish_checked(
     expected.revision = file.revision;
     rc = ngx_http_cache_purge_index_publish_tags(store, &expected, metadata,
                                                    tags, count, out, error);
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_publication_publish(store, id, identity,
+                                                      fd, 0, error);
+    }
     goto done;
 
 discarded:

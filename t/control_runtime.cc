@@ -417,6 +417,11 @@ propagation_tests()
                 if (n % 13 == 0) {
                     scope = std::string("scope-0\0tail", 12);
                 }
+                if (n % 11 == 0 && (kind == SelectorKind::namespace_tag
+                                    || kind == SelectorKind::namespace_tags))
+                {
+                    scope.clear();
+                }
                 value = "tag-" + std::to_string(random() % 10);
                 if (kind >= SelectorKind::namespace_tags) {
                     std::vector<std::string> tags{ value };
@@ -472,6 +477,9 @@ propagation_tests()
             c.ns = "scope-" + std::to_string(random() % 8);
             if (n % 9 == 0) {
                 c.ns = std::string("scope-0\0tail", 12);
+            }
+            if (n % 11 == 0) {
+                c.ns.clear();
             }
             if (n % 7 == 0) {
                 c.host = c.ns;
@@ -683,7 +691,10 @@ main()
                 tag_group({ "other", "photo" }), "wrong-namespace"),
             operation(14, SelectorKind::namespace_tag, binary_tag, context.ns),
             operation(15, SelectorKind::host_tag,
-                std::string("photo\0other", 11), context.host) };
+                std::string("photo\0other", 11), context.host),
+            operation(16, SelectorKind::namespace_tag, "photo", ""),
+            operation(17, SelectorKind::namespace_tags,
+                tag_group({ "other", "photo" }), "") };
         ops[1].stage = OperationStage::materialized;
         ops[4].stage = OperationStage::preparing;
         ops[4].propagate = false;
@@ -704,6 +715,14 @@ main()
                   == reference(ops, context, true, 302000),
             "window expiry does not clear FENCE");
         auto digested = digest_context(context);
+        auto empty_namespace = context;
+        empty_namespace.ns.clear();
+        auto empty_digests = digest_context(empty_namespace);
+        check(lookup(reader, empty_namespace)
+                  == reference(ops, empty_namespace, true, 5000)
+                  && lookup(reader, empty_digests, true, 5000, true)
+                         == reference(ops, empty_namespace, true, 5000),
+            "empty namespace is an exact scope for raw and digest TAGs");
         check(lookup(reader, digested, true, 5000, true)
                   == reference(ops, context, true, 5000),
             "TAG digests preserve scopes, groups and duplicate inputs");

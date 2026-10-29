@@ -2552,7 +2552,7 @@ ngx_http_cache_purge_capture_identity(ngx_http_cache_purge_capture_t *ctx)
 
     if (ctx->components[1].len == 0 || ctx->host.len == 0
         || ctx->components[3].len == 0
-        || ctx->namespace.len == 0 || ctx->namespace.len > 255)
+        || ctx->namespace.len > 255)
     {
         return NGX_ERROR;
     }

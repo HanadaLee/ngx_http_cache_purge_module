@@ -1308,6 +1308,171 @@ ngx_http_cache_purge_test_publication_sync_case(
 }
 
 static void
+ngx_http_cache_purge_test_file_proof()
+{
+    char directory[] = "/tmp/cache-file-proof-test-XXXXXX";
+    check(mkdtemp(directory) != nullptr, "proof test directory");
+    std::string path = std::string(directory) + "/file";
+    Descriptor fd(open(path.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC,
+        0600));
+    body(fd.fd);
+    ngx_http_cache_purge_file_proof_t input{}, output{};
+    ngx_http_cache_purge_file_marker_t marker{};
+    auto identity = id(1), ledger = id(2);
+    std::memcpy(input.marker.id, identity.data(), 16);
+    std::memcpy(input.ledger, ledger.data(), 16);
+    const unsigned char expected_identity[32] = {
+        0xf2, 0x90, 0x09, 0xee, 0xef, 0xd1, 0xf8, 0x77,
+        0xda, 0xea, 0xa1, 0x89, 0x62, 0x04, 0x4a, 0x29,
+        0xc9, 0x76, 0xc2, 0x82, 0xf2, 0xe2, 0x2c, 0x0d,
+        0xd7, 0x67, 0x6b, 0xff, 0xfd, 0x39, 0xb1, 0x4a
+    };
+    check(ngx_http_cache_purge_identity_digest(bytes("https://example.test/a"),
+              bytes("team"), bytes("x"), input.identity, &error) == 0
+              && std::memcmp(input.identity, expected_identity, 32) == 0,
+        "configuration tuple digest has an independent known vector");
+    unsigned char left[32], right[32];
+    check(ngx_http_cache_purge_identity_digest(bytes("ab"), bytes("c"),
+              bytes(""), left, &error) == 0
+              && ngx_http_cache_purge_identity_digest(bytes("b"), bytes("ca"),
+                     bytes(""), right, &error) == 0
+              && std::memcmp(left, right, 32) != 0,
+        "identity components cannot contaminate adjacent fields");
+    uint64_t offset;
+    check(ngx_http_cache_purge_file_address(bytes(path), input.marker.address,
+              &offset, &error) == 0, "proof address");
+    input.entity = 10;
+    input.validated = 12;
+    input.required = 11;
+    for (unsigned i = 0; i < 64; i++) {
+        std::string tag = "tag-" + std::to_string(i) + std::string("\0tail", 5);
+        check(ngx_http_cache_purge_tag_digest(bytes(tag), input.tags[i], &error)
+                  == 0, "binary TAG digest for file proof");
+    }
+    check(ngx_http_cache_purge_file_marker_prepare(fd.fd, identity.data(),
+              input.marker.address, 1, &error) == 0, "prepare proof instance");
+    check(ngx_http_cache_purge_file_proof_read(fd.fd, &output, &error)
+              == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND,
+        "legacy marker is never an independent proof");
+    std::vector<unsigned char> raw(NGX_HTTP_CACHE_PURGE_FILE_PROOF_SIZE);
+    for (unsigned count : { 0U, 1U, 64U }) {
+        input.tag_count = count;
+        check(ngx_http_cache_purge_file_proof_publish(fd.fd, &input, 1, &error)
+                  == 0, "publish bounded proof");
+        auto length = fgetxattr(fd.fd, "user.ngx_cache_purge.id", raw.data(),
+            raw.size());
+        check(length == NGX_HTTP_CACHE_PURGE_FILE_PROOF_HEADER + 16 * count
+                  && std::memcmp(raw.data(), "NCF2\0\0\0\2", 8) == 0,
+            "NCF2 uses one bounded attribute and canonical field counts");
+        check(ngx_http_cache_purge_file_marker_read(fd.fd, &marker, &error) == 0
+                  && marker.state == NGX_HTTP_CACHE_PURGE_FILE_READY
+                  && std::memcmp(marker.id, identity.data(), 16) == 0,
+            "instance readers recognize the extended proof");
+        check(ngx_http_cache_purge_file_proof_read(fd.fd, &output, &error) == 0
+                  && output.tag_count == count && output.entity == 10
+                  && output.validated == 12 && output.required == 11
+                  && std::memcmp(output.ledger, ledger.data(), 16) == 0
+                  && std::memcmp(output.identity, input.identity, 32) == 0
+                  && std::memcmp(output.tags, input.tags, 16 * count) == 0,
+            "proof carries exact TAGs and validation state");
+        intact(fd.fd);
+    }
+    auto restore = [&] {
+        check(fsetxattr(fd.fd, "user.ngx_cache_purge.id", raw.data(),
+                  raw.size(), XATTR_REPLACE) == 0, "restore proof fixture");
+    };
+    for (unsigned kind = 0; kind < 8; kind++) {
+        auto bad = raw;
+        if (kind == 0) bad[4] = 1;
+        if (kind == 1) bad[7] = NGX_HTTP_CACHE_PURGE_FILE_REVOKED;
+        if (kind == 2) bad[79] = 65;
+        if (kind == 3) std::memset(bad.data() + 72, 255, 4);
+        if (kind == 4) std::memset(bad.data() + 80, 0, 16);
+        if (kind == 5) std::memset(bad.data() + 104, 0, 8);
+        if (kind == 6) bad.resize(119);
+        if (kind == 7) bad.push_back(0);
+        check(fsetxattr(fd.fd, "user.ngx_cache_purge.id", bad.data(),
+                  bad.size(), XATTR_REPLACE) == 0, "corrupt proof fixture");
+        output.tag_count = 99;
+        check(ngx_http_cache_purge_file_proof_read(fd.fd, &output, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_CORRUPT
+                  && output.tag_count == 0 && output.marker.state == 0,
+            "malformed or oversized proofs cannot return partial admission");
+        restore();
+    }
+    input.tag_count = 65;
+    check(ngx_http_cache_purge_file_proof_publish(fd.fd, &input, 0, &error)
+              == NGX_HTTP_CACHE_ROCKSDB_INVALID, "reject excessive TAG count");
+    input.tag_count = 64;
+    input.marker.id[15] = 99;
+    check(ngx_http_cache_purge_file_proof_publish(fd.fd, &input, 0, &error)
+              == NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "reject another instance");
+    input.marker.id[15] = 1;
+    ngx_http_cache_purge_watermark_t required{};
+    std::memcpy(required.ledger, ledger.data(), 16);
+    required.sequence = 30;
+    check(ngx_http_cache_purge_file_proof_require(fd.fd, identity.data(),
+              input.marker.address, &required, &error) == 0,
+        "persist an Invalidate requirement beside the entity");
+    required.sequence = 20;
+    check(ngx_http_cache_purge_file_proof_require(fd.fd, identity.data(),
+              input.marker.address, &required, &error) == 0
+              && ngx_http_cache_purge_file_proof_read(fd.fd, &output, &error)
+                     == 0 && output.required == 30,
+        "older requirements cannot regress the file watermark");
+    check(ngx_http_cache_purge_test_watch_file(fd.fd, 1, nullptr, nullptr) == 0,
+        "fail one requirement sync");
+    required.sequence = 31;
+    check(ngx_http_cache_purge_file_proof_require(fd.fd, identity.data(),
+              input.marker.address, &required, &error)
+              == NGX_HTTP_CACHE_ROCKSDB_IO,
+        "attribute write without successful sync is not completion");
+    check(ngx_http_cache_purge_file_proof_require(fd.fd, identity.data(),
+              input.marker.address, &required, &error) == 0
+              && ngx_http_cache_purge_test_file_sync_count() == 2,
+        "idempotent retry repeats the failed durability barrier");
+    check(ngx_http_cache_purge_test_watch_file(fd.fd, 1, nullptr, nullptr) == 0,
+        "fail one revocation sync");
+    check(ngx_http_cache_purge_file_proof_revoke(fd.fd, identity.data(),
+              input.marker.address, &error) == NGX_HTTP_CACHE_ROCKSDB_IO
+              && ngx_http_cache_purge_file_proof_read(fd.fd, &output, &error)
+                     == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND,
+        "failed revocation sync leaves no readable in-memory proof");
+    check(ngx_http_cache_purge_file_proof_revoke(fd.fd, identity.data(),
+              input.marker.address, &error) == 0
+              && ngx_http_cache_purge_test_file_sync_count() == 2,
+        "revocation retry persists its already-written state");
+    check(ngx_http_cache_purge_test_watch_file(-1, 0, nullptr, nullptr) == 0,
+        "clear proof sync injection");
+    check(ngx_http_cache_purge_file_proof_publish(fd.fd, &input, 1, &error)
+              == 0,
+        "publish after caller revalidates the revoked entity");
+    struct stat st;
+    check(fstat(fd.fd, &st) == 0, "proof stat fixture");
+    struct timespec times[2] = { st.st_atim, st.st_mtim };
+    times[1].tv_sec++;
+    check(futimens(fd.fd, times) == 0
+              && ngx_http_cache_purge_file_proof_read(fd.fd, &output, &error)
+                     == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+        "physical header/entity modification invalidates its old proof");
+    times[1] = st.st_mtim;
+    check(futimens(fd.fd, times) == 0, "restore timestamp fixture");
+    Descriptor copy(open((path + ".copy").c_str(),
+        O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600));
+    body(copy.fd);
+    check(futimens(copy.fd, times) == 0
+              && fsetxattr(copy.fd, "user.ngx_cache_purge.id", raw.data(),
+                     raw.size(), 0) == 0
+              && ngx_http_cache_purge_file_proof_read(copy.fd, &output, &error)
+                     == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+        "copied proof cannot authorize another inode with equal size/mtime");
+    check(unlink(path.c_str()) == 0
+              && ngx_http_cache_purge_file_proof_read(fd.fd, &output, &error)
+                     == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+        "already-open descriptors cannot serve an unlinked instance");
+}
+
+static void
 ngx_http_cache_purge_test_publication_wal(const std::string &path,
     unsigned scenario)
 {
@@ -1628,6 +1793,7 @@ main(int argc, char **argv)
                        publication(argv[1], argv[2]);
         }
         ngx_http_cache_purge_test_pending_inspection();
+        ngx_http_cache_purge_test_file_proof();
         char sync_root[] = "/tmp/cache-purge-sync-test-XXXXXX";
         check(mkdtemp(sync_root) != nullptr, "file sync test directory");
         for (unsigned scenario = 0; scenario < 6; scenario++) {

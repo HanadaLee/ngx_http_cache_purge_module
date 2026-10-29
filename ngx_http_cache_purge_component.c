@@ -5,7 +5,6 @@
 #include "ngx_http_cache_purge_internal.h"
 
 #include <openssl/evp.h>
-#include <openssl/sha.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -2578,13 +2577,19 @@ ngx_http_cache_purge_component_process_file(ngx_http_cache_purge_component_t *c,
         required.sequence = op->sequence;
         rc = ngx_http_cache_purge_index_require_validation(
             c->operations.store, &expected, &required, error);
-        goto done;
+        if (rc != 0 || file.metadata.len < 4
+            || (memcmp(file.metadata.data, "NFP1", 4)
+                && memcmp(file.metadata.data, "NFR1", 4)
+                && memcmp(file.metadata.data, "NFV", 3)))
+        {
+            goto done;
+        }
     }
     address.len = file.root.len + 1 + file.path.len;
     path = malloc(address.len);
     if (path == NULL) {
         rc = ngx_http_cache_purge_component_error(error,
-            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "Delete path allocation failed");
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "purge path allocation failed");
         goto done;
     }
     memcpy(path, file.root.data, file.root.len);
@@ -2598,6 +2603,11 @@ ngx_http_cache_purge_component_process_file(ngx_http_cache_purge_component_t *c,
     if (rc == 0) {
         rc = ngx_http_cache_purge_file_lease_acquire(c->lease_path,
             c->lease_anchor, offset, &lease, error);
+    }
+    if (rc == 0 && op->input.mode == NGX_HTTP_CACHE_PURGE_INVALIDATE) {
+        rc = ngx_http_cache_purge_publications_require(c->publications, &file,
+            &required, c->lease_anchor, lease, c->options.client_uid, error);
+        goto done;
     }
     if (rc == 0) {
         rc = ngx_http_cache_purge_publications_remove_checked(c->publications,
@@ -3494,7 +3504,7 @@ ngx_http_cache_purge_component_options(
 }
 
 uint32_t
-ngx_http_cache_purge_component_abi_11(void)
+ngx_http_cache_purge_component_abi_12(void)
 {
     return NGX_HTTP_CACHE_PURGE_COMPONENT_ABI;
 }
@@ -4558,7 +4568,10 @@ ngx_http_cache_purge_control_validate(
 
     if (kind >= NGX_HTTP_CACHE_PURGE_NAMESPACE_TAG)
     {
-        if (!input->selector.scope.len || !input->selector.value.len
+        if ((!input->selector.scope.len
+             && kind != NGX_HTTP_CACHE_PURGE_NAMESPACE_TAG
+             && kind != NGX_HTTP_CACHE_PURGE_NAMESPACE_TAGS)
+            || !input->selector.value.len
             || (kind <= NGX_HTTP_CACHE_PURGE_HOST_TAG
                 && input->selector.value.len > 1024)
             || (kind > NGX_HTTP_CACHE_PURGE_HOST_TAG
@@ -4696,30 +4709,6 @@ ngx_http_cache_purge_control_prefix_build(
     }
     b->records[record].next = b->nodes[parent].record;
     b->nodes[parent].record = record;
-    return 0;
-}
-
-int
-ngx_http_cache_purge_tag_digest(ngx_http_cache_rocksdb_bytes_t tag,
-    unsigned char digest[NGX_HTTP_CACHE_PURGE_TAG_DIGEST_SIZE],
-    ngx_http_cache_rocksdb_error_t *error)
-{
-    unsigned char  hash[SHA256_DIGEST_LENGTH];
-
-    if (digest == NULL
-        || !ngx_http_cache_purge_control_bytes_valid(tag, 1024))
-    {
-        return ngx_http_cache_purge_control_error(error,
-            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid TAG digest input");
-    }
-    if (SHA256(tag.len ? tag.data : (const unsigned char *) "", tag.len,
-               hash) == NULL)
-    {
-        return ngx_http_cache_purge_control_error(error,
-            NGX_HTTP_CACHE_ROCKSDB_IO, "TAG digest failed");
-    }
-    memcpy(digest, hash, NGX_HTTP_CACHE_PURGE_TAG_DIGEST_SIZE);
-    ngx_http_cache_purge_control_clear(error);
     return 0;
 }
 
@@ -5802,7 +5791,7 @@ ngx_http_cache_purge_control_scope(ngx_http_cache_purge_control_matcher_t *m,
     uint32_t                                      i, steps, actual;
     int                                           rc;
 
-    if (m->image->scopes == 0 || scope.len == 0) {
+    if (m->image->scopes == 0) {
         return 0;
     }
     i = m->scopes[ngx_http_cache_purge_control_key_hash(m->shared->salt, kind,
@@ -7371,11 +7360,9 @@ ngx_http_cache_purge_component_record_guard(
     rc = ngx_http_cache_purge_component_validation_rules(&v,
         NGX_HTTP_CACHE_PURGE_KEY, file->key, empty, error);
     for (i = 0; rc == 0 && i < file->tag_count; i++) {
-        if (file->tag_namespace.len != 0) {
-            rc = ngx_http_cache_purge_component_validation_rules(&v,
-                NGX_HTTP_CACHE_PURGE_NAMESPACE_TAG, file->tags[i],
-                file->tag_namespace, error);
-        }
+        rc = ngx_http_cache_purge_component_validation_rules(&v,
+            NGX_HTTP_CACHE_PURGE_NAMESPACE_TAG, file->tags[i],
+            file->tag_namespace, error);
     }
     if (rc != 0) {
         return rc;

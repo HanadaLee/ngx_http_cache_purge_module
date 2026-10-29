@@ -468,7 +468,17 @@ def background_delete(cut):
             assert (root / 'cache/a/fresh').exists()
             stop()
         elif cut == 'invalidate':
+            until(lambda: operation()['pending'] == 1
+                  and operation('independent')['done'])
+            assert not operation()['done']
+            assert int.from_bytes(os.getxattr(first, 'user.ngx_cache_purge.id')[112:120], 'big') == 0
+            # File-side requirements cannot be published while a writer owns
+            # the path. The unrelated task must still finish independently.
+            fcntl.fcntl(lease, fcntl.F_OFD_SETLK,
+                        struct.pack('hhqqi', fcntl.F_UNLCK, os.SEEK_SET, offset, 1, 0) + b'\0' * 4)
             until(lambda: operation()['done'] and operation('independent')['done'])
+            marker = os.getxattr(first, 'user.ngx_cache_purge.id')
+            assert marker[:8] == b'NCF2\0\0\0\2' and int.from_bytes(marker[112:120], 'big') >= 1
             assert operation()['stage'] == operation('independent')['stage'] == 3
             assert int.from_bytes(rpc(23, struct.pack('>Q', 1)), 'big') == 1
             checkpoint = operation()['checkpoint']
@@ -518,6 +528,8 @@ def background_delete(cut):
             before = operation()['checkpoint']
             # A delayed publication with no valid origin must be rejected by
             # the persisted retirement floor before any filesystem mutation.
+            fcntl.fcntl(lease, fcntl.F_OFD_SETLK,
+                        struct.pack('hhqqi', fcntl.F_WRLCK, os.SEEK_SET, offset, 1, 0) + b'\0' * 4)
             with first.open('rb') as old:
                 rpc(18, record + string(str(root / 'cache/temporary')),
                     (lease, old.fileno()), code=7)

@@ -87,7 +87,7 @@ ngx_http_cache_purge_runtime_create(ngx_conf_t *cf)
     layout->vary_capacity = sizeof(((ngx_http_file_cache_header_t *) 0)->vary);
     layout->variant_offset = offsetof(ngx_http_file_cache_header_t, variant);
     if (rt->options.abi != NGX_HTTP_CACHE_PURGE_COMPONENT_ABI
-        || ngx_http_cache_purge_component_abi_11()
+        || ngx_http_cache_purge_component_abi_12()
                != NGX_HTTP_CACHE_PURGE_COMPONENT_ABI
         || ngx_array_init(&rt->roots, cf->pool, 2, sizeof(ngx_str_t)) != NGX_OK
         || ngx_array_init(&rt->file_roots, cf->pool, 8,
@@ -2643,7 +2643,8 @@ ngx_http_cache_purge_api_prepare(ngx_http_cache_purge_api_t *ctx,
         conf = ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_module);
         if (ngx_http_cache_purge_api_header(r, conf->tag_namespace_header,
                                            &scope) != NGX_OK
-            || scope.len == 0 || scope.len > 32768
+            || ((kind == 6 || kind == 8) && scope.len == 0)
+            || scope.len > 32768
             || !ngx_http_cache_purge_api_utf8(scope))
         {
             *error = "invalid_tag_scope_header";

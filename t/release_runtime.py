@@ -127,7 +127,7 @@ with (root / 'stdout.log').open('w') as log:
             for path in (root / 'cache').rglob('*'):
                 if path.is_file():
                     try:
-                        if os.getxattr(path, 'user.ngx_cache_purge.id').startswith(b'NCF1\0\0\0\2'):
+                        if os.getxattr(path, 'user.ngx_cache_purge.id')[:8] in (b'NCF1\0\0\0\2', b'NCF2\0\0\0\2'):
                             return True
                     except OSError:
                         pass
