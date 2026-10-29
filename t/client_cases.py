@@ -53,7 +53,7 @@ def run_client_cases(Run, root, checks):
                         rights.extend(array.array('i', raw))
                     assert not (flags & socket.MSG_CTRUNC)
                     magic, version, op, label, size, result = struct.unpack('>4sHHQII', first + self.take(23))
-                    assert magic == b'NCP1' and version == 1 and result == 0 and size <= 524288
+                    assert magic == b'NCP1' and version == 2 and result == 0 and size <= 524288
                     data = self.take(size)
                     assert len(rights) == (2 if op == 18 else 1 if op == 21 else 0)
                     with lock:

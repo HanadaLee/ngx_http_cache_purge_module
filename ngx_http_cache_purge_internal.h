@@ -15,8 +15,8 @@
 extern "C" {
 #endif
 
-#define NGX_HTTP_CACHE_PURGE_COMPONENT_ABI 12
-#define NGX_HTTP_CACHE_PURGE_PROTOCOL_VERSION 1
+#define NGX_HTTP_CACHE_PURGE_COMPONENT_ABI 13
+#define NGX_HTTP_CACHE_PURGE_PROTOCOL_VERSION 2
 #define NGX_HTTP_CACHE_PURGE_FRAME_SIZE 24
 
 typedef struct ngx_http_cache_purge_component_s
@@ -158,7 +158,7 @@ typedef struct {
 void ngx_http_cache_purge_component_options(
     ngx_http_cache_purge_component_options_t *options);
 /* Link-time header/archive compatibility marker. */
-uint32_t ngx_http_cache_purge_component_abi_12(void);
+uint32_t ngx_http_cache_purge_component_abi_13(void);
 
 /* Only start after fork in the selected nginx worker, never while parsing
  * configuration or in master. Copies its inputs and starts one executor thread.
@@ -855,7 +855,7 @@ typedef enum {
     NGX_HTTP_CACHE_PURGE_INDEX_RETIRE
 } ngx_http_cache_purge_index_action_e;
 
-unsigned ngx_http_cache_purge_index_schema_11(void);
+unsigned ngx_http_cache_purge_index_schema_12(void);
 int ngx_http_cache_purge_index_init(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_error_t *error);
 /* Atomic state transitions on the executor. COMMIT and RETIRE accept 1-32
@@ -873,7 +873,8 @@ typedef struct {
     uint64_t       revision;
     unsigned char  previous[16];
     ngx_http_cache_rocksdb_bytes_t key, url, host, tag_namespace;
-    ngx_http_cache_rocksdb_bytes_t root, zone, path, range, vary, metadata;
+    ngx_http_cache_rocksdb_bytes_t root, zone, path, range, vary, metadata,
+                                   misc;
     ngx_http_cache_rocksdb_bytes_t  components[6];
     ngx_http_cache_rocksdb_bytes_t  tags[64];
     size_t                          tag_count;
@@ -884,7 +885,7 @@ typedef struct {
 
 /* Owned, immutable key identity. No file or alias enumeration is needed. */
 typedef struct {
-    ngx_http_cache_rocksdb_bytes_t  url, host, tag_namespace;
+    ngx_http_cache_rocksdb_bytes_t  url, host, tag_namespace, misc;
     void                          *storage;
 } ngx_http_cache_purge_index_identity_t;
 

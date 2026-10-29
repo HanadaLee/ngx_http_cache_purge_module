@@ -129,7 +129,7 @@ def record(n, root='/cache/a', uri='/dir/a', misc='', metadata='proof-v1', zone=
     fields = ['team\x1fhttps\x1fa.test\x1f' + uri + '\x1f' + misc,
               'https://a.test' + uri, 'business.test', 'team', root,
               zone or ('zone-a' if root == '/cache/a' else 'zone-b'), path or f'a/00/{n}', 'bytes=0-99', 'lang']
-    return (identity(n) + b''.join(map(string, fields)) + string(metadata)
+    return (identity(n) + b''.join(map(string, fields)) + string(metadata) + string(misc)
             + bytes([len(tags)]) + b''.join(map(string, tags)) + b'\0\0'
             + string('') * 6 + identity(0))
 
@@ -159,7 +159,7 @@ class Client:
 
     def packet(self, operation, data=b''):
         self.counter += 1
-        return struct.pack('>4sHHQII', b'NCP1', 1, operation, self.counter, len(data), 0) + data
+        return struct.pack('>4sHHQII', b'NCP1', 2, operation, self.counter, len(data), 0) + data
 
     def read(self, size):
         chunks = []
@@ -173,7 +173,7 @@ class Client:
 
     def reply(self, operation, code=0):
         magic, version, op, request, size, result = struct.unpack('>4sHHQII', self.read(24))
-        assert (magic, version, op, request) == (b'NCP1', 1, operation, self.counter)
+        assert (magic, version, op, request) == (b'NCP1', 2, operation, self.counter)
         data = self.read(size)
         self.last_result = result
         assert result in (code if isinstance(code, tuple) else (code,)), (result, code, data)
@@ -195,7 +195,7 @@ class Client:
         try:
             magic, version, op, request, size, result = struct.unpack('>4sHHQII', first + self.read(23))
             payload = self.read(size)
-            assert (magic, version, op, request, result, flags & socket.MSG_CTRUNC) == (b'NCP1', 1, operation, self.counter, 0, 0)
+            assert (magic, version, op, request, result, flags & socket.MSG_CTRUNC) == (b'NCP1', 2, operation, self.counter, 0, 0)
             assert len(rights) == 1
             if target:
                 canonical = str(Path(target[0]).resolve())
@@ -317,7 +317,7 @@ def reply_before_poll(label, mode, operation):
             header = first + client.read(23)
         magic, version, op, request, size, result = struct.unpack('>4sHHQII', header)
         body = client.read(size)
-        assert (magic, version, op, request, result) == (b'NCP1', 1, operation, client.counter, 0)
+        assert (magic, version, op, request, result) == (b'NCP1', 2, operation, client.counter, 0)
         assert len(rights) == (1 if operation == 17 else 0)
         if operation == 17:
             digest = hashlib.sha256(address.encode()).digest()
@@ -754,8 +754,12 @@ try:
     # 512 KiB bodies fit; a third is rejected, without allocating its body.
     limited = Component(root / 'limited', timeout=700)
     limited.opened()
+    legacy = Client(limited.path)
+    legacy.socket.sendall(struct.pack('>4sHHQII', b'NCP1', 1, 1, 1, 0, 0))
+    check(legacy.socket.recv(1) == b'', 'old file descriptor protocol is rejected before decoding')
+    legacy.close()
     peers = [Client(limited.path) for _ in range(3)]
-    header = struct.pack('>4sHHQII', b'NCP1', 1, 3, 1, 512 * 1024, 0)
+    header = struct.pack('>4sHHQII', b'NCP1', 2, 3, 1, 512 * 1024, 0)
     for peer in peers:
         peer.socket.sendall(header)
     status = wait_for(lambda: (s if (s := limited.status())[4] >= 1 else None))
@@ -771,7 +775,7 @@ try:
     check(slow.socket.recv(1) == b'', 'incomplete frame deadline closes slow peer')
     slow.close()
     oversized = Client(limited.path)
-    oversized.socket.sendall(struct.pack('>4sHHQII', b'NCP1', 1, 3, 1, 2**32 - 1, 0))
+    oversized.socket.sendall(struct.pack('>4sHHQII', b'NCP1', 2, 3, 1, 2**32 - 1, 0))
     check(oversized.socket.recv(1) == b'', 'oversized frame rejected before payload allocation')
     oversized.close()
     peers = [Client(limited.path) for _ in range(12)]

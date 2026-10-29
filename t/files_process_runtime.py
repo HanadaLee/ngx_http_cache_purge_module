@@ -37,7 +37,7 @@ def recover_publication(root, expected_state):
             with socket.socket(socket.AF_UNIX) as client:
                 client.settimeout(4)
                 client.connect(str(root / 'db/component.sock'))
-                client.sendall(struct.pack('>4sHHQII', b'NCP1', 1, opcode, 1,
+                client.sendall(struct.pack('>4sHHQII', b'NCP1', 2, opcode, 1,
                                            len(payload), 0) + payload)
                 def read(size):
                     data = b''
@@ -47,7 +47,7 @@ def recover_publication(root, expected_state):
                         data += part
                     return data
                 magic, version, op, ident, size, code = struct.unpack('>4sHHQII', read(24))
-                assert (magic, version, op, ident, code) == (b'NCP1', 1, opcode, 1, 0)
+                assert (magic, version, op, ident, code) == (b'NCP1', 2, opcode, 1, 0)
                 return read(size)
         try:
             assert select.select([process.stdout], [], [], 8)[0]
@@ -134,7 +134,7 @@ def automatic(root):
     def revision():
         with socket.socket(socket.AF_UNIX) as client:
             client.settimeout(4); client.connect(str(root / 'db/component.sock'))
-            client.sendall(struct.pack('>4sHHQII', b'NCP1', 1, 2, 1, 16, 0) + (42).to_bytes(16, 'big'))
+            client.sendall(struct.pack('>4sHHQII', b'NCP1', 2, 2, 1, 16, 0) + (42).to_bytes(16, 'big'))
             def read(n):
                 data = b''
                 while len(data) < n:
@@ -142,7 +142,7 @@ def automatic(root):
                 return data
             magic, version, operation, request, size, result = struct.unpack('>4sHHQII', read(24))
             data = read(size)
-            assert (magic, version, operation, request, result) == (b'NCP1', 1, 2, 1, 0), data
+            assert (magic, version, operation, request, result) == (b'NCP1', 2, 2, 1, 0), data
             return int.from_bytes(data[1:9], 'big')
     try:
         assert line() == 'STARTED'
@@ -276,7 +276,7 @@ def background_delete(cut):
     def rpc(opcode, payload=b'', fds=(), code=0):
         with socket.socket(socket.AF_UNIX) as client:
             client.settimeout(4); client.connect(str(root / 'db/component.sock'))
-            packet = struct.pack('>4sHHQII', b'NCP1', 1, opcode, 1, len(payload), 0) + payload
+            packet = struct.pack('>4sHHQII', b'NCP1', 2, opcode, 1, len(payload), 0) + payload
             if fds:
                 assert client.sendmsg([packet[:1]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
                                       struct.pack(f'{len(fds)}i', *fds))]) == 1
@@ -290,7 +290,7 @@ def background_delete(cut):
                 return data
             magic, version, echoed, request, size, result = struct.unpack('>4sHHQII', read(24))
             data = read(size)
-            assert (magic, version, echoed, request) == (b'NCP1', 1, opcode, 1), data
+            assert (magic, version, echoed, request) == (b'NCP1', 2, opcode, 1), data
             assert code is None or result == code, (result, data)
             return (result, data) if code is None else data
 
@@ -492,7 +492,8 @@ def background_delete(cut):
             fields = ['pending-key', 'https://other.test/pending', 'other.test', 'tenant',
                       str(root / 'cache'), 'cache', 'a/pending', '', '']
             record = ((99).to_bytes(16, 'big') + b''.join(map(string, fields))
-                      + string('unknown-origin') + b'\0\0\0' + string('') * 6 + b'\0' * 16)
+                      + string('unknown-origin') + string('')
+                      + b'\0\0\0' + string('') * 6 + b'\0' * 16)
             rpc(3, b'\x01' + record)
             process.stdin.write('e\n'); process.stdin.flush()
             assert select.select([process.stdout], [], [], 8)[0]

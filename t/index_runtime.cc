@@ -83,6 +83,7 @@ file(unsigned n, std::string uri = "/dir/a", std::string misc = "",
     result.components = { "team", "https", "shared.cache.test", uri, misc,
         "bytes=0-99" };
     result.key = key(result.components);
+    result.misc = misc;
     result.url = "https://shared.cache.test" + uri;
     result.range = result.components[5];
     result.vary = "Accept-Language";
@@ -1858,7 +1859,7 @@ ngx_http_cache_purge_test_retention(const std::string &path)
                 + std::string(
                     reinterpret_cast<const char *>(first.id.data()), 16));
         Index upgraded(store);
-        check(ngx_http_cache_purge_test_raw(store, "M:index") == "11"
+        check(ngx_http_cache_purge_test_raw(store, "M:index") == "12"
                   && ngx_http_cache_purge_test_raw(store,
                          "O"
                              + std::string(reinterpret_cast<const char *>(
@@ -2175,19 +2176,35 @@ ngx_http_cache_purge_test_fixed_identity(const std::string &path)
     other.zone = "zone-b";
     other.path = "other-file";
     other.range = other.components[5] = "bytes=100-199";
-    auto variant = file(7003, "/fixed-identity", "other");
+    auto variant = file(7003, "/fixed-identity",
+        std::string("x\0\x1f\\tail", 8));
     auto isolated = file(7004, "/fixed-identity");
     isolated.tag_namespace = isolated.components[0] = "other-namespace";
     isolated.key = key(isolated.components);
     {
         Index index(store);
-        check(ngx_http_cache_purge_index_schema_11() == 11
-                  && ngx_http_cache_purge_test_raw(store, "M:index") == "11",
+        check(ngx_http_cache_purge_index_schema_12() == 12
+                  && ngx_http_cache_purge_test_raw(store, "M:index") == "12",
             "immutable identity schema is explicit");
         install(index, source);
         install(index, other);
         install(index, variant);
         install(index, isolated);
+        for (const auto &item : { source, other, variant, isolated }) {
+            check(index.get(item.id).misc == item.misc,
+                "misc is persisted and returned independently of key hints");
+            ngx_http_cache_purge_index_identity_t tuple{};
+            check(ngx_http_cache_purge_index_identity(store, bytes(item.key),
+                      &tuple, &error) == 0
+                      && ngx_http_cache_purge_cpp_bytes(tuple.misc)
+                             == item.misc,
+                "immutable identity returns the exact configured misc");
+            ngx_http_cache_purge_index_identity_free(&tuple);
+        }
+        auto changed = variant;
+        changed.misc = "changed";
+        fails(NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            [&] { index.prepare(changed); });
         check(selected(index, { SelectorKind::key, source.key, "" })
                   == std::set<unsigned>({ 7001, 7002 }),
             "one identity retains all zones and slices");
@@ -2198,14 +2215,14 @@ ngx_http_cache_purge_test_fixed_identity(const std::string &path)
         auto counter =
             "k" + ngx_http_cache_purge_test_raw(store, "K" + source.key);
         auto identity = ngx_http_cache_purge_test_raw(store, counter);
-        check(identity.size() == 32
+        check(identity.size() == 40
                   && ngx_http_cache_purge_test_number(identity, 0) == 2,
-            "file count and fixed URL/host/namespace references share one row");
+            "file count and URL/host/namespace/misc refs share one row");
         ngx_http_cache_rocksdb_stats_t before{}, after{};
         check(ngx_http_cache_rocksdb_stats(store, &before, &error) == 0,
             error.message);
         auto keys = raw_keys(store, cf);
-        for (unsigned dimension = 0; dimension != 3; ++dimension) {
+        for (unsigned dimension = 0; dimension != 4; ++dimension) {
             auto conflict = source;
             conflict.id = id(7010 + dimension);
             conflict.path = "conflicting-identity-" + std::to_string(dimension);
@@ -2214,8 +2231,10 @@ ngx_http_cache_purge_test_fixed_identity(const std::string &path)
                 conflict.structured_url = false;
             } else if (dimension == 1) {
                 conflict.host = "different.test";
-            } else {
+            } else if (dimension == 2) {
                 conflict.tag_namespace = "different-namespace";
+            } else {
+                conflict.misc = "different-misc";
             }
             auto valid = file(7020 + dimension, "/atomic-identity");
             fails(NGX_HTTP_CACHE_ROCKSDB_CONFLICT, [&] {
@@ -2241,11 +2260,11 @@ ngx_http_cache_purge_test_fixed_identity(const std::string &path)
         check(selected(index, { SelectorKind::url, source.url, "" })
                   == std::set<unsigned>({ 7003, 7004 }),
             "collecting one identity preserves other keys of the same URL");
-        raw_write(store, cf, "M:index", "10");
-        fails(NGX_HTTP_CACHE_ROCKSDB_SCHEMA, [&] { Index old(store); });
-        check(ngx_http_cache_purge_test_raw(store, "M:index") == "10",
-            "old prototype schema is rejected without rewriting its data");
         raw_write(store, cf, "M:index", "11");
+        fails(NGX_HTTP_CACHE_ROCKSDB_SCHEMA, [&] { Index old(store); });
+        check(ngx_http_cache_purge_test_raw(store, "M:index") == "11",
+            "schema without explicit misc is rejected without rewriting data");
+        raw_write(store, cf, "M:index", "12");
     }
     check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
     check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
@@ -2256,6 +2275,8 @@ ngx_http_cache_purge_test_fixed_identity(const std::string &path)
         check(selected(index, { SelectorKind::url, source.url, "" })
                   == std::set<unsigned>({ 7003, 7004 }),
             "fixed identities reopen without cache-file scanning");
+        check(index.get(variant.id).misc == variant.misc,
+            "binary misc survives restart independently of key encoding");
         check(index.get(isolated.id).tag_namespace == "other-namespace",
             "namespace isolation survives restart");
         for (auto value : { variant, isolated }) {

@@ -157,7 +157,7 @@ def text(value):
 
 
 def ipc(path, op, data=b''):
-    request = struct.pack('>4sHHQII', b'NCP1', 1, op, 1, len(data), 0) + data
+    request = struct.pack('>4sHHQII', b'NCP1', 2, op, 1, len(data), 0) + data
     if os.geteuid() == 0 and a.worker_user and pwd.getpwnam(a.worker_user).pw_uid != 0:
         script = """import socket,sys
 s=socket.socket(socket.AF_UNIX);s.settimeout(3);s.connect(sys.argv[1]);s.sendall(sys.stdin.buffer.read())
@@ -391,7 +391,7 @@ try:
         assert (case.path / 'index').stat().st_uid == worker_uid and directory_mode == 0o700
         probe_code = '''import socket,struct,sys
 s=socket.socket(socket.AF_UNIX);s.settimeout(2);s.connect(sys.argv[1]);print('connected',flush=True)
-s.sendall(struct.pack('>4sHHQII',b'NCP1',1,1,1,0,0))
+s.sendall(struct.pack('>4sHHQII',b'NCP1',2,1,1,0,0))
 def read(n):
  b=b''
  while len(b)<n:

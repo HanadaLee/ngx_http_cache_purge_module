@@ -520,7 +520,7 @@ ngx_http_cache_purge_component_tags(ngx_http_cache_purge_component_decoder_t *d,
 static void
 ngx_http_cache_purge_component_file_fields(
     ngx_http_cache_purge_index_file_t *file,
-    ngx_http_cache_rocksdb_bytes_t *fields[10])
+    ngx_http_cache_rocksdb_bytes_t *fields[11])
 {
     fields[0] = &file->key;
     fields[1] = &file->url;
@@ -532,20 +532,21 @@ ngx_http_cache_purge_component_file_fields(
     fields[7] = &file->range;
     fields[8] = &file->vary;
     fields[9] = &file->metadata;
+    fields[10] = &file->misc;
 }
 
 static void
 ngx_http_cache_purge_component_file(ngx_http_cache_purge_component_decoder_t *d,
     ngx_http_cache_purge_index_file_t *file)
 {
-    ngx_http_cache_rocksdb_bytes_t  *fields[10];
+    ngx_http_cache_rocksdb_bytes_t  *fields[11];
     size_t                           i;
 
     memset(file, 0, sizeof(*file));
     file->state = NGX_HTTP_CACHE_PURGE_INDEX_PREPARED;
     ngx_http_cache_purge_component_id(d, file->id);
     ngx_http_cache_purge_component_file_fields(file, fields);
-    for (i = 0; i < 10; i++) {
+    for (i = 0; i < 11; i++) {
         *fields[i] =
             ngx_http_cache_purge_component_string(d, i == 9 ? 16384 : 32768);
     }
@@ -651,12 +652,12 @@ ngx_http_cache_purge_component_put_file(
     ngx_http_cache_purge_component_encoder_t *e,
     ngx_http_cache_purge_index_file_t *file)
 {
-    ngx_http_cache_rocksdb_bytes_t  *fields[10];
+    ngx_http_cache_rocksdb_bytes_t  *fields[11];
     size_t                           i;
 
     ngx_http_cache_purge_component_put_raw(e, file->id, 16);
     ngx_http_cache_purge_component_file_fields(file, fields);
-    for (i = 0; i < 10; i++) {
+    for (i = 0; i < 11; i++) {
         ngx_http_cache_purge_component_put_string(e, *fields[i]);
     }
     ngx_http_cache_purge_component_put_integer(e, file->tag_count, 1);
@@ -3504,7 +3505,7 @@ ngx_http_cache_purge_component_options(
 }
 
 uint32_t
-ngx_http_cache_purge_component_abi_12(void)
+ngx_http_cache_purge_component_abi_13(void)
 {
     return NGX_HTTP_CACHE_PURGE_COMPONENT_ABI;
 }

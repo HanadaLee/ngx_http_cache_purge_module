@@ -318,10 +318,13 @@ The existing worker executor resumes the bounded scan from durable checkpoints.
 Admission checks that requirement even when no resident rule remains; successful
 conditional validation satisfies it without replacing the entity. Requirements
 are monotonic within one ledger and are collected with their retired file.
-Index schema 11 stores one immutable URL/host/namespace identity per key.
-Prototype schemas 1-10 are rejected without modifying their data; this release
+Index schema 12 stores one immutable URL/host/namespace/misc identity per key.
+The misc value has its own dictionary reference and is returned independently
+of transient key compression hints. File proofs bind this persisted value;
+empty and binary misc values remain distinct. Prototype schemas 1-11 are
+rejected without modifying their data; this release
 does not provide an automatic migration. Existing tasks and index data must be
-preserved when planning a transition. Reopening schema 11 reuses its WAL-backed
+preserved when planning a transition. Reopening schema 12 reuses its WAL-backed
 index without scanning cache directories. Native representation repair retains
 its bounded durable cursor; unresolved identities cannot imply an empty TAG set.
 Older module archives are rejected by a schema-specific configure link check.
@@ -547,11 +550,13 @@ On graceful reload, the old worker requests asynchronous executor shutdown so
 long-lived HTTP responses do not keep the database owner indefinitely. Its
 executor finishes the current operation and closes the DB before the replacement
 opens it. The old worker can continue sending its response and joins the stopped
-executor when it exits. The component C ABI is 12; rebuild its archives together
-with the addon. Upgrading from an earlier component ABI or shared-control ABI 5
+executor when it exits. The component C ABI is 13 and the internal IPC version
+is 2; rebuild its archives together with the addon. Upgrading from an earlier
+component ABI or shared-control ABI 5
 or earlier requires a full nginx restart; persisted cache files and indexes are
-retained. An old executor cannot serve the new object-query opcode during a
-mixed-version reload. nginx-ext ABI remains 1.
+retained, but incompatible index schemas require a separate migration before
+the new binary can open them. Old IPC frames are rejected before decoding.
+nginx-ext ABI remains 1.
 Override `CACHE_PURGE_ROCKSDB_LIBS` to use
 a fixed RocksDB archive and its compression/runtime dependencies. The default
 links the system shared RocksDB library. Static archives linked into a dynamic

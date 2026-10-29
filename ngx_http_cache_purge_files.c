@@ -1839,7 +1839,7 @@ ngx_http_cache_purge_publication_publish(ngx_http_cache_rocksdb_t *store,
     proof.required = required.sequence;
     proof.tag_count = (uint32_t) file.tag_count;
     rc = ngx_http_cache_purge_identity_digest(file.url, file.tag_namespace,
-        file.components[4], proof.identity, error);
+        file.misc, proof.identity, error);
     if (rc != 0) {
         goto done;
     }

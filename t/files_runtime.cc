@@ -1497,6 +1497,13 @@ ngx_http_cache_purge_test_publication_wal(const std::string &path,
         File file;
         file.id = id(1);
         file.key = "wal-publication";
+        file.misc = std::string("misc\0opaque", 11);
+        ngx_http_cache_purge_watermark_t origin{};
+        std::memset(origin.ledger, 0x17, 16);
+        unsigned char encoded[NGX_HTTP_CACHE_PURGE_WATERMARK_SIZE];
+        ngx_http_cache_purge_watermark_encode(&origin, encoded);
+        file.metadata.assign(reinterpret_cast<const char *>(encoded),
+            sizeof(encoded));
         file.url = "https://example.test/wal";
         file.host = "example.test";
         file.tag_namespace = "team";
@@ -1614,6 +1621,15 @@ ngx_http_cache_purge_test_publication_wal(const std::string &path,
                           NGX_HTTP_CACHE_PURGE_FILE_STAGED),
                 "only a still-valid synchronized instance becomes READY");
             if (scenario == 0) {
+                ngx_http_cache_purge_file_proof_t proof{};
+                unsigned char expected[32];
+                check(ngx_http_cache_purge_identity_digest(bytes(file.url),
+                          bytes(file.tag_namespace), bytes(file.misc),
+                          expected, &error) == 0
+                          && ngx_http_cache_purge_file_proof_read(fd.fd,
+                                 &proof, &error) == 0
+                          && std::memcmp(proof.identity, expected, 32) == 0,
+                    "publication binds binary misc with an opaque key");
                 check(guards == 2
                           && ngx_http_cache_purge_test_sync_count()
                                  == syncs + 1,

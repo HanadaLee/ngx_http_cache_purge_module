@@ -137,7 +137,7 @@ def rpc(op, payload=b''):
     with socket.socket(socket.AF_UNIX) as conn:
         conn.settimeout(8)
         conn.connect(str(run / 'index/component.sock'))
-        conn.sendall(struct.pack('>4sHHQII', b'NCP1', 1, op, 1, len(payload), 0) + payload)
+        conn.sendall(struct.pack('>4sHHQII', b'NCP1', 2, op, 1, len(payload), 0) + payload)
 
         def read(size):
             value = b''
@@ -149,7 +149,7 @@ def rpc(op, payload=b''):
 
         magic, version, operation, ident, size, code = struct.unpack('>4sHHQII', read(24))
         body = read(size)
-        assert (magic, version, operation, ident, code) == (b'NCP1', 1, op, 1, 0), body
+        assert (magic, version, operation, ident, code) == (b'NCP1', 2, op, 1, 0), body
         return body
 
 
@@ -184,7 +184,7 @@ def record(url):
         return None
     d = Decode(rpc(2, ident))
     d.take(25)
-    fields = [d.string() for _ in range(10)]
+    fields = [d.string() for _ in range(11)]
     tags = [d.string() for _ in range(d.number(1))]
     flags = d.take(2)
     components = [d.string() for _ in range(6)]
@@ -207,6 +207,7 @@ try:
             # GET_FILE resolves dictionary values; it does not return the
             # transient structured input flags or component array.
             assert tags == [b'topic']
+            assert stored[10] == fields[4]
             until(lambda: (target := Path(os.fsdecode(stored[4])) / os.fsdecode(stored[6])).exists()
                   and os.getxattr(target, 'user.ngx_cache_purge.id')[4:8] == b'\0\0\0\2')
             assert request(path)[1] == 'HIT'

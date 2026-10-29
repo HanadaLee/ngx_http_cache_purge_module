@@ -44,7 +44,7 @@ struct File {
     FileId id{};
     FileState state = FileState::prepared;
     uint64_t revision = 0;
-    std::string key, url, host, tag_namespace;
+    std::string key, url, host, tag_namespace, misc;
     std::string root, zone, path, range, vary;
     std::vector<std::string> tags;
     std::string metadata;
@@ -154,6 +154,7 @@ ngx_http_cache_purge_native_file(const File &file)
     out.range = ngx_http_cache_purge_native_bytes(file.range);
     out.vary = ngx_http_cache_purge_native_bytes(file.vary);
     out.metadata = ngx_http_cache_purge_native_bytes(file.metadata);
+    out.misc = ngx_http_cache_purge_native_bytes(file.misc);
     out.structured_key = file.structured_key;
     out.structured_url = file.structured_url;
     for (size_t i = 0; i < 6; i++) {
@@ -414,6 +415,7 @@ public:
         result.host = ngx_http_cache_purge_cpp_bytes(value.host);
         result.tag_namespace =
             ngx_http_cache_purge_cpp_bytes(value.tag_namespace);
+        result.misc = ngx_http_cache_purge_cpp_bytes(value.misc);
         result.root = ngx_http_cache_purge_cpp_bytes(value.root);
         result.zone = ngx_http_cache_purge_cpp_bytes(value.zone);
         result.path = ngx_http_cache_purge_cpp_bytes(value.path);
@@ -1083,7 +1085,7 @@ public:
 namespace ngx_http_cache_purge::protocol {
 
 /*
- * Internal IPC v1, all integers big-endian. Frame: "NCP1", u16 version, u16
+ * Internal IPC v2, all integers big-endian. Frame: "NCP1", u16 version, u16
  * opcode, u64 correlation ID, u32 payload length, u32 result (0 in requests).
  * Correlation IDs are transport labels, not durable idempotency keys. Strings:
  * u32 length + bytes; IDs: 16 raw bytes; bools: one byte 0/1. No struct
@@ -1244,6 +1246,7 @@ file(Decoder &d)
         *field = d.string();
     }
     f.metadata = d.string(16384);
+    f.misc = d.string();
     f.tags = tags(d);
     f.structured_key = d.flag();
     f.structured_url = d.flag();
@@ -1262,6 +1265,7 @@ file(Encoder &e, const File &f)
         e.string(*field);
     }
     e.string(f.metadata);
+    e.string(f.misc);
     tags(e, f.tags);
     e.byte(f.structured_key);
     e.byte(f.structured_url);

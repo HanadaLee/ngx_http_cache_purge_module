@@ -540,7 +540,7 @@ class Decode:
 def rpc(op, payload=b'', fds=(), receive_fd=False, codes=(0,)):
     with socket.socket(socket.AF_UNIX) as s:
         s.settimeout(8); s.connect(str(run / 'index/component.sock'))
-        packet = struct.pack('>4sHHQII', b'NCP1', 1, op, 1, len(payload), 0) + payload
+        packet = struct.pack('>4sHHQII', b'NCP1', 2, op, 1, len(payload), 0) + payload
         if fds:
             assert s.sendmsg([packet[:1]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', fds))]) == 1
             s.sendall(packet[1:])
@@ -562,7 +562,7 @@ def rpc(op, payload=b'', fds=(), receive_fd=False, codes=(0,)):
                 assert not flags & socket.MSG_CTRUNC
             magic, version, operation, ident, length, result = struct.unpack('>4sHHQII', first + read(24 - len(first)))
             body = read(length)
-            assert (magic, version, operation, ident) == (b'NCP1', 1, op, 1)
+            assert (magic, version, operation, ident) == (b'NCP1', 2, op, 1)
             assert result in codes, (result, body)
             if receive_fd: assert len(received) == (1 if result == 0 else 0)
             if result != 0: return None
@@ -629,7 +629,7 @@ def record(ident, optional=False):
     d = Decode(raw); state, revision = d.number(1), d.number(8); assert d.take(16) == ident
     names = ('key', 'url', 'host', 'namespace', 'root', 'zone', 'path', 'range', 'vary')
     result = {name: d.string() for name in names}
-    result.update(id=ident, state=state, revision=revision, metadata=d.string())
+    result.update(id=ident, state=state, revision=revision, metadata=d.string(), misc=d.string())
     result['tags'] = [d.string() for _ in range(d.number(1))]
     result['flags'] = d.take(2); result['components'] = [d.string() for _ in range(6)]; d.end()
     return result
@@ -694,7 +694,7 @@ def ready_file(item):
     marker = checked_marker(path)
     assert marker[:4] == b'NCF2'
     identity = b'NCI1' + b''.join(string(value) for value in
-        (item['namespace'], item['url'], item['components'][4]))
+        (item['namespace'], item['url'], item['misc']))
     assert marker[120:152] == hashlib.sha256(identity).digest()
     assert marker[152:] == b''.join(hashlib.sha256(tag).digest()[:16]
                                    for tag in item['tags'])
@@ -739,7 +739,8 @@ def prepared_replacement(item):
         ident = os.urandom(16)
         fields = ('key', 'url', 'host', 'namespace', 'root', 'zone', 'path', 'range', 'vary')
         payload = (ident + b''.join(string(item[name]) for name in fields)
-                   + string(origin_metadata(item)) + bytes([len(item['tags'])])
+                   + string(origin_metadata(item)) + string(item['misc'])
+                   + bytes([len(item['tags'])])
                    + b''.join(map(string, item['tags'])) + item['flags']
                    + b''.join(map(string, item['components'])) + item['id']
                    + string(str(temporary)))
@@ -883,6 +884,19 @@ try:
     assert len(origin_metadata(first)) == 28
     assert get('/asset')[1] == 'HIT' and calls.count('/asset') == 1
     checks.append('real upstream fill is WAL-indexed with the native key snapshot, scoped tags and READY marker')
+    misc_proofs = []
+    for misc in ('one', 'two'):
+        assert get('/misc-proof?m=' + misc)[1] == 'MISS'
+        items = records('/misc-proof', len(misc_proofs) + 1)
+        item = next(item for item in items if item['misc'] == misc.encode())
+        target = ready_file(item)
+        expected = b'NCI1' + string('tenant') + string('http://cache.test/misc-proof') + string(misc)
+        proof = checked_marker(target)[120:152]
+        assert proof == hashlib.sha256(expected).digest()
+        misc_proofs.append(proof)
+        assert get('/misc-proof?m=' + misc)[1] == 'HIT'
+    assert misc_proofs[0] != misc_proofs[1]
+    checks.append('two configured misc values under one URL produce independently verified distinct file proofs')
     conditional_paths.add('/empty-namespace')
     assert get('/empty-namespace') == (200, 'MISS', b'/empty-namespace')
     empty_namespace = records('/empty-namespace', 1)[0]
@@ -1588,7 +1602,7 @@ try:
     assert status == 200 and headers['Cache-Control'] == 'no-store' and caps['ready'], (status, caps)
     assert caps['authentication'] == 'nginx-configuration' and 'signed_events' not in caps
     assert caps['propagation_timeout_ms'] == '120000'
-    assert caps['index_schema'] == 11
+    assert caps['index_schema'] == 12
     assert caps['control_headers']['tag_namespace'] == 'X-Cache-Purge-Namespace'
     assert caps['index_id'] == ledger.hex() and caps['max_tags'] == 64
     assert caps['invalidate_stale_policy'] == ('forbid' if extension else 'native')

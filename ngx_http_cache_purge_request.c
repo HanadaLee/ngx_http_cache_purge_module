@@ -3677,7 +3677,7 @@ ngx_http_cache_purge_read_admit(ngx_http_cache_purge_capture_t *ctx,
     ngx_http_cache_purge_control_reader_t  *reader;
     ngx_http_cache_purge_control_context_t  context;
     ngx_http_cache_rocksdb_error_t          error;
-    ngx_http_cache_rocksdb_bytes_t           fields[10], tags[64], value;
+    ngx_http_cache_rocksdb_bytes_t           fields[11], tags[64], value;
     ngx_http_cache_purge_watermark_t        current, stored, validated;
     uint64_t                                publication, first, stamp;
     ngx_uint_t                              i, count;
@@ -3697,13 +3697,21 @@ ngx_http_cache_purge_read_admit(ngx_http_cache_purge_capture_t *ctx,
     }
     p = payload.data + 25;
     end = payload.data + payload.len - 16;
-    for (i = 0; i < 10; i++) {
+    for (i = 0; i < 11; i++) {
         if (ngx_http_cache_purge_read_field(&p, end, &fields[i]) != NGX_OK) {
             return 0;
         }
     }
     if (fields[0].len != ctx->key.len
         || ngx_memcmp(fields[0].data, ctx->key.data, ctx->key.len) != 0
+        || fields[3].len != ctx->namespace.len
+        || (ctx->namespace.len
+            && ngx_memcmp(fields[3].data, ctx->namespace.data,
+                          ctx->namespace.len) != 0)
+        || fields[10].len != ctx->components[4].len
+        || (ctx->components[4].len
+            && ngx_memcmp(fields[10].data, ctx->components[4].data,
+                          ctx->components[4].len) != 0)
         || p == end)
     {
         return 0;
@@ -4207,7 +4215,7 @@ ngx_http_cache_purge_capture_submit_prepare(ngx_http_cache_purge_capture_t *ctx)
         ctx->key,  ctx->url,  ctx->host,          ctx->namespace,  ctx->root,
         ctx->zone, ctx->path, ctx->components[5], ctx->cache->vary
     };
-    size_t      size = 16 + 9 * 4 + 4 + 1 + 2 + 6 * 4 + 16 + 4;
+    size_t      size = 16 + 9 * 4 + 8 + 1 + 2 + 6 * 4 + 16 + 4;
     ngx_uint_t  i;
     ngx_msec_t timeout = ngx_http_cache_purge_capture_remaining(ctx);
     ngx_int_t  rc;
@@ -4226,7 +4234,7 @@ ngx_http_cache_purge_capture_submit_prepare(ngx_http_cache_purge_capture_t *ctx)
             ctx->cache->variant, watermark);
         metadata.len = sizeof(watermark);
     }
-    size += metadata.len;
+    size += metadata.len + ctx->components[4].len;
     for (i = 0; i < 9; i++) {
         if (fields[i].len > 32768) {
             return NGX_ERROR;
@@ -4248,6 +4256,7 @@ ngx_http_cache_purge_capture_submit_prepare(ngx_http_cache_purge_capture_t *ctx)
         p = ngx_http_cache_purge_capture_string(p, fields[i]);
     }
     p = ngx_http_cache_purge_capture_string(p, metadata);
+    p = ngx_http_cache_purge_capture_string(p, ctx->components[4]);
     *p++ = (u_char) ctx->tag_count;
     for (i = 0; i < ctx->tag_count; i++) {
         p = ngx_http_cache_purge_capture_string(p, ctx->tags[i]);
