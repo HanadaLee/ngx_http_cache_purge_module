@@ -623,7 +623,7 @@ ngx_http_cache_purge_test_main(int argc, char **argv)
     size_t  expired;
     int     rc;
 
-    unsigned char raw[1024], schema[] = "10";
+    unsigned char raw[1024], schema[] = "11";
     char          path[] = "/tmp/ngx-cache-ledger-c-XXXXXX";
     const char    binding[] = { 'a', '\0', 'b' };
 

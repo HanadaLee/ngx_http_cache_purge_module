@@ -1532,7 +1532,7 @@ try:
     assert status == 200 and headers['Cache-Control'] == 'no-store' and caps['ready'], (status, caps)
     assert caps['authentication'] == 'nginx-configuration' and 'signed_events' not in caps
     assert caps['propagation_timeout_ms'] == '120000'
-    assert caps['index_schema'] == 10
+    assert caps['index_schema'] == 11
     assert caps['control_headers']['tag_namespace'] == 'X-Cache-Purge-Namespace'
     assert caps['index_id'] == ledger.hex() and caps['max_tags'] == 64
     assert caps['invalidate_stale_policy'] == ('forbid' if extension else 'native')

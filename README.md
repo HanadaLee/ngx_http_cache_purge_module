@@ -148,16 +148,14 @@ the control image through the existing reader gate. Per-file and selector
 requirements still enforce validation after FENCE removal. PROPAGATE keeps its
 independent deadline. Even a newer unrelated file intent conservatively delays
 retirement; retries neither scan all pending metadata nor rewrite checkpoints.
-Admission of an old entity under a newly observed URL or host alias persists a
-sparse Delete requirement before rejecting reuse. The executor drains that queue
-and the retired-file queue in bounded passes, preserving path writers and file
-IDs referenced by unfinished tasks. Native cleanup requires worker acknowledgement
-before index collection. Busy entries remain durable and do not block other
-entries; completed passes back off for one second. A new full entity can satisfy
-Delete, while a 304 alone cannot. Retired file IDs are diagnostic handles and
-may disappear after collection; operation receipts remain durable. Task completion
-covers its enumeration and drain, while subsequently discovered aliases use the
-persistent selector requirements and independent deferred cleanup queue.
+The executor drains deferred Delete requirements and the retired-file queue
+in bounded passes, preserving path writers and file IDs referenced by unfinished
+tasks. Native cleanup requires worker acknowledgement before index collection.
+Busy entries remain durable and do not block other entries; completed passes
+back off for one second. A new full entity can satisfy Delete, while a 304 alone
+cannot. Retired file IDs are diagnostic handles and may disappear after
+collection; operation receipts remain durable.
+
 Diagnostic acceptance still returns PREPARING. Internal IPC can activate a task
 only after its FENCE publication is READY; retries preserve the effective time and
 propagation deadline. Activation republishes its updated controls, so callers
@@ -183,8 +181,8 @@ share the same OFD lease protocol; completed receipts remain bounded across
 repeated validation. `VALIDATE_FILE` connects this transaction to native upstream
 304 handling. It transfers the lease and selected descriptor, verifies accepted
 controls before changing old TAG membership, and returns the durable record.
-Control publication must be ready; persisted URL aliases are visited within
-explicit count and byte budgets, with no complete alias set retained in memory.
+Control publication must be ready. Validation checks the file's fixed URL,
+host, namespace and actual TAG membership without an alias scan.
 
 `INSPECT_FILE` checks the actual cache descriptor on the executor through bounded
 IPC. It requires a READY marker, a committed current index record with no pending
@@ -229,14 +227,14 @@ bounded IPC. A zero count alone does not permit FENCE removal: queued IPC,
 unfinished durable transactions and physical processing still need closure.
 The internal shared-control ABI is 5; nginx-ext ABI remains 1.
 
-Native file responses use `ADMIT_FILE` to verify the selected descriptor, bind
-the captured key, and persist the observed URL association. Repeated observations
-do not write the database. The executor checks persisted URL aliases against
-FENCEs within count/byte budgets and returns a publication stamp and the highest
-unsatisfied Invalidate sequence with the record.
-The worker requires the same publication at final admission, closing the gap
-between the database check and response reuse. No alias collection is sent to or
-retained by the worker. Physical `INSPECT_FILE` remains a diagnostic operation.
+Native file responses still use `ADMIT_FILE` to verify the selected descriptor
+and require its exact key, URL and host. Admission does not add associations or
+write observation metadata. The executor checks the fixed identity and actual
+TAGs against resident and persistent requirements, returning a publication stamp
+and the highest unsatisfied Invalidate sequence with the record. The worker
+requires the same publication at final admission. Physical `INSPECT_FILE` remains
+a diagnostic operation. Normal HITs still wait for this database/IPC path;
+foreground isolation is unfinished.
 
 The operation ledger also persists a monotonic write floor with each materialized
 operation. PREPARE, uncommitted FINISH/recovery and new 304 validation writes
@@ -290,18 +288,21 @@ The shared node bit does not replace persistent operation ordering: an older
 Without the macro, native configured stale fallback remains available.
 
 File admission supports this behavior for current URL/key/prefix/host selectors,
-TAGs and persisted URL aliases. Background Invalidate now writes a sparse
+TAGs and the fixed key identity. Background Invalidate now writes a sparse
 per-instance validation requirement to RocksDB, without rewriting cache files.
 The existing worker executor resumes the bounded scan from durable checkpoints.
 Admission checks that requirement even when no resident rule remains; successful
 conditional validation satisfies it without replacing the entity. Requirements
 are monotonic within one ledger and are collected with their retired file.
-Index schema 10 upgrades existing index records without rebuilding cache files.
-The worker executor backfills native proxy representation bindings in bounded
-batches, retaining a durable cursor across restarts. Completed migrations do not
-rescan the index. Unresolved legacy identities remain explicitly marked by key;
-they must not be mistaken for uncached objects. Older readers reject the schema
-instead of ignoring required relationships. Pending NFV1 plans cannot recover
+Index schema 11 stores one immutable URL/host/namespace identity per key.
+Prototype schemas 1-10 are rejected without modifying their data; this release
+does not provide an automatic migration. Existing tasks and index data must be
+preserved when planning a transition. Reopening schema 11 reuses its WAL-backed
+index without scanning cache directories. Native representation repair retains
+its bounded durable cursor; unresolved identities cannot imply an empty TAG set.
+Older module archives are rejected by a schema-specific configure link check.
+
+Pending NFV1 plans cannot recover
 their removed old TAG membership
 and are conservatively discarded; completed NFR1 receipts and unrelated cache
 files remain valid. NFV2 plans retain
@@ -312,7 +313,7 @@ Persistent selector requirements also survive resident-rule retirement. The
 operation ledger retains the latest Invalidate and Delete sequence independently
 for each selector. Ordered predecessor seeks find matching bytewise prefixes
 without scanning unrelated operation history. File admission uses these records
-to protect URL aliases first observed after enumeration, across native zones.
+to protect older entities after resident FENCE retirement, across native zones.
 Full entities fetched after the latest accepted operation skip this historical
 lookup. Ledger schema 4 adds canonical TAG-set records on top of schema 3's
 sparse activation queue. Schemas 2 and 3 upgrade by changing their marker;
@@ -345,7 +346,7 @@ including checks against persistent requirements after resident-rule retirement.
 Completed upgrades do not replay on restart. This internal storage schema change
 does not change nginx-ext ABI, which remains 1.
 
-Memory-only errors do not receive a separate TAG/alias index. Initial internal
+Memory-only errors do not receive separate index records. Initial internal
 receipts remain PREPARING until activation; the HTTP API waits for activation
 and READY before acknowledging reliable acceptance.
 
@@ -374,7 +375,7 @@ original prepared revision and a lease descriptor, verifies the final instance,
 and completes WAL-indexed/READY-marker publication after a same-filesystem
 rename. Retries recover interrupted publication without recreating an evicted
 file. A busy FINISH keeps its lease and retries within the original publication
-deadline, including when an alias guard needs more batches. Cancellation and
+deadline. Cancellation and
 deadline expiry release the retained resources for background recovery.
 Raw index mutations cannot bypass these checks for physical records.
 `ACQUIRE_PUBLICATION` also resolves the registered root and current file ID, so
@@ -442,8 +443,8 @@ to 128 KiB; these limits exclude allocator overhead and native nginx buffers.
 Generation namespaces, inline PURGE/REFRESH handlers, directory walks and the old
 shared-memory task queue have been removed; their directives are rejected rather
 than silently ignored. New captures do not add arbitrary request URL/Host aliases.
-The backend still contains its earlier alias machinery pending removal; this
-configuration change does not complete the foreground database-isolation work.
+The backend rejects identity changes and no longer has alias observation,
+pagination or revision APIs. This does not complete foreground database isolation.
 
 ## Current features
 
@@ -671,7 +672,7 @@ original metadata size.
 
 Proxy mutations preserve resolved object times, local deadlines and immutable
 TAG memberships before replacement, TAG changes or collection. These records
-keep key aliases alive after the last file is collected. Incremental snapshot
+keep the fixed key identity alive after the last file is collected. Incremental snapshot
 queries match later local rules against retained memberships without loading all
 metadata into memory. Native representation bindings also preserve access to
 secondary Vary files after their main file is removed.
@@ -689,46 +690,26 @@ the same snapshot. Definition scans seek past whole variant groups. Unfinished
 migration and expired or corrupt snapshots return errors rather than a false
 empty result; uncommitted file postings do not supply TAG memberships.
 
-The coordinator can aggregate these memberships and paged URL/host aliases in
-bounded steps. It selects native Vary hashes from a transient snapshot of the
+The coordinator matches the fixed request identity once and aggregates
+selected memberships in bounded steps. It selects native Vary hashes from a transient snapshot of the
 proxy request headers, preserving duplicate-header order and nginx's Accept-*
 normalization. Headers are neither logged nor persisted. A control publication
 change or expired snapshot discards the partial result and requires a retry.
 
-A separate alias iterator streams URL and host associations from bounded
-snapshots and checks its revision before a mutation can use the completed result. The
-revision adds eight bytes to the existing per-key file counter; no new table or
-per-alias metadata is required. Repeated observations and file-count-only changes
-preserve it, while alias insertion and collection advance it atomically with
-their postings. Existing eight-byte counters upgrade on their next mutation.
-Before proxy files lose their old associations, retention now uses this iterator
-in batches of 32 aliases. The existing executor advances at most four pending
-scans in round-robin order. It checks the control publication and alias revision
-before persisting a complete result. Completed scans release their snapshots and
-file buffers; short-lived results are reused only after checking the selected
-file revision, accepted operation sequence and current alias stamp. No new
-thread, process or database is used.
+The per-key identity row contains four unsigned 64-bit values: file count,
+URL dictionary ID, host dictionary ID and namespace dictionary ID. A fill cannot
+change the identity of an existing key; a conflicting batch rolls back entirely.
+One URL may still select multiple misc/namespace keys, with multiple zones,
+slices and Vary files under each key. URL-to-key and host-to-key postings remain;
+the redundant reverse alias rows and alias revision counters have been removed.
+Internal opcode 12 is retired and rejected without renumbering later operations.
 
-File admission and publication guards now scan aliases in batches of eight,
-with four bounded query slots. They aggregate requirements separately from the
-caller's entity and validation watermarks. Old and proposed TAG sets use distinct
-query identities during 304 processing. Both retention and guard scans release
-all database cursors between batches and resume from a 17-byte position after
-checking the unchanged alias revision. Repeated 304 calls reuse their transaction,
-payload and lease while guards are pending, including after durable completion
-while final admission still waits.
-
-Completed retention and alias-guard scans keep their slot until a caller consumes
-the result or the original three-second deadline expires. New arrivals cannot
-evict an unread completion and force it to scan again. Consumed results remain
-eligible for bounded reuse after rechecking their identity and alias revision.
-
-Retained-history expiry now uses one bounded background scan, releasing cursors
-between alias batches. Before collection it matches later local rules against
-the retained namespace/TAG membership and all persisted aliases. Each completed
-membership commits independently, so a later pending scan cannot roll back its
-progress. Completed scans wake collection immediately; waiting does not extend
-the original propagation deadlines.
+Retention before a file mutation matches its fixed identity and TAGs in one
+bounded executor call. Retained-history expiry reads the owning key's immutable
+identity and checks later rules before collection. Neither path allocates alias
+scan slots, stores pending alias results or extends a propagation deadline.
+Dictionary references remain until both files and retained memberships release
+the key; unowned-key collection removes its identity atomically.
 
 Managed proxy-cache requests now resolve these associations asynchronously at
 the cache-entry gate. When the serving control image proves there are no local
@@ -803,8 +784,8 @@ uncached proxy hop; disabling propagation strips them on the origin leg.
 An ignored input does not contribute a requirement, and malformed accepted input
 is rejected before dispatch. No response acknowledgement is added.
 
-Full propagation remains unfinished. File validation, retention before mutation
-and retained-history expiry no longer have a fixed alias count limit.
+Full propagation remains unfinished. File validation and retained-history expiry
+use fixed identities; Vary and membership enumeration remains bounded.
 Per-step matching budgets and shared cursor capacity still require loaded
 performance and progress validation. Source tracing places the inspected
 Edgeresty parent/origin selection before native proxy content. A precontent

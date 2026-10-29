@@ -43,8 +43,8 @@ typedef enum {
     NGX_HTTP_CACHE_PURGE_OP_PENDING,
     NGX_HTTP_CACHE_PURGE_OP_RETIRED,
     NGX_HTTP_CACHE_PURGE_OP_COLLECT_KEYS,
-    NGX_HTTP_CACHE_PURGE_OP_ADD_URL,
-    NGX_HTTP_CACHE_PURGE_OP_UPDATE,
+    /* Opcode 12 (ADD_URL) is retired and must not be reused. */
+    NGX_HTTP_CACHE_PURGE_OP_UPDATE = 13,
     NGX_HTTP_CACHE_PURGE_OP_ACCEPT_OPERATION,
     NGX_HTTP_CACHE_PURGE_OP_GET_OPERATION,
     NGX_HTTP_CACHE_PURGE_OP_GET_CONTROL_STATUS,
@@ -69,7 +69,7 @@ typedef enum {
     NGX_HTTP_CACHE_PURGE_OP_REMOVE_FILE,
     /* root/zone/path/key/URL/host, one FD -> GET record, publication u64,
      * required Invalidate sequence u64 (zero permits ordinary reuse).
-     * Registers the observed URL/host and checks all persisted aliases. */
+     * Requires the selected file to have this exact key/URL/host. */
     NGX_HTTP_CACHE_PURGE_OP_ADMIT_FILE,
     /* operation ID; requires its FENCE publication to be READY */
     NGX_HTTP_CACHE_PURGE_OP_ACTIVATE_OPERATION,
@@ -782,6 +782,7 @@ typedef enum {
     NGX_HTTP_CACHE_PURGE_INDEX_RETIRE
 } ngx_http_cache_purge_index_action_e;
 
+unsigned ngx_http_cache_purge_index_schema_11(void);
 int ngx_http_cache_purge_index_init(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_error_t *error);
 /* Atomic state transitions on the executor. COMMIT and RETIRE accept 1-32
@@ -807,6 +808,19 @@ typedef struct {
     int                             structured_url;
     void                           *storage;
 } ngx_http_cache_purge_index_file_t;
+
+/* Owned, immutable key identity. No file or alias enumeration is needed. */
+typedef struct {
+    ngx_http_cache_rocksdb_bytes_t  url, host, tag_namespace;
+    void                          *storage;
+} ngx_http_cache_purge_index_identity_t;
+
+int ngx_http_cache_purge_index_identity(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_rocksdb_bytes_t key,
+    ngx_http_cache_purge_index_identity_t *identity,
+    ngx_http_cache_rocksdb_error_t *error);
+void ngx_http_cache_purge_index_identity_free(
+    ngx_http_cache_purge_index_identity_t *identity);
 
 typedef struct {
     ngx_http_cache_purge_index_file_t  file;
@@ -957,67 +971,6 @@ int ngx_http_cache_purge_index_publish_tags(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_rocksdb_bytes_t *tags, size_t count,
     ngx_http_cache_purge_index_match_t *out,
     ngx_http_cache_rocksdb_error_t *error);
-int ngx_http_cache_purge_index_add_url(ngx_http_cache_rocksdb_t *store,
-    ngx_http_cache_rocksdb_bytes_t key, ngx_http_cache_rocksdb_bytes_t url,
-    ngx_http_cache_rocksdb_error_t *error);
-int ngx_http_cache_purge_index_observe(ngx_http_cache_rocksdb_t *store,
-    ngx_http_cache_rocksdb_bytes_t key, ngx_http_cache_rocksdb_bytes_t url,
-    ngx_http_cache_rocksdb_bytes_t host,
-    ngx_http_cache_rocksdb_error_t *error);
-/* Visits every persisted URL or host for the key, without retaining the set.
- * The callback borrows each value until it returns. Exceeding either bound
- * fails with LIMIT; partial enumeration is not full coverage. */
-typedef int (*ngx_http_cache_purge_index_visit_pt)(void *data,
-    ngx_http_cache_rocksdb_bytes_t value,
-                                   ngx_http_cache_rocksdb_error_t *error);
-int ngx_http_cache_purge_index_visit_urls(ngx_http_cache_rocksdb_t *store,
-    const ngx_http_cache_purge_index_expected_t *file, size_t max_urls,
-    size_t max_bytes, ngx_http_cache_purge_index_visit_pt visit, void *data,
-    ngx_http_cache_rocksdb_error_t *error);
-int ngx_http_cache_purge_index_visit_hosts(ngx_http_cache_rocksdb_t *store,
-    const ngx_http_cache_purge_index_expected_t *file, size_t max_hosts,
-    size_t max_bytes, ngx_http_cache_purge_index_visit_pt visit, void *data,
-    ngx_http_cache_rocksdb_error_t *error);
-typedef struct ngx_http_cache_purge_alias_query_s
-    ngx_http_cache_purge_alias_query_t;
-
-typedef struct {
-    uint64_t  key_id, revision;
-} ngx_http_cache_purge_alias_stamp_t;
-
-/* One snapshot, one borrowed alias per call, URL then HOST. No total-count
- * limit; cursor lifetime and reusable buffers remain bounded. Before using
- * a completed scan to authorize a mutation, check that its key's aliases
- * are unchanged. Check and mutation must run on the same executor turn. */
-int ngx_http_cache_purge_index_aliases_open(ngx_http_cache_rocksdb_t *store,
-    ngx_http_cache_rocksdb_bytes_t key,
-    ngx_http_cache_purge_alias_query_t **query,
-    ngx_http_cache_rocksdb_error_t *error);
-int ngx_http_cache_purge_index_aliases_next(
-    ngx_http_cache_purge_alias_query_t *query, uint32_t *kind,
-    ngx_http_cache_rocksdb_bytes_t *value,
-    ngx_http_cache_rocksdb_error_t *error);
-/* Release this page's snapshot. Next resumes after the last returned alias
- * with a new bounded snapshot only if the key's alias revision is unchanged. */
-int ngx_http_cache_purge_index_aliases_yield(
-    ngx_http_cache_purge_alias_query_t *query,
-    ngx_http_cache_rocksdb_error_t *error);
-int ngx_http_cache_purge_index_aliases_check(
-    ngx_http_cache_purge_alias_query_t *query,
-    ngx_http_cache_rocksdb_error_t *error);
-/* A completed, checked scan can release its snapshot while a bounded caller
- * retains this stamp. Revalidate immediately before reusing its result. */
-int ngx_http_cache_purge_index_aliases_stamp(
-    ngx_http_cache_purge_alias_query_t *query,
-    ngx_http_cache_purge_alias_stamp_t *stamp,
-    ngx_http_cache_rocksdb_error_t *error);
-int ngx_http_cache_purge_index_aliases_validate(ngx_http_cache_rocksdb_t *store,
-    const ngx_http_cache_purge_alias_stamp_t *stamp,
-    ngx_http_cache_rocksdb_error_t *error);
-int ngx_http_cache_purge_index_aliases_close(
-    ngx_http_cache_purge_alias_query_t **query,
-    ngx_http_cache_rocksdb_error_t *error);
-
 int ngx_http_cache_purge_index_collect(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_expected_t *files, size_t count,
     ngx_http_cache_rocksdb_error_t *error);
@@ -1058,16 +1011,6 @@ int ngx_http_cache_purge_index_representations_member(
     ngx_http_cache_purge_representation_query_t *query, size_t budget,
     ngx_http_cache_purge_retained_context_t *context,
     ngx_http_cache_rocksdb_error_t *error);
-/* Incremental URL/HOST aliases from the same snapshot, without a total-count
- * cap. Opening resets that alias pass; next returns one borrowed value/DONE. */
-int ngx_http_cache_purge_index_representations_aliases(
-    ngx_http_cache_purge_representation_query_t *query, uint32_t kind,
-    ngx_http_cache_rocksdb_error_t *error);
-int ngx_http_cache_purge_index_representations_alias_next(
-    ngx_http_cache_purge_representation_query_t *query,
-    ngx_http_cache_rocksdb_bytes_t *value,
-    ngx_http_cache_rocksdb_error_t *error);
-
 typedef struct ngx_http_cache_purge_retained_query_s
     ngx_http_cache_purge_retained_query_t;
 
@@ -1079,8 +1022,8 @@ typedef int (*ngx_http_cache_purge_retention_guard_pt)(void *data,
 /* Executor-only retention of already matched, activated local requirements.
  * Identity is key/native main/Vary fields/native variant, independent of zone.
  * Call before changing or collecting the exact indexed file. Immutable TAG
- * sets keep namespace/TAG dictionary references and the key's aliases alive;
- * identical memberships are deduplicated. File state and TAGs are unchanged.
+ * sets keep namespace/TAG dictionary references and the key's identity alive.
+ * Identical memberships are deduplicated. File state and TAGs are unchanged.
  * Per-mode maxima may conservatively retain a newer time until the longest
  * matched local window. Reads never extend a deadline. The getter visits at
  * most 64 memberships and returns LIMIT, never a partial answer, on overflow.
@@ -1129,9 +1072,8 @@ int ngx_http_cache_purge_index_expire_propagation_checked(
     ngx_http_cache_rocksdb_t *store, uint64_t now, size_t budget,
     ngx_http_cache_purge_retention_guard_pt guard, void *data,
     size_t *removed, ngx_http_cache_rocksdb_error_t *error);
-/* BUSY retains bounded scan progress. coordinator_step() or the executor's
- * normal loop advances it; callers must retry before discarding the file's
- * associations. Completion is rechecked against the file and alias stamp. */
+/* Match the file's fixed identity and TAGs on the executor before discarding
+ * its associations. File revision and control publication must remain valid. */
 int ngx_http_cache_purge_coordinator_keep_file(
     ngx_http_cache_purge_coordinator_t *coordinator,
     const ngx_http_cache_purge_index_expected_t *file, uint64_t now,
@@ -1148,7 +1090,7 @@ typedef struct ngx_http_cache_purge_object_query_s
 /* Borrow request fields and a bounded HTTP header snapshot until close.
  * Headers encode u32 count, then name/value pairs as u32-length byte strings,
  * in native request-list order, excluding entries whose nginx hash is zero.
- * Steps visit a bounded number of definitions/members/aliases. Only a complete
+ * Steps visit a bounded number of definitions/members. Only a complete
  * unchanged-publication result is exposed; errors require closing/restarting.
  */
 int ngx_http_cache_purge_coordinator_object_open(

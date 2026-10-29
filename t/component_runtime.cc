@@ -8,6 +8,7 @@
 #include <thread>
 #include <cstring>
 #include <string>
+#include <openssl/evp.h>
 
 static int
 ngx_http_cache_purge_test_seed(const char *path)
@@ -52,9 +53,29 @@ ngx_http_cache_purge_test_seed(const char *path)
             NGX_HTTP_CACHE_PURGE_INDEX_COMMIT, &expected, 1, &prepared, &error);
     }
     for (unsigned i = 0; i < 2048 && rc == 0; i++) {
-        auto url = "https://object-alias.test/" + std::to_string(i);
-        rc = ngx_http_cache_purge_index_add_url(
-            store, file.key, bytes(url.c_str()), &error);
+        auto field = "x-query-test-" + std::to_string(i);
+        auto name = "object-" + std::to_string(i);
+        std::string input(reinterpret_cast<char *>(main), sizeof(main));
+        input += field + ":\r\n";
+        unsigned length = 0;
+        if (EVP_Digest(input.data(), input.size(), variant, &length,
+                EVP_md5(), nullptr) != 1 || length != sizeof(variant))
+        {
+            rc = NGX_HTTP_CACHE_ROCKSDB_IO;
+            break;
+        }
+        file.id[14] = (i + 2) >> 8;
+        file.id[15] = i + 2;
+        file.path = bytes(name.c_str());
+        file.vary = bytes(field.c_str());
+        rc = ngx_http_cache_purge_index_prepare_native(store, &file, nullptr,
+            main, variant, &prepared, &error);
+        if (rc == 0) {
+            std::memcpy(expected.id, file.id, 16);
+            rc = ngx_http_cache_purge_index_apply(store,
+                NGX_HTTP_CACHE_PURGE_INDEX_COMMIT, &expected, 1, &prepared,
+                &error);
+        }
     }
     int closed = ngx_http_cache_rocksdb_close(&store, nullptr);
     if (rc != 0) {

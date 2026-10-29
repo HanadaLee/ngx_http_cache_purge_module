@@ -85,7 +85,8 @@ ngx_feature_path="src/core src/event src/event/modules src/os/unix $NGX_OBJS $ng
 ngx_feature_libs="$CACHE_PURGE_LIBS $CACHE_ROCKSDB_LIBS"
 ngx_feature_test='ngx_http_cache_purge_component_options_t o;
                   ngx_http_cache_purge_component_options(&o);
-                  if (o.abi != ngx_http_cache_purge_component_abi_11()) return 1;'
+                  if (o.abi != ngx_http_cache_purge_component_abi_11()) return 1;
+                  if (ngx_http_cache_purge_index_schema_11() != 11) return 1;'
 . auto/feature
 if [ "$ngx_found" != yes ]; then
     echo "cache purge persistent runtime libraries could not link"

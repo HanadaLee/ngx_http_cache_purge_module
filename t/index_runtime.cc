@@ -94,7 +94,13 @@ file(unsigned n, std::string uri = "/dir/a", std::string misc = "",
 static Match
 install(Index &index, const File &record, const FileId &previous = {})
 {
-    auto prepared = index.prepare(record, previous);
+    Match prepared;
+    try {
+        prepared = index.prepare(record, previous);
+    } catch (const IndexError &error) {
+        throw IndexError(error.code, "prepare file "
+            + std::to_string(numeric(record.id)) + ": " + error.what());
+    }
     check(prepared.state == FileState::prepared && prepared.revision == 1,
         "prepare state");
     return index.commit(record.id, prepared.revision);
@@ -648,25 +654,6 @@ ngx_http_cache_purge_test_number(const std::string &data, size_t offset)
     return value;
 }
 
-static std::string
-ngx_http_cache_purge_test_number(uint64_t value)
-{
-    std::string result(8, '\0');
-    for (size_t i = 0; i < 8; i++) {
-        result[7 - i] = value & 255;
-        value >>= 8;
-    }
-    return result;
-}
-
-static int
-ngx_http_cache_purge_test_visit(void *data,
-    ngx_http_cache_rocksdb_bytes_t value, ngx_http_cache_rocksdb_error_t *)
-{
-    auto values = static_cast<std::set<std::string> *>(data);
-    values->emplace(reinterpret_cast<const char *>(value.data), value.len);
-    return 0;
-}
 
 static void
 ngx_http_cache_purge_test_hosts(const std::string &path)
@@ -681,50 +668,47 @@ ngx_http_cache_purge_test_hosts(const std::string &path)
         "host fixture open");
     const auto cf = NGX_HTTP_CACHE_ROCKSDB_DEFAULT;
     auto a = file(401, "/host-shared", "", "first.test");
-    auto b = file(402, "/host-shared", "", "second.test", "/cache/b");
-    const std::string observed = "observed.test";
+    auto b = file(402, "/host-shared", "", "first.test", "/cache/b");
+    const std::string observed = "first.test";
     {
         Index index(store);
         install(index, a);
         install(index, b);
-        check(ngx_http_cache_purge_index_observe(
-                  store, bytes(a.key), bytes(a.url), bytes(observed), &error)
-                  == 0,
-            "observe business host without rewriting file metadata");
+        ngx_http_cache_purge_index_identity_t identity{};
         ngx_http_cache_rocksdb_stats_t before{}, after{};
-        ngx_http_cache_rocksdb_stats(store, &before, &error);
-        check(ngx_http_cache_purge_index_observe(
-                  store, bytes(a.key), bytes(a.url), bytes(observed), &error)
-                  == 0,
-            "repeat host observation");
-        ngx_http_cache_rocksdb_stats(store, &after, &error);
-        check(before.writes == after.writes,
-            "repeated host observations require no WAL write");
-        auto expected = ngx_http_cache_purge_native_expected(a.id, 2);
-        std::set<std::string> hosts;
-        check(ngx_http_cache_purge_index_visit_hosts(store, &expected, 8, 1024,
-                  ngx_http_cache_purge_test_visit, &hosts, &error)
-                      == 0
-                  && hosts
-                         == std::set<std::string>{ "first.test", "second.test",
-                             observed },
-            "host visitor covers original and observed business hosts");
-        check(ngx_http_cache_purge_index_visit_hosts(store, &expected, 2, 1024,
-                  ngx_http_cache_purge_test_visit, &hosts, &error)
-                  == NGX_HTTP_CACHE_ROCKSDB_LIMIT,
-            "host visitor rejects partial coverage beyond count budget");
-        check(ngx_http_cache_purge_index_visit_hosts(store, &expected, 8, 1,
-                  ngx_http_cache_purge_test_visit, &hosts, &error)
-                  == NGX_HTTP_CACHE_ROCKSDB_LIMIT,
-            "host visitor enforces byte budget");
+        check(ngx_http_cache_rocksdb_stats(store, &before, &error) == 0,
+            "fixed host statistics");
+        check(ngx_http_cache_purge_index_identity(store, bytes(a.key),
+                  &identity, &error) == 0,
+            "read immutable key identity");
+        check(ngx_http_cache_purge_cpp_bytes(identity.url) == a.url
+                  && ngx_http_cache_purge_cpp_bytes(identity.host) == a.host
+                  && ngx_http_cache_purge_cpp_bytes(identity.tag_namespace)
+                         == a.tag_namespace,
+            "fixed identity owns one URL, host and namespace");
+        ngx_http_cache_purge_index_identity_free(&identity);
+        check(identity.storage == nullptr && identity.url.len == 0,
+            "identity cleanup releases and clears owned output");
+        check(ngx_http_cache_purge_index_identity(store, bytes("missing"),
+                  &identity, &error) == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND
+                  && identity.storage == nullptr,
+            "unknown identity has no partial output");
+        check(ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
+                  && before.writes == after.writes,
+            "fixed identity lookup does not write metadata");
+        std::set<std::string> hosts{ "first.test" };
         for (const auto &host : hosts) {
             check(selected(index, { SelectorKind::host, host, "" })
                       == std::set<unsigned>{ 401, 402 },
-                "each business host covers both zones");
+                "each fixed host covers both zones");
         }
         check(selected(index, { SelectorKind::host, "shared.cache.test", "" })
                   .empty(),
-            "cache-key host is not implicitly a business host");
+            "cache-key host is not implicitly a fixed host");
+        auto unrelated = file(403, "/other-host", "", "other.test");
+        install(index, unrelated);
+        auto another = file(404, "/another-host", "", "other.test");
+        install(index, another);
         Selector selector{ SelectorKind::host_tag, "photo", observed };
         auto query = index.query(selector);
         Match match;
@@ -759,21 +743,21 @@ ngx_http_cache_purge_test_hosts(const std::string &path)
             selected(index, selector) == std::set<unsigned>{ 401 }
                 && selected(index, { SelectorKind::host_tag, "new", observed })
                        == std::set<unsigned>{ 402 },
-            "TAG changes update all business-host views");
+            "TAG changes update all fixed-host views");
         auto object = ngx_http_cache_purge_test_raw(store,
             "O" + std::string(reinterpret_cast<const char *>(a.id.data()), 16));
-        auto forward = "B" + object.substr(58, 8) + object.substr(42, 8);
-        auto reverse = "b" + object.substr(42, 8) + object.substr(58, 8);
-        raw_write(store, cf, reverse, "", true);
+        auto other_object = ngx_http_cache_purge_test_raw(store,
+            "O" + std::string(
+                reinterpret_cast<const char *>(unrelated.id.data()), 16));
+        auto false_posting =
+            "B" + other_object.substr(58, 8) + object.substr(42, 8);
+        raw_write(store, cf, false_posting, "");
         fails(NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
-            [&] { selected(index, { SelectorKind::host, "first.test", "" }); });
-        check(ngx_http_cache_purge_index_observe(
-                  store, bytes(a.key), bytes(a.url), bytes(a.host), &error)
-                  == NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
-            "one-sided host relationship cannot be silently rewritten");
-        raw_write(store, cf, reverse, "");
-        check(ngx_http_cache_purge_test_raw(store, forward).empty(),
-            "forward host posting remains intact");
+            [&] { selected(index, { SelectorKind::host, "other.test", "" }); });
+        raw_write(store, cf, false_posting, "", true);
+        check(selected(index, { SelectorKind::host, "other.test", "" })
+                  == std::set<unsigned>{ 403, 404 },
+            "host postings must agree with immutable file identity");
     }
     check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
         "close host fixture");
@@ -783,7 +767,8 @@ ngx_http_cache_purge_test_hosts(const std::string &path)
     {
         Index index(store);
         check(selected(index, { SelectorKind::host, "first.test", "" })
-                  == std::set<unsigned>{ 401, 402 },
+                  == std::set<unsigned>({ 401, 402, 410, 411, 412, 413,
+                         414, 415, 416, 417 }),
             "host relations persist without a rebuild");
         for (unsigned n : scan(index, { SelectorKind::key_prefix, "", "" })) {
             auto value = index.get(id(n));
@@ -802,116 +787,6 @@ ngx_http_cache_purge_test_hosts(const std::string &path)
         "close collected host fixture");
 }
 
-static void
-ngx_http_cache_purge_test_host_migration(const std::string &path)
-{
-    check(mkdir(path.c_str(), 0700) == 0, "host migration directory");
-    ngx_http_cache_rocksdb_options_t options;
-    ngx_http_cache_rocksdb_options(&options);
-    ngx_http_cache_rocksdb_t *store = nullptr;
-    ngx_http_cache_rocksdb_error_t error{};
-    check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
-              == 0,
-        "open host migration fixture");
-    const auto cf = NGX_HTTP_CACHE_ROCKSDB_DEFAULT;
-    const auto tag_cf = NGX_HTTP_CACHE_ROCKSDB_TAG;
-    std::set<unsigned> all;
-    std::string damaged, original;
-    {
-        Index index(store);
-        for (unsigned i = 0; i < 40; i++) {
-            install(index, file(500 + i, "/migration", "",
-                               i % 2 ? "second.test" : "first.test"));
-            all.insert(500 + i);
-        }
-        for (const auto &key : raw_keys(store, cf)) {
-            if (key[0] == 'O') {
-                auto value = ngx_http_cache_purge_test_raw(store, key);
-                raw_write(
-                    store, cf, "H" + value.substr(58, 8) + key.substr(1), "");
-                if (static_cast<unsigned char>(key.back()) == (532 & 255)) {
-                    damaged = key;
-                    original = value;
-                }
-            } else if (key[0] == 'B') {
-                auto dict_key = "V" + key.substr(1, 8);
-                auto dict = ngx_http_cache_purge_test_raw(store, dict_key);
-                auto count = ngx_http_cache_purge_test_number(dict, 1);
-                check(count > 1, "migration host retains file references");
-                dict.replace(1, 8, ngx_http_cache_purge_test_number(count - 1));
-                raw_write(store, cf, dict_key, dict);
-                raw_write(store, cf, key, "", true);
-            } else if (key[0] == 'b') {
-                raw_write(store, cf, key, "", true);
-            }
-        }
-        for (const auto &key : raw_keys(store, tag_cf)) {
-            if (key[0] == 'T') {
-                auto object =
-                    ngx_http_cache_purge_test_raw(store, "O" + key.substr(9));
-                raw_write(store, tag_cf,
-                    "H" + object.substr(58, 8) + key.substr(1), "");
-                raw_write(store, tag_cf, key, "", true);
-            }
-        }
-        raw_write(store, cf, "M:index", "3");
-        check(!damaged.empty(), "select second migration batch failure");
-        raw_write(store, cf, damaged, "broken object");
-        fails(
-            NGX_HTTP_CACHE_ROCKSDB_CORRUPT, [&] { Index interrupted(store); });
-        check(ngx_http_cache_purge_test_raw(store, "M:index") == "10"
-                  && ngx_http_cache_purge_test_raw(store, "M:host-cursor")
-                         == "O"
-                                + std::string(reinterpret_cast<const char *>(
-                                                  id(531).data()),
-                                    16),
-            "migration fences old readers and checkpoints only committed "
-            "batches");
-    }
-    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
-        "close interrupted migration");
-    check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
-              == 0,
-        "reopen interrupted migration");
-    raw_write(store, cf, damaged, original);
-    {
-        Index index(store);
-        for (const auto &host : { "first.test", "second.test" }) {
-            check(selected(index, { SelectorKind::host, host, "" }) == all
-                      && selected(
-                             index, { SelectorKind::host_tag, "photo", host })
-                             == all,
-                "legacy per-file postings upgrade to shared host membership");
-        }
-        check(ngx_http_cache_purge_test_raw(store, damaged) == original,
-            "migration preserves file revision, fingerprint and metadata");
-        for (const auto &key : raw_keys(store, cf)) {
-            check(key[0] != 'H' && key != "M:host-cursor",
-                "migration removes old host postings and cursor");
-        }
-        for (const auto &key : raw_keys(store, tag_cf)) {
-            check(key[0] != 'H', "migration removes old host-tag postings");
-        }
-        ngx_http_cache_rocksdb_stats_t before{}, after{};
-        ngx_http_cache_rocksdb_stats(store, &before, &error);
-        Index reopened(store);
-        ngx_http_cache_rocksdb_stats(store, &after, &error);
-        check(before.writes == after.writes,
-            "completed schema migration is not replayed on reopen");
-        for (unsigned n : all) {
-            index.retire(id(n), 2);
-            index.collect_file(id(n), 3);
-        }
-        while (index.collect_keys(2)) {
-        }
-        check(raw_keys(store, cf).size() == 4 && raw_keys(store, tag_cf).empty()
-                  && ngx_http_cache_purge_test_raw(store, "M:native-cursor")
-                         == "O",
-            "migrated dictionary references remain balanced after GC");
-    }
-    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
-        "close migrated host fixture");
-}
 
 static void
 ngx_http_cache_purge_test_validation_policy(const std::string &path)
@@ -1036,7 +911,6 @@ ngx_http_cache_purge_test_validation_policy(const std::string &path)
                       == 0
                   && found.sequence == 9,
             "metadata and TAG changes do not discard unmet invalidation");
-        raw_write(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, "M:index", "2");
     }
     check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
         "close policy database");
@@ -1050,7 +924,7 @@ ngx_http_cache_purge_test_validation_policy(const std::string &path)
                       == 0
                   && found.sequence == 9
                   && std::memcmp(found.ledger, policy.ledger, 16) == 0,
-            "schema v2 upgrades and persistent policy survives reopen");
+            "persistent policy survives same-schema reopen");
         check(ngx_http_cache_purge_index_delete_requirement(
                   store, &expected, &found, &error)
                       == 0
@@ -1187,7 +1061,7 @@ process_test(const std::string &mode, const char *path)
         error.message);
     {
         Index index(store);
-        auto a = file(1), b = file(2, "/dir/a", "", "b.example", "/cache/b"),
+        auto a = file(1), b = file(2, "/dir/a", "", "a.example", "/cache/b"),
              c = file(3, "/dir/a", "fr");
         if (mode == "--crash-prepare") {
             index.prepare_batch({ { a, {} }, { b, {} }, { c, {} } });
@@ -1205,7 +1079,6 @@ process_test(const std::string &mode, const char *path)
                       == std::set<unsigned>({ 1, 2, 3 }),
                 "prepared cross-zone URL links survive");
             index.commit_batch(files);
-            index.add_url(a.key, "https://alias.test/a");
             index.retire(c.id, 2);
             ngx_http_cache_purge_index_expected_t expected{};
             std::memcpy(expected.id, a.id.data(), 16);
@@ -1244,8 +1117,8 @@ process_test(const std::string &mode, const char *path)
                 "URL scan survives without rebuild");
             check(selected(
                       index, { SelectorKind::url, "https://alias.test/a", "" })
-                      == std::set<unsigned>({ 1, 2 }),
-                "alias survives without rebuild");
+                      .empty(),
+                "rejected URL unrelated URLs remain absent after restart");
             check(selected(
                       index, { SelectorKind::namespace_tag, "photo", "team" })
                       == std::set<unsigned>({ 1, 2 }),
@@ -1453,7 +1326,8 @@ ngx_http_cache_purge_test_native_migration(const std::string &path)
             install(index, f);
             files.push_back(f);
         }
-        raw_write(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, "M:index", "8");
+        raw_write(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+            "M:native-cursor", "O");
         Index upgraded(store);
         check(!ready(files[0]), "unfinished migration is not an empty catalog");
         check(ready(file(999, "/never-indexed")),
@@ -1629,9 +1503,6 @@ ngx_http_cache_purge_test_representations(const std::string &path)
                 "pending members share a selected representation");
         }
         ngx_http_cache_purge_representation_query_t *query = nullptr;
-        for (unsigned i = 0; i < 90; i++) {
-            index.add_url(first.key, "https://alias.test/" + std::to_string(i));
-        }
         auto open = [&](int expected = 0) {
             check(ngx_http_cache_purge_index_representations_open(store,
                       ngx_http_cache_purge_native_bytes(first.key), main,
@@ -1657,28 +1528,6 @@ ngx_http_cache_purge_test_representations(const std::string &path)
             check(ngx_http_cache_rocksdb_stats(store, &usage, &error) == 0
                       && usage.cursor_handles <= 1,
                 "paused catalog retains at most one snapshot anchor");
-        };
-        auto aliases = [&](uint32_t kind) {
-            check(ngx_http_cache_purge_index_representations_aliases(
-                      query, kind, &error)
-                      == 0,
-                "open incremental alias pass");
-            std::set<std::string> values;
-            ngx_http_cache_rocksdb_bytes_t value{};
-            int rc;
-            pause();
-            while ((rc = ngx_http_cache_purge_index_representations_alias_next(
-                        query, &value, &error))
-                   == 0)
-            {
-                check(
-                    values.insert(ngx_http_cache_purge_cpp_bytes(value)).second,
-                    "alias pass emits each stored relationship once");
-                pause();
-            }
-            check(rc == NGX_HTTP_CACHE_ROCKSDB_DONE && value.len == 0,
-                "alias pass completes without a fixed total-count cap");
-            return values;
         };
         std::string expected_tag = "photo";
         auto members = [&](unsigned selected) {
@@ -1721,12 +1570,6 @@ ngx_http_cache_purge_test_representations(const std::string &path)
                 check(context.times.invalidate_ms
                           == (selected == 1003 || selected == 1004 ? 10 : 0),
                     "historical requirements survive selected file removal");
-                auto before = ngx_http_cache_purge_cpp_bytes(context.key);
-                check(aliases(NGX_HTTP_CACHE_PURGE_URL).size() >= 91
-                          && !aliases(NGX_HTTP_CACHE_PURGE_HOST).empty(),
-                    "selected membership can match arbitrarily paged aliases");
-                check(ngx_http_cache_purge_cpp_bytes(context.key) == before,
-                    "alias dictionary reads preserve borrowed membership");
                 count++;
             }
             return count;
@@ -1778,11 +1621,6 @@ ngx_http_cache_purge_test_representations(const std::string &path)
             "catalog is read-only and releases every handle");
         open();
         insert(1211, "X-Later", false);
-        index.add_url(first.key, "https://alias.test/later");
-        check(
-            aliases(NGX_HTTP_CACHE_PURGE_URL).count("https://alias.test/later")
-                == 0,
-            "alias pass shares the opening representation snapshot");
         index.update_metadata(id(1002), 2, "later", { "new-later" });
         check(read()
                   == std::set<std::string>({ "", "Accept-Language", "Cookie" }),
@@ -1790,10 +1628,6 @@ ngx_http_cache_purge_test_representations(const std::string &path)
         close();
         expected_tag = "new-later";
         open();
-        check(
-            aliases(NGX_HTTP_CACHE_PURGE_URL).count("https://alias.test/later")
-                == 1,
-            "a new alias pass sees later relationships after reopening");
         check(read().count("X-Later") == 1,
             "new catalog observes later Vary definitions");
         close();
@@ -1854,8 +1688,6 @@ ngx_http_cache_purge_test_representations(const std::string &path)
         close();
         first.key = "unknown-key";
         open();
-        check(aliases(NGX_HTTP_CACHE_PURGE_URL).empty(),
-            "absent key has no alias cursor or relationships");
         check(read().empty(), "confirmed absent key has no definitions");
         close();
     }
@@ -1877,7 +1709,7 @@ ngx_http_cache_purge_test_native_bindings(const std::string &path)
     {
         Index index(store);
         auto source = file(801, "/native-binding");
-        auto other = file(802, "/native-binding", "", "b.test", "/cache/b");
+        auto other = file(802, "/native-binding", "", "a.example", "/cache/b");
         unsigned char main[16] = { 1 }, variant[16] = { 2 };
         ngx_http_cache_purge_index_match_t prepared{};
         ngx_http_cache_rocksdb_stats_t before{}, after{};
@@ -1984,7 +1816,7 @@ ngx_http_cache_purge_test_retention(const std::string &path)
     const auto cf = NGX_HTTP_CACHE_ROCKSDB_DEFAULT;
     unsigned char main[16] = { 1 }, english[16] = { 2 }, german[16] = { 3 };
     auto first = file(701, "/retained");
-    auto other_zone = file(702, "/retained", "", "b.example", "/cache/b");
+    auto other_zone = file(702, "/retained", "", "a.example", "/cache/b");
     auto other_variant = file(703, "/retained");
     auto open = [&] {
         check(
@@ -2025,16 +1857,15 @@ ngx_http_cache_purge_test_retention(const std::string &path)
             "O"
                 + std::string(
                     reinterpret_cast<const char *>(first.id.data()), 16));
-        raw_write(store, cf, "M:index", "6");
         Index upgraded(store);
-        check(ngx_http_cache_purge_test_raw(store, "M:index") == "10"
+        check(ngx_http_cache_purge_test_raw(store, "M:index") == "11"
                   && ngx_http_cache_purge_test_raw(store,
                          "O"
                              + std::string(reinterpret_cast<const char *>(
                                                first.id.data()),
                                  16))
                          == original,
-            "schema 6 upgrades without rewriting file records");
+            "same-schema open preserves file records");
         ngx_http_cache_purge_retention_t required{ 10, 500, 20, 700 };
         keep(first, english, required);
         ngx_http_cache_rocksdb_stats_t before{}, after{};
@@ -2079,7 +1910,7 @@ ngx_http_cache_purge_test_retention(const std::string &path)
         }
         check(!raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_URL).empty()
                   && raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_TAG).empty(),
-            "history keeps URL aliases without retaining file TAG postings");
+            "history keeps URL identity without retaining file TAG postings");
     }
     check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
         "close retained database");
@@ -2129,7 +1960,7 @@ ngx_http_cache_purge_test_retention(const std::string &path)
         get(english, 700, NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND);
         check(
             get(german, 700).invalidate_ms == 40 && index.collect_keys(1) == 0,
-            "another representation keeps the same key and aliases alive");
+            "another representation keeps the same key identity alive");
         check(get(german, 900).invalidate_ms == 0,
             "expired rows cannot propagate before physical GC");
         check(ngx_http_cache_purge_index_expire_propagation(
@@ -2141,7 +1972,7 @@ ngx_http_cache_purge_test_retention(const std::string &path)
         while (index.collect_keys(1)) {
             check(++rounds < 100, "retained key collection remains bounded");
         }
-        check(raw_keys(store, cf).size() == 4
+        check(raw_keys(store, cf).size() == 3
                   && raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_URL).empty()
                   && raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_TAG).empty(),
             "expiry releases every key, Vary value and identity association");
@@ -2219,7 +2050,7 @@ ngx_http_cache_purge_test_retention(const std::string &path)
             total == 66, "all historical TAG sets were independently retained");
         while (index.collect_keys(1)) {
         }
-        check(raw_keys(store, cf).size() == 4,
+        check(raw_keys(store, cf).size() == 3,
             "large history releases every dictionary reference");
         ngx_http_cache_rocksdb_stats_t before{}, after{};
         check(ngx_http_cache_rocksdb_stats(store, &before, &error) == 0,
@@ -2327,250 +2158,132 @@ ngx_http_cache_purge_test_retention(const std::string &path)
 }
 
 static void
-ngx_http_cache_purge_test_alias_snapshots(const std::string &path)
+ngx_http_cache_purge_test_fixed_identity(const std::string &path)
 {
-    check(mkdir(path.c_str(), 0700) == 0, "alias snapshot directory");
+    check(mkdir(path.c_str(), 0700) == 0, "fixed identity directory");
     ngx_http_cache_rocksdb_options_t options;
     ngx_http_cache_rocksdb_options(&options);
-    options.cursor_lifetime_ms = 5000;
     ngx_http_cache_rocksdb_t *store = nullptr;
     ngx_http_cache_rocksdb_error_t error{};
     check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
               == 0,
         error.message);
-    auto item = file(4201, "/alias-snapshot");
-    const auto cf = NGX_HTTP_CACHE_ROCKSDB_DEFAULT;
-    ngx_http_cache_purge_alias_query_t *query = nullptr;
-    auto open = [&] {
-        check(ngx_http_cache_purge_index_aliases_open(
-                  store, bytes(item.key), &query, &error)
-                  == 0,
-            error.message);
-    };
-    auto drain = [&](bool paged = false) {
-        std::set<std::pair<uint32_t, std::string>> aliases;
-        ngx_http_cache_rocksdb_bytes_t value{};
-        uint32_t kind = 0;
-        int rc;
-        while ((rc = ngx_http_cache_purge_index_aliases_next(
-                    query, &kind, &value, &error))
-               == 0)
-        {
-            check(kind == NGX_HTTP_CACHE_PURGE_URL
-                      || kind == NGX_HTTP_CACHE_PURGE_HOST,
-                "streamed alias has an explicit kind");
-            aliases.emplace(
-                kind, std::string(reinterpret_cast<const char *>(value.data),
-                          value.len));
-            if (paged && aliases.size() % 8 == 0) {
-                check(ngx_http_cache_purge_index_aliases_yield(query, &error)
-                          == 0,
-                    "yield aliases without retaining cursors");
-                ngx_http_cache_rocksdb_stats_t stats{};
-                check(ngx_http_cache_rocksdb_stats(store, &stats, &error) == 0
-                          && !stats.cursor_handles && !stats.active_cursors,
-                    "a yielded alias scan holds no database snapshots");
-            }
-        }
-        check(rc == NGX_HTTP_CACHE_ROCKSDB_DONE && !value.len && !kind,
-            "alias enumeration clears output at completion");
-        return aliases;
-    };
-    auto close = [&] {
-        check(ngx_http_cache_purge_index_aliases_close(&query, &error) == 0
-                  && !query,
-            "close alias snapshot");
-    };
-    std::string counter;
+    auto source = file(7001, "/fixed-identity");
+    auto other = source;
+    other.id = id(7002);
+    other.root = "/cache/b";
+    other.zone = "zone-b";
+    other.path = "other-file";
+    other.range = other.components[5] = "bytes=100-199";
+    auto variant = file(7003, "/fixed-identity", "other");
+    auto isolated = file(7004, "/fixed-identity");
+    isolated.tag_namespace = isolated.components[0] = "other-namespace";
+    isolated.key = key(isolated.components);
     {
         Index index(store);
-        install(index, item);
-        counter = "k" + ngx_http_cache_purge_test_raw(store, "K" + item.key);
-        auto raw = ngx_http_cache_purge_test_raw(store, counter);
-        check(raw.size() == 16 && ngx_http_cache_purge_test_number(raw, 0) == 1
-                  && ngx_http_cache_purge_test_number(raw, 8) == 2,
-            "key count and alias revision share one record");
-        for (unsigned i = 0; i < 512; i++) {
-            auto host = "alias-" + std::to_string(i) + ".test";
-            auto url = "https://" + host + "/snapshot";
-            check(ngx_http_cache_purge_index_observe(
-                      store, bytes(item.key), bytes(url), bytes(host), &error)
-                      == 0,
-                error.message);
-        }
-        open();
-        auto original_query = query;
-        int foreign_result = 0;
-        std::thread foreign([&] {
-            foreign_result =
-                ngx_http_cache_purge_index_aliases_close(&query, nullptr);
-        });
-        foreign.join();
-        check(foreign_result == NGX_HTTP_CACHE_ROCKSDB_OWNER
-                  && query == original_query,
-            "foreign-thread close preserves the owner's alias query");
-        check(ngx_http_cache_purge_index_aliases_check(query, &error)
-                  == NGX_HTTP_CACHE_ROCKSDB_INVALID,
-            "an incomplete scan cannot authorize mutation");
-        auto old = drain();
-        check(
-            old.size() == 1026
-                && ngx_http_cache_purge_index_aliases_check(query, &error) == 0,
-            "more than 64 URL and host aliases stream completely");
+        check(ngx_http_cache_purge_index_schema_11() == 11
+                  && ngx_http_cache_purge_test_raw(store, "M:index") == "11",
+            "immutable identity schema is explicit");
+        install(index, source);
+        install(index, other);
+        install(index, variant);
+        install(index, isolated);
+        check(selected(index, { SelectorKind::key, source.key, "" })
+                  == std::set<unsigned>({ 7001, 7002 }),
+            "one identity retains all zones and slices");
+        check(selected(index, { SelectorKind::url, source.url, "" })
+                  == std::set<unsigned>({ 7001, 7002, 7003, 7004 }),
+            "one URL retains independent misc and namespace keys");
+        const auto cf = NGX_HTTP_CACHE_ROCKSDB_DEFAULT;
+        auto counter =
+            "k" + ngx_http_cache_purge_test_raw(store, "K" + source.key);
+        auto identity = ngx_http_cache_purge_test_raw(store, counter);
+        check(identity.size() == 32
+                  && ngx_http_cache_purge_test_number(identity, 0) == 2,
+            "file count and fixed URL/host/namespace references share one row");
         ngx_http_cache_rocksdb_stats_t before{}, after{};
         check(ngx_http_cache_rocksdb_stats(store, &before, &error) == 0,
-            "repeated alias baseline");
-        check(ngx_http_cache_purge_index_observe(store, bytes(item.key),
-                  bytes(item.url), bytes(item.host), &error)
-                  == 0,
-            "repeat existing associations");
-        check(
-            ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
-                && before.writes == after.writes
-                && ngx_http_cache_purge_index_aliases_check(query, &error) == 0,
-            "repeat observations neither write nor invalidate snapshots");
-        auto other = file(4202, "/unrelated");
-        install(index, other);
-        check(ngx_http_cache_purge_index_aliases_check(query, &error) == 0,
-            "unrelated cache fills do not invalidate an alias snapshot");
-        auto duplicate = item;
-        duplicate.id = id(4203);
-        duplicate.path = "duplicate";
-        install(index, duplicate);
-        auto retired = index.retire(duplicate.id, 2);
-        index.collect_file(duplicate.id, retired.revision);
-        check(ngx_http_cache_purge_index_aliases_check(query, &error) == 0,
-            "file reference count changes preserve the alias revision");
-        close();
-        open();
-        check(ngx_http_cache_purge_index_aliases_yield(query, &error) == 0,
-            "yield before the first alias");
-        check(
-            drain(true) == old
-                && ngx_http_cache_purge_index_aliases_check(query, &error) == 0,
-            "paged snapshots do not repeat or skip URL or host aliases");
-        close();
-        open();
-        check(ngx_http_cache_purge_index_aliases_yield(query, &error) == 0,
-            "yield before concurrent alias mutation");
-        index.add_url(item.key, "https://pause-race.test/item");
-        ngx_http_cache_rocksdb_bytes_t absent{};
-        uint32_t absent_kind = 0;
-        check(ngx_http_cache_purge_index_aliases_next(
-                  query, &absent_kind, &absent, &error)
-                      == NGX_HTTP_CACHE_ROCKSDB_CONFLICT
-                  && !absent.len && !absent_kind,
-            "resume rejects changed aliases without returning partial data");
-        close();
-        open();
-        old = drain();
-        close();
-
-        for (bool host_only : { false, true }) {
-            open();
-            auto host = host_only ? "new-host.test" : item.host;
-            auto url = host_only ? item.url : "https://new-alias.test/item";
-            check(ngx_http_cache_purge_index_observe(
-                      store, bytes(item.key), bytes(url), bytes(host), &error)
-                      == 0,
-                error.message);
-            check(drain().size() == old.size(),
-                "new associations are absent from an existing snapshot");
-            check(ngx_http_cache_purge_index_aliases_check(query, &error)
-                      == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
-                "new URL or host invalidates a completed mutation check");
-            close();
-            open();
-            old = drain();
-            check(ngx_http_cache_purge_index_aliases_check(query, &error) == 0,
-                "restarted scan covers newly observed associations");
-            close();
-        }
-
-        raw = ngx_http_cache_purge_test_raw(store, counter);
-        raw_write(store, cf, counter, raw.substr(0, 8));
-        raw_write(store, cf, "M:index", "9");
+            error.message);
         auto keys = raw_keys(store, cf);
-        check(ngx_http_cache_purge_index_init(store, &error) == 0,
-            "schema 9 upgrades without rebuilding metadata");
-        check(raw_keys(store, cf) == keys
-                  && ngx_http_cache_purge_test_raw(store, counter).size() == 8
-                  && ngx_http_cache_purge_test_raw(store, "M:index") == "10",
-            "schema 9 migration does not scan or rewrite legacy counters");
-        open();
-        drain();
-        check(ngx_http_cache_purge_index_aliases_check(query, &error) == 0,
-            "legacy eight-byte counter has a stable initial revision");
-        index.add_url(item.key, "https://lazy-upgrade.test/item");
-        check(ngx_http_cache_purge_test_raw(store, counter).size() == 16
-                  && ngx_http_cache_purge_index_aliases_check(query, &error)
-                         == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
-            "first new alias upgrades the counter and invalidates old scans");
-        close();
-        raw = ngx_http_cache_purge_test_raw(store, counter);
-        raw_write(store, cf, counter,
-            raw.substr(0, 8) + ngx_http_cache_purge_test_number(UINT64_MAX));
-        auto prior = raw_keys(store, cf);
-        fails(NGX_HTTP_CACHE_ROCKSDB_LIMIT,
-            [&] { index.add_url(item.key, "https://overflow.test/item"); });
-        check(raw_keys(store, cf) == prior,
-            "alias revision overflow rolls back dictionaries and postings");
-        raw_write(store, cf, counter, raw);
-        open();
-        drain();
-        retired = index.retire(item.id, 2);
-        index.collect_file(item.id, retired.revision);
-        check(index.collect_keys(1) > 0,
-            "alias collection proceeds in a bounded batch");
-        check(ngx_http_cache_purge_index_aliases_check(query, &error)
-                  == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
-            "partial alias collection invalidates a previous snapshot");
-        close();
-        while (index.collect_keys(32)) {
+        for (unsigned dimension = 0; dimension != 3; ++dimension) {
+            auto conflict = source;
+            conflict.id = id(7010 + dimension);
+            conflict.path = "conflicting-identity-" + std::to_string(dimension);
+            if (dimension == 0) {
+                conflict.url = "https://different.test/item";
+                conflict.structured_url = false;
+            } else if (dimension == 1) {
+                conflict.host = "different.test";
+            } else {
+                conflict.tag_namespace = "different-namespace";
+            }
+            auto valid = file(7020 + dimension, "/atomic-identity");
+            fails(NGX_HTTP_CACHE_ROCKSDB_CONFLICT, [&] {
+                index.prepare_batch({ { valid, {} }, { conflict, {} } });
+            });
+            fails(NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND, [&] { index.get(valid.id); });
+            fails(NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND,
+                [&] { index.get(conflict.id); });
         }
-        retired = index.retire(other.id, 2);
-        index.collect_file(other.id, retired.revision);
-        while (index.collect_keys(32)) {
+        check(ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
+                  && after.writes == before.writes
+                  && raw_keys(store, cf) == keys
+                  && ngx_http_cache_purge_test_raw(store, counter) == identity,
+            "identity conflicts roll back entire batches without WAL writes");
+        for (auto value : { source, other }) {
+            auto retired = index.retire(value.id, 2);
+            index.collect_file(value.id, retired.revision);
         }
-        check(raw_keys(store, cf).size() == 3,
-            "alias revisions leave no extra rows after key collection");
-        install(index, item);
+        check(index.collect_keys(1) == 1, "one key collection unit");
+        keys = raw_keys(store, cf);
+        check(std::find(keys.begin(), keys.end(), counter) == keys.end(),
+            "one fixed-identity collection atomically removes the key row");
+        check(selected(index, { SelectorKind::url, source.url, "" })
+                  == std::set<unsigned>({ 7003, 7004 }),
+            "collecting one identity preserves other keys of the same URL");
+        raw_write(store, cf, "M:index", "10");
+        fails(NGX_HTTP_CACHE_ROCKSDB_SCHEMA, [&] { Index old(store); });
+        check(ngx_http_cache_purge_test_raw(store, "M:index") == "10",
+            "old prototype schema is rejected without rewriting its data");
+        raw_write(store, cf, "M:index", "11");
     }
-    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
-        "close alias database before restart");
-    options.cursor_lifetime_ms = 20;
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
     check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
               == 0,
         error.message);
-    open();
-    drain();
-    check(ngx_http_cache_purge_index_aliases_check(query, &error) == 0,
-        "alias counter and membership survive restart");
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
-    check(ngx_http_cache_purge_index_aliases_check(query, &error)
-              == NGX_HTTP_CACHE_ROCKSDB_EXPIRED,
-        "completed scan still has its original snapshot deadline");
-    close();
-    open();
-    check(ngx_http_cache_purge_index_aliases_yield(query, &error) == 0,
-        "release a short-lived snapshot before its deadline");
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
-    check(drain().size() == 2
-              && ngx_http_cache_purge_index_aliases_check(query, &error) == 0,
-        "unchanged aliases resume beyond the preceding page's deadline");
-    close();
-    ngx_http_cache_rocksdb_stats_t stats{};
-    check(ngx_http_cache_rocksdb_stats(store, &stats, &error) == 0
-              && !stats.active_cursors && !stats.cursor_handles,
-        "alias close releases all cursors and snapshots");
-    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
-        "close alias snapshot database");
+    {
+        Index index(store);
+        check(selected(index, { SelectorKind::url, source.url, "" })
+                  == std::set<unsigned>({ 7003, 7004 }),
+            "fixed identities reopen without cache-file scanning");
+        check(index.get(isolated.id).tag_namespace == "other-namespace",
+            "namespace isolation survives restart");
+        for (auto value : { variant, isolated }) {
+            auto retired = index.retire(value.id, 2);
+            index.collect_file(value.id, retired.revision);
+        }
+        unsigned passes = 0;
+        while (index.collect_keys(1)) {
+            check(++passes < 8, "fixed identity collection stays bounded");
+        }
+        check(raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT).size() == 3
+                  && raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_URL).empty()
+                  && raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_TAG).empty(),
+            "identity ownership releases namespace and dictionary references");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
 }
 
 int
 main(int argc, char **argv)
 {
     try {
+        if (argc == 3 && std::string(argv[1]) == "--fixed-identity") {
+            ngx_http_cache_purge_test_fixed_identity(argv[2]);
+            std::cout << "PASS " << assertions << " fixed identity assertions"
+                      << std::endl;
+            return 0;
+        }
         if (argc == 3 && std::string(argv[1]) == "--retention-sync") {
             ngx_http_cache_purge_test_retention_sync(argv[2]);
             std::cout << "PASS retained association sync barriers" << std::endl;
@@ -2622,8 +2335,8 @@ main(int argc, char **argv)
         ngx_http_cache_purge_test_collect_sync(std::string(path) + "-collect");
         ngx_http_cache_purge_test_retention_sync(
             std::string(path) + "-retention-sync");
-        ngx_http_cache_purge_test_alias_snapshots(
-            std::string(path) + "-aliases");
+        ngx_http_cache_purge_test_fixed_identity(
+            std::string(path) + "-identities");
         ngx_http_cache_purge_test_native_migration(
             std::string(path) + "-migration");
         ngx_http_cache_purge_test_native_bindings(
@@ -2693,26 +2406,26 @@ main(int argc, char **argv)
             index.collect_file(pub_replacement.id, 3);
             auto retained = file(202, "/schema-retained");
             install(index, retained);
-            raw_write(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, "M:index", "1");
             Index upgraded(store);
             check(!upgraded.current(publication.root, publication.path),
-                "v1 schema upgrades without rebuilding index records");
+                "same-schema reopen does not rebuild index records");
             check(upgraded.current(retained.root, retained.path)->id
                           == retained.id
                       && upgraded.get(retained.id).metadata == retained.metadata
                       && selected(
                              upgraded, { SelectorKind::url, retained.url, "" })
                              == std::set<unsigned>{ 202 },
-                "schema migration preserves existing files, metadata and URL "
+                "same-schema reopen preserves files, metadata and URL "
                 "relationships");
             upgraded.retire(retained.id, 2);
             upgraded.collect_file(retained.id, 3);
             auto a = file(1),
-                 b = file(2, "/dir/a", "", "b.example", "/cache/b");
+                 b = file(2, "/dir/a", "", "a.example", "/cache/b");
             b.range = b.components[5] = "bytes=100-199";
             auto c = file(3, "/dir/a", "fr"),
                  d = file(4, "/dir/a", "", "a.example", "/cache/c");
-            d.tag_namespace = "other";
+            d.tag_namespace = d.components[0] = "other";
+            d.key = key(d.components);
             d.vary = "Accept-Encoding";
             auto e = file(5, "/dir/ab"), f = file(6, "/dir/a/child");
             auto prepared = index.prepare(a);
@@ -2757,7 +2470,7 @@ main(int argc, char **argv)
                 raw_write(store, cf, projection, "", true);
             }
             check(selected(index, { SelectorKind::key, a.key, "" })
-                      == std::set<unsigned>({ 1, 2, 4 }),
+                      == std::set<unsigned>({ 1, 2 }),
                 "key expands all zones/slice/Vary");
             check(selected(index, { SelectorKind::url, a.url, "" })
                       == std::set<unsigned>({ 1, 2, 3, 4 }),
@@ -2768,16 +2481,16 @@ main(int argc, char **argv)
             check(selected(index, { SelectorKind::url_prefix, a.url, "" })
                       == std::set<unsigned>({ 1, 2, 3, 4, 5, 6 }),
                 "byte prefix includes ab");
-            check(selected(index, { SelectorKind::host, "b.example", "" })
-                      == std::set<unsigned>({ 1, 2, 4 }),
-                "business host covers all files of its shared cache key");
+            check(selected(index, { SelectorKind::host, "a.example", "" })
+                      == std::set<unsigned>({ 1, 2, 3, 4, 5, 6 }),
+                "fixed host covers every matching key and zone");
             check(selected(
                       index, { SelectorKind::namespace_tag, "photo", "other" })
                       == std::set<unsigned>{ 4 },
                 "namespace-tag isolation");
             check(selected(
-                      index, { SelectorKind::host_tag, "photo", "b.example" })
-                      == std::set<unsigned>({ 1, 2, 4 }),
+                      index, { SelectorKind::host_tag, "photo", "a.example" })
+                      == std::set<unsigned>({ 1, 2, 3, 4, 5, 6 }),
                 "host-tag covers shared key files across zones");
             check(index.get(a.id).tags
                       == std::vector<std::string>({ "common", "photo" }),
@@ -2840,13 +2553,9 @@ main(int argc, char **argv)
                 "stale metadata update rejected");
 
             const std::string alias = "https://aliases.test/";
-            for (unsigned i = 0; i != 20; ++i) {
-                index.add_url(a.key, alias + std::to_string(i));
-            }
-            index.add_url(a.key, alias + "0");
             check(selected(index, { SelectorKind::url, alias + "0", "" })
-                      == std::set<unsigned>({ 2, 4, 11 }),
-                "URL alias expands all matching key files");
+                      .empty(),
+                "a key cannot gain a second URL");
             for (const auto &selector :
                 std::vector<Selector>{ { SelectorKind::key, a.key, "" },
                     { SelectorKind::url, a.url, "" },
@@ -2935,6 +2644,7 @@ main(int argc, char **argv)
             std::vector<Fill> fills;
             for (unsigned n = 100; n != 132; ++n) {
                 fills.push_back({ file(n, "/batch/" + std::to_string(n)), {} });
+                fills.back().file.tags.push_back("batch-tag-" + std::to_string(n));
             }
             ngx_http_cache_rocksdb_stats_t before, after;
             check(ngx_http_cache_rocksdb_stats(store, &before, &error) == 0,
@@ -3025,8 +2735,8 @@ main(int argc, char **argv)
             index.collect_file(id(98), pending.revision);
             check(selected(index,
                       { SelectorKind::url, "https://aliases.test/0", "" })
-                      == std::set<unsigned>({ 2, 4, 11 }),
-                "aliases persist without rebuilding");
+                      .empty(),
+                "rejected unrelated URLs remain absent after reopening");
             auto aborted = index.abort_prepare(id(99), 1);
             index.collect_file(id(99), aborted.revision);
             auto all = scan(index, { SelectorKind::key_prefix, "", "" });
@@ -3044,20 +2754,16 @@ main(int argc, char **argv)
             check(raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_TAG).empty(),
                 "TAG CF reclaimed");
             auto keys = raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT);
-            check(keys.size() == 4
-                      && ngx_http_cache_purge_test_raw(store, "M:native-cursor")
-                             == "O"
+            check(keys.size() == 3
                       && std::find(keys.begin(), keys.end(), "M:index")
                              != keys.end()
                       && std::find(keys.begin(), keys.end(), "M:next")
                              != keys.end(),
-                "all file/value/component/alias records reclaimed");
+                "all file/value/component/identity records reclaimed");
         }
         check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
         bounded_scan(std::string(path) + "-bounded");
         ngx_http_cache_purge_test_hosts(std::string(path) + "-hosts");
-        ngx_http_cache_purge_test_host_migration(
-            std::string(path) + "-host-migration");
         ngx_http_cache_purge_test_validation_policy(
             std::string(path) + "-validation");
         ngx_http_cache_purge_test_retention(std::string(path) + "-retention");

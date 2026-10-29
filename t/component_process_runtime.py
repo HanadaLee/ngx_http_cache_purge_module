@@ -54,7 +54,7 @@ class Component:
             env['CACHE_PURGE_TEST_REPLY_GATE'] = str(reply_gate)
             env['CACHE_PURGE_TEST_REPLY_MODE'] = reply_mode
         if seed:
-            # Preparing 2,048 durable aliases is fixture setup, not startup.
+            # Preparing 2,048 Vary definitions is fixture setup, not startup.
             subprocess.run([str(args.binary), str(path), '--seed'], env=env,
                            stdout=subprocess.DEVNULL, stderr=self.stderr,
                            timeout=60, check=True)
@@ -642,8 +642,8 @@ try:
     check(found == [1, 2, 3], 'bounded pages with client-owned bookmark')
     c.call(13, identity(1) + struct.pack('>Q', 2) + string('validated') + b'\x01' + string('new'))
     check(c.page(5, 'new', 'team')[0] == [1], 'metadata TAG replacement over IPC')
-    c.call(12, string('team\x1fhttps\x1fa.test\x1f/dir/a\x1f') + string('https://alias.test/a'))
-    check(c.page(1, 'https://alias.test/a')[0] == [1, 2], 'URL alias lookup')
+    c.call(12, string('team\x1fhttps\x1fa.test\x1f/dir/a\x1f') + string('https://alias.test/a'), code=4)
+    check(c.page(1, 'https://alias.test/a')[0] == [], 'a second URL is rejected over IPC')
     c.close()
 
     contender = Component(path)
@@ -659,7 +659,7 @@ try:
     first.stop()
     successor.opened()
     c = Client(path)
-    check(c.page(1, 'https://alias.test/a')[0] == [1, 2], 'new owner reopens persistent relationships')
+    check(c.page(1, 'https://a.test/dir/a')[0] == [1, 2, 3], 'new owner reopens canonical relationships')
     check(c.call(15, string('operation-1')) == receipt, 'owner handoff preserves operation ledger')
     c.close()
     successor.process.kill()
@@ -880,20 +880,19 @@ try:
     v.admit_file(address, key, 'https://a.test/forbidden-alias', selected, code=7, host='')
     v.admit_file(address, 'another-key', 'https://a.test/forbidden-alias', selected, code=7)
     assert struct.unpack('>9Q', v.call(1))[1] == writes and v.page(1, 'https://a.test/forbidden-alias')[0] == []
-    assert v.admit_file(address, key, 'https://a.test/discovered-alias', selected) == original
+    v.admit_file(address, key, 'https://a.test/discovered-alias', selected, code=7)
+    assert v.page(1, 'https://a.test/discovered-alias')[0] == []
+    assert v.admit_file(address, key, 'https://a.test/read-alias', selected) == original
     stamp = v.admission_stamp
     assert stamp == struct.unpack('>IQ', v.call(16))[1]
-    assert v.page(1, 'https://a.test/discovered-alias')[0] == [605]
-    writes = struct.unpack('>9Q', v.call(1))[1]
-    assert v.admit_file(address, key, 'https://a.test/discovered-alias', selected) == original
     assert struct.unpack('>9Q', v.call(1))[1] == writes
-    check(True, 'ADMIT_FILE requires an explicit host, binds the native key and atomically registers request identities without rewriting repeated observations')
-    validation_operation('discovered-alias-rule', 1, 'https://a.test/discovered-alias')
+    check(True, 'ADMIT_FILE checks key, URL and host without discovering aliases or writing metadata')
+    validation_operation('canonical-url-rule', 1, 'https://a.test/read-alias')
     wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
     assert stamp != struct.unpack('>IQ', v.call(16))[1]
     v.admit_file(address, key, 'https://a.test/read-alias', selected, code=7)
     assert v.inspect_file(address, selected) == original
-    check(True, 'a FENCE on another persisted alias rejects read admission while physical inspection remains diagnostic only')
+    check(True, 'a FENCE on the canonical URL rejects read admission while physical inspection remains diagnostic only')
     os.close(selected)
     source = validation_temp / 'fresh-alias-606'; source.write_bytes(b'fresh alias entity')
     fd = os.open(source, os.O_RDWR | os.O_CLOEXEC)
@@ -902,9 +901,9 @@ try:
     v.prepare_file(payload[:-16] + identity(605) + string(str(source)), [lease, fd])
     source.rename(target); v.finish_file(606, lease); os.close(fd)
     selected = os.open(target, os.O_RDONLY | os.O_CLOEXEC)
-    assert v.admit_file(address, key, 'https://a.test/discovered-alias', selected) == v.call(2, identity(606))
+    assert v.admit_file(address, key, 'https://a.test/read-alias', selected) == v.call(2, identity(606))
     os.close(lease); os.close(selected)
-    check(True, 'a newer full entity satisfies the persisted alias FENCE and retains its key URL associations')
+    check(True, 'a newer full entity satisfies the canonical URL FENCE and retains its fixed identity')
 
     full_origin = validating.watermark()
     target, lease, selected = make_validation_file(607, '/conditional', metadata=full_origin)
@@ -981,10 +980,10 @@ try:
     check(True, 'an unrelated accepted rule permits validation through the bounded URL visitor')
 
     key = 'team\x1fhttps\x1fa.test\x1f/validate\x1f'
-    v.call(12, string(key) + string('https://a.test/alias'))
+    v.call(12, string(key) + string('https://a.test/alias'), code=4)
     assert validating.match()[0] == 0
     validating.guard()
-    validation_operation('alias-before-validation', 1, 'https://a.test/alias')
+    validation_operation('url-before-validation', 1, 'https://a.test/validate')
     wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 5)
     packet = validation_packet(601, revision=6, token=3, before=b'new-head', tags=[])
     previous = v.call(2, identity(601))
@@ -996,8 +995,8 @@ try:
     assert v.call(2, identity(601)) == previous and v.page(5, 'new-tag', 'team')[0] == [601]
     assert v.validate_file(committed_before_alias, lease, selected) == previous
     assert v.admission_stamp == 0
-    check(True, 'a completed validation receipt can replay under a new alias FENCE but its zero stamp cannot authorize response reuse')
-    check(True, 'accepted but unpublished controls stop validation; a persisted alias FENCE blocks TAG removal after publication')
+    check(True, 'a completed validation receipt can replay under a new URL FENCE but its zero stamp cannot authorize response reuse')
+    check(True, 'accepted but unpublished controls stop validation; a canonical URL FENCE blocks TAG removal after publication')
     os.close(lease); os.close(selected)
 
     # Each operation uses a distinct file/tag until the final broad host rule.
@@ -1024,58 +1023,31 @@ try:
 
     target, lease, selected = make_validation_file(620, '/alias-limit')
     key = 'team\x1fhttps\x1fa.test\x1f/alias-limit\x1f'
-    for i in range(64):
-        v.call(12, string(key) + string(f'https://a.test/many/{i}'))
-    previous = v.call(2, identity(620))
     packet = validation_packet(620)
-    v.validate_file(packet, lease, selected, code=6)
-    assert v.call(2, identity(620)) == previous and target.read_bytes().startswith(b'old-head')
-    def validation_ready():
-        reply = v.validate_file(packet, lease, selected, code=(0, 6))
-        return reply if v.last_result == 0 else None
-    reply = wait_for(validation_ready)
+    reply = v.validate_file(packet, lease, selected)
     assert reply[:9] == b'\x02' + struct.pack('>Q', 4)
-    assert int.from_bytes(reply[-16:-8], 'big') != 0
+    assert v.admission_stamp != 0
     assert target.read_bytes().startswith(b'new-head')
     assert v.admit_file((str(validation_cache), 'zone-a', 'a/00/620'), key,
-                       'https://a.test/alias-limit', selected) == reply[:-16]
+                       'https://a.test/alias-limit', selected) == reply
     os.close(lease); os.close(selected)
-    check(True, 'large URL alias sets yield before validation, then complete the same transaction and permit stamped read admission')
+    check(True, 'fixed URL identity validates in one call and permits stamped read admission')
 
     held_guards = [make_validation_file(n, '/guard-results') for n in range(622, 627)]
     guard_key = 'team\x1fhttps\x1fa.test\x1f/guard-results\x1f'
-    for number in range(64):
-        v.call(12, string(guard_key) + string(f'https://a.test/guard-alias/{number}'))
-    def guard_read(number, code):
+    def guard_read(number):
         return v.admit_file((str(validation_cache), 'zone-a', f'a/00/{622 + number}'),
-                            guard_key, 'https://a.test/guard-results', held_guards[number][2], code=code)
-    for number in range(4):
-        guard_read(number, 6)
-    # Each PING advances the real component loop; no timing sleep decides
-    # completion. Four scans need fewer than 128 eight-alias dispatches.
-    for _ in range(128):
-        v.call(1)
-    guard_read(4, 6)
-    for number in range(4):
-        result = guard_read(number, (0, 6))
-        assert v.last_result == 0, 'a new file evicted an unconsumed completed alias guard'
-    def fifth_guard():
-        result = guard_read(4, (0, 6))
-        return result if v.last_result == 0 else None
-    wait_for(fifth_guard)
-    validation_operation('guard-result-expiry', 1, 'https://a.test/unrelated-guard-expiry')
+                            guard_key, 'https://a.test/guard-results', held_guards[number][2])
+    for number in range(5):
+        assert guard_read(number) == v.call(2, identity(622 + number))
+    validation_operation('fixed-identity-unrelated', 1, 'https://a.test/unrelated-guard')
     wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
-    for number in range(4):
-        guard_read(number, 6)
-    for _ in range(128):
-        v.call(1)
-    guard_read(4, 6)
-    wait_for(fifth_guard, timeout=4)
+    for number in range(5):
+        assert guard_read(number) == v.call(2, identity(622 + number))
     for _, lease, selected in held_guards:
         os.close(lease)
         os.close(selected)
-    check(True, 'completed alias guards survive new arrivals until consumed, then their slots permit continued progress')
-    check(True, 'abandoned completed alias guards release their slots at the original three-second deadline')
+    check(True, 'fixed-identity admission has no four-slot alias scan gate or abandoned result state')
 
     target, lease, selected = make_validation_file(621, '/host-rule')
     validation_operation('validation-host', 4, 'business.test')
@@ -1258,20 +1230,11 @@ try:
     address = (str(validation_cache), 'zone-a', 'a/00/655')
     key = 'team\x1fhttps\x1fa.test\x1f/late-delete-alias\x1f'
     v.admit_file(address, key, 'https://a.test/new-delete-alias', selected, code=7)
-    # A path lease keeps the newly queued Delete durable across owner death.
-    time.sleep(1.1)
     assert target.exists() and v.call(2, identity(655))[0] == 2
-    v.close(); validating.process.kill(); validating.process.wait(timeout=5)
-    validating = Component(validating.path, shared=validation_shared,
-                           roots=(validation_cache, validation_temp))
-    validating.opened(); v = Client(validating.path)
-    wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
-    assert target.exists()
+    assert v.page(1, 'https://a.test/new-delete-alias')[0] == []
+    assert v.admit_file(address, key, 'https://a.test/late-delete-alias', selected) == v.call(2, identity(655))
     os.close(lease); os.close(selected)
-    wait_for(lambda: not target.exists())
-    wait_for(lambda: v.page(1, 'https://a.test/new-delete-alias')[0] == [])
-    v.call(2, identity(655), code=1)
-    check(True, 'late URL aliases after FENCE retirement queue durable Delete, survive owner death and are collected after the path lease drains')
+    check(True, 'an empty-scan rule for another URL cannot create a late alias or retire the canonical file')
 
     current_origin = validating.watermark()
 
@@ -1431,7 +1394,7 @@ try:
             result = struct.unpack('>QQQ', pending.reply(32))
             assert result[:2] == (1000, 0) and result[2]
         pending.close()
-    check(True, 'OBJECT_PROPAGATION yields between alias pages, keeps its input live, and releases disconnected query snapshots')
+    check(True, 'OBJECT_PROPAGATION yields between Vary definitions, keeps its input live, and releases disconnected query snapshots')
     indexed_before = probe.call(2, identity(1))
     writes_before = struct.unpack('>9Q', probe.call(1))[1]
     result = struct.unpack('>QQQ', probe.call(32, payload))

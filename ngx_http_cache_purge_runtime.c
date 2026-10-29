@@ -2919,7 +2919,7 @@ ngx_http_cache_purge_api_render(ngx_http_cache_purge_api_t *ctx,
             "\"selectors\":[\"host\",\"url\",\"key\",\"prefix\",\"tag\"],"
             "\"modes\":[\"invalidate\",\"delete\"],\"binary_selectors\":true,"
             "\"tag_scopes\":[\"namespace\",\"host\"],\"max_tags\":64,"
-            "\"index_schema\":10,\"ledger_schema\":4,"
+            "\"index_schema\":11,\"ledger_schema\":4,"
             "\"propagation_timeout_ms\":\"%uL\","
             "\"propagation_protocols\":[],\"proxy_propagation_ready\":false,"
             "\"proxy_header_transport\":\"%s\","

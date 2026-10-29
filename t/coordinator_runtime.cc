@@ -224,23 +224,14 @@ ngx_http_cache_purge_test_object_propagation()
         result = query(std::string(4, '\0'), 2100);
         check(result.invalidate_ms == 0 && result.delete_ms == 0,
             "unknown Vary has no TAG compensation");
-        for (unsigned i = 0; i < 90; i++) {
-            auto host = "alias-" + std::to_string(i) + ".test";
-            check(ngx_http_cache_purge_index_observe(store, request.key,
-                      ngx_http_cache_purge_native_bytes(
-                          "https://" + host + "/item"),
-                      ngx_http_cache_purge_native_bytes(host), &error)
-                      == 0,
-                "object aliases beyond the old fixed limit");
-        }
-        add("alias-red", { SelectorKind::host_tag, "red", "alias-89.test" },
+        add("alias-red", { SelectorKind::host_tag, "red", "cache.test" },
             PurgeMode::remove, 1500);
         add("alias-url",
-            { SelectorKind::url, "https://alias-88.test/item", "" },
+            { SelectorKind::url, "https://cache.test/item", "" },
             PurgeMode::invalidate, 1800);
         result = query(red_headers, 2100);
         check(result.invalidate_ms == 1800 && result.delete_ms == 1500,
-            "paged host TAG and URL aliases both participate");
+            "canonical host TAG and URL rules both participate");
         {
             ngx_http_cache_purge_object_query_t *pending[4]{};
             for (auto &entry : pending) {
@@ -314,8 +305,8 @@ ngx_http_cache_purge_test_object_propagation()
             "expired outgoing windows do not emit requirements");
         request.key = ngx_http_cache_purge_native_bytes(unknown_key);
         result = query(red_headers, 3000);
-        check(result.invalidate_ms == 0 && result.delete_ms == 0,
-            "confirmed unknown key proceeds without TAG compensation");
+        check(result.invalidate_ms == 1800 && result.delete_ms == 0,
+            "unknown key receives the URL rule without borrowing TAG membership");
         ngx_http_cache_purge_object_query_t *q = nullptr;
         std::string malformed = red_headers + "trailing";
         check(ngx_http_cache_purge_coordinator_object_open(coordinator.native(),
@@ -505,17 +496,11 @@ ngx_http_cache_purge_test_propagation_policy()
         result = query(red, 2000);
         check(result.invalidate_ms == 1000 && result.delete_ms == 0,
             "namespace isolation uses indexed file metadata");
-        check(ngx_http_cache_purge_index_observe(store,
-                  ngx_http_cache_purge_native_bytes(red.key),
-                  ngx_http_cache_purge_native_bytes("https://alias.test/item"),
-                  ngx_http_cache_purge_native_bytes("alias.test"), &error)
-                  == 0,
-            "add URL and business-host aliases to the shared key");
-        add("host-blue", { SelectorKind::host_tag, "blue", "alias.test" },
+        add("host-blue", { SelectorKind::host_tag, "blue", "cache.test" },
             PurgeMode::remove, 2000);
-        add("alias", { SelectorKind::url, "https://alias.test/item", "" },
+        add("alias", { SelectorKind::url, "https://cache.test/item", "" },
             PurgeMode::remove, 1100);
-        add("prefix", { SelectorKind::url_prefix, "https://alias.test/", "" },
+        add("prefix", { SelectorKind::url_prefix, "https://cache.test/", "" },
             PurgeMode::invalidate, 1300);
         add("current-host", { SelectorKind::host_tag, "red", "fresh.test" },
             PurgeMode::remove, 2200);
@@ -532,16 +517,10 @@ ngx_http_cache_purge_test_propagation_policy()
             "read propagation baseline statistics");
         result = query(red, 2000);
         check(result.invalidate_ms == 1300 && result.delete_ms == 1100,
-            "historical URL alias contributes independent mode maxima");
+            "canonical URL rules contribute independent mode maxima");
         result = query(blue, 2000);
         check(result.invalidate_ms == 1300 && result.delete_ms == 2000,
-            "host TAG checks alias scope and this file's actual TAGs");
-        result = query(red, 2000, 0, &observed);
-        check(result.invalidate_ms == 2300 && result.delete_ms == 2200,
-            "new request identities match before their aliases are persisted");
-        result = query(blue, 2000, 0, &observed);
-        check(result.invalidate_ms == 2300 && result.delete_ms == 2000,
-            "current host TAG still uses the selected file's membership");
+            "host TAG checks canonical scope and selected TAGs");
         auto wrong = observed;
         const std::string wrong_key = "other-key";
         wrong.key = ngx_http_cache_purge_native_bytes(wrong_key);
@@ -580,11 +559,7 @@ ngx_http_cache_purge_test_propagation_policy()
         index.retire(blue.id, 2);
         check(query(blue, 3001).delete_ms == 2000,
             "retired committed files retain known membership until collection");
-        for (unsigned n = 0; n < 63; n++) {
-            index.add_url(red.key, "https://many.test/" + std::to_string(n));
-        }
-        check(query(red, 3001).invalidate_ms == 1300,
-            "paged request query exceeds the retired diagnostic alias limit");
+
     }
     check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
     munmap(shared, size);
@@ -627,12 +602,7 @@ ngx_http_cache_purge_test_retention()
         file.path = std::string(31, '0') + '1';
         auto prepared = index.prepare(file);
         index.commit(file.id, prepared.revision);
-        check(ngx_http_cache_purge_index_observe(store,
-                  ngx_http_cache_purge_native_bytes(file.key),
-                  ngx_http_cache_purge_native_bytes("https://alias.test/item"),
-                  ngx_http_cache_purge_native_bytes("alias.test"), &error)
-                  == 0,
-            "retention source has historical URL and host aliases");
+
         Coordinator coordinator(operations, shared, size);
         ready(coordinator);
         unsigned char main[16] = {}, variant[16] = {};
@@ -777,17 +747,17 @@ ngx_http_cache_purge_test_retention()
                 PurgeMode::remove, 999, 200, 1000);
         activate(wrong, 200);
         auto host =
-            accept("host", { SelectorKind::host_tag, "red", "alias.test" },
+            accept("host", { SelectorKind::host_tag, "red", "cache.test" },
                 PurgeMode::invalidate, 30, 220, 100);
         activate(host, 220);
         auto alias = accept("alias",
-            { SelectorKind::url_prefix, "https://alias.test/", "" },
+            { SelectorKind::url_prefix, "https://cache.test/", "" },
             PurgeMode::remove, 40, 220, 10);
         activate(alias, 220);
         history_open(221);
         auto alias_result = history_result();
         check(alias_result.invalidate_ms == 30 && alias_result.delete_ms == 40,
-            "retained URL aliases participate in new prefix rules before GC");
+            "retained canonical URLs participate in new prefix rules before GC");
         check(ngx_http_cache_purge_coordinator_expire_propagation(
                   coordinator.native(), 241, 8, &processed, &error)
                       == 0
@@ -795,7 +765,7 @@ ngx_http_cache_purge_test_retention()
             error.message);
         result = get(241);
         check(result.invalidate_ms == 30 && !result.delete_ms,
-            "history renewal uses retained TAGs and persistent host aliases "
+            "history renewal uses retained TAGs and fixed hosts "
             "with namespace isolation");
         history_open(241);
         check(ngx_http_cache_purge_coordinator_expire_propagation(
@@ -808,7 +778,7 @@ ngx_http_cache_purge_test_retention()
         }
         auto historical = history_result();
         check(historical.invalidate_ms == 30 && !historical.delete_ms,
-            "history TAGs and host aliases remain in one snapshot while "
+            "history TAGs and fixed hosts remain in one snapshot while "
             "live GC releases their dictionaries");
     }
     check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
@@ -862,15 +832,6 @@ ngx_http_cache_purge_test_keep_pages()
             index.commit(file.id, prepared.revision);
             expected[i] = ngx_http_cache_purge_native_expected(file.id, 2);
         }
-        for (unsigned i = 0; i < 160; i++) {
-            auto host = "alias-" + std::to_string(i) + ".test";
-            check(ngx_http_cache_purge_index_observe(store,
-                      ngx_http_cache_purge_native_bytes(file.key),
-                      ngx_http_cache_purge_native_bytes("https://" + host),
-                      ngx_http_cache_purge_native_bytes(host), &error)
-                      == 0,
-                error.message);
-        }
         auto add = [&](const char *name, Selector selector, PurgeMode mode,
                        uint64_t issued) {
             auto op = coordinator.accept(
@@ -895,82 +856,36 @@ ngx_http_cache_purge_test_keep_pages()
                 error.message);
             return value;
         };
-        auto advance = [&] {
-            for (unsigned i = 0; i < 64; i++) {
-                coordinator.step();
-            }
-        };
         add("red", { SelectorKind::namespace_tag, "red", "tenant" },
             PurgeMode::invalidate, 10);
-        add("late-host", { SelectorKind::host_tag, "red", "late.test" },
+        add("host", { SelectorKind::host_tag, "red", "keep.test" },
             PurgeMode::remove, 30);
-        check(keep(0) == NGX_HTTP_CACHE_ROCKSDB_BUSY,
-            "large retention scan yields instead of a fixed-alias failure");
-        retained(0, NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND);
-        coordinator.step();
-        check(ngx_http_cache_purge_index_observe(store,
-                  ngx_http_cache_purge_native_bytes(file.key),
-                  ngx_http_cache_purge_native_bytes("https://late.test/item"),
-                  ngx_http_cache_purge_native_bytes("late.test"), &error)
-                  == 0,
-            "observe a matching host during a retention scan");
-        advance();
-        retained(0, NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND);
-        check(keep(0) == NGX_HTTP_CACHE_ROCKSDB_BUSY,
-            "changed alias stamp restarts without publishing a partial result");
-        advance();
-        check(keep(0) == 0 && retained(0).invalidate_ms == 10
-                  && retained(0).delete_ms == 30,
-            "restarted retention includes late host TAG associations");
+        for (unsigned i = 0; i < 5; i++) {
+            check(keep(i) == 0 && retained(i).invalidate_ms == 10
+                      && retained(i).delete_ms == 30,
+                "fixed identity retention completes without four-slot gating");
+        }
         ngx_http_cache_rocksdb_stats_t before{}, after{};
         check(ngx_http_cache_rocksdb_stats(store, &before, &error) == 0
-                  && !before.cursor_handles,
-            "completed retention unpins snapshots");
+                  && !before.cursor_handles && !before.active_cursors,
+            "retention leaves no pending cursor state");
         check(keep(0) == 0
                   && ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
                   && before.writes == after.writes,
-            "completed retention retries need no alias rescan or WAL write");
-
+            "repeated retention does not rewrite an unchanged membership");
         add("new-red", { SelectorKind::namespace_tag, "red", "tenant" },
             PurgeMode::invalidate, 40);
         for (unsigned i = 0; i < 5; i++) {
-            check(keep(i) == NGX_HTTP_CACHE_ROCKSDB_BUSY,
-                "four retention slots bound concurrently retained metadata");
-        }
-        check(ngx_http_cache_rocksdb_stats(store, &after, &error) == 0
-                  && !after.cursor_handles && !after.active_cursors,
-            "four pending retention scans release cursors between batches");
-        advance();
-        check(keep(4) == NGX_HTTP_CACHE_ROCKSDB_BUSY,
-            "a new file cannot evict an unconsumed completed retention scan");
-        for (unsigned i = 0; i < 4; i++) {
             check(keep(i) == 0 && retained(i).invalidate_ms == 40,
-                "round-robin coordinator work completes each pending file");
+                "each file observes the new published control image");
         }
-        check(keep(4) == NGX_HTTP_CACHE_ROCKSDB_BUSY,
-            "a completed slot can admit another file");
-        add("during-scan", { SelectorKind::namespace_tag, "red", "tenant" },
-            PurgeMode::remove, 50);
-        coordinator.step();
-        check(keep(4) == NGX_HTTP_CACHE_ROCKSDB_BUSY,
-            "new accepted controls invalidate pending retention work");
-        advance();
-        check(keep(4) == 0 && retained(4).delete_ms == 50,
-            "restarted retention uses the new published controls");
-        check(ngx_http_cache_purge_index_observe(store,
-                  ngx_http_cache_purge_native_bytes(file.key),
-                  ngx_http_cache_purge_native_bytes("https://another.test"),
-                  ngx_http_cache_purge_native_bytes("another.test"), &error)
-                  == 0,
-            "change aliases after a completed retention result");
-        check(keep(4) == NGX_HTTP_CACHE_ROCKSDB_BUSY,
-            "completed memo checks current aliases before reuse");
         auto changed = index.update_metadata(file.id, 2, "changed", { "blue" });
         check(keep(4) == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
-            "completed memo cannot authorize a changed file revision");
-        (void) changed;
-        check(keep(0) == NGX_HTTP_CACHE_ROCKSDB_BUSY,
-            "leave a pending retention scan for coordinator shutdown");
+            "retention rejects an obsolete file revision");
+        expected[4].revision = changed.revision;
+        check(keep(4) == 0,
+            "current metadata can be retained without abandoned scan slots");
+
     }
     ngx_http_cache_rocksdb_stats_t stats{};
     check(ngx_http_cache_rocksdb_stats(store, &stats, &error) == 0
@@ -1030,15 +945,6 @@ ngx_http_cache_purge_test_expiry_pages()
                       == 0,
                 error.message);
         }
-        for (unsigned i = 0; i < 96; i++) {
-            auto host = "expiry-alias-" + std::to_string(i) + ".test";
-            check(ngx_http_cache_purge_index_observe(store,
-                      ngx_http_cache_purge_native_bytes(file.key),
-                      ngx_http_cache_purge_native_bytes("https://" + host),
-                      ngx_http_cache_purge_native_bytes(host), &error)
-                      == 0,
-                error.message);
-        }
         for (unsigned i = 1; i <= 2; i++) {
             file.id[15] = i;
             auto retired = index.retire(file.id, 2);
@@ -1046,7 +952,7 @@ ngx_http_cache_purge_test_expiry_pages()
         }
         auto op = coordinator.accept(
             { "host-red",
-                { SelectorKind::host_tag, "red", "expiry-alias-95.test" },
+                { SelectorKind::host_tag, "red", "expiry.test" },
                 PurgeMode::remove, 20, "expiry-pages" },
             150, 1000);
         ready(coordinator);
@@ -1066,71 +972,22 @@ ngx_http_cache_purge_test_expiry_pages()
         };
         size_t processed = 99;
         check(ngx_http_cache_purge_coordinator_expire_propagation(
-                  coordinator.native(), 201, 8, &processed, &error)
-                      == NGX_HTTP_CACHE_ROCKSDB_BUSY
-                  && !processed,
-            "large retained identity starts bounded expiry work");
-        ngx_http_cache_rocksdb_stats_t stats{};
-        check(ngx_http_cache_rocksdb_stats(store, &stats, &error) == 0
-                  && !stats.cursor_handles,
-            "pending expiry retains no database cursor between steps");
-        file.id[15] = 3;
-        file.path = "new-alias-owner";
-        file.url = "https://expiry-new.test/item";
-        file.host = "expiry-new.test";
-        main[15] = 3;
-        auto raw = ngx_http_cache_purge_native_file(file);
-        ngx_http_cache_purge_index_match_t prepared{};
-        check(ngx_http_cache_purge_index_prepare_native(
-                  store, &raw, nullptr, main, variant, &prepared, &error)
-                  == 0,
-            error.message);
-        index.commit(file.id, prepared.revision);
-        for (unsigned i = 0; i < 16; i++) {
-            coordinator.step();
-        }
-        check(ngx_http_cache_purge_coordinator_expire_propagation(
-                  coordinator.native(), 201, 8, &processed, &error)
-                      == NGX_HTTP_CACHE_ROCKSDB_BUSY
-                  && !processed,
-            "new alias from a concurrent fill restarts history expiry");
-        auto retired_new = index.retire(file.id, 2);
-        index.collect_file(file.id, retired_new.revision);
-        for (unsigned i = 0; i < 16; i++) {
-            coordinator.step();
-        }
-        check(ngx_http_cache_purge_coordinator_expire_propagation(
-                  coordinator.native(), 201, 8, &processed, &error)
-                      == NGX_HTTP_CACHE_ROCKSDB_BUSY
+                  coordinator.native(), 201, 1, &processed, &error) == 0
                   && processed == 1,
-            "completed first membership commits before the next scan yields");
+            "one membership is processed within the supplied expiry budget");
+        check(ngx_http_cache_purge_coordinator_expire_propagation(
+                  coordinator.native(), 201, 1, &processed, &error) == 0
+                  && processed == 1,
+            "the next membership is processed independently");
         check(get(1).delete_ms == 20,
-            "renewal matches a host TAG beyond the old alias count limit");
-        check(!get(2).invalidate_ms && !get(2).delete_ms,
-            "pending second membership remains indexed until checked");
-        for (unsigned i = 0; i < 16; i++) {
-            coordinator.step();
-        }
-        check(ngx_http_cache_purge_coordinator_expire_propagation(
-                  coordinator.native(), 201, 8, &processed, &error)
-                      == 0
-                  && processed == 1,
-            "second membership with no live match is collected independently");
+            "a canonical host TAG renews the matching retained representation");
         get(2, NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND);
         check(ngx_http_cache_purge_coordinator_expire_propagation(
-                  coordinator.native(), 1151, 8, &processed, &error)
-                      == NGX_HTTP_CACHE_ROCKSDB_BUSY
-                  && !processed,
-            "renewed membership retains its original next deadline");
-        for (unsigned i = 0; i < 16; i++) {
-            coordinator.step();
-        }
-        check(ngx_http_cache_purge_coordinator_expire_propagation(
-                  coordinator.native(), 1151, 8, &processed, &error)
-                      == 0
+                  coordinator.native(), 1151, 1, &processed, &error) == 0
                   && processed == 1,
-            "expired later operation does not reopen a propagation window");
+            "an expired operation does not reopen its propagation window");
         get(1, NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND);
+        ngx_http_cache_rocksdb_stats_t stats{};
         while (index.collect_keys(32)) {
         }
         check(ngx_http_cache_rocksdb_stats(store, &stats, &error) == 0

@@ -428,15 +428,6 @@ public:
         return result;
     }
     void
-    add_url(const std::string &key, const std::string &url)
-    {
-        ngx_http_cache_rocksdb_error_t error;
-        int rc = ngx_http_cache_purge_index_add_url(store_,
-            ngx_http_cache_purge_native_bytes(key),
-            ngx_http_cache_purge_native_bytes(url), &error);
-        ngx_http_cache_purge_index_checked(rc, error);
-    }
-    void
     collect_file(const FileId &id, uint64_t revision)
     {
         auto input = ngx_http_cache_purge_native_expected(id, revision);
