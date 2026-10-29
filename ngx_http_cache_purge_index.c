@@ -7919,10 +7919,10 @@ ngx_http_cache_purge_index_collect_one(ngx_http_cache_purge_index_tx_t *tx,
     }
 }
 
-int
-ngx_http_cache_purge_index_collect(ngx_http_cache_rocksdb_t *store,
+static int
+ngx_http_cache_purge_index_collect_internal(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_expected_t *files, size_t count,
-    ngx_http_cache_rocksdb_error_t *error)
+    int deferred, ngx_http_cache_rocksdb_error_t *error)
 {
     ngx_http_cache_purge_index_tx_t  *tx;
     size_t                            i;
@@ -7941,6 +7941,7 @@ ngx_http_cache_purge_index_collect(ngx_http_cache_rocksdb_t *store,
     if (tx == NULL) {
         return NGX_HTTP_CACHE_ROCKSDB_LIMIT;
     }
+    tx->deferred = deferred;
     for (i = 0; i < count && tx->context->status == 0; i++) {
         ngx_http_cache_purge_index_collect_one(tx, &files[i]);
     }
@@ -7949,8 +7950,27 @@ ngx_http_cache_purge_index_collect(ngx_http_cache_rocksdb_t *store,
 }
 
 int
-ngx_http_cache_purge_index_collect_keys(ngx_http_cache_rocksdb_t *store,
-    size_t budget, size_t *removed, ngx_http_cache_rocksdb_error_t *error)
+ngx_http_cache_purge_index_collect(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *files, size_t count,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_purge_index_collect_internal(store, files, count, 0,
+                                                      error);
+}
+
+int
+ngx_http_cache_purge_index_collect_deferred(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *files, size_t count,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_purge_index_collect_internal(store, files, count, 1,
+                                                      error);
+}
+
+static int
+ngx_http_cache_purge_index_collect_keys_internal(
+    ngx_http_cache_rocksdb_t *store, size_t budget, size_t *removed,
+    int deferred, ngx_http_cache_rocksdb_error_t *error)
 {
     ngx_http_cache_purge_index_tx_t    *tx;
     ngx_http_cache_purge_query_t       *q;
@@ -7972,6 +7992,7 @@ ngx_http_cache_purge_index_collect_keys(ngx_http_cache_rocksdb_t *store,
     if (tx == NULL) {
         return NGX_HTTP_CACHE_ROCKSDB_LIMIT;
     }
+    tx->deferred = deferred;
     q = tx->context;
     ngx_http_cache_purge_index_cursor_open(q, &q->outer,
                                            NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
@@ -8148,6 +8169,23 @@ ngx_http_cache_purge_index_collect_keys(ngx_http_cache_rocksdb_t *store,
         *removed = done + !remaining;
     }
     return ngx_http_cache_purge_index_tx_end(tx, error);
+}
+
+int
+ngx_http_cache_purge_index_collect_keys(ngx_http_cache_rocksdb_t *store,
+    size_t budget, size_t *removed, ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_purge_index_collect_keys_internal(store, budget,
+                                                          removed, 0, error);
+}
+
+int
+ngx_http_cache_purge_index_collect_keys_deferred(
+    ngx_http_cache_rocksdb_t *store, size_t budget, size_t *removed,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_purge_index_collect_keys_internal(store, budget,
+                                                          removed, 1, error);
 }
 
 typedef struct {

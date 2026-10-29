@@ -1024,6 +1024,14 @@ int
 ngx_http_cache_purge_index_collect_keys(ngx_http_cache_rocksdb_t *store,
     size_t budget, size_t *removed, ngx_http_cache_rocksdb_error_t *error);
 
+/* Background GC may replay after a crash; retirement remains synchronous. */
+int ngx_http_cache_purge_index_collect_deferred(ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *files, size_t count,
+    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_collect_keys_deferred(
+    ngx_http_cache_rocksdb_t *store, size_t budget, size_t *removed,
+    ngx_http_cache_rocksdb_error_t *error);
+
 typedef struct {
     uint64_t  invalidate_ms, invalidate_until_ms;
     uint64_t  delete_ms, delete_until_ms;

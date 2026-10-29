@@ -20,6 +20,22 @@ a = p.parse_args()
 checks = []
 roots = []
 timings = {}
+for truncate in (False, True):
+    root = Path(tempfile.mkdtemp(prefix='cache-purge-gc-replacement-', dir='/tmp'))
+    roots.append(str(root))
+    written = subprocess.check_output(
+        [str(a.binary), '--gc-replacement-crash', str(root)], text=True, timeout=30)
+    boundaries = [line.split() for line in written.splitlines() if line.startswith('WAL ')]
+    assert boundaries
+    for _, name, size in boundaries:
+        wal = Path(name).resolve()
+        assert wal.is_relative_to(root.resolve()) and wal.suffix == '.log'
+        assert wal.stat().st_size > int(size)
+        if truncate:
+            os.truncate(wal, int(size))
+    mode = '--gc-replacement-lost' if truncate else '--gc-replacement-recover'
+    checks.append(subprocess.check_output(
+        [str(a.binary), mode, str(root)], text=True, timeout=30).strip())
 for cut in ('prepared', 'rename', 'index', 'marker', 'missing'):
     root = Path(tempfile.mkdtemp(prefix='cache-purge-file-publication-', dir='/tmp'))
     roots.append(str(root))

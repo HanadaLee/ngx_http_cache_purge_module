@@ -2674,7 +2674,7 @@ ngx_http_cache_purge_component_collect_ack(ngx_http_cache_purge_component_t *c,
     if (rc == 0) {
         memcpy(expected.id, file.id, 16);
         expected.revision = file.revision;
-        rc = ngx_http_cache_purge_index_collect(c->operations.store,
+        rc = ngx_http_cache_purge_index_collect_deferred(c->operations.store,
                                                    &expected, 1, error);
     }
     ngx_http_cache_purge_index_file_free(&file);
@@ -2787,7 +2787,7 @@ ngx_http_cache_purge_component_collect_file(ngx_http_cache_purge_component_t *c,
     }
     if (rc == 0 && !waiting) {
         expected.revision = removed.revision;
-        rc = ngx_http_cache_purge_index_collect(c->operations.store,
+        rc = ngx_http_cache_purge_index_collect_deferred(c->operations.store,
                                                    &expected, 1, error);
     }
 
@@ -2871,8 +2871,8 @@ ngx_http_cache_purge_component_collect(ngx_http_cache_purge_component_t *c,
         rc = ngx_http_cache_purge_component_collect_result(rc, error);
     }
     if (rc == 0) {
-        rc = ngx_http_cache_purge_index_collect_keys(c->operations.store,
-                                                       8, &removed, error);
+        rc = ngx_http_cache_purge_index_collect_keys_deferred(
+            c->operations.store, 8, &removed, error);
     }
     /* Complete both passes before revisiting busy rows. Empty/blocked
      * catalogs sleep; one blocked instance never stalls the remaining scan. */

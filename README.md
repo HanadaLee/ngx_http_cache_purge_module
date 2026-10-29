@@ -31,6 +31,12 @@ The WAL sync group includes both single-file/native preparation and the batch
 preparation API. Native representation bindings and their file intent remain in
 the same atomic batch. Tests count actual WAL sync calls through these entry
 points and verify process recovery and loss of an unsynchronized WAL suffix.
+Background collection of retired records and unreferenced key metadata also
+joins this bounded sync group. After synchronous retirement, lost collection
+progress restores retired records for another cleanup pass. If the lost suffix
+also contains a cache replacement, the physical instance must still match its
+index record; an older path mapping cannot authorize the replacement file.
+Explicit collection APIs retain their synchronous contract.
 
 Bounded dictionary digest probes can fill the existing shared RocksDB block
 cache. Bulk prefix scans and forked cursors retain their no-fill policy, so
@@ -56,9 +62,10 @@ bytewise prefix scans, shared value storage, and batched fill/retirement records
 The component executor hosts that index on one thread and accepts bounded local
 IPC independently of nginx's event loops. It supports cancellable owner
 handoff, explicit shutdown, and paged queries without retaining server cursors
-between requests. Cache-fill capture is connected; invalidation request handling
-and the rest of the file lifecycle are still being implemented. Index state changes
-do not perform filesystem operations or provide immediate invalidation by themselves.
+between requests. HTTP tests cover filling, invalidation, file cleanup and
+restart recovery; full deployment and performance acceptance remain open.
+Index state changes alone do not perform filesystem operations or provide
+immediate invalidation.
 
 The executor automatically revisits unfinished native file publications in
 bounded background steps, including after owner restart or a lost reply. It

@@ -1088,10 +1088,123 @@ removal(const std::string &mode, const std::string &path)
     return 0;
 }
 
+static int
+ngx_http_cache_purge_test_collection_replacement(
+    const std::string &mode, const std::string &path)
+{
+    std::filesystem::create_directories(path + "/cache");
+    std::filesystem::create_directories(path + "/db");
+    int anchor_fd, lease_fd;
+    check(ngx_http_cache_purge_file_locks_open(
+              (path + "/locks").c_str(), getuid(), 1, &anchor_fd, &error)
+              == 0,
+        "replacement collection lock file");
+    Descriptor anchor(anchor_fd);
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    check(ngx_http_cache_rocksdb_open(
+              (path + "/db").c_str(), &options, &store, &error)
+              == 0,
+        "replacement collection database");
+    {
+        Index index(store);
+        Publications publications(
+            { { path + "/cache", "cache", NGX_HTTP_CACHE_PURGE_ROOT_CACHE } },
+            path + "/db");
+        File file;
+        file.key = "replacement";
+        file.url = "https://example.test/replacement";
+        file.host = "example.test";
+        file.tag_namespace = "tenant";
+        file.root = path + "/cache";
+        file.zone = "cache";
+        file.path = "file";
+        auto target = file.root + '/' + file.path;
+        auto temporary = file.root + "/temporary";
+        unsigned char digest[16];
+        uint64_t offset;
+        check(ngx_http_cache_purge_file_address(
+                  bytes(target), digest, &offset, &error)
+                      == 0
+                  && ngx_http_cache_purge_file_lease_acquire(
+                         (path + "/locks").c_str(), anchor.fd, offset,
+                         &lease_fd, &error)
+                         == 0,
+            "replacement collection lease");
+        Descriptor lease(lease_fd);
+        auto create = [&](unsigned number, FileId previous) {
+            file.id = id(number);
+            Descriptor fd(open(temporary.c_str(),
+                O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600));
+            auto entity = "entity-" + std::to_string(number);
+            check(write(fd.fd, entity.data(), entity.size())
+                      == static_cast<ssize_t>(entity.size()),
+                "write replacement entity");
+            publications.prepare(index, { file, previous }, temporary,
+                anchor.fd, lease.fd, fd.fd, getuid());
+            check(rename(temporary.c_str(), target.c_str()) == 0,
+                "rename replacement entity");
+            publications.finish(
+                index, file.id, 1, anchor.fd, lease.fd, getuid());
+        };
+        if (mode == "--gc-replacement-crash") {
+            create(1, {});
+            check(ngx_http_cache_rocksdb_sync(store, &error) == 0,
+                "durable original before replacement");
+            for (const auto &entry :
+                std::filesystem::directory_iterator(path + "/db"))
+            {
+                if (entry.path().extension() == ".log") {
+                    std::cout << "WAL " << entry.path().string() << ' '
+                              << entry.file_size() << std::endl;
+                }
+            }
+            create(2, id(1));
+            auto expected = ngx_http_cache_purge_native_expected(
+                id(1), index.get(id(1)).revision);
+            check(ngx_http_cache_purge_index_collect_deferred(
+                      store, &expected, 1, &error)
+                      == 0,
+                "collect replacement's retired predecessor");
+            _exit(0);
+        }
+        Descriptor selected(open(target.c_str(), O_RDONLY | O_CLOEXEC));
+        char entity[8]{};
+        check(read(selected.fd, entity, 8) == 8
+                  && std::memcmp(entity, "entity-2", 8) == 0,
+            "durable physical replacement remains present");
+        ngx_http_cache_purge_index_file_t inspected{};
+        int rc = ngx_http_cache_purge_publications_inspect(
+            publications.native(), store, bytes(file.root), bytes(file.zone),
+            bytes(file.path), selected.fd, getuid(), &inspected, &error);
+        if (mode == "--gc-replacement-lost") {
+            check(index.current(file.root, file.path)->id == id(1),
+                "WAL-tail loss restores the original index mapping");
+            check(rc == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND
+                      && inspected.revision == 0,
+                "old mapping cannot admit a different physical instance");
+        } else {
+            check(mode == "--gc-replacement-recover" && rc == 0
+                      && std::memcmp(inspected.id, id(2).data(), 16) == 0,
+                "normal restart recovers replacement and collection");
+        }
+        ngx_http_cache_purge_index_file_free(&inspected);
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
+        "close replacement collection database");
+    std::cout << "PASS replacement collection recovery " << mode << std::endl;
+    return 0;
+}
+
 int
 main(int argc, char **argv)
 {
     try {
+        if (argc == 3 && std::string(argv[1]).find("--gc-replacement-") == 0) {
+            return ngx_http_cache_purge_test_collection_replacement(
+                argv[1], argv[2]);
+        }
         if (argc == 4 && std::string(argv[1]) == "--activate-background") {
             return activate_background(argv[2], argv[3]);
         }

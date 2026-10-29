@@ -35,9 +35,27 @@ for truncate in (False, True):
     checks.append(subprocess.check_output([str(a.binary), mode, str(directory)],
                                          text=True, timeout=30).strip())
     native.append({'root': str(directory), 'truncated': truncate})
+collection = []
+for truncate in (False, True):
+    directory = Path(tempfile.mkdtemp(prefix='cache-purge-collection-wal-', dir='/tmp'))
+    written = subprocess.check_output([str(a.binary), '--crash-collect-deferred', str(directory)],
+                                      text=True, timeout=30)
+    boundaries = [line.split() for line in written.splitlines() if line.startswith('WAL ')]
+    assert boundaries
+    for _, name, size in boundaries:
+        wal = Path(name).resolve()
+        assert wal.is_relative_to(directory.resolve()) and wal.suffix == '.log'
+        assert wal.stat().st_size > int(size)
+        if truncate:
+            os.truncate(wal, int(size))
+    mode = '--recover-collect-lost' if truncate else '--recover-collect-deferred'
+    checks.append(subprocess.check_output([str(a.binary), mode, str(directory)],
+                                         text=True, timeout=30).strip())
+    collection.append({'root': str(directory), 'truncated': truncate})
 result = {'checks': checks, 'database': str(root),
           'publication_database': str(publication),
           'native_deferred': native,
+          'collection_deferred': collection,
           'scope': 'application index WAL recovery; no filesystem or nginx cache-hook simulation'}
 a.output.write_text(json.dumps(result, indent=2) + '\n')
 print(json.dumps(result), flush=True)

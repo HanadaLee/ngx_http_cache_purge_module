@@ -143,6 +143,134 @@ ngx_http_cache_purge_test_prepare_sync(const std::string &path)
 }
 
 static void
+ngx_http_cache_purge_test_collect_sync(const std::string &path)
+{
+    check(mkdir(path.c_str(), 0700) == 0, "collection sync directory");
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    ngx_http_cache_rocksdb_error_t error{};
+    check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
+              == 0,
+        error.message);
+    {
+        Index index(store);
+        auto source = file(1, "/collect-sync");
+        auto published = install(index, source);
+        auto expected =
+            ngx_http_cache_purge_native_expected(source.id, published.revision);
+        check(ngx_http_cache_purge_index_collect_deferred(
+                  store, &expected, 1, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "deferred collection still rejects a live instance");
+        auto before = ngx_http_cache_purge_test_sync_count();
+        auto retired = index.retire(source.id, published.revision);
+        check(ngx_http_cache_purge_test_sync_count() == before + 1,
+            "retirement remains an immediate durable barrier");
+        before = ngx_http_cache_purge_test_sync_count();
+        expected.revision = retired.revision;
+        check(ngx_http_cache_purge_index_collect_deferred(
+                  store, &expected, 1, &error)
+                  == 0,
+            error.message);
+        size_t removed = 0;
+        check(ngx_http_cache_purge_index_collect_keys_deferred(
+                  store, 8, &removed, &error)
+                      == 0
+                  && removed != 0,
+            "background key collection removes unreferenced aliases");
+        check(ngx_http_cache_purge_test_sync_count() == before,
+            "background metadata collection joins the WAL sync group");
+        fails(NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND, [&] { index.get(source.id); });
+        check(ngx_http_cache_rocksdb_sync(store, &error) == 0
+                  && ngx_http_cache_purge_test_sync_count() == before + 1,
+            "one barrier persists the collection group");
+        source = file(2, "/strict-collect");
+        published = install(index, source);
+        retired = index.retire(source.id, published.revision);
+        before = ngx_http_cache_purge_test_sync_count();
+        index.collect_file(source.id, retired.revision);
+        check(ngx_http_cache_purge_test_sync_count() == before + 1,
+            "explicit collection keeps its synchronous contract");
+        check(index.collect_keys() != 0
+                  && ngx_http_cache_purge_test_sync_count() == before + 2,
+            "explicit key collection remains synchronous");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
+}
+
+static void
+ngx_http_cache_purge_test_collect_recovery(
+    const std::string &mode, const std::string &path)
+{
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    ngx_http_cache_rocksdb_error_t error{};
+    check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
+              == 0,
+        error.message);
+    {
+        Index index(store);
+        auto source = file(1, "/collect-recovery");
+        bool writing = mode == "--crash-collect-deferred";
+        if (writing) {
+            auto published = install(index, source);
+            index.retire(source.id, published.revision);
+            for (const auto &entry : std::filesystem::directory_iterator(path))
+            {
+                if (entry.path().extension() == ".log") {
+                    std::cout << "WAL " << entry.path().string() << ' '
+                              << entry.file_size() << std::endl;
+                }
+            }
+        }
+        if (writing || mode == "--recover-collect-lost") {
+            auto saved = index.get(source.id);
+            check(saved.state == FileState::retired
+                      && !index.current(source.root, source.path),
+                "lost collection never restores a reusable cache instance");
+            auto expected =
+                ngx_http_cache_purge_native_expected(source.id, saved.revision);
+            auto before = ngx_http_cache_purge_test_sync_count();
+            check(ngx_http_cache_purge_index_collect_deferred(
+                      store, &expected, 1, &error)
+                      == 0,
+                error.message);
+            size_t removed = 0;
+            check(ngx_http_cache_purge_index_collect_keys_deferred(
+                      store, 8, &removed, &error)
+                          == 0
+                      && removed != 0,
+                "replayed collection preserves dictionary reference counts");
+            check(ngx_http_cache_purge_test_sync_count() == before,
+                "collection does not synchronize each removed record");
+            if (writing) {
+                _exit(0);
+            }
+        } else {
+            check(mode == "--recover-collect-deferred",
+                "deferred collection recovery mode");
+            fails(NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND,
+                [&] { index.get(source.id); });
+        }
+        auto query = index.query({ SelectorKind::url, source.url, "" });
+        Match match;
+        check(!query->next(match), "collected URL has no file postings");
+        query.reset();
+        auto replacement = source;
+        replacement.id = id(2);
+        install(index, replacement);
+        check(index.current(source.root, source.path)->id == replacement.id,
+            "recovered dictionary and path mapping accept a new instance");
+        check(ngx_http_cache_rocksdb_sync(store, &error) == 0,
+            "synchronize replay and replacement");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
+    std::cout << "PASS collection WAL recovery " << mode << std::endl;
+}
+
+static void
 ngx_http_cache_purge_test_prepare_recovery(
     const std::string &mode, const std::string &path)
 {
@@ -2262,6 +2390,20 @@ int
 main(int argc, char **argv)
 {
     try {
+        if (argc == 3 && std::string(argv[1]) == "--collect-sync") {
+            ngx_http_cache_purge_test_collect_sync(argv[2]);
+            std::cout << "PASS background collection sync barriers"
+                      << std::endl;
+            return 0;
+        }
+        if (argc == 3
+            && (std::string(argv[1]) == "--crash-collect-deferred"
+                || std::string(argv[1]) == "--recover-collect-deferred"
+                || std::string(argv[1]) == "--recover-collect-lost"))
+        {
+            ngx_http_cache_purge_test_collect_recovery(argv[1], argv[2]);
+            return 0;
+        }
         if (argc == 3 && std::string(argv[1]) == "--prepare-sync") {
             ngx_http_cache_purge_test_prepare_sync(argv[2]);
             std::cout << "PASS native and single-file PREPARE sync barriers"
@@ -2282,6 +2424,7 @@ main(int argc, char **argv)
         char path[] = "/tmp/cache-purge-index-test-XXXXXX";
         check(mkdtemp(path) != nullptr, "test directory");
         ngx_http_cache_purge_test_tag_groups();
+        ngx_http_cache_purge_test_collect_sync(std::string(path) + "-collect");
         ngx_http_cache_purge_test_alias_snapshots(
             std::string(path) + "-aliases");
         ngx_http_cache_purge_test_native_migration(
