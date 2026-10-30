@@ -21,6 +21,12 @@ On Linux, the executor names its writer `cache_index` and its lookup thread
 nice value to 19 as a best-effort scheduling hint. The HTTP worker,
 lookup thread and nginx I/O pools retain their inherited priorities.
 
+The writer dispatches at most four queued commands between background
+maintenance steps, visiting each connection once and rotating the starting
+connection. The lookup executor keeps its one-command budget. Ready replies
+are flushed after each command; the existing connection and memory limits stay
+unchanged.
+
 New cache-file records use atomic WAL batches with deferred synchronization.
 The existing executor checks for pending WAL data every 100 ms; 64 batches or
 one configured maximum batch of accumulated WAL bytes force an earlier sync.

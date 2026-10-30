@@ -3426,6 +3426,8 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
         }
         executed = 0;
         start = c->next_peer;
+        /* A bounded batch advances queued publications between background
+         * file operations. Visit each peer at most once per iteration. */
         for (step = 0; step < c->options.max_connections; step++) {
             i = (start + step) % c->options.max_connections;
             p = &c->peers[i];
@@ -3451,14 +3453,15 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
                     continue;
                 }
             }
-            if (rc == 0 && !executed && !p->output.len && p->parsed
+            if (rc == 0 && executed < (c->read_store == NULL ? 4 : 1)
+                && !p->output.len && p->parsed
                 && p->input_used == p->input.len
                 && (p->publication_wait.store == NULL
                     || p->publication_wait.ticket <= synced))
             {
                 rc = ngx_http_cache_purge_component_execute(c, store, p, error);
                 if (rc == 0) {
-                    executed = 1;
+                    executed++;
                     c->next_peer = (i + 1) % c->options.max_connections;
                     if (p->output.len != 0
                         && !ngx_http_cache_purge_component_flush(c, p))
