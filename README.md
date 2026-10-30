@@ -500,6 +500,8 @@ lifecycle separately. `t/capture_runtime.py` exercises real native fills through
 the companion key module, worker IPC, WAL preparation, rename and READY
 publication. It also covers selected-descriptor admission, 304 commits,
 background invalidation, native-node cleanup and HTTP management requests.
+Use `--open-file-cache` to repeat these checks with cached file descriptors and
+negative file entries enabled.
 
 Configure the store and state zone together at HTTP scope. Provide independent
 identity expressions and enable the protocol at HTTP, server or location scope:
@@ -725,6 +727,11 @@ selections are resolved at configuration time.
 `cache` is the shared database cache budget, including the write-buffer charge;
 it is not a process RSS limit. The database directory must be outside cache-file
 directories and be a private directory owned by the configured worker UID.
+On Linux, the owner probes direct I/O with a temporary unnamed file when opening
+the database. Where supported, RocksDB flush and compaction use direct I/O to
+reduce system page-cache pressure; point reads remain buffered. Failed or
+unsupported probes retain buffered I/O. This does not change WAL durability,
+native cache-file synchronization, the database format, or resource budgets.
 New storage is created for that UID; existing agent-owned storage must be migrated
 while stopped. Existing directories are not recursively chowned. Store and
 state-zone identity changes require a full restart.

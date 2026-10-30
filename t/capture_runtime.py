@@ -39,6 +39,7 @@ p.add_argument('--expr', type=Path)
 p.add_argument('--workers', type=int, default=2)
 p.add_argument('--capacity', action='store_true')
 p.add_argument('--cache-root-aliases', action='store_true', help='Exercise configured symlink roots alongside canonical roots')
+p.add_argument('--open-file-cache', action='store_true', help='Exercise cached native file descriptors and negative entries')
 p.add_argument('--reuse-build', type=Path, help='Reuse matching compiled sources after test-only edits')
 a = p.parse_args()
 repo = Path(__file__).resolve().parents[1]
@@ -335,6 +336,10 @@ dns_server = socketserver.ThreadingUDPServer(('127.0.0.1', 0), DNS)
 dns_server.daemon_threads = True
 threading.Thread(target=dns_server.serve_forever, daemon=True).start()
 
+open_file_cache = '''open_file_cache max=10000 inactive=20s;
+ open_file_cache_valid 10s;
+ open_file_cache_min_uses 2;
+ open_file_cache_errors on;''' if a.open_file_cache else ''
 config = loads + f'''daemon off; master_process on; worker_processes {a.workers};
 pid {run}/pid; error_log {run}/error.log debug;
 thread_pool default threads=2;
@@ -342,6 +347,7 @@ thread_pool proof threads=1 max_queue=64;
 thread_pool publish threads=1 max_queue=64;
 events {{ worker_connections 256; }}
 http {{ access_log off; client_body_temp_path {run}/body; proxy_temp_path {run}/temp;
+ {open_file_cache}
  cache_purge_store {run}/index cache=8m write_buffer=2m;
  cache_purge_state_zone capture 4m;
  cache_purge_read_pool proof;
@@ -2601,7 +2607,8 @@ result = {'root': str(root), 'run': str(run), 'nginx_revision': revision,
           'core_source_patch_sha256': hashlib.sha256(source_patch).hexdigest(),
           'dynamic': a.dynamic, 'key_last': a.key_last, 'sanitizer': a.sanitize, 'expr': bool(a.expr), 'extension': extension,
           'sanitizer_exclusions': ['nonnull-attribute', 'alignment instrumentation for native ngx_md5.o only'] if a.sanitize else [],
-          'workers': a.workers, 'cache_root_aliases': cache_root_aliases, 'checks': checks,
+          'workers': a.workers, 'cache_root_aliases': cache_root_aliases,
+          'open_file_cache': a.open_file_cache, 'checks': checks,
           'hit_query_budget': hit_query_budget,
           'sources': {group: {str(p.relative_to(directory)): hashlib.sha256(p.read_bytes()).hexdigest() for p in directory.rglob('*') if p.is_file()}
                       for group, directory in [('addon', addon), ('key', key)]},

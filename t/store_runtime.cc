@@ -9,8 +9,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -20,6 +22,9 @@ extern "C" int ngx_http_cache_purge_store_c_probe(
     ngx_http_cache_rocksdb_t *store);
 extern "C" unsigned ngx_http_cache_purge_test_sync_count(void);
 extern "C" void ngx_http_cache_purge_test_sync_fail(unsigned fail);
+extern "C" void ngx_http_cache_purge_test_direct_fail(unsigned mode);
+extern "C" unsigned ngx_http_cache_purge_test_direct_count(void);
+extern "C" unsigned ngx_http_cache_purge_test_direct_supported(void);
 static unsigned checks;
 static ngx_http_cache_rocksdb_error_t error;
 
@@ -126,6 +131,66 @@ close(ngx_http_cache_rocksdb_t *&store)
     expect(ngx_http_cache_rocksdb_close(&store, &error),
         NGX_HTTP_CACHE_ROCKSDB_OK, "close");
     require(store == nullptr, "store handle consumed");
+}
+
+static void
+ngx_http_cache_purge_test_direct_io()
+{
+    char path[] = "/tmp/cache-purge-direct-XXXXXX";
+    require(mkdtemp(path) != nullptr, "create direct I/O fixture");
+    auto configuration = [&]() {
+        std::filesystem::path latest;
+        for (auto &entry : std::filesystem::directory_iterator(path)) {
+            auto name = entry.path().filename().string();
+            if (name.rfind("OPTIONS-", 0) == 0 && entry.path() > latest) {
+                latest = entry.path();
+            }
+        }
+        require(!latest.empty(), "database options were persisted");
+        std::ifstream input(latest);
+        require(input.good(), "read actual database options");
+        return std::string(std::istreambuf_iterator<char>(input),
+                           std::istreambuf_iterator<char>());
+    };
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_purge_test_direct_fail(0);
+    auto *store = open(path, options);
+    bool supported = ngx_http_cache_purge_test_direct_supported() != 0;
+    auto normal = configuration();
+    require(normal.find("use_direct_reads=false") != std::string::npos,
+            "point reads keep buffered I/O");
+    require(normal.find(supported ?
+                            "use_direct_io_for_flush_and_compaction=true" :
+                            "use_direct_io_for_flush_and_compaction=false")
+                != std::string::npos,
+            "background I/O follows the filesystem probe");
+    close(store);
+    for (unsigned mode = 1; mode <= (supported ? 3U : 1U); mode++) {
+        ngx_http_cache_purge_test_direct_fail(mode);
+        store = open(path, options);
+        require(ngx_http_cache_purge_test_direct_count() == 1,
+                "probe failure was injected before database work");
+        ngx_http_cache_purge_test_direct_fail(0);
+        require(configuration().find(
+                    "use_direct_io_for_flush_and_compaction=false")
+                    != std::string::npos,
+                "unsupported probe falls back without failing the database");
+        write(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, "io/recover",
+              std::to_string(mode));
+        close(store);
+        store = open(path, options);
+        require(configuration().find(supported ?
+                    "use_direct_io_for_flush_and_compaction=true" :
+                    "use_direct_io_for_flush_and_compaction=false")
+                    != std::string::npos,
+                "a failed probe does not disable later supported opens");
+        require(get(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, "io/recover")
+                    == std::to_string(mode),
+                "fallback writes survive reopening with the normal I/O mode");
+        close(store);
+    }
+    std::cout << "direct I/O probe supported=" << supported << std::endl;
 }
 
 static void
@@ -531,6 +596,7 @@ main(int argc, char **argv)
             return 0;
         }
 
+        ngx_http_cache_purge_test_direct_io();
         ngx_http_cache_purge_test_deferred();
         char path[] = "/tmp/cache-purge-store-test-XXXXXX";
         require(mkdtemp(path) != nullptr, "create test directory");

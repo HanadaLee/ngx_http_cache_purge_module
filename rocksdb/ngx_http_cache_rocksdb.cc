@@ -322,6 +322,31 @@ ngx_http_cache_rocksdb_read(ngx_http_cache_rocksdb_t *store,
     return ngx_http_cache_rocksdb_copy(found, value);
 }
 
+bool
+ngx_http_cache_rocksdb_direct_io(const std::string &path)
+{
+#if (defined(__linux__) && defined(O_TMPFILE))
+    alignas(4096) unsigned char  data[4096] = { 0 };
+    bool                         supported;
+    int                          fd;
+
+    /* Probe under the owner lock without leaving a named file behind. */
+    fd = open(path.c_str(), O_TMPFILE | O_RDWR | O_DIRECT | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        return false;
+    }
+    supported = pwrite(fd, data, sizeof(data), 0)
+                    == static_cast<ssize_t>(sizeof(data))
+                && pread(fd, data, sizeof(data), 0)
+                    == static_cast<ssize_t>(sizeof(data));
+    close(fd);
+    return supported;
+#else
+    (void) path;
+    return false;
+#endif
+}
+
 int
 ngx_http_cache_rocksdb_initialize(ngx_http_cache_rocksdb_t *store,
     const std::string &path, ngx_http_cache_rocksdb_error_t *error)
@@ -338,6 +363,10 @@ ngx_http_cache_rocksdb_initialize(ngx_http_cache_rocksdb_t *store,
     options.max_open_files = static_cast<int>(store->options.max_open_files);
     options.max_background_jobs =
         static_cast<int>(store->options.background_jobs);
+    /* Keep bulk SST rewrites from displacing native cache pages. Point reads
+     * retain buffered I/O; unsupported filesystems retain the old behavior. */
+    options.use_direct_io_for_flush_and_compaction =
+        ngx_http_cache_rocksdb_direct_io(path);
     options.compression = rocksdb::kSnappyCompression;
     options.max_log_file_size = 1 << 20;
     options.keep_log_file_num = 2;
