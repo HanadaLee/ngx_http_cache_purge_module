@@ -3193,6 +3193,17 @@ ngx_http_cache_purge_tag_expression(ngx_http_request_t *r)
 }
 
 static ngx_int_t
+ngx_http_cache_purge_publication_available(void)
+{
+    return ngx_http_cache_purge_retained_count
+           < NGX_HTTP_CACHE_PURGE_CAPTURE_COUNT
+           && NGX_DEFAULT_POOL_SIZE
+              + sizeof(ngx_http_cache_purge_publication_t)
+              <= NGX_HTTP_CACHE_PURGE_CAPTURE_BYTES
+                 - ngx_http_cache_purge_retained_bytes;
+}
+
+static ngx_int_t
 ngx_http_cache_purge_capture_header(ngx_http_request_t *r)
 {
     ngx_http_cache_purge_capture_t  *ctx;
@@ -3218,6 +3229,15 @@ ngx_http_cache_purge_capture_header(ngx_http_request_t *r)
     if (ctx && !ctx->detached && !ctx->failed
         && ctx->cache == r->cache && !r->cached)
     {
+        if (r->upstream != NULL && r->upstream->cacheable
+            && !ngx_http_cache_purge_publication_available())
+        {
+            /* Native cache-file creation follows this filter. Avoid writing
+             * an entity that cannot enter the bounded publication queue. */
+            r->upstream->cacheable = 0;
+            ngx_http_cache_purge_origin_release(&ctx->registration);
+            return ngx_http_cache_purge_capture_next_header(r);
+        }
         expression = ngx_http_cache_purge_tag_expression(r);
         rc = NGX_ERROR;
         if (expression == NULL
@@ -4638,11 +4658,7 @@ ngx_http_cache_purge_publication_create(ngx_http_cache_purge_capture_t *ctx,
     u_char  watermark[NGX_HTTP_CACHE_PURGE_VARIANT_SIZE];
 
     if (!ctx->origin_valid || !ctx->registration.registered
-        || ngx_http_cache_purge_retained_count
-           >= NGX_HTTP_CACHE_PURGE_CAPTURE_COUNT
-        || NGX_DEFAULT_POOL_SIZE + sizeof(*job)
-           > NGX_HTTP_CACHE_PURGE_CAPTURE_BYTES
-             - ngx_http_cache_purge_retained_bytes)
+        || !ngx_http_cache_purge_publication_available())
     {
         return NULL;
     }

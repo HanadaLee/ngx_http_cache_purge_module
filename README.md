@@ -555,6 +555,11 @@ new. Duplicate files use the existing bounded asynchronous cleanup without
 another publication RPC. A fill started after a newer purge keeps its own
 publication; detached 304 jobs are excluded. This does not coalesce work across
 workers or increase publication limits.
+If the publication queue or its memory budget is already full when response
+headers arrive, the module skips caching before nginx creates the cache file.
+The response is still served, and existing HITs are unaffected. Capacity is
+checked again after the body; long responses can still exhaust the queue after
+their headers have been accepted.
 Generation namespaces, legacy zone/key PURGE syntax, REFRESH handlers, directory
 walks and the old shared-memory task queue have been removed; obsolete directives
 are rejected rather than silently ignored. New captures do not add arbitrary
