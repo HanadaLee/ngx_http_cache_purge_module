@@ -17,8 +17,8 @@ body in the same turn. Short writes and EAGAIN retain the remaining frame for
 POLLOUT; ready replies do not wait behind the next background maintenance pass.
 
 On Linux, the executor names its writer `cache_index` and its lookup thread
-`cache_lookup`. After creating the lookup thread, the writer adds 10 to its own
-nice value, capped at 19, as a best-effort scheduling hint. The HTTP worker,
+`cache_lookup`. After creating the lookup thread, the writer sets its own
+nice value to 19 as a best-effort scheduling hint. The HTTP worker,
 lookup thread and nginx I/O pools retain their inherited priorities.
 
 New cache-file records use atomic WAL batches with deferred synchronization.

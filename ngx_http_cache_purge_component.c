@@ -3266,21 +3266,12 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
         return rc;
     }
 #if (defined(__linux__))
-    {
-        int  priority;
-
-        (void) pthread_setname_np(pthread_self(),
-            c->read_store == NULL ? "cache_index" : "cache_lookup");
-        /* Linux nice values are per-thread. Create the reader first so it
-         * keeps the caller's priority; scheduling hints may be denied. */
-        if (c->read_store == NULL) {
-            errno = 0;
-            priority = getpriority(PRIO_PROCESS, 0);
-            if (errno == 0 && priority < 19) {
-                priority = priority < 9 ? priority + 10 : 19;
-                (void) setpriority(PRIO_PROCESS, 0, priority);
-            }
-        }
+    (void) pthread_setname_np(pthread_self(),
+        c->read_store == NULL ? "cache_index" : "cache_lookup");
+    /* Linux nice values are per-thread. Create the reader first so it
+     * keeps the caller's priority; scheduling hints may be denied. */
+    if (c->read_store == NULL) {
+        (void) setpriority(PRIO_PROCESS, 0, 19);
     }
 #endif
     expire_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 1000;

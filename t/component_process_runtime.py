@@ -420,8 +420,8 @@ def executor_priority(increment):
     wait_for(lambda: {'cache_index', 'cache_lookup'} <= priorities().keys())
     actual = priorities()
     inherited = os.getpriority(os.PRIO_PROCESS, component.process.pid)
-    check(actual['cache_lookup'] == inherited and actual['cache_index'] == min(19, inherited + 10),
-          'writer priority is relative and bounded without changing the reader: ' + str(increment))
+    check(actual['cache_lookup'] == inherited and actual['cache_index'] == 19,
+          'writer uses the lowest nice priority without changing the reader: ' + str(increment))
     component.stop()
 
 
@@ -463,7 +463,7 @@ def publication_synced_finish():
 
 
 try:
-    for increment in (5, 15):
+    for increment in (5, 15, 19):
         executor_priority(increment)
     publication_synced_finish()
     for mode in ('complete', 'disconnect', 'timeout', 'restart'):

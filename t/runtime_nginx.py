@@ -387,7 +387,7 @@ try:
     until(lambda: {'cache_index', 'cache_lookup'} <= executor_priorities().keys())
     priorities = executor_priorities()
     inherited_priority = os.getpriority(os.PRIO_PROCESS, owner)
-    assert priorities['cache_index'] == min(19, inherited_priority + 10)
+    assert priorities['cache_index'] == 19
     assert priorities['cache_lookup'] == inherited_priority
     checks.append('only the writer lowers its nice priority; the HTTP worker and lookup thread retain theirs')
     for _ in range(2):
