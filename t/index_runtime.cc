@@ -1,4 +1,5 @@
 #include "ngx_http_cache_purge_test.hpp"
+#include <rocksdb/perf_context.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <algorithm>
@@ -12,6 +13,7 @@
 
 using namespace ngx_http_cache_purge;
 extern "C" unsigned ngx_http_cache_purge_test_sync_count(void);
+extern "C" void ngx_http_cache_purge_test_sync_exit_after(unsigned);
 extern "C" unsigned ngx_http_cache_purge_test_query_api(
     ngx_http_cache_rocksdb_t *, const unsigned char *, size_t,
     const unsigned char *);
@@ -769,7 +771,7 @@ ngx_http_cache_purge_test_hosts(const std::string &path)
         while (index.collect_keys(1)) {
             check(++rounds < 100, "host GC progresses with one-item budget");
         }
-        check(raw_keys(store, cf).size() == 3
+        check(raw_keys(store, cf).size() == 8
                   && raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_TAG).empty(),
             "last-file GC reclaims every host link and dictionary reference");
     }
@@ -1419,7 +1421,7 @@ ngx_http_cache_purge_test_native_migration(const std::string &path)
         }
         while (index.collect_keys(8)) {
         }
-        check(raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT).size() == 3
+        check(raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT).size() == 8
                   && ready(files[4]),
             "collection releases unresolved markers and key references");
     }
@@ -1788,7 +1790,7 @@ ngx_http_cache_purge_test_native_bindings(const std::string &path)
         index.collect_file(legacy.id, retired.revision);
         while (index.collect_keys(8)) {
         }
-        check(raw_keys(store, cf).size() == 3,
+        check(raw_keys(store, cf).size() == 8,
             "collection releases native postings and reverse bindings");
     }
     check(ngx_http_cache_rocksdb_close(&store, &error) == 0,
@@ -1849,7 +1851,7 @@ ngx_http_cache_purge_test_retention(const std::string &path)
                 + std::string(
                     reinterpret_cast<const char *>(first.id.data()), 16));
         Index upgraded(store);
-        check(ngx_http_cache_purge_test_raw(store, "M:index") == "13"
+        check(ngx_http_cache_purge_test_raw(store, "M:index") == "14"
                   && ngx_http_cache_purge_test_raw(store,
                          "O"
                              + std::string(reinterpret_cast<const char *>(
@@ -1963,7 +1965,7 @@ ngx_http_cache_purge_test_retention(const std::string &path)
         while (index.collect_keys(1)) {
             check(++rounds < 100, "retained key collection remains bounded");
         }
-        check(raw_keys(store, cf).size() == 3
+        check(raw_keys(store, cf).size() == 8
                   && raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_URL).empty()
                   && raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_TAG).empty(),
             "expiry releases every key, Vary value and identity association");
@@ -2041,7 +2043,7 @@ ngx_http_cache_purge_test_retention(const std::string &path)
             total == 66, "all historical TAG sets were independently retained");
         while (index.collect_keys(1)) {
         }
-        check(raw_keys(store, cf).size() == 3,
+        check(raw_keys(store, cf).size() == 8,
             "large history releases every dictionary reference");
         ngx_http_cache_rocksdb_stats_t before{}, after{};
         check(ngx_http_cache_rocksdb_stats(store, &before, &error) == 0,
@@ -2173,8 +2175,8 @@ ngx_http_cache_purge_test_fixed_identity(const std::string &path)
     isolated.key = key(isolated.components);
     {
         Index index(store);
-        check(ngx_http_cache_purge_index_schema_13() == 13
-                  && ngx_http_cache_purge_test_raw(store, "M:index") == "13",
+        check(ngx_http_cache_purge_index_schema_14() == 14
+                  && ngx_http_cache_purge_test_raw(store, "M:index") == "14",
             "immutable identity schema is explicit");
         install(index, source);
         install(index, other);
@@ -2288,7 +2290,7 @@ ngx_http_cache_purge_test_fixed_identity(const std::string &path)
         fails(NGX_HTTP_CACHE_ROCKSDB_SCHEMA, [&] { Index old(store); });
         check(ngx_http_cache_purge_test_raw(store, "M:index") == "12",
             "previous layout is rejected without rewriting data or tasks");
-        raw_write(store, cf, "M:index", "13");
+        raw_write(store, cf, "M:index", "14");
     }
     check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
     check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error)
@@ -2311,10 +2313,164 @@ ngx_http_cache_purge_test_fixed_identity(const std::string &path)
         while (index.collect_keys(1)) {
             check(++passes < 8, "fixed identity collection stays bounded");
         }
-        check(raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT).size() == 3
+        check(raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT).size() == 8
                   && raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_URL).empty()
                   && raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_TAG).empty(),
             "identity ownership releases namespace and dictionary references");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
+}
+
+static void
+ngx_http_cache_purge_test_catalog_upgrade(const std::string &mode,
+    const char *path)
+{
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    ngx_http_cache_rocksdb_error_t error{};
+    check(ngx_http_cache_rocksdb_open(path, &options, &store, &error) == 0,
+        error.message);
+    auto cf = NGX_HTTP_CACHE_ROCKSDB_DEFAULT;
+    if (mode == "--catalog-legacy") {
+        Index index(store);
+        for (unsigned i = 1; i <= 17; i++) {
+            index.prepare(file(i, "/legacy/" + std::to_string(i)));
+        }
+        for (const auto &key : raw_keys(store, cf)) {
+            if (key[0] == 'q' || key.compare(0, 10, "M:catalog:") == 0) {
+                raw_write(store, cf, key, "", true);
+            }
+        }
+        raw_write(store, cf, "M:index", "13");
+    } else {
+        if (mode == "--catalog-cut") {
+            ngx_http_cache_purge_test_sync_exit_after(3);
+        } else {
+            check(ngx_http_cache_purge_test_raw(store, "M:index")
+                      == "14:catalog"
+                      && ngx_http_cache_purge_test_number(
+                             ngx_http_cache_purge_test_raw(
+                                 store, "M:catalog:I"), 1)
+                             == 16,
+                "interrupted upgrade retains two atomic catalog batches");
+        }
+        Index index(store);
+        auto query = index.pending_fills();
+        Match item;
+        std::set<unsigned> seen;
+        while (query->next(item)) {
+            check(seen.insert(item.id[15]).second,
+                "upgrade does not duplicate active nodes");
+        }
+        check(seen.size() == 17
+                  && ngx_http_cache_purge_test_raw(store, "M:index") == "14",
+            "upgrade resumes all original file intents without rebuilding files");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
+}
+
+static void
+ngx_http_cache_purge_test_catalog(const std::string &path)
+{
+    check(mkdir(path.c_str(), 0700) == 0, "catalog directory");
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    ngx_http_cache_rocksdb_error_t error{};
+    check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error) == 0,
+        error.message);
+    auto cf = NGX_HTTP_CACHE_ROCKSDB_DEFAULT;
+    {
+        Index index(store);
+        auto a = file(1), b = file(2), c = file(3), d = file(4);
+        index.prepare_batch({ { a, {} }, { b, {} }, { c, {} } });
+        auto snapshot = index.pending_fills();
+        Match item;
+        check(snapshot->next(item) && item.id == a.id, "catalog snapshot head");
+        auto first = snapshot->bookmark();
+        index.abort_prepare(b.id, 1);
+        index.commit(c.id, 1);
+        index.prepare(d);
+        check(snapshot->next(item) && item.id == b.id
+                  && snapshot->next(item) && item.id == c.id
+                  && !snapshot->next(item),
+            "catalog snapshot preserves removed middle/tail and excludes append");
+        snapshot.reset();
+        auto resumed = index.pending_fills(first);
+        check(resumed->next(item) && item.id == d.id && !resumed->next(item),
+            "live bookmark follows updated next link");
+        auto removed = resumed->bookmark();
+        resumed.reset();
+        index.abort_prepare(d.id, 1);
+        resumed = index.pending_fills(removed);
+        check(resumed->next(item) && item.id == a.id && !resumed->next(item),
+            "removed bookmark revisits live head without losing surviving work");
+        resumed.reset();
+        auto header = ngx_http_cache_purge_test_raw(store, "M:catalog:I");
+        fails(NGX_HTTP_CACHE_ROCKSDB_CONFLICT, [&] { index.commit(a.id, 99); });
+        check(header == ngx_http_cache_purge_test_raw(store, "M:catalog:I"),
+            "rejected transition preserves live catalog");
+        std::string node;
+        for (const auto &key : raw_keys(store, cf)) {
+            if (key.compare(0, 2, "qI") == 0) {
+                node = key;
+            }
+        }
+        auto links = ngx_http_cache_purge_test_raw(store, node);
+        raw_write(store, cf, node, "", true);
+        fails(NGX_HTTP_CACHE_ROCKSDB_CORRUPT, [&] {
+            auto broken = index.pending_fills();
+            broken->next(item);
+        });
+        raw_write(store, cf, node, links);
+        index.commit(a.id, 1);
+        check(!index.pending_fills()->next(item), "last removal empties catalog");
+
+        /* Leave physical RocksDB tombstones beneath I, with no active rows.
+         * A linked empty query must not iterate over those historical keys. */
+        std::vector<std::string> keys;
+        const std::string dead = "dead";
+        for (unsigned i = 0; i < 4096; i++) {
+            keys.push_back("I:deleted:" + std::to_string(i));
+        }
+        for (unsigned start = 0; start < keys.size(); start += 128) {
+            std::vector<ngx_http_cache_rocksdb_mutation_t> batch;
+            for (unsigned n = start; n < start + 128; n++) {
+                batch.push_back({ cf, NGX_HTTP_CACHE_ROCKSDB_PUT,
+                    bytes(keys[n]), bytes(dead) });
+            }
+            check(ngx_http_cache_rocksdb_write(store, batch.data(), batch.size(),
+                      nullptr, 0, &error) == 0,
+                "tombstone fixture insertion");
+            for (auto &entry : batch) {
+                entry.type = NGX_HTTP_CACHE_ROCKSDB_DELETE;
+                entry.value = { nullptr, 0 };
+            }
+            check(ngx_http_cache_rocksdb_write(store, batch.data(), batch.size(),
+                      nullptr, 0, &error) == 0,
+                "tombstone fixture deletion");
+        }
+        rocksdb::SetPerfLevel(rocksdb::kEnableCount);
+        rocksdb::get_perf_context()->Reset();
+        check(!index.pending_fills()->next(item)
+                  && rocksdb::get_perf_context()->internal_delete_skipped_count
+                         == 0,
+            "empty pending catalog does not traverse historical tombstones");
+        rocksdb::SetPerfLevel(rocksdb::kDisable);
+        index.prepare(file(5));
+        check(index.pending_fills()->next(item) && item.id == id(5),
+            "nonempty catalog remains reachable after tombstone history");
+    }
+    check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
+    check(ngx_http_cache_rocksdb_open(path.c_str(), &options, &store, &error) == 0,
+        error.message);
+    {
+        Index index(store);
+        Match item;
+        auto query = index.pending_fills();
+        check(query->next(item) && item.id == id(5) && !query->next(item),
+            "reopen recovers exactly the remaining active node");
     }
     check(ngx_http_cache_rocksdb_close(&store, &error) == 0, error.message);
 }
@@ -2323,6 +2479,11 @@ int
 main(int argc, char **argv)
 {
     try {
+        if (argc == 3 && std::string(argv[1]).compare(0, 10, "--catalog-") == 0) {
+            ngx_http_cache_purge_test_catalog_upgrade(argv[1], argv[2]);
+            std::cout << "PASS catalog upgrade " << argv[1] << std::endl;
+            return 0;
+        }
         if (argc == 3 && std::string(argv[1]) == "--fixed-identity") {
             ngx_http_cache_purge_test_fixed_identity(argv[2]);
             std::cout << "PASS " << assertions << " fixed identity assertions"
@@ -2376,6 +2537,7 @@ main(int argc, char **argv)
         }
         char path[] = "/tmp/cache-purge-index-test-XXXXXX";
         check(mkdtemp(path) != nullptr, "test directory");
+        ngx_http_cache_purge_test_catalog(std::string(path) + "-catalog");
         ngx_http_cache_purge_test_tag_groups();
         ngx_http_cache_purge_test_collect_sync(std::string(path) + "-collect");
         ngx_http_cache_purge_test_retention_sync(
@@ -2798,7 +2960,7 @@ main(int argc, char **argv)
             check(raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_TAG).empty(),
                 "TAG CF reclaimed");
             auto keys = raw_keys(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT);
-            check(keys.size() == 3
+            check(keys.size() == 8
                       && std::find(keys.begin(), keys.end(), "M:index")
                              != keys.end()
                       && std::find(keys.begin(), keys.end(), "M:next")

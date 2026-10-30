@@ -1669,6 +1669,11 @@ try:
     assert restart_path.read_bytes() == restart_contents
     stop(process); process = start()
     until(lambda: (run / 'index/component.sock').exists())
+    # This assertion checks reuse after recovery, not the transient gate while
+    # recovery materializes and retires the deliberately unfinished FENCE.
+    # Poll only management state; do not warm /asset with a retrying GET.
+    until(lambda: api('/__purge/v2/operations/invalidate-before-restart')[2]
+                  ['cleanup']['state'] == 'done')
     until(lambda: struct.unpack('>IQ', rpc(16))[0] == 6)
     assert {x[0] for x in query('http://cache.test/asset')} == before
     assert get('/asset')[1] == 'HIT'
@@ -1960,7 +1965,7 @@ try:
     assert status == 200 and headers['Cache-Control'] == 'no-store' and caps['ready'], (status, caps)
     assert caps['authentication'] == 'nginx-configuration' and 'signed_events' not in caps
     assert caps['propagation_timeout_ms'] == '120000'
-    assert caps['index_schema'] == 13
+    assert caps['index_schema'] == 14
     assert caps['purge_method'] and 'key' not in caps['json_selectors']
     assert caps['control_headers']['purge_type'] == 'X-Cache-Purge-Type'
     assert caps['control_headers']['purge_action'] == 'X-Cache-Purge-Action'

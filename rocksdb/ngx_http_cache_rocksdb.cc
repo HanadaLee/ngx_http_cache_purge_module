@@ -470,7 +470,7 @@ ngx_http_cache_rocksdb_options(ngx_http_cache_rocksdb_options_t *options)
     options->max_key_bytes = 64 << 10;
     options->max_value_bytes = 256 << 10;
     options->max_batch_bytes = 1 << 20;
-    options->max_batch_entries = 1024;
+    options->max_batch_entries = 2048;
     options->max_cursors = 8;
     options->cursor_lifetime_ms = 1000;
     options->max_open_files = 64;

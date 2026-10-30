@@ -13,6 +13,11 @@ p.add_argument('--output', type=Path, required=True)
 a = p.parse_args()
 root = Path(tempfile.mkdtemp(prefix='cache-purge-index-process-', dir='/tmp'))
 checks = []
+catalog = Path(tempfile.mkdtemp(prefix='cache-purge-catalog-upgrade-', dir='/tmp'))
+checks.append(subprocess.check_output([str(a.binary), '--catalog-legacy', str(catalog)], text=True, timeout=30).strip())
+cut = subprocess.run([str(a.binary), '--catalog-cut', str(catalog)], timeout=30)
+assert cut.returncode == 86, cut.returncode
+checks.append(subprocess.check_output([str(a.binary), '--catalog-finish', str(catalog)], text=True, timeout=30).strip())
 for mode in ('--crash-prepare', '--crash-commit', '--recover'):
     checks.append(subprocess.check_output([str(a.binary), mode, str(root)], text=True, timeout=30).strip())
 publication = Path(tempfile.mkdtemp(prefix='cache-purge-publication-process-', dir='/tmp'))
@@ -71,6 +76,7 @@ for barrier in ('none', 'retire', 'validate'):
                                              text=True, timeout=30).strip())
         retention.append({'root': str(directory), 'barrier': barrier, 'truncated': truncate})
 result = {'checks': checks, 'database': str(root),
+          'catalog_upgrade_database': str(catalog),
           'publication_database': str(publication),
           'native_deferred': native,
           'collection_deferred': collection,

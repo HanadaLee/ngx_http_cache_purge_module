@@ -14,6 +14,7 @@
 
 static unsigned  ngx_http_cache_purge_test_syncs;
 static unsigned  ngx_http_cache_purge_test_sync_error;
+static unsigned  ngx_http_cache_purge_test_sync_cut;
 static __thread unsigned ngx_http_cache_purge_test_wal_armed;
 static __thread unsigned ngx_http_cache_purge_test_wal_paused;
 
@@ -175,6 +176,13 @@ ngx_http_cache_purge_test_sync_fail(unsigned fail)
                      __ATOMIC_RELAXED);
 }
 
+void
+ngx_http_cache_purge_test_sync_exit_after(unsigned count)
+{
+    ngx_http_cache_purge_test_sync_cut =
+        ngx_http_cache_purge_test_sync_count() + count;
+}
+
 int
 ngx_http_cache_purge_test_watch_file(int fd, unsigned fail,
     void (*hook)(int, void *), void *data)
@@ -299,6 +307,15 @@ ngx_http_cache_purge_test_sync(int fd, long operation)
                             __ATOMIC_RELAXED))
         {
             errno = EIO;
+            return -1;
+        }
+        if (ngx_http_cache_purge_test_sync_cut != 0
+            && ngx_http_cache_purge_test_sync_count()
+               == ngx_http_cache_purge_test_sync_cut)
+        {
+            if (syscall(operation, fd) == 0) {
+                _exit(86);
+            }
             return -1;
         }
     }

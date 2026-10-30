@@ -861,7 +861,7 @@ typedef enum {
     NGX_HTTP_CACHE_PURGE_INDEX_RETIRE
 } ngx_http_cache_purge_index_action_e;
 
-unsigned ngx_http_cache_purge_index_schema_13(void);
+unsigned ngx_http_cache_purge_index_schema_14(void);
 int ngx_http_cache_purge_index_init(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_error_t *error);
 /* Atomic state transitions on the executor. COMMIT and RETIRE accept 1-32

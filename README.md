@@ -343,18 +343,28 @@ The existing worker executor resumes the bounded scan from durable checkpoints.
 Admission checks that requirement even when no resident rule remains; successful
 conditional validation satisfies it without replacing the entity. Requirements
 are monotonic within one ledger and are collected with their retired file.
-Index schema 13 stores one immutable URL/host/namespace/misc identity per key.
+Index schema 14 stores one immutable URL/host/namespace/misc identity per key.
 The URL secondary key contains only fixed URL, namespace and misc IDs; its value
 is the internal key ID. One entry covers every slice, Vary file and cache zone.
 Exact identity lookup uses a 32-byte binary digest, with no whole-key text
 dictionary or duplicate text projection. The misc bytes have one shared
 dictionary reference per identity and are returned independently. File proofs
 bind these persisted values; empty and binary misc values remain distinct.
-Prototype schemas 1-12 are
-rejected without modifying their data; this release
-does not provide an automatic migration. Existing tasks and index data must be
-preserved when planning a transition. Reopening schema 13 reuses its WAL-backed
-index without scanning cache directories. Native representation repair retains
+Prototype schemas 1-12 are rejected without modifying their data. Schema 13
+upgrades its pending, retired, deferred-Delete, empty-key and native-retry
+catalogs in resumable atomic batches before accepting new writer work. URL/TAG
+identities and native files are preserved. The first upgrade can scan historical
+RocksDB deletion markers; subsequent opens use the saved catalogs directly.
+Downgrading an upgraded database is unsupported.
+
+Each work catalog stores its head, tail and count plus links between active rows
+in the existing default CF. Exact address mappings and links change in the same
+batch. Snapshot traversal follows point lookups, so empty catalogs do not scan
+historical deletion markers. No full catalog is loaded into memory and no new
+CF, thread or core hook is needed. The batch entry limit is 2048 to accommodate
+link updates; the existing byte and memory budgets still apply.
+Reopening schema 14 reuses its WAL-backed index without scanning cache
+directories. Native representation repair retains
 its bounded durable cursor; unresolved identities cannot imply an empty TAG set.
 Older module archives are rejected by a schema-specific configure link check.
 

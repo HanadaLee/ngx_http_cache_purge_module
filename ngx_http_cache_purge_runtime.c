@@ -3287,7 +3287,7 @@ ngx_http_cache_purge_api_render(ngx_http_cache_purge_api_t *ctx,
             "\"control_headers\":{\"tag_namespace\":",
             (size_t) 32, ledger, ready ? "true" : "false", publication,
             last, retired, live, bytes,
-            (ngx_uint_t) ngx_http_cache_purge_index_schema_13(), policy,
+            (ngx_uint_t) ngx_http_cache_purge_index_schema_14(), policy,
 #if (NGX_RESTY_EXT && NGX_HTTP_PROXY_FILTER)
             "filter",
 #else
