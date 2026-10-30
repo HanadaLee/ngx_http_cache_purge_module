@@ -814,7 +814,7 @@ def watermark(item):
 def prepared_replacement(item, allow_retired=False):
     target = ready_file(item)
     address = b''.join(string(item[name]) for name in ('root', 'zone', 'path'))
-    acquired, lease = rpc(20, address, receive_fd=True)
+    acquired, lease = until(lambda: rpc(20, address, receive_fd=True, codes=(0, 6)))
     temporary = None
     fd = -1
     try:
@@ -1034,7 +1034,7 @@ def inline_purge_cases():
     item = records('/inline/bulk/a', 1)[0]
     target = ready_file(item)
     address = b''.join(string(item[name]) for name in ('root', 'zone', 'path'))
-    _, lease = rpc(20, address, receive_fd=True)
+    _, lease = until(lambda: rpc(20, address, receive_fd=True, codes=(0, 6)))
     try:
         pushed = accepted('/push/prefix', {'X-Target': 'http://cache.test/inline/bulk/', 'X-Cache-Purge-Type': 'prefix'})
         assert status(pushed)['cleanup']['state'] != 'done' and target.exists()
@@ -1711,7 +1711,7 @@ try:
     for path, (original, target, inode, contents) in validation_files.items():
         if path == '/revalidate-retain':
             address = b''.join(string(original[name]) for name in ('root', 'zone', 'path'))
-            acquired, lease = rpc(20, address, receive_fd=True)
+            acquired, lease = until(lambda: rpc(20, address, receive_fd=True, codes=(0, 6)))
             client = http.client.HTTPConnection('127.0.0.1', port, timeout=1)
             try:
                 client.request('GET', path, headers={'Host': 'cache.test'})
@@ -2219,7 +2219,7 @@ try:
     assert get(held_uri)[0] == 200
     held_file = records(held_uri, 1)[0]
     held_path = ready_file(held_file)
-    _, lease = rpc(17, string(str(held_path)), receive_fd=True)
+    _, lease = until(lambda: rpc(17, string(str(held_path)), receive_fd=True, codes=(0, 6)))
     try:
         conn = http.client.HTTPConnection('127.0.0.1', port, timeout=15)
         conn.request('PURGE', '/push/disconnected', headers={

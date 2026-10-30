@@ -52,7 +52,7 @@ typedef enum {
     NGX_HTTP_CACHE_PURGE_OP_ACQUIRE_FILE_LEASE,
     /* file, previous ID, temp path; two FDs: lease, temp */
     NGX_HTTP_CACHE_PURGE_OP_PREPARE_FILE,
-    /* file ID, prepared revision; one FD: lease */
+    /* file ID, prepared revision, optional synchronized flag; one FD: lease */
     NGX_HTTP_CACHE_PURGE_OP_FINISH_FILE,
     /* root, zone, path -> canonical root, prior ID, digest/offset +
      * lease FD */
@@ -1329,6 +1329,25 @@ typedef struct {
  * retains its lease, input and deadline. Other results clear wait. Never send
  * this owner-local state over IPC or reuse it after the store is closed. */
 int ngx_http_cache_purge_publications_finish_deferred(
+    ngx_http_cache_purge_publications_t *publications,
+    ngx_http_cache_rocksdb_t *store, const unsigned char id[16],
+    uint64_t prepared_revision, int anchor_fd, int lease_fd, uint32_t peer_uid,
+    ngx_http_cache_purge_publication_wait_t *wait,
+    ngx_http_cache_purge_publication_guard_pt guard, void *data,
+    ngx_http_cache_purge_index_match_t *match,
+    ngx_http_cache_rocksdb_error_t *error);
+
+/* The caller holds the address lease across rename, synchronization and
+ * FINISH. These helpers neither read the index nor publish a READY marker. */
+int ngx_http_cache_purge_file_sync_publication(int fd,
+    const unsigned char id[16], ngx_http_cache_rocksdb_bytes_t source,
+    size_t source_root, ngx_http_cache_rocksdb_bytes_t target,
+    size_t target_root, ngx_http_cache_rocksdb_error_t *error);
+
+/* A volatile worker assertion: the complete file and both directory chains
+ * were synchronized while holding this lease. Recovery uses ordinary FINISH.
+ * Physical identity, rules and WAL durability are still checked here. */
+int ngx_http_cache_purge_publications_finish_synced(
     ngx_http_cache_purge_publications_t *publications,
     ngx_http_cache_rocksdb_t *store, const unsigned char id[16],
     uint64_t prepared_revision, int anchor_fd, int lease_fd, uint32_t peer_uid,

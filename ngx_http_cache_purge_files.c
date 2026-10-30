@@ -1529,6 +1529,146 @@ ngx_http_cache_purge_publication_sync_parents(
     }
 }
 
+static int
+ngx_http_cache_purge_publication_sync_root(
+    ngx_http_cache_rocksdb_bytes_t path, size_t length, int *fd,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_rocksdb_bytes_t  relative;
+    char                           *name;
+    int                             rc;
+
+    *fd = -1;
+    if (!ngx_http_cache_purge_publication_valid(path, 32768)
+        || length < 2 || length > 4096 || path.len <= length + 1
+        || path.data[0] != '/' || path.data[length] != '/')
+    {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid synchronization path");
+    }
+    relative.data = path.data + 1;
+    relative.len = path.len - 1;
+    if (!ngx_http_cache_purge_publication_relative(relative)) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "unsafe synchronization path");
+    }
+    name = malloc(length + 1);
+    if (name == NULL) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_LIMIT, "allocate synchronization path");
+    }
+    memcpy(name, path.data, length);
+    name[length] = 0;
+    /* Configured root aliases are allowed, as in publications_open().
+     * Components below this root are opened without following symlinks. */
+    *fd = open(name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    rc = *fd < 0 ? ngx_http_cache_purge_io(error,
+                                         "open synchronization root") : 0;
+    free(name);
+    return rc;
+}
+
+int
+ngx_http_cache_purge_file_sync_publication(int fd,
+    const unsigned char id[16], ngx_http_cache_rocksdb_bytes_t source,
+    size_t source_root, ngx_http_cache_rocksdb_bytes_t target,
+    size_t target_root, ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_publication_root_t  from, to;
+    ngx_http_cache_purge_file_marker_t       marker;
+    ngx_http_cache_rocksdb_bytes_t           relative;
+    struct stat                              before, named, after;
+    int                                      observed, rc;
+
+    ngx_http_cache_purge_result(error, 0, "");
+    if (fd < 0 || id == NULL || ngx_http_cache_purge_zero(id)) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid synchronization instance");
+    }
+    from.fd = -1;
+    to.fd = -1;
+    observed = -1;
+    rc = ngx_http_cache_purge_publication_sync_root(source, source_root,
+                                                   &from.fd, error);
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_publication_sync_root(target, target_root,
+                                                       &to.fd, error);
+    }
+    if (rc != 0) {
+        goto done;
+    }
+    relative.data = target.data + target_root + 1;
+    relative.len = target.len - target_root - 1;
+    rc = ngx_http_cache_purge_publication_beneath(to.fd, relative, 0, 0,
+                                                &observed, error);
+    if (rc != 0) {
+        goto done;
+    }
+    if (fstat(fd, &before) != 0 || fstat(observed, &named) != 0) {
+        rc = ngx_http_cache_purge_io(error, "inspect synchronization instance");
+        goto done;
+    }
+    if (!S_ISREG(before.st_mode) || before.st_nlink != 1
+        || before.st_dev != named.st_dev || before.st_ino != named.st_ino)
+    {
+        rc = ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "synchronization target differs from the descriptor");
+        goto done;
+    }
+    rc = ngx_http_cache_purge_file_marker_read(fd, &marker, error);
+    if (rc != 0) {
+        goto done;
+    }
+    if (memcmp(marker.id, id, 16)
+        || (marker.state != NGX_HTTP_CACHE_PURGE_FILE_STAGED
+            && marker.state != NGX_HTTP_CACHE_PURGE_FILE_PREPARED))
+    {
+        rc = ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "synchronization marker differs from the prepared instance");
+        goto done;
+    }
+    if (fsync(fd) != 0) {
+        rc = ngx_http_cache_purge_io(error, "sync publication entity");
+        goto done;
+    }
+    rc = ngx_http_cache_purge_publication_sync_parents(&to, relative, error);
+    relative.data = source.data + source_root + 1;
+    relative.len = source.len - source_root - 1;
+    if (rc == 0) {
+        rc = ngx_http_cache_purge_publication_sync_parents(&from, relative,
+                                                         error);
+    }
+    if (rc != 0) {
+        goto done;
+    }
+    if (fstat(fd, &after) != 0) {
+        rc = ngx_http_cache_purge_io(error, "recheck synchronized instance");
+        goto done;
+    }
+    if (after.st_nlink != 1 || before.st_size != after.st_size
+        || before.st_mtim.tv_sec != after.st_mtim.tv_sec
+        || before.st_mtim.tv_nsec != after.st_mtim.tv_nsec)
+    {
+        rc = ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "publication changed during synchronization");
+    }
+
+done:
+    if (observed >= 0) {
+        close(observed);
+    }
+    if (to.fd >= 0) {
+        close(to.fd);
+    }
+    if (from.fd >= 0) {
+        close(from.fd);
+    }
+    return rc;
+}
+
 static uint64_t
 ngx_http_cache_purge_publication_number(const unsigned char *p, unsigned n)
 {
@@ -2784,6 +2924,7 @@ ngx_http_cache_purge_publications_finish_run(
     ngx_http_cache_rocksdb_t *store, const unsigned char id[16],
     uint64_t revision, int anchor, int lease, uint32_t peer_uid,
     ngx_http_cache_purge_publication_wait_t *wait,
+    int file_synced,
     ngx_http_cache_purge_publication_guard_pt guard, void *data,
     ngx_http_cache_purge_index_match_t *out,
     ngx_http_cache_rocksdb_error_t *error)
@@ -2991,17 +3132,19 @@ ngx_http_cache_purge_publications_finish_run(
             goto done;
         }
     }
-    if ((wait == NULL || wait->store == NULL) && fsync(fd) != 0) {
+    if (!file_synced && (wait == NULL || wait->store == NULL)
+        && fsync(fd) != 0)
+    {
         rc = ngx_http_cache_purge_io(error, "sync final cache file");
         goto done;
     }
-    if (wait == NULL || wait->store == NULL) {
+    if (!file_synced && (wait == NULL || wait->store == NULL)) {
         rc = ngx_http_cache_purge_publication_sync_parents(target, file.path,
                                                           error);
     }
     relative.data = saved.temporary.data + source->length + 1;
     relative.len = saved.temporary.len - source->length - 1;
-    if (rc == 0 && (wait == NULL || wait->store == NULL)) {
+    if (rc == 0 && !file_synced && (wait == NULL || wait->store == NULL)) {
         rc = ngx_http_cache_purge_publication_sync_parents(source, relative,
                                                            error);
     }
@@ -3111,7 +3254,7 @@ ngx_http_cache_purge_publications_finish_checked(
     ngx_http_cache_rocksdb_error_t *error)
 {
     return ngx_http_cache_purge_publications_finish_run(p, store, id,
-        revision, anchor, lease, peer_uid, NULL, guard, data, out, error);
+        revision, anchor, lease, peer_uid, NULL, 0, guard, data, out, error);
 }
 
 int
@@ -3129,7 +3272,25 @@ ngx_http_cache_purge_publications_finish_deferred(
             NGX_HTTP_CACHE_ROCKSDB_INVALID, "missing publication wait state");
     }
     return ngx_http_cache_purge_publications_finish_run(p, store, id,
-        revision, anchor, lease, peer_uid, wait, guard, data, out, error);
+        revision, anchor, lease, peer_uid, wait, 0, guard, data, out, error);
+}
+
+int
+ngx_http_cache_purge_publications_finish_synced(
+    ngx_http_cache_purge_publications_t *p,
+    ngx_http_cache_rocksdb_t *store, const unsigned char id[16],
+    uint64_t revision, int anchor, int lease, uint32_t peer_uid,
+    ngx_http_cache_purge_publication_wait_t *wait,
+    ngx_http_cache_purge_publication_guard_pt guard, void *data,
+    ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    if (wait == NULL) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "missing publication wait state");
+    }
+    return ngx_http_cache_purge_publications_finish_run(p, store, id,
+        revision, anchor, lease, peer_uid, wait, 1, guard, data, out, error);
 }
 
 int

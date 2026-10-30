@@ -39,7 +39,7 @@ def wait_for(function, timeout=10):
 
 
 class Component:
-    def __init__(self, path, connections=8, timeout=3000, budget=1100000, payload=512 * 1024, shared=None, roots=None, seed=False, reply_gate=None, reply_mode='plain', wal_gate=None):
+    def __init__(self, path, connections=8, timeout=3000, budget=1100000, payload=512 * 1024, shared=None, roots=None, seed=False, reply_gate=None, reply_mode='plain', wal_gate=None, priority=None):
         self.path = path
         path.mkdir(exist_ok=True)
         self.stderr = (root / f'stderr-{len(processes)}.log').open('w')
@@ -64,6 +64,7 @@ class Component:
         if roots:
             env['CACHE_PURGE_TEST_CACHE_ROOT'], env['CACHE_PURGE_TEST_TEMP_ROOT'] = map(str, roots)
         self.process = subprocess.Popen(command, env=env,
+                                        preexec_fn=(lambda: os.nice(priority)) if priority is not None else None,
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=self.stderr, text=True, bufsize=1)
         processes.append(self)
@@ -222,12 +223,13 @@ class Client:
         self.socket.sendall(packet[1:])
         return self.reply(18, code)
 
-    def finish_file(self, n, lease, revision=1, code=0):
-        self.begin_finish(n, lease, revision)
+    def finish_file(self, n, lease, revision=1, code=0, synced=None):
+        self.begin_finish(n, lease, revision, synced)
         return self.reply(19, code)
 
-    def begin_finish(self, n, lease, revision=1):
-        packet = self.packet(19, identity(n) + struct.pack('>Q', revision))
+    def begin_finish(self, n, lease, revision=1, synced=None):
+        tail = b'' if synced is None else bytes([synced])
+        packet = self.packet(19, identity(n) + struct.pack('>Q', revision) + tail)
         assert self.socket.sendmsg([packet[:1]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [lease]))]) == 1
         self.socket.sendall(packet[1:])
 
@@ -407,7 +409,63 @@ def publication_wal_wait(mode):
     component.stop()
 
 
+def executor_priority(increment):
+    component = Component(root / ('priority-' + str(increment)),
+                          shared=root / ('priority-' + str(increment) + '.shm'),
+                          priority=increment)
+    component.opened()
+    def priorities():
+        return {(task / 'comm').read_text().strip(): os.getpriority(os.PRIO_PROCESS, int(task.name))
+                for task in Path(f'/proc/{component.process.pid}/task').iterdir()}
+    wait_for(lambda: {'cache_index', 'cache_lookup'} <= priorities().keys())
+    actual = priorities()
+    inherited = os.getpriority(os.PRIO_PROCESS, component.process.pid)
+    check(actual['cache_lookup'] == inherited and actual['cache_index'] == min(19, inherited + 10),
+          'writer priority is relative and bounded without changing the reader: ' + str(increment))
+    component.stop()
+
+
+def publication_synced_finish():
+    base = root / 'publication-synced'
+    base.mkdir()
+    cache, temporary = base / 'cache', base / 'temp'
+    cache.mkdir()
+    temporary.mkdir()
+    component = Component(base / 'db', roots=(cache, temporary))
+    component.opened()
+    client = Client(component.path)
+    source, target = temporary / 'body', cache / 'object'
+    source.write_bytes(b'synchronized before FINISH')
+    fd = os.open(source, os.O_RDWR | os.O_CLOEXEC)
+    lease = client.lease(str(target))
+    try:
+        payload = record(402, root=str(cache), zone='zone-a', path='object')
+        client.prepare_file(payload + string(str(source)), [lease, fd])
+        source.rename(target)
+        client.finish_file(402, lease, synced=2, code=4)
+        assert os.getxattr(fd, 'user.ngx_cache_purge.id')[7] == 3
+        os.fsync(fd)
+        for path in (cache, temporary):
+            directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        result = client.finish_file(402, lease, synced=1)
+        assert result == identity(402) + struct.pack('>QB', 2, 2)
+        assert os.getxattr(fd, 'user.ngx_cache_purge.id')[7] == 2
+        check(True, 'FINISH accepts synchronized workers and rejects malformed synchronization flags')
+    finally:
+        os.close(lease)
+        os.close(fd)
+        client.close()
+    component.stop()
+
+
 try:
+    for increment in (5, 15):
+        executor_priority(increment)
+    publication_synced_finish()
     for mode in ('complete', 'disconnect', 'timeout', 'restart'):
         publication_wal_wait(mode)
     for label, mode, operation in [('plain', 'plain', 1), ('lease', 'plain', 17),

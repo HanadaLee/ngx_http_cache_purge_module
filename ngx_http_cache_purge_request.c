@@ -395,6 +395,8 @@ typedef struct {
 
 typedef struct {
     ngx_str_t        source, target;
+    size_t           source_root, target_root;
+    u_char           id[16];
     ngx_atomic_t     cancelled;
     ngx_file_uniq_t  uniq;
     off_t            fs_size;
@@ -402,6 +404,7 @@ typedef struct {
     int              fd;
     unsigned         cleanup:1;
     unsigned         remove:1;
+    unsigned         synced:1;
 } ngx_http_cache_purge_publication_io_t;
 
 typedef struct {
@@ -4237,6 +4240,8 @@ ngx_http_cache_purge_publication_io(void *data, ngx_log_t *log)
     ngx_ext_rename_file_t                   ext;
     ngx_file_info_t                         info;
     ngx_err_t                               err;
+    ngx_http_cache_rocksdb_bytes_t          source, target;
+    ngx_http_cache_rocksdb_error_t          error;
 
     io->result = NGX_ABORT;
     if (io->cleanup) {
@@ -4276,6 +4281,18 @@ ngx_http_cache_purge_publication_io(void *data, ngx_log_t *log)
         } else {
             io->uniq = ngx_file_uniq(&info);
             io->fs_size = ngx_file_fs_size(&info);
+            source.data = io->source.data;
+            source.len = io->source.len;
+            target.data = io->target.data;
+            target.len = io->target.len;
+            io->synced = ngx_http_cache_purge_file_sync_publication(io->fd,
+                io->id, source, io->source_root, target, io->target_root,
+                &error) == 0;
+            if (!io->synced) {
+                ngx_log_error(NGX_LOG_WARN, log, 0,
+                    "cache publication synchronization failed: %s",
+                    error.message);
+            }
         }
     }
 }
@@ -4287,6 +4304,8 @@ ngx_http_cache_purge_publication_io_post(
     job->io.source = job->temporary.file.name;
     job->io.target = job->cache.file.name;
     job->io.fd = job->temporary.file.fd;
+    ngx_memcpy(job->io.id, job->id, sizeof(job->io.id));
+    job->io.synced = 0;
     job->io.cleanup = cleanup;
     job->io.remove = job->validation == NULL;
     job->io_task.ctx = &job->io;
@@ -4667,15 +4686,16 @@ ngx_http_cache_purge_publication_finish(ngx_http_cache_purge_publication_t *job,
         ngx_http_cache_purge_publication_free(job);
         return;
     }
-    job->payload.data = ngx_http_cache_purge_publication_alloc(job, 24);
+    job->payload.data = ngx_http_cache_purge_publication_alloc(job, 25);
     if (job->payload.data == NULL) {
         ngx_http_cache_purge_publication_free(job);
         return;
     }
-    job->payload.len = 24;
+    job->payload.len = 25;
     p = ngx_cpymem(job->payload.data, job->id, 16);
     /* New file revisions start at 1, including a lost PREPARE reply. */
     ngx_http_cache_purge_capture_number(p, 1, 8);
+    p[8] = (u_char) job->io.synced;
     job->rpc = NGX_HTTP_CACHE_PURGE_RPC_FINISH;
     ngx_http_cache_purge_publication_retry(&job->retry);
 }
@@ -4787,7 +4807,7 @@ ngx_http_cache_purge_publication_reserve(ngx_http_cache_purge_capture_t *ctx)
     {
         return NGX_BUSY;
     }
-    size = copies + address + NGX_MAX_PATH + 1 + prepare + 24;
+    size = copies + address + NGX_MAX_PATH + 1 + prepare + 25;
     ctx->publication = ngx_http_cache_purge_publication_new(ctx, size);
     return ctx->publication ? NGX_OK : NGX_BUSY;
 }
@@ -4838,6 +4858,9 @@ ngx_http_cache_purge_publication_create(ngx_http_cache_purge_capture_t *ctx,
         goto failed;
     }
     root = cache->file_cache->path->name;
+    job->io.target_root = root.len;
+    job->io.source_root = proof == NULL && cache->file_cache->use_temp_path ?
+        ctx->request->upstream->conf->temp_path->name.len : root.len;
     name = cache->file.name;
     if (name.len <= root.len + 1 || ngx_memcmp(name.data, root.data, root.len)
         || name.data[root.len] != '/')

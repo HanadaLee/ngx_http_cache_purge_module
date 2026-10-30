@@ -16,6 +16,11 @@ ready. Descriptor replies can send their one-byte rights envelope and ordinary
 body in the same turn. Short writes and EAGAIN retain the remaining frame for
 POLLOUT; ready replies do not wait behind the next background maintenance pass.
 
+On Linux, the executor names its writer `cache_index` and its lookup thread
+`cache_lookup`. After creating the lookup thread, the writer adds 10 to its own
+nice value, capped at 19, as a best-effort scheduling hint. The HTTP worker,
+lookup thread and nginx I/O pools retain their inherited priorities.
+
 New cache-file records use atomic WAL batches with deferred synchronization.
 The existing executor checks for pending WAL data every 100 ms; 64 batches or
 one configured maximum batch of accumulated WAL bytes force an earlier sync.
@@ -35,8 +40,12 @@ its preceding instance reservation, and completion flushes all prior progress
 before removing FENCE. Power loss can replay intermediate work, but cannot lose
 an accepted task or turn incomplete work into a completed receipt. The explicit
 checkpoint API remains synchronous, including replay of a deferred checkpoint.
-New entities synchronize their completed data and STAGED identity once in
-FINISH. Target and source directories are synchronized before COMMIT_PENDING.
+After rename, the publication pool synchronizes the completed data, STAGED
+identity, and target/source directory chains. FINISH carries a volatile flag
+for that completed work; the executor still verifies the physical instance and
+current rules before COMMIT_PENDING. Legacy calls and recovery perform the
+same synchronization inside FINISH. Failure never sets the flag, and the flag
+is not persisted in the file or index.
 The executor then waits for that commit's existing WAL group before writing
 READY and removing the publication intent. Each connection retains a 40-byte
 owner-local wait record on 64-bit builds; the bounded recovery scan has one more.
@@ -541,6 +550,10 @@ deadline starts after the complete body is transferred to the background job.
 Normal HITs are unaffected. Request inputs and each publication payload are
 separately bounded to 128 KiB; these limits exclude allocator overhead and native
 nginx buffers.
+The existing publication pool also performs file and directory synchronization;
+it remains separate from the proof-read pool. It uses owned paths and FDs,
+without reading RocksDB or retaining an HTTP request. The fixed job context
+keeps two root lengths and an instance ID; no new thread or index table is used.
 Cache-file publication uses up to four reusable IPC clients per worker. It
 selects the least busy client after the response body is complete, and keeps
 that client for ACQUIRE/PREPARE/FINISH and retries. Selection rotates equal-load

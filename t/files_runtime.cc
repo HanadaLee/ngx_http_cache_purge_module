@@ -1584,6 +1584,8 @@ static void
 ngx_http_cache_purge_test_publication_wal(const std::string &path,
     unsigned scenario)
 {
+    bool offloaded = scenario >= 4;
+    scenario %= 4;
     std::filesystem::create_directories(path + "/cache");
     std::filesystem::create_directories(path + "/db");
     int anchor_fd, lease_fd;
@@ -1638,9 +1640,75 @@ ngx_http_cache_purge_test_publication_wal(const std::string &path,
             lease.fd, fd.fd, getuid());
         check(rename(temporary.c_str(), target.c_str()) == 0,
             "rename WAL publication file");
+        auto synchronize = [&] {
+            return ngx_http_cache_purge_file_sync_publication(fd.fd,
+                file.id.data(), bytes(temporary), file.root.size(),
+                bytes(target), file.root.size(), &error);
+        };
+        if (offloaded && scenario == 0) {
+            auto wrong = id(2);
+            auto descriptor_count = [] {
+                size_t count = 0;
+                for (const auto &entry :
+                    std::filesystem::directory_iterator("/proc/self/fd"))
+                {
+                    (void) entry;
+                    count++;
+                }
+                return count;
+            };
+            size_t descriptors = descriptor_count();
+            check(ngx_http_cache_purge_file_sync_publication(fd.fd,
+                      wrong.data(), bytes(temporary), file.root.size(),
+                      bytes(target), file.root.size(), &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+                "offloaded sync rejects a mismatched instance");
+            check(ngx_http_cache_purge_file_sync_publication(fd.fd,
+                      file.id.data(), bytes(temporary), file.root.size(),
+                      bytes(target), 0, &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                "offloaded sync rejects an invalid target root");
+            check(descriptor_count() == descriptors,
+                "failed synchronization releases roots and inspected files");
+            auto alias = path + "/cache-alias";
+            std::filesystem::create_directory_symlink(file.root, alias);
+            check(ngx_http_cache_purge_file_sync_publication(fd.fd,
+                      file.id.data(), bytes(alias + "/temporary"),
+                      alias.size(), bytes(alias + "/file"), alias.size(),
+                      &error) == 0,
+                "offloaded sync accepts configured root aliases");
+            std::filesystem::create_directory_symlink(
+                file.root, file.root + "/nested-alias");
+            check(ngx_http_cache_purge_file_sync_publication(fd.fd,
+                      file.id.data(), bytes(temporary), file.root.size(),
+                      bytes(file.root + "/nested-alias/file"),
+                      file.root.size(), &error)
+                      == NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                "offloaded sync rejects symlinks beneath a root");
+            check(descriptor_count() == descriptors,
+                "root aliases and rejected descendants release their FDs");
+            check(ngx_http_cache_purge_test_watch_file(
+                      fd.fd, 1, nullptr, nullptr) == 0,
+                "inject offloaded entity sync failure");
+            check(synchronize() == NGX_HTTP_CACHE_ROCKSDB_IO,
+                "entity synchronization failure cannot claim success");
+            Descriptor directory(open(file.root.c_str(),
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+            check(ngx_http_cache_purge_test_watch_file(
+                      directory.fd, 1, nullptr, nullptr) == 0,
+                "inject offloaded directory sync failure");
+            check(synchronize() == NGX_HTTP_CACHE_ROCKSDB_IO,
+                "directory synchronization failure cannot claim success");
+        }
         check(ngx_http_cache_purge_test_watch_file(
                   fd.fd, 0, nullptr, nullptr) == 0,
             "observe one publication file sync");
+        if (offloaded) {
+            check(synchronize() == 0,
+                "publication pool synchronizes without accessing the index");
+            check(index.get(file.id).state == FileState::prepared,
+                "offloaded synchronization does not commit the file");
+        }
         unsigned guards = 0;
         auto guard = [](void *data,
                          const ngx_http_cache_purge_index_file_t *,
@@ -1656,7 +1724,10 @@ ngx_http_cache_purge_test_publication_wal(const std::string &path,
                               ngx_http_cache_rocksdb_error_t *) -> int {
                 return NGX_HTTP_CACHE_ROCKSDB_CONFLICT;
             };
-            return ngx_http_cache_purge_publications_finish_deferred(
+            auto complete = offloaded ?
+                ngx_http_cache_purge_publications_finish_synced :
+                ngx_http_cache_purge_publications_finish_deferred;
+            return complete(
                 publications.native(), store, file.id.data(), 1, anchor.fd,
                 lease.fd, getuid(), &wait, veto ? +reject : +guard, &guards,
                 &result, &error);
@@ -1927,7 +1998,7 @@ main(int argc, char **argv)
                 std::string(sync_root) + '/' + std::to_string(scenario),
                 scenario);
         }
-        for (unsigned scenario = 0; scenario < 4; scenario++) {
+        for (unsigned scenario = 0; scenario < 8; scenario++) {
             ngx_http_cache_purge_test_publication_wal(
                 std::string(sync_root) + "/wal-" + std::to_string(scenario),
                 scenario);

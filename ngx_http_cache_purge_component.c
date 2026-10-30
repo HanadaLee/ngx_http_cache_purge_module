@@ -15,6 +15,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/random.h>
+#include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -965,6 +966,7 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
     uint32_t                                   state;
     int                                        rc;
     int                                        done;
+    int                                        file_synced;
 
     memset(&d, 0, sizeof(d));
     d.data = p->input.data ? p->input.data : (const unsigned char *) "";
@@ -1253,11 +1255,20 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
     case NGX_HTTP_CACHE_PURGE_OP_FINISH_FILE:
         ngx_http_cache_purge_component_id(&d, expected[0].id);
         expected[0].revision = ngx_http_cache_purge_component_integer(&d, 8);
+        file_synced = d.at < d.len ?
+                      ngx_http_cache_purge_component_flag(&d) : 0;
         if ((rc = ngx_http_cache_purge_component_end(&d)) != 0) {
             break;
         }
         rc = ngx_http_cache_purge_component_anchor(c, error);
-        if (rc == 0) {
+        if (rc == 0 && file_synced) {
+            rc = ngx_http_cache_purge_publications_finish_synced(
+                c->publications, store, expected[0].id, expected[0].revision,
+                c->lease_anchor, p->input_rights[0], p->uid,
+                &p->publication_wait,
+                ngx_http_cache_purge_component_publication_guard,
+                c, &matches[0], error);
+        } else if (rc == 0) {
             rc = ngx_http_cache_purge_publications_finish_deferred(
                 c->publications, store, expected[0].id, expected[0].revision,
                 c->lease_anchor, p->input_rights[0], p->uid,
@@ -3254,6 +3265,24 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
     if (rc != 0) {
         return rc;
     }
+#if (defined(__linux__))
+    {
+        int  priority;
+
+        (void) pthread_setname_np(pthread_self(),
+            c->read_store == NULL ? "cache_index" : "cache_lookup");
+        /* Linux nice values are per-thread. Create the reader first so it
+         * keeps the caller's priority; scheduling hints may be denied. */
+        if (c->read_store == NULL) {
+            errno = 0;
+            priority = getpriority(PRIO_PROCESS, 0);
+            if (errno == 0 && priority < 19) {
+                priority = priority < 9 ? priority + 10 : 19;
+                (void) setpriority(PRIO_PROCESS, 0, priority);
+            }
+        }
+    }
+#endif
     expire_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 1000;
     sync_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC) + 100;
     ngx_http_cache_purge_component_store32(&c->state,

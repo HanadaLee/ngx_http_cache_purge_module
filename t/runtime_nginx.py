@@ -381,6 +381,15 @@ try:
         if pid != owner:
             assert len(list(Path(f'/proc/{pid}/task').iterdir())) == 1
     checks.append('real addon opens DB/control publisher only in ' + expected.decode())
+    def executor_priorities():
+        return {(task / 'comm').read_text().strip(): os.getpriority(os.PRIO_PROCESS, int(task.name))
+                for task in Path(f'/proc/{owner}/task').iterdir()}
+    until(lambda: {'cache_index', 'cache_lookup'} <= executor_priorities().keys())
+    priorities = executor_priorities()
+    inherited_priority = os.getpriority(os.PRIO_PROCESS, owner)
+    assert priorities['cache_index'] == min(19, inherited_priority + 10)
+    assert priorities['cache_lookup'] == inherited_priority
+    checks.append('only the writer lowers its nice priority; the HTTP worker and lookup thread retain theirs')
     for _ in range(2):
         response = case.get('/publication-pool?pool=1')
         assert response[0] == 200
@@ -445,6 +454,8 @@ print(struct.unpack('>Q',read(struct.unpack('>I',h[16:20])[0])[:8])[0])
         assert case.get('/cache/a')[0] == 503
     checks.append('three HUP reloads preserve real addon SHM and durable operation')
     # New worker channel descriptors must not accumulate in the long-lived helper.
+    # Control publication can precede the new lookup listener after a reload.
+    until(lambda: (case.path / 'index/read.sock').is_socket())
     before_fds = len(list(Path(f'/proc/{owner}/fd').iterdir()))
     for _ in range(3):
         children = list(map(int, Path(f'/proc/{case.process.pid}/task/{case.process.pid}/children').read_text().split()))
