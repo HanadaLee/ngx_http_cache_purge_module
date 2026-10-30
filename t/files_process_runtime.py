@@ -210,11 +210,13 @@ for cut in ('basic', 'intent', 'prefix', 'torn', 'done', 'automatic'):
         for _ in range(2):
             checks.append(subprocess.check_output([str(a.binary), '--validate-origin-recover', str(root)], text=True, timeout=30).strip())
 
-for cut in ('basic', 'retired', 'unlinked'):
+for cut in ('basic', 'retired', 'unlinked', 'parent', 'parent-failure',
+            'ancestor', 'missing-parent', 'crash-parent'):
     root = Path(tempfile.mkdtemp(prefix='cache-purge-removal-', dir='/tmp'))
     roots.append(str(root))
-    mode = '--remove-basic' if cut == 'basic' else '--remove-crash-' + cut
+    mode = '--remove-' + ('crash-' if cut in ('retired', 'unlinked') else '') + cut
     checks.append(subprocess.check_output([str(a.binary), mode, str(root)], text=True, timeout=30).strip())
+    (root / 'cache/a/00').mkdir(exist_ok=True)
     unrelated = root / 'cache/a/00/unrelated'; unrelated.write_bytes(b'untouched')
     for _ in range(2):
         checks.append(subprocess.check_output([str(a.binary), '--remove-recover', str(root)], text=True, timeout=30).strip())

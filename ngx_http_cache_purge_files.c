@@ -3587,7 +3587,20 @@ ngx_http_cache_purge_publications_remove_checked(
             }
         }
     }
-    rc = ngx_http_cache_purge_publication_sync_parents(root, file.path, error);
+    if (parent >= 0) {
+        /* Unlink changes only this directory. Keep the pinned parent so the
+         * barrier covers the same directory entry, including a missing file.
+         */
+        if (fsync(parent) != 0) {
+            rc = ngx_http_cache_purge_io(error, "sync cache removal directory");
+        }
+    } else {
+        /*
+         * A directory disappeared; persist absence at its surviving ancestor.
+         */
+        rc = ngx_http_cache_purge_publication_sync_parents(root, file.path,
+                                                          error);
+    }
     if (rc == 0) {
         *out = retired;
         *outcome = result;

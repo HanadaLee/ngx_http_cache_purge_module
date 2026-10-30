@@ -545,6 +545,10 @@ other jobs wait for file I/O. The component
 connection budget and worker count can reduce the pool size. Its approximately
 512 KiB request-byte budget is divided across the pool, and the existing 64
 publication slots bound aggregate pending work, including detached 304 jobs.
+Background removal synchronizes the pinned parent directory after revoking the
+file proof and unlinking the instance. If the parent is already missing, it
+synchronizes the surviving ancestor chain instead. A failed directory barrier
+leaves the retired instance available for retry.
 Management calls and object reads retain their separate clients when a
 publication connection share is available; otherwise publication reuses the
 original control client. This lets other publications progress while one FINISH

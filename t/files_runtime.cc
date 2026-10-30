@@ -1054,7 +1054,9 @@ removal(const std::string &mode, const std::string &path)
                           .state
                       == FileState::committed,
                 "publish removal fixture");
-            if (mode != "--remove-basic") {
+            if (mode == "--remove-crash-retired"
+                || mode == "--remove-crash-unlinked")
+            {
                 check(index.retire(file.id, 2).state == FileState::retired,
                     "persist retirement before unlink");
                 if (mode == "--remove-crash-unlinked") {
@@ -1073,6 +1075,69 @@ removal(const std::string &mode, const std::string &path)
         expected.revision = saved.revision;
         ngx_http_cache_purge_index_match_t removed{};
         uint32_t outcome = 0;
+        bool parent_sync = mode == "--remove-parent"
+                           || mode == "--remove-parent-failure"
+                           || mode == "--remove-crash-parent";
+        bool ancestor_sync = mode == "--remove-ancestor";
+        bool missing_parent = mode == "--remove-missing-parent";
+        Descriptor entity(open(parent_sync ? target.c_str() : "/dev/null",
+            O_RDONLY | O_CLOEXEC));
+        if (missing_parent) {
+            check(unlink(target.c_str()) == 0
+                      && rmdir((file.root + "/a/00").c_str()) == 0,
+                "remove file and parent before retirement");
+        }
+        std::string directory_path = ancestor_sync ? file.root :
+                                    missing_parent ? file.root + "/a" :
+                                                     file.root + "/a/00";
+        Descriptor directory(open(directory_path.c_str(),
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        struct Observation {
+            Index *index;
+            File *file;
+            const std::string *target;
+            int entity;
+            bool crash;
+        } observation{ &index, &file, &target, entity.fd,
+            mode == "--remove-crash-parent" };
+        auto observe = [](int, void *data) {
+            auto &state = *static_cast<Observation *>(data);
+            ngx_http_cache_purge_file_marker_t marker{};
+            check(state.index->get(state.file->id).state == FileState::retired
+                      && !std::filesystem::exists(*state.target),
+                "directory barrier follows retirement and unlink");
+            check(ngx_http_cache_purge_file_marker_read(
+                      state.entity, &marker, &error) == 0
+                      && marker.state == NGX_HTTP_CACHE_PURGE_FILE_REVOKED,
+                "directory barrier follows proof revocation");
+            if (state.crash) {
+                std::cout << "PASS crash before removal directory sync"
+                          << std::endl;
+                _exit(0);
+            }
+        };
+        if (parent_sync || ancestor_sync || missing_parent) {
+            check(ngx_http_cache_purge_test_watch_file(directory.fd,
+                      mode == "--remove-parent-failure" || ancestor_sync ?
+                          1 : 0,
+                      parent_sync ? +observe : nullptr, &observation) == 0,
+                "observe removal durability boundary");
+        }
+        if (mode == "--remove-parent-failure") {
+            check(ngx_http_cache_purge_publications_remove(
+                      publications.native(), store, &expected, anchor.fd,
+                      lease.fd, getuid(), &outcome, &removed, &error)
+                      == NGX_HTTP_CACHE_PURGE_FILE_ERROR
+                      && outcome == 0 && removed.revision == 0,
+                "failed parent barrier cannot report completed removal");
+            check(index.get(file.id).state == FileState::retired
+                      && !std::filesystem::exists(target),
+                "failed parent sync retains recoverable retired work");
+            expected.revision = index.get(file.id).revision;
+            check(ngx_http_cache_purge_test_watch_file(
+                      directory.fd, 0, +observe, &observation) == 0,
+                "retry the missing entry with a working barrier");
+        }
         check(ngx_http_cache_purge_publications_remove(publications.native(),
                   store, &expected, anchor.fd, lease.fd, getuid(), &outcome,
                   &removed, &error)
@@ -1083,6 +1148,14 @@ removal(const std::string &mode, const std::string &path)
                   && removed.state == NGX_HTTP_CACHE_PURGE_INDEX_RETIRED
                   && removed.revision == 3 && !std::filesystem::exists(target),
             "removed result and absent file");
+        if (parent_sync || ancestor_sync || missing_parent) {
+            check(ngx_http_cache_purge_test_file_sync_count()
+                      == (ancestor_sync ? 0u : 1u),
+                "sync the changed parent or the surviving ancestor");
+            check(ngx_http_cache_purge_test_watch_file(
+                      -1, 0, nullptr, nullptr) == 0,
+                "stop observing removal barriers");
+        }
         check(!index.current(file.root, file.path),
             "removed instance has no current mapping");
         Match pending;
