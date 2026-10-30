@@ -250,6 +250,7 @@ proxy_cache_path {self.path}/cache-b keys_zone=b:1m;
 {extra_paths}
 server {{ listen 127.0.0.1:{self.port};
 {rpc_locations}
+location = /publication-pool {{ cache_purge_test_rpc runtime; }}
 location /hold/ {{ proxy_pass http://127.0.0.1:{origin.server_port}; proxy_buffering off; }}
 location /cache/a {{ cache_purge_test_reader on; proxy_cache a; proxy_cache_key "tenant\x1fhttp\x1fexample.test\x1f$uri\x1f\x1f";
 proxy_pass http://127.0.0.1:{origin.server_port}; add_header X-Cache $upstream_cache_status always; }}
@@ -380,6 +381,11 @@ try:
         if pid != owner:
             assert len(list(Path(f'/proc/{pid}/task').iterdir())) == 1
     checks.append('real addon opens DB/control publisher only in ' + expected.decode())
+    for _ in range(2):
+        response = case.get('/publication-pool?pool=1')
+        assert response[0] == 200
+        assert json.loads(response[2]) == {'clients': 4, 'uses': [16, 16, 16, 16], 'pending': 0}
+    checks.append('publication selection rotates equally idle clients before any RPC is queued')
     for path in ('/cache/a', '/cache/b', '/other'):
         warm(case, path)
     memory['component_empty'] = process_memory(case.process.pid)

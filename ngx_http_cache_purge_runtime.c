@@ -37,6 +37,7 @@ struct ngx_http_cache_purge_runtime_s {
     ngx_http_cache_purge_client_t            *read_client;
     ngx_http_cache_purge_client_t
         *publish_client[NGX_HTTP_CACHE_PURGE_PUBLISH_CLIENTS];
+    ngx_uint_t                                publish_next;
     uid_t                                     owner_uid;
     ngx_msec_t                                propagation;
     ngx_uint_t                                started;
@@ -1027,7 +1028,7 @@ ngx_http_cache_purge_runtime_client_get(ngx_http_request_t *r,
     ngx_http_cache_purge_client_stats_t     stats;
     ngx_http_cache_purge_client_t         **slot;
     ngx_core_conf_t                        *core;
-    ngx_uint_t                              i, limit, pending;
+    ngx_uint_t                              i, n, selected, limit, pending;
     ngx_str_t                               path, suffix;
     u_char  socket_path[sizeof(((struct sockaddr_un *) 0)->sun_path)];
     u_char *p;
@@ -1053,20 +1054,27 @@ ngx_http_cache_purge_runtime_client_get(ngx_http_request_t *r,
         }
         limit = ngx_min(limit - 1, NGX_HTTP_CACHE_PURGE_PUBLISH_CLIENTS);
         pending = NGX_MAX_UINT32_VALUE;
+        selected = rt->publish_next % limit;
         for (i = 0; i < limit; i++) {
-            if (rt->publish_client[i] == NULL) {
-                slot = &rt->publish_client[i];
+            n = (rt->publish_next + i) % limit;
+            if (rt->publish_client[n] == NULL) {
+                slot = &rt->publish_client[n];
+                selected = n;
                 break;
             }
-            ngx_http_cache_purge_client_stats(rt->publish_client[i], &stats);
+            ngx_http_cache_purge_client_stats(rt->publish_client[n], &stats);
             if (stats.pending < pending) {
-                slot = &rt->publish_client[i];
+                slot = &rt->publish_client[n];
+                selected = n;
                 pending = stats.pending;
                 if (pending == 0) {
                     break;
                 }
             }
         }
+        /* Queued finalizers and file I/O do not appear in IPC pending counts.
+         * Rotate equal-load choices instead of repeatedly using client zero. */
+        rt->publish_next = (selected + 1) % limit;
     }
     if (*slot == NULL) {
         if (kind == 1) {

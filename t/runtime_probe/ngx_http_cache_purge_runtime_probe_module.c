@@ -540,9 +540,36 @@ ngx_http_cache_purge_probe_rpc_handler(ngx_http_request_t *r)
     ngx_int_t                           rc;
     ngx_str_t                           value, body;
     ngx_http_cache_purge_client_t      *client;
+    ngx_http_cache_purge_client_t      *clients[4];
     ngx_http_cache_purge_client_stats_t stats;
+    ngx_uint_t                          i, n, count = 0, pending = 0;
+    ngx_uint_t                          uses[4] = { 0 };
     u_char                              buffer[384];
 
+    if (ngx_http_arg(r, (u_char *) "pool", 4, &value) == NGX_OK) {
+        /* Select without submitting: queued finalizers also see empty IPC
+         * queues, and must still spread over the bounded connection pool. */
+        for (i = 0; i < 64; i++) {
+            if (ngx_http_cache_purge_runtime_publish_client(r, &client) != 0) {
+                return 503;
+            }
+            for (n = 0; n < count && clients[n] != client; n++) { /* void */ }
+            if (n == count) {
+                if (count == 4) {
+                    return 500;
+                }
+                clients[count++] = client;
+            }
+            uses[n]++;
+            ngx_http_cache_purge_client_stats(client, &stats);
+            pending += stats.pending;
+        }
+        body.data = buffer;
+        body.len = ngx_snprintf(buffer, sizeof(buffer),
+            "{\"clients\":%ui,\"uses\":[%ui,%ui,%ui,%ui],\"pending\":%ui}",
+            count, uses[0], uses[1], uses[2], uses[3], pending) - buffer;
+        return ngx_http_cache_purge_probe_rpc_send(r, 200, &body);
+    }
     if (ngx_http_arg(r, (u_char *) "stop", 4, &value) == NGX_OK) {
         client = ngx_http_cache_purge_probe_rpc_client(r);
         if (client == NULL) {

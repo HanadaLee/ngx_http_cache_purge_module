@@ -539,7 +539,9 @@ separately bounded to 128 KiB; these limits exclude allocator overhead and nativ
 nginx buffers.
 Cache-file publication uses up to four reusable IPC clients per worker. It
 selects the least busy client after the response body is complete, and keeps
-that client for ACQUIRE/PREPARE/FINISH and retries. The existing component
+that client for ACQUIRE/PREPARE/FINISH and retries. Selection rotates equal-load
+choices, including before deferred finalizers submit their first RPC and while
+other jobs wait for file I/O. The component
 connection budget and worker count can reduce the pool size. Its approximately
 512 KiB request-byte budget is divided across the pool, and the existing 64
 publication slots bound aggregate pending work, including detached 304 jobs.
