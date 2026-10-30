@@ -4828,6 +4828,8 @@ ngx_http_cache_purge_capture_step(ngx_http_request_t *r,
     ngx_http_cache_purge_publication_t  *job;
     ngx_pool_cleanup_t                  *cleanup;
     ngx_pool_cleanup_file_t             *file;
+    ngx_queue_t                         *q;
+    ngx_flag_t                           duplicate;
 
     if (phase == NGX_HTTP_CACHE_PURGE_FILL_FINISH) {
         ngx_http_cache_purge_origin_release(&ctx->registration);
@@ -4852,18 +4854,50 @@ ngx_http_cache_purge_capture_step(ngx_http_request_t *r,
     if (cleanup == NULL || !tf->persistent) {
         return NGX_DECLINED;
     }
+    duplicate = 0;
+    if (ngx_http_cache_purge_publications_initialized) {
+        /* At most 64 detached jobs exist in this worker. Their pinned native
+         * nodes identify physical files without another index or native-key
+         * parser. A newer purge watermark must keep its own publication. */
+        for (q = ngx_queue_head(&ngx_http_cache_purge_publications);
+             q != ngx_queue_sentinel(&ngx_http_cache_purge_publications);
+             q = ngx_queue_next(q))
+        {
+            job = ngx_queue_data(q, ngx_http_cache_purge_publication_t, queue);
+            if (!job->cancelled && job->validation == NULL
+                && job->cache.node == cache->node
+                && job->cache.file_cache == cache->file_cache
+                && job->fields[0].len == ctx->key.len
+                && ngx_memcmp(job->fields[0].data, ctx->key.data,
+                              ctx->key.len) == 0
+                && ngx_memcmp(job->origin.ledger, ctx->origin.ledger, 16) == 0
+                && job->origin.sequence >= ctx->origin.sequence)
+            {
+                duplicate = 1;
+                break;
+            }
+        }
+    }
     job = ngx_http_cache_purge_publication_create(ctx, cache, tf->file.fd,
                                                  tf->file.name, NULL);
     if (job == NULL) {
         return NGX_DECLINED;
     }
-    if (ngx_http_cache_purge_publication_address(job, 0) != NGX_OK) {
+    if (!duplicate
+        && ngx_http_cache_purge_publication_address(job, 0) != NGX_OK)
+    {
         ngx_http_cache_purge_publication_free(job);
         return NGX_DECLINED;
     }
     job->rpc = NGX_HTTP_CACHE_PURGE_RPC_ACQUIRE;
     cleanup->handler = ngx_pool_cleanup_file;
     ngx_http_cache_purge_publication_attach(job, ctx);
+    if (duplicate) {
+        /* Disposal uses the same bounded asynchronous file cleanup. Do not
+         * return DECLINED here: native free would unlink in the HTTP worker. */
+        job->cancelled = 1;
+        ngx_http_cache_purge_publication_free(job);
+    }
     return NGX_DONE;
 }
 

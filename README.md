@@ -549,6 +549,12 @@ The jobs do not retain the HTTP request, so keepalive reuse does not wait for
 publication or 304 persistence. Adopted publication rename/stat and cleanup run
 on the configured publication thread pool; native cleanup of rejected fills and
 end-to-end performance remain separate validation work.
+Within a worker, complete fills for the same pinned native file and configured
+identity share an active publication when its purge watermark is at least as
+new. Duplicate files use the existing bounded asynchronous cleanup without
+another publication RPC. A fill started after a newer purge keeps its own
+publication; detached 304 jobs are excluded. This does not coalesce work across
+workers or increase publication limits.
 Generation namespaces, legacy zone/key PURGE syntax, REFRESH handlers, directory
 walks and the old shared-memory task queue have been removed; obsolete directives
 are rejected rather than silently ignored. New captures do not add arbitrary
