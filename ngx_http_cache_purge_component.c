@@ -1124,11 +1124,18 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
         validation_guard.operations = &c->operations;
         rc = ngx_http_cache_purge_component_anchor(c, error);
         if (rc == 0) {
-            rc = ngx_http_cache_purge_publications_validate_prepare(
+            rc = ngx_http_cache_purge_publications_validate_prepare_deferred(
                 c->publications, store, &validation, c->lease_anchor,
                 p->input_rights[0], p->input_rights[1], p->uid,
+                &p->publication_wait,
                 ngx_http_cache_purge_component_validation_guard,
                 &validation_guard, &matches[0], error);
+        }
+        if (rc == NGX_HTTP_CACHE_ROCKSDB_BUSY
+            && p->publication_wait.store != NULL)
+        {
+            rc = NGX_HTTP_CACHE_PURGE_COMPONENT_PENDING;
+            break;
         }
         if (rc == 0) {
             rc = ngx_http_cache_purge_publications_validate_finish_checked(

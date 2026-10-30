@@ -503,6 +503,91 @@ validation(
                       && !index.has_fill_intent(file.id),
                 "rejected validation leaves catalogue unchanged");
         }
+        if (mode.find("--validate-deferred") == 0) {
+            ngx_http_cache_purge_publication_wait_t wait{};
+            ngx_http_cache_purge_file_marker_t marker{};
+            auto prepare = [&]() {
+                return ngx_http_cache_purge_publications_validate_prepare_deferred(
+                    publications.native(), store, &input, anchor.fd, lease.fd,
+                    selected.fd, getuid(), &wait, validation_guard, nullptr,
+                    &result, &error);
+            };
+            unsigned syncs = ngx_http_cache_purge_test_sync_count();
+            check(prepare() == NGX_HTTP_CACHE_ROCKSDB_BUSY
+                      && wait.store == store && wait.ticket != 0
+                      && result.revision == 0,
+                "deferred validation prepares without a WAL barrier");
+            uint64_t ticket = wait.ticket;
+            check(index.has_fill_intent(file.id)
+                      && index.get(file.id).tags == file.tags,
+                "waiting validation retains intent and old TAGs");
+            std::string header(before.size(), '\0');
+            check(pread(selected.fd, header.data(), header.size(), 0)
+                          == (ssize_t) header.size()
+                      && header == before
+                      && ngx_http_cache_purge_file_marker_read(
+                             selected.fd, &marker, &error) == 0
+                      && marker.state == NGX_HTTP_CACHE_PURGE_FILE_READY,
+                "unsynced preparation leaves the old file unchanged");
+            for (unsigned n = 0; n < 3; n++) {
+                check(prepare() == NGX_HTTP_CACHE_ROCKSDB_BUSY
+                          && wait.ticket == ticket,
+                    "waiting retry keeps its original WAL ticket");
+            }
+            check(ngx_http_cache_purge_test_sync_count() == syncs,
+                "preparation and waiting do not force WAL synchronization");
+            auto foreign = input;
+            foreign.file.id[0] ^= 1;
+            check(ngx_http_cache_purge_publications_validate_prepare_deferred(
+                      publications.native(), store, &foreign, anchor.fd,
+                      lease.fd, selected.fd, getuid(), &wait, validation_guard,
+                      nullptr, &result, &error)
+                          == NGX_HTTP_CACHE_ROCKSDB_INVALID
+                      && wait.ticket == ticket,
+                "a wait cannot authorize another file");
+            if (mode == "--validate-deferred-crash-wait") {
+                _exit(0);
+            }
+            if (mode == "--validate-deferred-sync-failure") {
+                ngx_http_cache_purge_test_sync_fail(1);
+                check(ngx_http_cache_rocksdb_sync(store, &error)
+                          == NGX_HTTP_CACHE_ROCKSDB_IO,
+                    "failed preparation WAL barrier is reported");
+                ngx_http_cache_purge_test_sync_fail(0);
+                check(prepare() == NGX_HTTP_CACHE_ROCKSDB_BUSY
+                          && ngx_http_cache_purge_file_marker_read(
+                                 selected.fd, &marker, &error) == 0
+                          && marker.state == NGX_HTTP_CACHE_PURGE_FILE_READY,
+                    "failed WAL barrier cannot mutate the old file");
+                check(ngx_http_cache_rocksdb_close(&store, &error)
+                          == NGX_HTTP_CACHE_ROCKSDB_IO,
+                    "close failed validation preparation database");
+                std::cout << "PASS failed validation barrier " << assertions
+                          << " assertions" << std::endl;
+                return 0;
+            }
+            check(ngx_http_cache_rocksdb_sync(store, &error) == 0,
+                "flush the shared validation preparation group");
+            if (mode == "--validate-deferred-crash-synced") {
+                _exit(0);
+            }
+            const std::string key = "C:validation-later", value = "later";
+            ngx_http_cache_rocksdb_mutation_t mutation{
+                NGX_HTTP_CACHE_ROCKSDB_DEFAULT, NGX_HTTP_CACHE_ROCKSDB_PUT,
+                bytes(key), bytes(value) };
+            check(ngx_http_cache_rocksdb_write_deferred(
+                      store, &mutation, 1, nullptr, 0, &error) == 0,
+                "write unrelated work after the preparation barrier");
+            check(prepare() == 0 && wait.store == nullptr
+                      && result.revision == 3
+                      && ngx_http_cache_purge_test_sync_count() == syncs + 1,
+                "covered preparation resumes without syncing newer work");
+            check(ngx_http_cache_purge_file_marker_read(
+                      selected.fd, &marker, &error) == 0
+                      && marker.state == NGX_HTTP_CACHE_PURGE_FILE_REVOKED
+                      && index.get(file.id).tags == file.tags,
+                "durable preparation revokes only the old file proof");
+        }
         check(ngx_http_cache_purge_publications_validate_prepare(
                   publications.native(), store, &input, anchor.fd, lease.fd,
                   selected.fd, getuid(), validation_guard, nullptr, &result,
@@ -568,10 +653,18 @@ validation(
                   << " assertions" << std::endl;
         return 0;
     }
-    check(ngx_http_cache_purge_publications_validate_finish(
+    int completed;
+    if (mode == "--validate-deferred-veto") {
+        completed = ngx_http_cache_purge_publications_validate_finish_checked(
+            publications.native(), store, file.id.data(), nullptr, 0,
+            anchor.fd, lease.fd, getuid(), validation_guard, &input, &result,
+            &error);
+    } else {
+        completed = ngx_http_cache_purge_publications_validate_finish(
               publications.native(), store, file.id.data(), nullptr, 0,
-              anchor.fd, lease.fd, getuid(), &result, &error)
-              == 0,
+              anchor.fd, lease.fd, getuid(), &result, &error);
+    }
+    check(completed == 0,
         "finish or recover validation");
     if (mode == "--validate-crash-done") {
         _exit(0);

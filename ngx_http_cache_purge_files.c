@@ -3994,11 +3994,12 @@ ngx_http_cache_purge_validation_base(ngx_http_cache_rocksdb_bytes_t base,
     return ngx_http_cache_purge_result(error, 0, "");
 }
 
-int
-ngx_http_cache_purge_publications_validate_prepare(
+static int
+ngx_http_cache_purge_publications_validate_prepare_run(
     ngx_http_cache_purge_publications_t *p, ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_validation_t *input, int anchor, int lease,
     int selected_fd, uint32_t uid,
+    ngx_http_cache_purge_publication_wait_t *wait,
     ngx_http_cache_purge_validation_guard_pt guard, void *guard_data,
     ngx_http_cache_purge_index_match_t *out,
     ngx_http_cache_rocksdb_error_t *error)
@@ -4013,9 +4014,9 @@ ngx_http_cache_purge_publications_validate_prepare(
     struct stat                               st;
     unsigned char                             digest[32], identity[16];
     unsigned char                            *raw, *next, *before;
-    uint64_t                                  offset;
+    uint64_t                                  offset, written, synced;
     size_t                                    count, size, i;
-    int                                       rc, owned, flags;
+    int                                       rc, owned, flags, pending;
 
     ngx_http_cache_purge_result(error, 0, "");
     if (out != NULL) {
@@ -4033,11 +4034,28 @@ ngx_http_cache_purge_publications_validate_prepare(
     if (rc != 0) {
         return rc;
     }
+    if (wait != NULL && wait->store != NULL) {
+        if (wait->store != store || memcmp(wait->id, input->file.id, 16)) {
+            return ngx_http_cache_purge_result(error,
+                NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                "validation wait belongs to another file");
+        }
+        rc = ngx_http_cache_rocksdb_durability(store, &written, &synced, error);
+        if (rc != 0) {
+            return rc;
+        }
+        if (synced < wait->ticket) {
+            return ngx_http_cache_purge_result(error,
+                NGX_HTTP_CACHE_ROCKSDB_BUSY,
+                "validation preparation awaits WAL sync");
+        }
+    }
     memset(&checked, 0, sizeof(checked));
     memset(&address, 0, sizeof(address));
     memset(&updated, 0, sizeof(updated));
     raw = NULL;
     before = NULL;
+    pending = 0;
     rc = ngx_http_cache_purge_index_get_file(
         store, input->file.id, &file, error);
     if (rc != 0) {
@@ -4149,14 +4167,11 @@ ngx_http_cache_purge_publications_validate_prepare(
             if (rc != 0) {
                 goto done;
             }
-        } else {
-            rc = ngx_http_cache_purge_file_proof_revoke(selected_fd, file.id,
-                                                        identity, error);
-            if (rc != 0) {
-                goto done;
-            }
         }
         ngx_http_cache_purge_validation_match(&file, out);
+        if (owned) {
+            goto prepared;
+        }
         goto done;
     }
     if (plan.pending || file.revision != input->file.revision) {
@@ -4249,8 +4264,32 @@ ngx_http_cache_purge_publications_validate_prepare(
     }
     metadata.data = raw;
     metadata.len = size;
-    rc = ngx_http_cache_purge_index_update_pending(store, &input->file,
-        metadata, file.tags, file.tag_count, out, error);
+    if (wait == NULL) {
+        rc = ngx_http_cache_purge_index_update_pending(store, &input->file,
+            metadata, file.tags, file.tag_count, out, error);
+    } else {
+        rc = ngx_http_cache_purge_index_update_pending_deferred(store,
+            &input->file, metadata, file.tags, file.tag_count, out, error);
+    }
+
+prepared:
+    if (rc == 0 && wait != NULL) {
+        rc = ngx_http_cache_rocksdb_durability(store, &written, &synced, error);
+        if (rc == 0 && wait->store == NULL) {
+            wait->store = store;
+            memcpy(wait->id, file.id, 16);
+            wait->revision = out->revision;
+            wait->ticket = written;
+        }
+        if (rc == 0 && synced < wait->ticket) {
+            pending = 1;
+            memset(out, 0, sizeof(*out));
+            rc = ngx_http_cache_purge_result(error,
+                NGX_HTTP_CACHE_ROCKSDB_BUSY,
+                "validation preparation awaits WAL sync");
+            goto done;
+        }
+    }
     if (rc == 0) {
         rc = ngx_http_cache_purge_file_proof_revoke(selected_fd, file.id,
                                                     identity, error);
@@ -4261,6 +4300,9 @@ conflict:
     rc = ngx_http_cache_purge_result(error, NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
                                     "validation instance or revision changed");
 done:
+    if (wait != NULL && !pending) {
+        memset(wait, 0, sizeof(*wait));
+    }
     free(raw);
     free(before);
     free((void *) updated.data);
@@ -4268,6 +4310,39 @@ done:
     ngx_http_cache_purge_index_file_free(&checked);
     ngx_http_cache_purge_index_file_free(&file);
     return rc;
+}
+
+int
+ngx_http_cache_purge_publications_validate_prepare(
+    ngx_http_cache_purge_publications_t *p, ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_validation_t *input, int anchor, int lease,
+    int selected_fd, uint32_t uid,
+    ngx_http_cache_purge_validation_guard_pt guard, void *guard_data,
+    ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_purge_publications_validate_prepare_run(p, store,
+        input, anchor, lease, selected_fd, uid, NULL, guard, guard_data, out,
+        error);
+}
+
+int
+ngx_http_cache_purge_publications_validate_prepare_deferred(
+    ngx_http_cache_purge_publications_t *p, ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_validation_t *input, int anchor, int lease,
+    int selected_fd, uint32_t uid,
+    ngx_http_cache_purge_publication_wait_t *wait,
+    ngx_http_cache_purge_validation_guard_pt guard, void *guard_data,
+    ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    if (wait == NULL) {
+        return ngx_http_cache_purge_result(error,
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "missing validation wait");
+    }
+    return ngx_http_cache_purge_publications_validate_prepare_run(p, store,
+        input, anchor, lease, selected_fd, uid, wait, guard, guard_data, out,
+        error);
 }
 
 int

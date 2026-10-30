@@ -7763,7 +7763,7 @@ ngx_http_cache_purge_index_update_internal(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_expected_t *file,
     ngx_http_cache_rocksdb_bytes_t metadata,
     const ngx_http_cache_rocksdb_bytes_t *input, size_t count,
-    ngx_http_cache_purge_index_match_t *out, int pending,
+    ngx_http_cache_purge_index_match_t *out, int pending, int deferred,
     ngx_http_cache_rocksdb_error_t *error)
 {
     ngx_http_cache_purge_index_tx_t     *tx;
@@ -7790,6 +7790,7 @@ ngx_http_cache_purge_index_update_internal(ngx_http_cache_rocksdb_t *store,
     }
     q = tx->context;
     n = ngx_http_cache_purge_index_tags(q, input, count, tags);
+    tx->deferred = deferred;
     if (!ngx_http_cache_purge_index_input(q, metadata, 16384)
         || !ngx_http_cache_purge_index_load(tx, file, &record)
         || !ngx_http_cache_purge_index_require(q, record.state == 2,
@@ -7891,7 +7892,7 @@ ngx_http_cache_purge_index_update(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_error_t *error)
 {
     return ngx_http_cache_purge_index_update_internal(
-        store, file, metadata, tags, count, out, 0, error);
+        store, file, metadata, tags, count, out, 0, 0, error);
 }
 
 int
@@ -7903,7 +7904,20 @@ ngx_http_cache_purge_index_update_pending(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_error_t *error)
 {
     return ngx_http_cache_purge_index_update_internal(
-        store, file, metadata, tags, count, out, 1, error);
+        store, file, metadata, tags, count, out, 1, 0, error);
+}
+
+int
+ngx_http_cache_purge_index_update_pending_deferred(
+    ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file,
+    ngx_http_cache_rocksdb_bytes_t metadata,
+    const ngx_http_cache_rocksdb_bytes_t *tags, size_t count,
+    ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    return ngx_http_cache_purge_index_update_internal(
+        store, file, metadata, tags, count, out, 1, 1, error);
 }
 
 int
@@ -7915,7 +7929,7 @@ ngx_http_cache_purge_index_publish_tags(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_error_t *error)
 {
     return ngx_http_cache_purge_index_update_internal(
-        store, file, metadata, tags, count, out, 2, error);
+        store, file, metadata, tags, count, out, 2, 0, error);
 }
 
 int

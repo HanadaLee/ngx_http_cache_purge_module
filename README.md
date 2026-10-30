@@ -31,7 +31,7 @@ New cache-file records use atomic WAL batches with deferred synchronization.
 The existing executor checks for pending WAL data every 100 ms; 64 batches or
 one configured maximum batch of accumulated WAL bytes force an earlier sync.
 A synchronous write and graceful close also flush preceding deferred records.
-When no command is runnable but FINISH replies await that WAL group, the
+When no command is runnable but publication replies await that WAL group, the
 executor synchronizes the group before sleeping. Available commands still join
 the batch first; the periodic interval and existing size limits remain.
 WAL synchronization uses the writer thread without a mutation queue. Ordinary
@@ -70,6 +70,11 @@ unchanged. Older module readers reject NCF2; a binary upgrade requires a full
 restart, and downgrading is not a transparent reuse of these markers.
 
 Background Invalidate persists the file requirement before advancing its task.
+304 preparation shares the existing WAL wait record and sync group. The old
+file and TAG set stay unchanged until the preparation is durable; waiting keeps
+the path lease and recovery intent. Final validation still checks current rules
+and synchronizes its new header and final index transaction before publishing
+READY and acknowledging completion.
 304 preparation and Delete durably revoke the old proof before header mutation
 or unlink. Successful 304 validation publishes the new TAG set and watermarks
 after its index transaction commits. A reader checks the exact descriptor and
@@ -83,8 +88,8 @@ preparation API. Native representation bindings and their file intent remain in
 the same atomic batch. Tests count actual WAL sync calls through these entry
 points and verify process recovery and loss of an unsynchronized WAL suffix.
 Executor retention of matched historical associations also joins this
-group. A changing RETIRE or 304 validation intent synchronizes earlier retained
-associations; deferred replacement and collection follow them in WAL order.
+group. A changing RETIRE or the 304 preparation barrier synchronizes earlier
+retained associations; deferred replacement and collection follow them in WAL order.
 Explicit retention remains synchronous, including a replay of a deferred result.
 Background collection of retired records and unreferenced key metadata also
 joins this bounded sync group. After synchronous retirement, lost collection

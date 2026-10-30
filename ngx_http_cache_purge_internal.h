@@ -1040,6 +1040,13 @@ int ngx_http_cache_purge_index_update_pending(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_rocksdb_bytes_t *tags, size_t count,
     ngx_http_cache_purge_index_match_t *out,
     ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_index_update_pending_deferred(
+    ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_index_expected_t *file,
+    ngx_http_cache_rocksdb_bytes_t metadata,
+    const ngx_http_cache_rocksdb_bytes_t *tags, size_t count,
+    ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_index_publish_update(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_index_expected_t *file,
     ngx_http_cache_rocksdb_bytes_t metadata,
@@ -1440,6 +1447,17 @@ int ngx_http_cache_purge_publications_validate_prepare(
     ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_purge_validation_t *validation,
     int anchor_fd, int lease_fd, int selected_fd, uint32_t peer_uid,
+    ngx_http_cache_purge_validation_guard_pt guard, void *guard_data,
+    ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+/* BUSY with a nonempty wait keeps the path lease and selected descriptor.
+ * No file mutation occurs until the preparation reaches the WAL barrier. */
+int ngx_http_cache_purge_publications_validate_prepare_deferred(
+    ngx_http_cache_purge_publications_t *publications,
+    ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_validation_t *validation,
+    int anchor_fd, int lease_fd, int selected_fd, uint32_t peer_uid,
+    ngx_http_cache_purge_publication_wait_t *wait,
     ngx_http_cache_purge_validation_guard_pt guard, void *guard_data,
     ngx_http_cache_purge_index_match_t *out,
     ngx_http_cache_rocksdb_error_t *error);
