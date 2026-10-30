@@ -562,6 +562,11 @@ other jobs wait for file I/O. The component
 connection budget and worker count can reduce the pool size. Its approximately
 512 KiB request-byte budget is divided across the pool, and the existing 64
 publication slots bound aggregate pending work, including detached 304 jobs.
+Configured cache roots may be symbolic links. Workers and cache helpers use
+the roots resolved during initialization, so native file names and admission
+proofs use the same canonical path. The master retains the configured paths
+for reload checks. This adds no per-request path resolution or index lookup;
+symlinks below a cache root remain unsupported.
 Background removal synchronizes the pinned parent directory after revoking the
 file proof and unlinking the instance. If the parent is already missing, it
 synchronizes the surviving ancestor chain instead. A failed directory barrier

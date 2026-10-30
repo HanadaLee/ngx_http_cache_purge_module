@@ -531,12 +531,12 @@ ngx_http_cache_purge_runtime_paths(ngx_http_cache_purge_runtime_t *rt,
     }
     native = rt->native.elts;
     for (i = 0; i < rt->native.nelts; i++) {
-        if (ngx_realpath(native[i].cache->path->name.data,
-                         native[i].path.data) == NULL)
+        if (ngx_realpath(native[i].cache->path->name.data, cache) == NULL)
         {
             return NGX_ERROR;
         }
-        native[i].path.len = ngx_strlen(native[i].path.data);
+        native[i].path.len = ngx_strlen(cache);
+        ngx_memcpy(native[i].path.data, cache, native[i].path.len + 1);
     }
     return NGX_OK;
 }
@@ -863,12 +863,27 @@ ngx_http_cache_purge_runtime_process_init(ngx_cycle_t *cycle)
 {
     ngx_http_cache_purge_main_conf_t  *main;
     ngx_http_cache_purge_runtime_t    *rt;
-    if (ngx_process != NGX_PROCESS_WORKER) {
+    ngx_http_cache_purge_native_t     *native;
+    ngx_uint_t                         i;
+
+    if (ngx_process != NGX_PROCESS_WORKER && ngx_process != NGX_PROCESS_HELPER)
+    {
         return NGX_OK;
     }
     main =
         ngx_http_cycle_get_module_main_conf(cycle, ngx_http_cache_purge_module);
     if (main == NULL || main->runtime->path == NULL) {
+        return NGX_OK;
+    }
+    rt = main->runtime;
+    native = rt->native.elts;
+    for (i = 0; i < rt->native.nelts; i++) {
+        /* Use the resolved root for native file names and admission proofs.
+         * This child-private change also covers cache manager/loader paths;
+         * the master retains the configured name for reload comparisons. */
+        native[i].cache->path->name = native[i].path;
+    }
+    if (ngx_process != NGX_PROCESS_WORKER) {
         return NGX_OK;
     }
     if (ngx_http_cache_purge_runtime_files(cycle) != NGX_OK) {
@@ -877,7 +892,6 @@ ngx_http_cache_purge_runtime_process_init(ngx_cycle_t *cycle)
     if (ngx_worker != 0) {
         return NGX_OK;
     }
-    rt = main->runtime;
     rt->owner_event.handler = ngx_http_cache_purge_worker_owner_tick;
     rt->owner_event.data = rt;
     rt->owner_event.log = cycle->log;

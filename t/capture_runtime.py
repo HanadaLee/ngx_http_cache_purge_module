@@ -38,6 +38,7 @@ p.add_argument('--sanitize', action='store_true')
 p.add_argument('--expr', type=Path)
 p.add_argument('--workers', type=int, default=2)
 p.add_argument('--capacity', action='store_true')
+p.add_argument('--cache-root-aliases', action='store_true', help='Exercise configured symlink roots alongside canonical roots')
 p.add_argument('--reuse-build', type=Path, help='Reuse matching compiled sources after test-only edits')
 a = p.parse_args()
 repo = Path(__file__).resolve().parents[1]
@@ -259,6 +260,12 @@ with socket.socket() as s: s.bind(('127.0.0.1', 0)); port = s.getsockname()[1]
 run = root / (f'run-{time.time_ns()}' if a.reuse_build else 'run'); run.mkdir(); (run / 'logs').mkdir()
 for directory in ('cache-a', 'cache-b', 'index'): (run / directory).mkdir()
 (run / 'index').chmod(0o700)
+cache_root_aliases = {}
+if a.cache_root_aliases:
+    for name, alias in (('cache-a', 'cache-link-a-longer'), ('cache-b', 'b'),
+                        ('cache-fastcgi', 'fastcgi-link'), ('cache-uwsgi', 'u')):
+        (run / alias).symlink_to(run / name, target_is_directory=True)
+        cache_root_aliases[name] = alias
 gateway_paths, gateway_locations = [], []
 for name, server in gateways.items():
     (run / ('cache-' + name)).mkdir()
@@ -550,6 +557,8 @@ if extension and a.expr:
     }}
     '''
     config = config.replace('location = /negative-error', error_when + 'location = /negative-error')
+for name, alias in cache_root_aliases.items():
+    config = config.replace(f'{run}/{name} levels=', f'{run}/{alias} levels=')
 (run / 'nginx.conf').write_text(config)
 if a.sanitize:
     suppression = run / 'leaks.supp'; suppression.write_text('leak:ngx_event_process_init\n')
@@ -782,6 +791,8 @@ def ready_file(item):
     assert item['state'] == 2 and metadata.startswith(b'NFP1')
     marker = checked_marker(path)
     assert marker[:4] == b'NCF2'
+    assert path == path.resolve(), path
+    assert marker[24:40] == hashlib.sha256(os.fsencode(path)).digest()[:16]
     identity = b'NCI1' + b''.join(string(value) for value in
         (item['namespace'], item['url'], item['misc']))
     assert marker[120:152] == hashlib.sha256(identity).digest()
@@ -1167,6 +1178,9 @@ try:
     assert len(origin_metadata(first)) == 28
     assert get('/asset')[1] == 'HIT' and calls.count('/asset') == 1
     checks.append('real upstream fill is WAL-indexed with the native key snapshot, scoped tags and READY marker')
+    if a.cache_root_aliases:
+        assert first['root'] == os.fsencode(run / 'cache-a'), first['root']
+        checks.append('configured symlink roots publish canonical paths and preserve first-request HIT admission')
     assert get('/index-off?bad=bad,namespace')[1] == 'MISS'
     until(lambda: get('/index-off?bad=bad,namespace')[1] == 'HIT')
     initial_requests = int.from_bytes(rpc(1)[40:48], 'big')
@@ -2587,7 +2601,7 @@ result = {'root': str(root), 'run': str(run), 'nginx_revision': revision,
           'core_source_patch_sha256': hashlib.sha256(source_patch).hexdigest(),
           'dynamic': a.dynamic, 'key_last': a.key_last, 'sanitizer': a.sanitize, 'expr': bool(a.expr), 'extension': extension,
           'sanitizer_exclusions': ['nonnull-attribute', 'alignment instrumentation for native ngx_md5.o only'] if a.sanitize else [],
-          'workers': a.workers, 'checks': checks,
+          'workers': a.workers, 'cache_root_aliases': cache_root_aliases, 'checks': checks,
           'hit_query_budget': hit_query_budget,
           'sources': {group: {str(p.relative_to(directory)): hashlib.sha256(p.read_bytes()).hexdigest() for p in directory.rglob('*') if p.is_file()}
                       for group, directory in [('addon', addon), ('key', key)]},
