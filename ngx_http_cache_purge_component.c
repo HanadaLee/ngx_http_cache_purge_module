@@ -3186,6 +3186,7 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
     int                                      acknowledged;
     int                                      collected;
     int                                      ready;
+    int                                      publication_waiting;
     int                                      complete;
     int                                      pending;
     int                                      executed;
@@ -3330,6 +3331,7 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
         events[1].fd = c->listener;
         events[1].events = POLLIN;
         ready = 0;
+        publication_waiting = 0;
         now = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC);
         for (i = 0; i < c->options.max_connections; i++) {
             events[i + 2].fd = -1;
@@ -3350,6 +3352,9 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
             ready |= complete && p->output.len == 0
                      && (p->publication_wait.store == NULL
                          || p->publication_wait.ticket <= synced);
+            publication_waiting |= complete && p->output.len == 0
+                                   && p->publication_wait.store != NULL
+                                   && p->publication_wait.ticket > synced;
         }
         pending = c->coordinator != NULL
                   && ngx_http_cache_purge_component_load32(&c->control_state)
@@ -3379,7 +3384,8 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
             }
         }
         rc = poll(events, c->options.max_connections + 2,
-                  ready || (pending && progress) ? 0 : timeout);
+                  ready || publication_waiting || (pending && progress)
+                  ? 0 : timeout);
         if (rc < 0) {
             if (errno == EINTR) {
                 continue;
@@ -3450,6 +3456,17 @@ ngx_http_cache_purge_component_serve(ngx_http_cache_purge_component_t *c,
                 ngx_http_cache_purge_component_add64(&c->rejected, 1);
                 ngx_http_cache_purge_component_drop(c, i);
             }
+        }
+        if (!executed && publication_waiting) {
+            /* Finish the current batch before sleeping with publication
+             * clients blocked behind it. Runnable commands still batch first.
+             */
+            rc = ngx_http_cache_rocksdb_sync(store, error);
+            if (rc != 0) {
+                return rc;
+            }
+            sync_at = ngx_http_cache_purge_component_now(CLOCK_MONOTONIC)
+                      + 100;
         }
         /* Pending object queries retain their input and snapshot only until
          * completion, disconnect or the original request deadline. */

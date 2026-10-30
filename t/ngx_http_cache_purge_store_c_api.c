@@ -114,6 +114,16 @@ ngx_http_cache_purge_test_poll(struct pollfd *fds, nfds_t count, int timeout)
             usleep(1000);
         }
     }
+    directory = getenv("CACHE_PURGE_TEST_PUBLICATION_WAL_GATE");
+    if (directory != NULL && ngx_http_cache_purge_test_wal_armed
+        && !ngx_http_cache_purge_test_wal_paused && timeout > 0)
+    {
+        snprintf(path, sizeof(path), "%s/idle-poll", directory);
+        marker = open(path, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+        if (marker >= 0) {
+            close(marker);
+        }
+    }
     return (int) syscall(SYS_poll, fds, count, timeout);
 }
 

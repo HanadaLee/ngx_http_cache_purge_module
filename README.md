@@ -20,6 +20,9 @@ New cache-file records use atomic WAL batches with deferred synchronization.
 The existing executor checks for pending WAL data every 100 ms; 64 batches or
 one configured maximum batch of accumulated WAL bytes force an earlier sync.
 A synchronous write and graceful close also flush preceding deferred records.
+When no command is runnable but FINISH replies await that WAL group, the
+executor synchronizes the group before sleeping. Available commands still join
+the batch first; the periodic interval and existing size limits remain.
 WAL synchronization uses the writer thread without a mutation queue. Ordinary
 process restarts recover the WAL. Machine power loss may lose its unsynchronized
 cache-record suffix;
@@ -37,8 +40,9 @@ FINISH. Target and source directories are synchronized before COMMIT_PENDING.
 The executor then waits for that commit's existing WAL group before writing
 READY and removing the publication intent. Each connection retains a 40-byte
 owner-local wait record on 64-bit builds; the bounded recovery scan has one more.
-Waiting does not repeat file syncs, hold a shared-control pin, or force a WAL
-sync per file. The original IPC deadline still applies. After the group syncs,
+Waiting does not repeat file syncs or hold a shared-control pin. FINISH does not
+flush the WAL itself; the executor decides when to finish the shared group.
+The original IPC deadline still applies. After the group syncs,
 the publisher rechecks file identity and current rules before becoming readable.
 Disconnects and timeouts leave the committed intent for bounded recovery. PREPARE
 does not synchronize an unpublished file. A power loss that loses only READY

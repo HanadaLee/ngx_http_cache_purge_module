@@ -361,6 +361,8 @@ def publication_wal_wait(mode):
         source.rename(target)
         client.begin_finish(401, lease)
         wait_for(lambda: (gate / 'paused').exists())
+        check(not (gate / 'idle-poll').exists(),
+              'idle executor flushes a waiting publication before sleeping: ' + mode)
         check((gate / 'armed').exists()
               and os.getxattr(fd, 'user.ngx_cache_purge.id')[7] == 3
               and not select.select([client.socket], [], [], .02)[0],
