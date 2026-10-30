@@ -529,13 +529,16 @@ successful 304 updates. TAG values are comma separated, case sensitive, trimmed
 and deduplicated; an empty value clears the new entity's TAG set. A normal HIT
 retains the selected representation's recorded TAGs.
 
-Publication is limited to 64 concurrent transactions and a 2 MiB logical buffer
-budget per worker, with a three-second overall IPC deadline. The limits apply
-after the response body is complete and do not turn normal HITs into origin
-requests. Request inputs and each publication payload are separately bounded
-to 128 KiB; these limits exclude allocator overhead and native nginx buffers.
+Each worker allows at most 64 reserved fills and detached publications combined,
+within a 2 MiB logical material budget. Response headers reserve a slot and
+bounded storage before nginx writes the cache file. One 128 KiB foreground query
+frame remains available within that budget. The three-second publication IPC
+deadline starts after the complete body is transferred to the background job.
+Normal HITs are unaffected. Request inputs and each publication payload are
+separately bounded to 128 KiB; these limits exclude allocator overhead and native
+nginx buffers.
 Cache-file publication uses up to four reusable IPC clients per worker. It
-selects the least busy client after a publication slot is admitted, and keeps
+selects the least busy client after the response body is complete, and keeps
 that client for ACQUIRE/PREPARE/FINISH and retries. The existing component
 connection budget and worker count can reduce the pool size. Its approximately
 512 KiB request-byte budget is divided across the pool, and the existing 64
@@ -557,9 +560,11 @@ publication; detached 304 jobs are excluded. This does not coalesce work across
 workers or increase publication limits.
 If the publication queue or its memory budget is already full when response
 headers arrive, the module skips caching before nginx creates the cache file.
-The response is still served, and existing HITs are unaffected. Capacity is
-checked again after the body; long responses can still exhaust the queue after
-their headers have been accepted.
+The response is still served, and existing HITs are unaffected. Later fills
+cannot consume a slow response's reserved slot or material storage. The request
+releases unused reservations on cleanup; completed fills transfer ownership to
+the existing asynchronous publisher. File-descriptor exhaustion, failed bodies
+and native proxy buffering remain separate cleanup boundaries.
 Generation namespaces, legacy zone/key PURGE syntax, REFRESH handlers, directory
 walks and the old shared-memory task queue have been removed; obsolete directives
 are rejected rather than silently ignored. New captures do not add arbitrary

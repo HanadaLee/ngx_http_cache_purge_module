@@ -282,6 +282,9 @@ ngx_http_cache_purge_fill_complete(ngx_http_cache_purge_fill_t *f, ngx_int_t rc)
 #define NGX_HTTP_CACHE_PURGE_CAPTURE_BYTES   (2 * 1024 * 1024)
 #define NGX_HTTP_CACHE_PURGE_CAPTURE_COUNT   64
 #define NGX_HTTP_CACHE_PURGE_CAPTURE_RECORD  (128 * 1024)
+/* Keep one synchronous foreground query frame outside publication storage. */
+#define NGX_HTTP_CACHE_PURGE_PUBLICATION_BYTES \
+    (NGX_HTTP_CACHE_PURGE_CAPTURE_BYTES - NGX_HTTP_CACHE_PURGE_CAPTURE_RECORD)
 #define NGX_HTTP_CACHE_PURGE_CAPTURE_TIMEOUT 3000
 #define NGX_HTTP_CACHE_PURGE_PROPAGATION_LINE 8192
 #define NGX_HTTP_CACHE_PURGE_RETIRE_BYTES (256 * 1024)
@@ -418,6 +421,7 @@ typedef struct {
     ngx_event_t                           timer, retry;
     ngx_str_t                             fields[9], misc, tags[64], payload;
     ngx_str_t                             metadata;
+    u_char                               *last, *end;
     size_t                                reserved;
     ngx_uint_t                            tag_count, rpc;
     ngx_msec_t                            deadline;
@@ -444,6 +448,7 @@ typedef struct {
     ngx_int_t                    (*create_request)(ngx_http_request_t *);
     void (*error_finalize)(ngx_http_request_t *, ngx_int_t);
     ngx_http_cache_purge_redirect_t      *redirect;
+    ngx_http_cache_purge_publication_t   *publication;
     ngx_http_cache_purge_revalidation_t  *validation;
     ngx_http_cache_purge_propagation_t   *propagation;
     ngx_http_cache_purge_propagation_t   *propagation_shared;
@@ -563,6 +568,8 @@ ngx_http_cache_purge_publication_reply(ngx_http_cache_purge_call_t *, void *,
     const ngx_http_cache_purge_reply_t *);
 static void ngx_http_cache_purge_publication_free(
     ngx_http_cache_purge_publication_t *job);
+static ngx_int_t ngx_http_cache_purge_publication_reserve(
+    ngx_http_cache_purge_capture_t *ctx);
 static void ngx_http_cache_purge_publication_finish(
     ngx_http_cache_purge_publication_t *job, ngx_int_t result);
 static void ngx_http_cache_purge_publication_io_done(ngx_event_t *event);
@@ -2491,6 +2498,10 @@ ngx_http_cache_purge_capture_cleanup(void *data)
 {
     ngx_http_cache_purge_capture_t *ctx = data;
     ngx_http_cache_purge_send_cancel(ctx);
+    if (ctx->publication) {
+        ngx_http_cache_purge_publication_free(ctx->publication);
+        ctx->publication = NULL;
+    }
     if (ctx->error_held) {
         ctx->cache->updated = 0;
         ctx->cache->error = 0;
@@ -3197,9 +3208,11 @@ ngx_http_cache_purge_publication_available(void)
 {
     return ngx_http_cache_purge_retained_count
            < NGX_HTTP_CACHE_PURGE_CAPTURE_COUNT
+           && ngx_http_cache_purge_retained_bytes
+              <= NGX_HTTP_CACHE_PURGE_PUBLICATION_BYTES
            && NGX_DEFAULT_POOL_SIZE
               + sizeof(ngx_http_cache_purge_publication_t)
-              <= NGX_HTTP_CACHE_PURGE_CAPTURE_BYTES
+              <= NGX_HTTP_CACHE_PURGE_PUBLICATION_BYTES
                  - ngx_http_cache_purge_retained_bytes;
 }
 
@@ -3229,7 +3242,8 @@ ngx_http_cache_purge_capture_header(ngx_http_request_t *r)
     if (ctx && !ctx->detached && !ctx->failed
         && ctx->cache == r->cache && !r->cached)
     {
-        if (r->upstream != NULL && r->upstream->cacheable
+        if (ctx->publication == NULL && r->upstream != NULL
+            && r->upstream->cacheable
             && !ngx_http_cache_purge_publication_available())
         {
             /* Native cache-file creation follows this filter. Avoid writing
@@ -3246,8 +3260,14 @@ ngx_http_cache_purge_capture_header(ngx_http_request_t *r)
                 == NGX_OK
                 && ngx_http_cache_purge_capture_tags(ctx, value) == NGX_OK))
         {
-            rc = ngx_http_cache_purge_fill_arm(r, &ctx->fill,
-                ngx_http_cache_purge_capture_step, ctx);
+            rc = ngx_http_cache_purge_publication_reserve(ctx);
+            if (rc == NGX_OK) {
+                rc = ngx_http_cache_purge_fill_arm(r, &ctx->fill,
+                    ngx_http_cache_purge_capture_step, ctx);
+            } else if (rc == NGX_BUSY) {
+                r->upstream->cacheable = 0;
+                rc = NGX_DECLINED;
+            }
         }
         if (rc == NGX_ERROR)
         {
@@ -3258,6 +3278,10 @@ ngx_http_cache_purge_capture_header(ngx_http_request_t *r)
                           "cache fill");
         }
         if (rc != NGX_OK) {
+            if (ctx->publication) {
+                ngx_http_cache_purge_publication_free(ctx->publication);
+                ctx->publication = NULL;
+            }
             ngx_http_cache_purge_origin_release(&ctx->registration);
         }
     }
@@ -4469,8 +4493,20 @@ ngx_http_cache_purge_publication_alloc(ngx_http_cache_purge_publication_t *job,
 {
     void  *p;
 
+    if (job->last) {
+        if (size > NGX_HTTP_CACHE_PURGE_CAPTURE_RECORD
+            || size > (size_t) (job->end - job->last))
+        {
+            return NULL;
+        }
+        p = job->last;
+        job->last += size;
+        return p;
+    }
     if (size > NGX_HTTP_CACHE_PURGE_CAPTURE_RECORD
-        || size > NGX_HTTP_CACHE_PURGE_CAPTURE_BYTES
+        || ngx_http_cache_purge_retained_bytes
+           > NGX_HTTP_CACHE_PURGE_PUBLICATION_BYTES
+        || size > NGX_HTTP_CACHE_PURGE_PUBLICATION_BYTES
                   - ngx_http_cache_purge_retained_bytes)
     {
         return NULL;
@@ -4645,20 +4681,17 @@ ngx_http_cache_purge_publication_finish(ngx_http_cache_purge_publication_t *job,
 }
 
 static ngx_http_cache_purge_publication_t *
-ngx_http_cache_purge_publication_create(ngx_http_cache_purge_capture_t *ctx,
-    ngx_http_cache_t *cache, ngx_fd_t fd, ngx_str_t temporary,
-    const ngx_http_cache_purge_file_proof_t *proof)
+ngx_http_cache_purge_publication_new(ngx_http_cache_purge_capture_t *ctx,
+    size_t size)
 {
     ngx_http_cache_purge_capture_main_t  *main;
     ngx_http_cache_purge_publication_t   *job;
     ngx_pool_t                           *pool;
-    ngx_str_t                             fields[9], name, root, metadata;
-    ngx_uint_t                            i;
 
-    u_char  watermark[NGX_HTTP_CACHE_PURGE_VARIANT_SIZE];
-
-    if (!ctx->origin_valid || !ctx->registration.registered
-        || !ngx_http_cache_purge_publication_available())
+    if (!ngx_http_cache_purge_publication_available()
+        || size > NGX_HTTP_CACHE_PURGE_PUBLICATION_BYTES
+                  - ngx_http_cache_purge_retained_bytes
+                  - NGX_DEFAULT_POOL_SIZE - sizeof(*job))
     {
         return NULL;
     }
@@ -4677,9 +4710,111 @@ ngx_http_cache_purge_publication_create(ngx_http_cache_purge_capture_t *ctx,
     job->thread_pool = main->publish_pool;
     job->lease = -1;
     job->temporary.file.fd = NGX_INVALID_FILE;
-    job->reserved = NGX_DEFAULT_POOL_SIZE + sizeof(*job);
+    if (size) {
+        job->last = ngx_pnalloc(pool, size);
+        if (job->last == NULL) {
+            ngx_destroy_pool(pool);
+            return NULL;
+        }
+        job->end = job->last + size;
+    }
+    job->reserved = NGX_DEFAULT_POOL_SIZE + sizeof(*job) + size;
     ngx_http_cache_purge_retained_bytes += job->reserved;
     ngx_http_cache_purge_retained_count++;
+    return job;
+}
+
+static ngx_int_t
+ngx_http_cache_purge_publication_reserve(ngx_http_cache_purge_capture_t *ctx)
+{
+    ngx_http_request_t   *r;
+    ngx_http_upstream_t  *u;
+    ngx_http_cache_t     *c;
+    ngx_path_t          *path, *temporary;
+    size_t               fields, tags, filename, relative, tempname;
+    size_t               copies, address, prepare, size;
+    ngx_uint_t           i;
+
+    if (ctx->publication) {
+        return NGX_OK;
+    }
+    r = ctx->request;
+    u = r->upstream;
+    c = r->cache;
+    if (c == NULL || u == NULL || r->cached || c->updated
+        || !u->buffering || !u->cacheable || u->upgrade)
+    {
+        return NGX_DECLINED;
+    }
+    if (!ctx->origin_valid || !ctx->registration.registered) {
+        return NGX_BUSY;
+    }
+    path = c->file_cache->path;
+    temporary = u->conf->temp_path;
+    if (temporary == NULL || path->name.len > NGX_MAX_PATH
+        || path->len > NGX_MAX_PATH || temporary->name.len > NGX_MAX_PATH
+        || temporary->len > NGX_MAX_PATH)
+    {
+        return NGX_BUSY;
+    }
+    /* Native hashes and temporary counters have fixed widths. Vary can
+     * select another hash after this filter, but cannot lengthen the path. */
+    relative = path->len + 2 * NGX_HTTP_CACHE_KEY_LEN;
+    filename = path->name.len + 1 + relative;
+    tempname = c->file_cache->use_temp_path ?
+        temporary->name.len + 1 + temporary->len + 10 : filename + 11;
+    fields = ctx->key.len + ctx->url.len + ctx->host.len + ctx->namespace.len
+             + path->name.len + c->file_cache->shm_zone->shm.name.len
+             + relative + NGX_HTTP_CACHE_VARY_LEN;
+    tags = 0;
+    for (i = 0; i < ctx->tag_count; i++) {
+        tags += ctx->tags[i].len;
+    }
+    copies = fields + tags + ctx->misc.len
+             + NGX_HTTP_CACHE_PURGE_VARIANT_SIZE + filename + tempname
+             + 13 + ctx->tag_count;
+    address = 3 * 4 + path->name.len
+              + c->file_cache->shm_zone->shm.name.len + relative;
+    /* ACQUIRE may return a longer canonical root. Its registered directory
+     * must still be openable by the native pathname API. Reserve both its
+     * replacement copy and its appearance in the one PREPARE payload. */
+    prepare = 16 + 9 * 4 + 8 + 1 + 2 + 6 * 4 + 16 + 4
+              + fields - path->name.len + NGX_MAX_PATH
+              + NGX_HTTP_CACHE_PURGE_VARIANT_SIZE + ctx->misc.len
+              + tags + 4 * ctx->tag_count + tempname;
+    if (address > NGX_HTTP_CACHE_PURGE_CAPTURE_RECORD
+        || prepare > NGX_HTTP_CACHE_PURGE_CAPTURE_RECORD)
+    {
+        return NGX_BUSY;
+    }
+    size = copies + address + NGX_MAX_PATH + 1 + prepare + 24;
+    ctx->publication = ngx_http_cache_purge_publication_new(ctx, size);
+    return ctx->publication ? NGX_OK : NGX_BUSY;
+}
+
+static ngx_http_cache_purge_publication_t *
+ngx_http_cache_purge_publication_create(ngx_http_cache_purge_capture_t *ctx,
+    ngx_http_cache_t *cache, ngx_fd_t fd, ngx_str_t temporary,
+    const ngx_http_cache_purge_file_proof_t *proof)
+{
+    ngx_http_cache_purge_publication_t  *job;
+    ngx_str_t                            fields[9], name, root, metadata;
+    ngx_uint_t                           i;
+
+    u_char  watermark[NGX_HTTP_CACHE_PURGE_VARIANT_SIZE];
+
+    if (!ctx->origin_valid || !ctx->registration.registered) {
+        return NULL;
+    }
+    if (proof) {
+        job = ngx_http_cache_purge_publication_new(ctx, 0);
+    } else {
+        job = ctx->publication;
+        ctx->publication = NULL;
+    }
+    if (job == NULL) {
+        return NULL;
+    }
     if (job->thread_pool == NULL
         || ngx_http_cache_purge_runtime_publish_client(ctx->request,
                                                        &job->client) != 0)
