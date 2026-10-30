@@ -1530,6 +1530,34 @@ ngx_http_cache_purge_publication_sync_parents(
 }
 
 static int
+ngx_http_cache_purge_publication_same_parents(
+    ngx_http_cache_purge_publication_root_t *from,
+    ngx_http_cache_rocksdb_bytes_t source,
+    ngx_http_cache_purge_publication_root_t *to,
+    ngx_http_cache_rocksdb_bytes_t target)
+{
+    struct stat  first, second;
+
+    while (source.len && source.data[source.len - 1] != '/') {
+        source.len--;
+    }
+    while (target.len && target.data[target.len - 1] != '/') {
+        target.len--;
+    }
+    if (source.len != target.len
+        || memcmp(source.data, target.data, source.len) != 0)
+    {
+        return 0;
+    }
+    if (from->fd == to->fd) {
+        return 1;
+    }
+    /* Root aliases are allowed. Uncertain identity keeps both barriers. */
+    return fstat(from->fd, &first) == 0 && fstat(to->fd, &second) == 0
+           && first.st_dev == second.st_dev && first.st_ino == second.st_ino;
+}
+
+static int
 ngx_http_cache_purge_publication_sync_root(
     ngx_http_cache_rocksdb_bytes_t path, size_t length, int *fd,
     ngx_http_cache_rocksdb_error_t *error)
@@ -1576,7 +1604,7 @@ ngx_http_cache_purge_file_sync_publication(int fd,
 {
     ngx_http_cache_purge_publication_root_t  from, to;
     ngx_http_cache_purge_file_marker_t       marker;
-    ngx_http_cache_rocksdb_bytes_t           relative;
+    ngx_http_cache_rocksdb_bytes_t           relative, temporary;
     struct stat                              before, named, after;
     int                                      observed, rc;
 
@@ -1634,10 +1662,12 @@ ngx_http_cache_purge_file_sync_publication(int fd,
         goto done;
     }
     rc = ngx_http_cache_purge_publication_sync_parents(&to, relative, error);
-    relative.data = source.data + source_root + 1;
-    relative.len = source.len - source_root - 1;
-    if (rc == 0) {
-        rc = ngx_http_cache_purge_publication_sync_parents(&from, relative,
+    temporary.data = source.data + source_root + 1;
+    temporary.len = source.len - source_root - 1;
+    if (rc == 0 && !ngx_http_cache_purge_publication_same_parents(
+                       &from, temporary, &to, relative))
+    {
+        rc = ngx_http_cache_purge_publication_sync_parents(&from, temporary,
                                                          error);
     }
     if (rc != 0) {
@@ -3144,7 +3174,10 @@ ngx_http_cache_purge_publications_finish_run(
     }
     relative.data = saved.temporary.data + source->length + 1;
     relative.len = saved.temporary.len - source->length - 1;
-    if (rc == 0 && !file_synced && (wait == NULL || wait->store == NULL)) {
+    if (rc == 0 && !file_synced && (wait == NULL || wait->store == NULL)
+        && !ngx_http_cache_purge_publication_same_parents(
+                source, relative, target, file.path))
+    {
         rc = ngx_http_cache_purge_publication_sync_parents(source, relative,
                                                            error);
     }

@@ -47,7 +47,10 @@ before removing FENCE. Power loss can replay intermediate work, but cannot lose
 an accepted task or turn incomplete work into a completed receipt. The explicit
 checkpoint API remains synchronous, including replay of a deferred checkpoint.
 After rename, the publication pool synchronizes the completed data, STAGED
-identity, and target/source directory chains. FINISH carries a volatile flag
+identity, and target/source directory chains. A rename within one directory
+synchronizes the shared parent chain once; distinct source and target chains
+retain both barriers. Root aliases are compared by directory identity.
+FINISH carries a volatile flag
 for that completed work; the executor still verifies the physical instance and
 current rules before COMMIT_PENDING. Legacy calls and recovery perform the
 same synchronization inside FINISH. Failure never sets the flag, and the flag

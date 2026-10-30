@@ -1792,6 +1792,74 @@ ngx_http_cache_purge_test_publication_wal(const std::string &path,
                 "inject offloaded directory sync failure");
             check(synchronize() == NGX_HTTP_CACHE_ROCKSDB_IO,
                 "directory synchronization failure cannot claim success");
+            check(ngx_http_cache_purge_test_watch_file(
+                      directory.fd, 0, nullptr, nullptr) == 0,
+                "count identical publication directory barriers");
+            check(synchronize() == 0
+                      && ngx_http_cache_purge_test_file_sync_count() == 1,
+                "same-directory rename synchronizes its parent only once");
+            check(ngx_http_cache_purge_test_watch_file(
+                      directory.fd, 0, nullptr, nullptr) == 0,
+                "count aliased publication directory barriers");
+            check(ngx_http_cache_purge_file_sync_publication(fd.fd,
+                      file.id.data(), bytes(alias + "/temporary"),
+                      alias.size(), bytes(target), file.root.size(), &error)
+                          == 0
+                      && ngx_http_cache_purge_test_file_sync_count() == 1,
+                "different aliases of one root share the parent barrier");
+            auto nested = file.root + "/source";
+            std::filesystem::create_directory(nested);
+            Descriptor source_directory(open(nested.c_str(),
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+            check(ngx_http_cache_purge_test_watch_file(
+                      source_directory.fd, 1, nullptr, nullptr) == 0,
+                "fail the distinct source subdirectory barrier");
+            check(ngx_http_cache_purge_file_sync_publication(fd.fd,
+                      file.id.data(), bytes(nested + "/temporary"),
+                      file.root.size(), bytes(target), file.root.size(), &error)
+                          == NGX_HTTP_CACHE_ROCKSDB_IO
+                      && ngx_http_cache_purge_test_file_sync_count() == 1,
+                "same root does not omit a different source directory");
+            auto other = path + "/other-cache";
+            std::filesystem::create_directory(other);
+            Descriptor other_directory(open(other.c_str(),
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+            check(ngx_http_cache_purge_test_watch_file(
+                      other_directory.fd, 1, nullptr, nullptr) == 0,
+                "fail a distinct source root barrier");
+            check(ngx_http_cache_purge_file_sync_publication(fd.fd,
+                      file.id.data(), bytes(other + "/temporary"),
+                      other.size(), bytes(target), file.root.size(), &error)
+                          == NGX_HTTP_CACHE_ROCKSDB_IO
+                      && ngx_http_cache_purge_test_file_sync_count() == 1,
+                "equal relative parents do not merge different roots");
+            auto parents = file.root + "/nested/path";
+            std::filesystem::create_directories(parents);
+            auto nested_target = parents + "/file";
+            check(rename(target.c_str(), nested_target.c_str()) == 0,
+                "place the file below a shared directory chain");
+            check(ngx_http_cache_purge_test_watch_file(
+                      directory.fd, 0, nullptr, nullptr) == 0,
+                "count the shared ancestor barrier");
+            check(ngx_http_cache_purge_file_sync_publication(fd.fd,
+                      file.id.data(), bytes(parents + "/temporary"),
+                      file.root.size(), bytes(nested_target), file.root.size(),
+                      &error) == 0
+                      && ngx_http_cache_purge_test_file_sync_count() == 1,
+                "identical nested parents synchronize their ancestor once");
+            Descriptor leaf(open(parents.c_str(),
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+            check(ngx_http_cache_purge_test_watch_file(
+                      leaf.fd, 0, nullptr, nullptr) == 0,
+                "count the shared leaf directory barrier");
+            check(ngx_http_cache_purge_file_sync_publication(fd.fd,
+                      file.id.data(), bytes(parents + "/temporary"),
+                      file.root.size(), bytes(nested_target), file.root.size(),
+                      &error) == 0
+                      && ngx_http_cache_purge_test_file_sync_count() == 1,
+                "identical nested parents synchronize their leaf once");
+            check(rename(nested_target.c_str(), target.c_str()) == 0,
+                "restore the prepared file before index completion");
         }
         check(ngx_http_cache_purge_test_watch_file(
                   fd.fd, 0, nullptr, nullptr) == 0,
