@@ -502,6 +502,13 @@ publication. It also covers selected-descriptor admission, 304 commits,
 background invalidation, native-node cleanup and HTTP management requests.
 Use `--open-file-cache` to repeat these checks with cached file descriptors and
 negative file entries enabled.
+Writer registration can race with a shared-rule publication. A failed
+registration disables that fill; it does not by itself bypass an existing
+cache file. The file proof and current rules still decide whether a cached
+response can be served.
+`t/origin_admission_runtime.py` checks this boundary by injecting one BUSY
+result into writer registration while leaving the native file and its proof
+checks active.
 
 Configure the store and state zone together at HTTP scope. Provide independent
 identity expressions and enable the protocol at HTTP, server or location scope:

@@ -479,7 +479,6 @@ typedef struct {
     size_t                                  input_bytes;
     ngx_msec_t                              deadline;
     ngx_http_cache_purge_watermark_t        origin;
-    uint64_t                                origin_publication;
     ngx_http_cache_purge_origin_t           registration;
     u_char                                  native_main[16];
     unsigned                                failed : 1;
@@ -551,8 +550,6 @@ static void ngx_http_cache_purge_read_event(ngx_event_t *event);
 static ngx_int_t ngx_http_cache_purge_proof_start(
     ngx_http_cache_purge_capture_t *ctx);
 static ngx_int_t ngx_http_cache_purge_read_header(
-    ngx_http_cache_purge_capture_t *ctx);
-static ngx_int_t ngx_http_cache_purge_read_request(
     ngx_http_cache_purge_capture_t *ctx);
 static ngx_int_t ngx_http_cache_purge_read_process_header(
     ngx_http_request_t *r);
@@ -1446,7 +1443,6 @@ ngx_http_cache_purge_send_grant(ngx_http_cache_purge_capture_t *ctx)
      * No IPC, allocation or network I/O occurs while the guard is held. */
     if (!ctx->detached) {
         ctx->origin = watermark;
-        ctx->origin_publication = publication;
     }
     ctx->send_started = 1;
     if (ngx_http_cache_purge_control_guard_end(reader, &error) != 0) {
@@ -3033,7 +3029,6 @@ ngx_http_cache_purge_capture_origin(ngx_http_cache_purge_capture_t *ctx)
         ngx_memcpy(ngx_http_cache_purge_origin_ledger, origin.ledger, 16);
     }
     ctx->origin = origin;
-    ctx->origin_publication = publication;
     if (!ctx->registration.registered) {
         ctx->registration.reader = reader;
         ctx->registration.sequence = ctx->origin.sequence;
@@ -3100,16 +3095,17 @@ ngx_http_cache_purge_capture_guard_value(ngx_http_script_engine_t *engine)
     if (ctx && !ctx->incoming_error && !ctx->origin_valid
         && ngx_http_cache_purge_capture_origin(ctx) != NGX_OK)
     {
+        /*
+         * A publication race may prevent writer registration.  Skip this
+         * fill, but let existing files pass through the current proof gate.
+         */
         r->upstream->cacheable = 0;
-        rc = NGX_DECLINED;
     }
     if (rc == NGX_OK
         || (ctx && !ctx->failed && ctx->origin_valid && rc == NGX_DECLINED))
     {
         if (ctx && ctx->read_state == NGX_HTTP_CACHE_PURGE_READ_OFF) {
-            if ((!ctx->incoming_error
-                 && ngx_http_cache_purge_read_request(ctx) != NGX_OK)
-                || r->main->blocked >= NGX_HTTP_MAX_BLOCKED
+            if (r->main->blocked >= NGX_HTTP_MAX_BLOCKED
                 || r->main->count == 65535)
             {
                 rc = NGX_DECLINED;
@@ -3774,32 +3770,6 @@ ngx_http_cache_purge_read_match(void *data,
         }
     }
     return 0;
-}
-
-static ngx_int_t
-ngx_http_cache_purge_read_request(ngx_http_cache_purge_capture_t *ctx)
-{
-    ngx_http_cache_purge_control_reader_t  *reader;
-    ngx_http_cache_rocksdb_error_t          error;
-    int                                     rc;
-
-    if (!ctx->origin_valid
-        || ngx_http_cache_purge_runtime_reader(ctx->request, &reader, &error)
-        != 0)
-    {
-        return NGX_DECLINED;
-    }
-    rc = ngx_http_cache_purge_control_guard_begin(reader,
-                                                   ctx->origin_publication,
-                                                   &error);
-    if (rc != 0) {
-        return NGX_DECLINED;
-    }
-    /* All cache writers in this mode suppress memory-only errors. The file
-     * gate can therefore decide every selector against actual entity proof,
-     * preserving conditional revalidation and already-covered HITs. */
-    rc = ngx_http_cache_purge_control_guard_end(reader, &error);
-    return rc == 0 ? NGX_OK : NGX_DECLINED;
 }
 
 static ngx_int_t
