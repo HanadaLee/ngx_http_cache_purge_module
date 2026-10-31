@@ -1128,8 +1128,8 @@ uncached proxy hop; disabling propagation strips them on the origin leg.
 An ignored input does not contribute a requirement, and malformed accepted input
 is rejected before dispatch. No response acknowledgement is added.
 
-Full propagation remains unfinished. File validation and retained-history expiry
-use fixed identities; Vary and membership enumeration remains bounded.
+File validation and retained-history expiry use fixed identities; Vary and
+membership enumeration remains bounded.
 Per-step matching budgets and shared cursor capacity still require loaded
 performance and progress validation. Source tracing places the inspected
 Edgeresty parent/origin selection before native proxy content. A precontent
@@ -1138,8 +1138,13 @@ probe and real three-tier HTTP/1 and HTTP/2 tests cover that timing, propagation
 native-date in-flight boundary. They do not execute the complete production Lua
 deployment. Broader body/retry/cancellation and concurrency combinations, full
 deployment integration, and loaded memory/latency acceptance remain open.
-Capabilities reports the sender transport as
-`filter` or `variables`, while `proxy_propagation_ready` remains false.
+Capabilities reports `propagation_protocols: ["proxy"]` when the native proxy
+module is loaded, and an empty list otherwise. `proxy_header_transport` is
+`filter`, `variables`, or `unavailable`. These describe supported functionality;
+they do not evaluate business-location switches, conditional routing, or manual
+`proxy_set_header` configuration. The obsolete `proxy_propagation_ready` field
+is removed. `ready` reports the persistent coordinator and shared rules state,
+not deployment validation or a performance guarantee.
 The protocol has no module-side authentication, signatures, key management,
 or response verification exchange.
 

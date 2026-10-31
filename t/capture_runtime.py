@@ -1995,7 +1995,10 @@ try:
     assert caps['control_headers']['tag_namespace'] == 'X-Cache-Purge-Namespace'
     assert caps['index_id'] == ledger.hex() and caps['max_tags'] == 64
     assert caps['invalidate_stale_policy'] == ('forbid' if extension else 'native')
-    assert not caps['proxy_propagation_ready'] and caps['propagation_protocols'] == []
+    assert 'proxy_propagation_ready' not in caps
+    assert caps['propagation_protocols'] == ['proxy']
+    framework = 'NGX_HTTP_PROXY_FILTER' in (build / 'objs/ngx_auto_config.h').read_text()
+    assert caps['proxy_header_transport'] == ('filter' if extension and framework else 'variables')
     assert api('/__purge/v2/capabilities', method='HEAD')[0::2] == (200, None)
     custom = api('/__custom/v2/capabilities')[2]
     assert custom['control_headers']['tag_namespace'] == 'X-Test-Purge-Scope'
@@ -2017,7 +2020,7 @@ try:
     assert api('/__purge/v2/operations/missing-api-operation')[0] == 404
     denied = api('/__purge/v2/capabilities', method='POST', payload={})
     assert denied[0] == 405 and denied[1]['Allow'] == 'GET, HEAD'
-    checks.append('HTTP capabilities and status use real readiness, instance identity, macro policy and effective header names without advertising unavailable L2/signatures')
+    checks.append('HTTP capabilities distinguish coordinator readiness from supported proxy transport and preserve instance identity, stale policy and effective header names')
 
     uri = '/invalidate/api-expired'
     assert get(uri)[0] == 200 and get(uri + '?z=b')[0] == 200

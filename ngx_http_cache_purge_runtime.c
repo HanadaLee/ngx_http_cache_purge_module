@@ -3268,6 +3268,7 @@ ngx_http_cache_purge_api_render(ngx_http_cache_purge_api_t *ctx,
     ngx_http_cache_purge_loc_conf_t   *conf;
     ngx_http_cache_purge_api_decode_t  d;
     ngx_http_cache_rocksdb_bytes_t     raw, tags[64];
+    ngx_module_t                      *module;
     ngx_buf_t                         *buffer;
     ngx_str_t                          id, value, scope, binding, message,
                                        encoded, route;
@@ -3279,6 +3280,7 @@ ngx_http_cache_purge_api_render(ngx_http_cache_purge_api_t *ctx,
     ngx_uint_t                         state, mode, kind, stage, done,
                                        propagation, ready;
     ngx_uint_t                         binary;
+    ngx_flag_t                         proxy;
     u_char                             ledger[32], *p, *identity;
     size_t                             size, count, i;
     static const char *types[] = {"key", "url", "prefix", "prefix",
@@ -3336,6 +3338,16 @@ ngx_http_cache_purge_api_render(ngx_http_cache_purge_api_t *ctx,
         if (d.at != d.end) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
+        proxy = 0;
+        for (i = 0; ngx_cycle->modules[i]; i++) {
+            module = ngx_cycle->modules[i];
+            if (module->type == NGX_HTTP_MODULE && module->name != NULL
+                && ngx_strcmp(module->name, "ngx_http_proxy_module") == 0)
+            {
+                proxy = 1;
+                break;
+            }
+        }
         buffer = ngx_create_temp_buf(r->pool, 8192);
         if (buffer == NULL) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -3354,7 +3366,7 @@ ngx_http_cache_purge_api_render(ngx_http_cache_purge_api_t *ctx,
             "\"tag_scopes\":[\"namespace\",\"host\"],\"max_tags\":64,"
             "\"index_schema\":%ui,\"ledger_schema\":4,"
             "\"propagation_timeout_ms\":\"%uL\","
-            "\"propagation_protocols\":[],\"proxy_propagation_ready\":false,"
+            "\"propagation_protocols\":%s,"
             "\"proxy_header_transport\":\"%s\","
             "\"invalidate_stale_policy\":\"%s\","
             "\"limits\":{\"body_bytes\":262144,\"selector_bytes\":32768,"
@@ -3365,10 +3377,11 @@ ngx_http_cache_purge_api_render(ngx_http_cache_purge_api_t *ctx,
             (size_t) 32, ledger, ready ? "true" : "false", publication,
             last, retired, live, bytes,
             (ngx_uint_t) ngx_http_cache_purge_index_schema_14(), policy,
+            proxy ? "[\"proxy\"]" : "[]",
 #if (NGX_RESTY_EXT && NGX_HTTP_PROXY_FILTER)
-            "filter",
+            proxy ? "filter" : "unavailable",
 #else
-            "variables",
+            proxy ? "variables" : "unavailable",
 #endif
 #if (NGX_RESTY_EXT)
             "forbid"
