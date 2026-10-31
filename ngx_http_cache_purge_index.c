@@ -1568,6 +1568,22 @@ ngx_http_cache_purge_operations_get(ngx_http_cache_purge_operations_t *ops,
     return ngx_http_cache_purge_op_result(&tx, out, error);
 }
 
+static void
+ngx_http_cache_purge_op_boundary(ngx_http_cache_purge_op_tx_t *tx,
+    uint64_t *last, uint64_t *retired)
+{
+    uint64_t  next;
+
+    next = ngx_http_cache_purge_op_counter(tx, "M:op-next");
+    ngx_http_cache_purge_op_require(tx, next != 0,
+                                    NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                                    "invalid operation sequence allocator");
+    *last = next - 1;
+    *retired = ngx_http_cache_purge_op_counter(tx, "M:op-retired");
+    ngx_http_cache_purge_op_require(tx, *retired < next,
+        NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid retired origin boundary");
+}
+
 int
 ngx_http_cache_purge_operations_usage(ngx_http_cache_purge_operations_t *ops,
     ngx_http_cache_purge_operation_usage_t *out,
@@ -1575,21 +1591,13 @@ ngx_http_cache_purge_operations_usage(ngx_http_cache_purge_operations_t *ops,
 {
     ngx_http_cache_purge_op_tx_t            tx;
     ngx_http_cache_purge_operation_usage_t  usage;
-    uint64_t                                next;
 
     ngx_http_cache_purge_op_begin(&tx, ops, out);
     if (out != NULL) {
         memset(out, 0, sizeof(*out));
     }
-    next = ngx_http_cache_purge_op_counter(&tx, "M:op-next");
-    ngx_http_cache_purge_op_require(&tx, next != 0,
-                                    NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
-                                    "invalid operation sequence allocator");
-    usage.last_sequence = next - 1;
-    usage.retired_sequence =
-        ngx_http_cache_purge_op_counter(&tx, "M:op-retired");
-    ngx_http_cache_purge_op_require(&tx, usage.retired_sequence < next,
-        NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid retired origin boundary");
+    ngx_http_cache_purge_op_boundary(&tx, &usage.last_sequence,
+                                     &usage.retired_sequence);
     usage.live_records = ngx_http_cache_purge_op_counter(&tx, "M:op-live");
     usage.live_selector_bytes =
         ngx_http_cache_purge_op_counter(&tx, "M:op-bytes");
@@ -1604,27 +1612,22 @@ ngx_http_cache_purge_operations_origin(ngx_http_cache_purge_operations_t *ops,
     const ngx_http_cache_purge_watermark_t *origin,
     ngx_http_cache_rocksdb_error_t *error)
 {
-    ngx_http_cache_purge_operation_usage_t  usage;
-    int                                     rc;
+    ngx_http_cache_purge_op_tx_t  tx;
+    uint64_t                      last, retired;
 
-    rc = ngx_http_cache_purge_operations_usage(ops, &usage, error);
-    if (rc != 0) {
-        return rc;
-    }
-    if ((origin == NULL && usage.retired_sequence != 0)
+    ngx_http_cache_purge_op_begin(&tx, ops, &last);
+    /* Publication needs the writable interval, not live-operation usage. */
+    ngx_http_cache_purge_op_boundary(&tx, &last, &retired);
+    if (tx.status == 0
+        && ((origin == NULL && retired != 0)
         || (origin != NULL
             && (memcmp(origin->ledger, ops->ledger, 16)
-                || origin->sequence < usage.retired_sequence
-                || origin->sequence > usage.last_sequence)))
+                || origin->sequence < retired || origin->sequence > last))))
     {
-        if (error != NULL) {
-            error->code = NGX_HTTP_CACHE_ROCKSDB_CONFLICT;
-            snprintf(error->message, sizeof(error->message),
-                     "origin outside writable boundary");
-        }
-        return NGX_HTTP_CACHE_ROCKSDB_CONFLICT;
+        ngx_http_cache_purge_op_fail(&tx, NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+                                     "origin outside writable boundary");
     }
-    return 0;
+    return ngx_http_cache_purge_op_end(&tx, error);
 }
 
 static int

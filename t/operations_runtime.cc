@@ -950,10 +950,23 @@ main(int argc, char **argv)
             raw_write(store, "M:op-retired", "broken");
             fails(NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
                 [&] { Operations broken(store); });
+            ngx_http_cache_rocksdb_error_t boundary_error;
+            check(ngx_http_cache_purge_operations_origin(
+                      ops.native(), nullptr, &boundary_error)
+                      == NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                "publication rejects a malformed retired boundary");
             raw_write(store, "M:op-retired", std::string(8, '\xff'));
             fails(NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
                 [&] { Operations future(store); });
+            check(ngx_http_cache_purge_operations_origin(
+                      ops.native(), nullptr, &boundary_error)
+                      == NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                "publication rejects an inverted writable interval");
             raw_write(store, "M:op-retired", "", true);
+            check(ngx_http_cache_purge_operations_origin(
+                      ops.native(), nullptr, &boundary_error)
+                      == NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                "publication rejects a missing retired boundary before upgrade");
             before = writes(store);
             Operations upgraded(store);
             check(upgraded.usage().retired_sequence == last
@@ -965,6 +978,15 @@ main(int argc, char **argv)
             check(again.usage().retired_sequence == last
                       && writes(store) == before,
                 "normal reopen preserves the retired floor without writes");
+            check(ngx_http_cache_purge_operations_origin(
+                      nullptr, nullptr, &boundary_error)
+                      == NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                "publication rejects a missing operation handle");
+            raw_write(store, "M:op-next", std::string(8, '\0'));
+            check(ngx_http_cache_purge_operations_origin(
+                      again.native(), nullptr, &boundary_error)
+                      == NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                "publication rejects a zero sequence allocator");
         }
         close(store);
         ngx_http_cache_purge_test_submission();
