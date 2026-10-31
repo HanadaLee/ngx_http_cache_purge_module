@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define NGX_HTTP_CACHE_ROCKSDB_ABI  1
+#define NGX_HTTP_CACHE_ROCKSDB_ABI  2
 
 typedef struct ngx_http_cache_rocksdb_s        ngx_http_cache_rocksdb_t;
 typedef struct ngx_http_cache_rocksdb_cursor_s  ngx_http_cache_rocksdb_cursor_t;
@@ -65,6 +65,7 @@ typedef struct {
     uint32_t  cursor_lifetime_ms;
     uint32_t  max_open_files;
     uint32_t  background_jobs;
+    uint64_t  io_rate; /* background bytes per second; zero disables limiting */
 } ngx_http_cache_rocksdb_options_t;
 
 typedef enum {
@@ -103,7 +104,7 @@ typedef struct {
 } ngx_http_cache_rocksdb_stats_t;
 
 void ngx_http_cache_rocksdb_options(ngx_http_cache_rocksdb_options_t *options);
-uint32_t ngx_http_cache_rocksdb_abi_1(void);
+uint32_t ngx_http_cache_rocksdb_abi_2(void);
 
 /* Blocking APIs: call only on the owning worker's executor thread.
  * A handle belongs to its opening process/thread and must never cross fork,

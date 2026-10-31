@@ -8,6 +8,7 @@
 #include <rocksdb/db.h>
 #include <rocksdb/env.h>
 #include <rocksdb/filter_policy.h>
+#include <rocksdb/rate_limiter.h>
 #include <rocksdb/table.h>
 #include <rocksdb/write_buffer_manager.h>
 #include <sys/file.h>
@@ -365,13 +366,17 @@ ngx_http_cache_rocksdb_initialize(ngx_http_cache_rocksdb_t *store,
     options.target_file_size_base = options.write_buffer_size;
     options.max_bytes_for_level_base = options.write_buffer_size
         * options.level0_file_num_compaction_trigger;
+    if (store->options.io_rate != 0) {
+        options.rate_limiter.reset(rocksdb::NewGenericRateLimiter(
+            static_cast<int64_t>(store->options.io_rate), 1000, 10,
+            rocksdb::RateLimiter::Mode::kAllIo));
+    }
     options.max_open_files = static_cast<int>(store->options.max_open_files);
     options.max_background_jobs =
         static_cast<int>(store->options.background_jobs);
 #if (defined(__linux__))
-    /* Keep shared Env flush and compaction work at background priority. */
+    /* Compaction yields CPU; flushes must release the bounded write buffer. */
     options.env->LowerThreadPoolCPUPriority(rocksdb::Env::LOW);
-    options.env->LowerThreadPoolCPUPriority(rocksdb::Env::HIGH);
 #endif
     /* Keep bulk SST rewrites from displacing native cache pages. Point reads
      * retain buffered I/O; unsupported filesystems retain the old behavior. */
@@ -514,10 +519,11 @@ ngx_http_cache_rocksdb_options(ngx_http_cache_rocksdb_options_t *options)
     options->cursor_lifetime_ms = 1000;
     options->max_open_files = 64;
     options->background_jobs = 2;
+    options->io_rate = 16 << 20;
 }
 
 extern "C" uint32_t
-ngx_http_cache_rocksdb_abi_1(void)
+ngx_http_cache_rocksdb_abi_2(void)
 {
     return NGX_HTTP_CACHE_ROCKSDB_ABI;
 }
@@ -533,6 +539,8 @@ ngx_http_cache_rocksdb_open(const char *path,
     return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
         if (!output || !path || !*path || std::strlen(path) > 4096 || !options
             || options->abi != NGX_HTTP_CACHE_ROCKSDB_ABI
+            || (options->io_rate != 0 && options->io_rate < 1024)
+            || options->io_rate > INT64_MAX
             || options->cache_bytes < (4U << 20)
             || options->write_buffer_bytes < (1U << 20)
             || options->write_buffer_bytes > options->cache_bytes / 2

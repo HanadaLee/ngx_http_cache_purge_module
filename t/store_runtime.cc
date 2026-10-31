@@ -54,8 +54,8 @@ ngx_http_cache_purge_test_background_priority(int inherited)
                 result->set_value(getpriority(PRIO_PROCESS, 0));
             },
             result, pool);
-        require(future.get() == 19,
-            "RocksDB background pool uses the lowest nice priority");
+        require(future.get() == (pool == rocksdb::Env::LOW ? 19 : inherited),
+            "compaction yields CPU while flushes keep the owner priority");
     }
     require(getpriority(PRIO_PROCESS, 0) == inherited,
         "RocksDB scheduling leaves the caller priority unchanged");
@@ -157,6 +157,35 @@ close(ngx_http_cache_rocksdb_t *&store)
     expect(ngx_http_cache_rocksdb_close(&store, &error),
         NGX_HTTP_CACHE_ROCKSDB_OK, "close");
     require(store == nullptr, "store handle consumed");
+}
+
+static void
+ngx_http_cache_purge_test_options()
+{
+    ngx_http_cache_rocksdb_options_t options;
+    ngx_http_cache_rocksdb_options(&options);
+    ngx_http_cache_rocksdb_t *store = nullptr;
+    options.abi = NGX_HTTP_CACHE_ROCKSDB_ABI - 1;
+    expect(ngx_http_cache_rocksdb_open("/unused", &options, &store, &error),
+        NGX_HTTP_CACHE_ROCKSDB_INVALID, "reject an older options layout");
+    options.abi = NGX_HTTP_CACHE_ROCKSDB_ABI;
+    for (uint64_t rate : { uint64_t(1), uint64_t(1023), UINT64_MAX }) {
+        options.io_rate = rate;
+        expect(ngx_http_cache_rocksdb_open("/unused", &options, &store, &error),
+            NGX_HTTP_CACHE_ROCKSDB_INVALID, "reject invalid I/O rate");
+        require(store == nullptr, "invalid options do not create a store");
+    }
+    char path[] = "/tmp/cache-purge-unlimited-XXXXXX";
+    require(mkdtemp(path) != nullptr, "create unlimited I/O fixture");
+    options.io_rate = 0;
+    store = open(path, options);
+    write(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, "rate", "unlimited");
+    close(store);
+    ngx_http_cache_rocksdb_options(&options);
+    store = open(path, options);
+    require(get(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, "rate") == "unlimited",
+        "I/O rate changes preserve the existing database");
+    close(store);
 }
 
 static void
@@ -622,6 +651,7 @@ main(int argc, char **argv)
             return 0;
         }
 
+        ngx_http_cache_purge_test_options();
         ngx_http_cache_purge_test_direct_io();
         ngx_http_cache_purge_test_deferred();
         char path[] = "/tmp/cache-purge-store-test-XXXXXX";

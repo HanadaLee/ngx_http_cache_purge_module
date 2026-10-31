@@ -356,8 +356,20 @@ ngx_http_cache_purge_store(ngx_conf_t *cf, ngx_command_t *cmd, void *data)
             }
             main->options.write_buffer_bytes = (size_t) parsed;
             seen |= 2;
+        } else if (value[i].len > 8
+                   && ngx_strncmp(value[i].data, "io_rate=", 8) == 0
+                   && !(seen & 4))
+        {
+            size.data = value[i].data + 8;
+            size.len = value[i].len - 8;
+            parsed = ngx_parse_size(&size);
+            if (parsed != 0 && parsed < 1024) {
+                return "requires io_rate=0 or io_rate >= 1k";
+            }
+            main->options.io_rate = (uint64_t) parsed;
+            seen |= 4;
         } else {
-            return "accepts a path, cache=SIZE and buffer=SIZE";
+            return "accepts a path, cache=SIZE, buffer=SIZE and io_rate=SIZE";
         }
     }
     return NGX_CONF_OK;

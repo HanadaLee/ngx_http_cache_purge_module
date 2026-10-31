@@ -31,6 +31,7 @@ parser.add_argument('--request-delay', type=int, default=0, help='wrk delay in m
 parser.add_argument('--evict', action='store_true', help='Limit the native cache to 1 MiB during fill samples to exercise its cache manager')
 parser.add_argument('--seed-store', type=Path, help='Copy an offline, closed RocksDB store into each enabled run before nginx starts')
 parser.add_argument('--url-origin', default='http://bench.test', help='Scheme and host used by the configured purge URL identity')
+parser.add_argument('--io-rate', help='Override the store background I/O rate, for example 16m or 0')
 parser.add_argument('--profile', nargs='?', const='worker', choices=('worker', 'all'), help='Sample worker main threads or all nginx threads with perf; timing is diagnostic only')
 parser.add_argument('--owner-control', action='store_true', help='Also measure configured resources with the business location disabled')
 parser.add_argument('--hold-cleanup', action='store_true', help='Keep the first target unreadable to measure a rule without bulk file processing')
@@ -45,6 +46,8 @@ assert 0 < args.rules <= 256 and args.hot_path.startswith('/hot')
 assert not args.distinct_prefixes or args.bulk >= args.rules
 assert not args.evict or args.fills > 512
 assert re.fullmatch(r'https?://[a-zA-Z0-9.:-]+', args.url_origin)
+assert args.io_rate is None or re.fullmatch(r'(?:0|[1-9][0-9]*[kKmMgG]?)', args.io_rate)
+store_options = '' if args.io_rate is None else ' io_rate=' + args.io_rate
 root = Path(tempfile.mkdtemp(prefix='cache-simple-benchmark-'))
 calls = hot_calls = 0
 
@@ -96,6 +99,7 @@ report = {'root': str(root), 'binary': str(args.binary),
           'seed_store': str(args.seed_store) if args.seed_store else None,
           'seed_store_synced_in_cgroup': bool(args.seed_store and args.cgroup),
           'url_origin': args.url_origin,
+          'io_rate': args.io_rate,
           'owner_control': args.owner_control,
           'hold_cleanup': args.hold_cleanup,
           'admission_before_load': args.hold_cleanup,
@@ -191,7 +195,7 @@ os.close(descriptor)
         with socket.socket() as available:
             available.bind(('127.0.0.1', 0))
             port = available.getsockname()[1]
-        settings = f'''cache_purge_store {run}/store;
+        settings = f'''cache_purge_store {run}/store{store_options};
             cache_purge_state_zone purge 1m;
             cache_purge_key_url {args.url_origin}$uri;
             cache_purge_tag $upstream_http_cache_tag;

@@ -37,6 +37,10 @@ explicit index migration or a fresh cache-key namespace when first enabling
 this mode. The module does not infer historical identities from native keys or
 rebuild the index on ordinary HITs. Normal restarts reuse the persistent index.
 
+For a first MISS with no indexed file, a purge can complete before that
+in-flight response is stored. The old response can then become a HIT; strict
+prevention of this boundary is not implemented.
+
 ## Configuration contract
 
 The key module and purge module are independent. Purge identity comes from
@@ -106,6 +110,20 @@ validation proofs are stored by this index.
 RocksDB's target SST size and base-level capacity follow the write-buffer
 budget: 2 MiB and 8 MiB by default. They are compaction targets, not a limit on
 the total index size.
+
+The store's `io_rate=SIZE` parameter limits combined RocksDB flush and
+compaction reads/writes in bytes per second. It defaults to `16m`; `0` disables
+the limit, and nonzero values must be at least `1k`. For example:
+
+```nginx
+cache_purge_store /var/cache/nginx/index cache=16m buffer=4m io_rate=16m;
+```
+
+The limit uses RocksDB's rate limiter with a 1 ms refill interval. Ordinary
+index reads and WAL writes keep their existing behavior. Native cache-file
+cleanup still uses the executor's separate batch limit. The bridge options
+structure now uses ABI 2; rebuild both addons together. nginx's core ABI and
+the persisted index schema are unchanged.
 
 Background tasks use a durable admission record and an ordered pending queue.
 The nginx executor processes at most 8 files per batch, with at least 50 ms
@@ -199,6 +217,7 @@ connection to compare latency below saturation; it is not an open-loop load.
 `--seed-store` copies an offline, closed index before each enabled run; copied
 files are synchronized before measurement and charged to `--cgroup` when set.
 `--url-origin` selects the scheme and host of the configured purge URL identity.
+`--io-rate` overrides the store limit for comparisons with the same binary.
 `--cgroup` uses an existing Linux memory cgroup; `--profile` samples worker main
 threads with perf, while `--profile all` includes the cache manager and database
 threads. Profiling is for diagnosis, not latency acceptance. These focused

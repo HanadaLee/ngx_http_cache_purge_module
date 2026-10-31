@@ -428,6 +428,22 @@ output = (root / 'runtime.log').open('w')
 checks, responses = [], []
 expected_manager_exits = []
 
+if args.public_module:
+    store_directive = f'cache_purge_store {run}/store;'
+    assert config.count(store_directive) == 1
+    for value, valid in (('0', True), ('1k', True), ('16m', True),
+                         ('64m', True), ('1', False), ('1023', False),
+                         ('-1', False), ('bad', False),
+                         ('16m io_rate=32m', False)):
+        candidate = config.replace(store_directive,
+            f'cache_purge_store {run}/store io_rate={value};')
+        candidate = candidate.replace(str(run / 'error.log'), str(run / 'config-check.log'))
+        (run / 'config-check.conf').write_text(candidate)
+        result = subprocess.run([str(binary), '-t', '-p', str(run),
+            '-c', str(run / 'config-check.conf')], capture_output=True, text=True)
+        assert (result.returncode == 0) == valid, (value, result.stderr)
+    checks.append('store I/O rate accepts disabled and sized limits, rejects invalid and duplicate values')
+
 def start():
     proc = subprocess.Popen([str(binary), '-p', str(run), '-c', str(run / 'nginx.conf')],
                             stdout=output, stderr=subprocess.STDOUT)
