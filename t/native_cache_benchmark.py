@@ -11,6 +11,7 @@ import re
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -27,6 +28,8 @@ parser.add_argument('--server-cores', type=int, default=2)
 parser.add_argument('--fills', type=int, default=0)
 parser.add_argument('--fill-rate', type=int, default=500)
 parser.add_argument('--evict', action='store_true', help='Limit the native cache to 1 MiB during fill samples to exercise its cache manager')
+parser.add_argument('--seed-store', type=Path, help='Copy an offline, closed RocksDB store into each enabled run before nginx starts')
+parser.add_argument('--url-origin', default='http://bench.test', help='Scheme and host used by the configured purge URL identity')
 parser.add_argument('--profile', action='store_true', help='Sample worker main threads with perf; timing is diagnostic only')
 parser.add_argument('--owner-control', action='store_true', help='Also measure configured resources with the business location disabled')
 parser.add_argument('--hold-cleanup', action='store_true', help='Keep the first target unreadable to measure a rule without bulk file processing')
@@ -39,6 +42,7 @@ assert args.seconds > 0 and args.rounds >= 0 and args.bulk > 0
 assert 0 < args.rules <= 256 and args.hot_path.startswith('/hot')
 assert not args.distinct_prefixes or args.bulk >= args.rules
 assert not args.evict or args.fills > 512
+assert re.fullmatch(r'https?://[a-zA-Z0-9.:-]+', args.url_origin)
 root = Path(tempfile.mkdtemp(prefix='cache-simple-benchmark-'))
 calls = hot_calls = 0
 
@@ -83,6 +87,9 @@ report = {'root': str(root), 'binary': str(args.binary),
           'connections': args.connections, 'seconds': args.seconds,
           'fills': args.fills, 'fill_rate': args.fill_rate,
           'native_eviction': args.evict,
+          'seed_store': str(args.seed_store) if args.seed_store else None,
+          'seed_store_synced_in_cgroup': bool(args.seed_store and args.cgroup),
+          'url_origin': args.url_origin,
           'owner_control': args.owner_control,
           'hold_cleanup': args.hold_cleanup,
           'admission_before_load': args.hold_cleanup,
@@ -158,12 +165,28 @@ try:
         run = root / str(number)
         (run / 'cache').mkdir(parents=True)
         (run / 'logs').mkdir()
+        if enabled and args.seed_store:
+            subprocess.run([sys.executable, '-c',
+                            '''import os,shutil,sys
+from pathlib import Path
+target = Path(sys.argv[2])
+shutil.copytree(sys.argv[1], target)
+for path in target.rglob('*'):
+    if path.is_file():
+        with path.open('rb') as handle:
+            os.fsync(handle.fileno())
+descriptor = os.open(target, os.O_RDONLY | os.O_DIRECTORY)
+os.fsync(descriptor)
+os.close(descriptor)
+''',
+                            str(args.seed_store), str(run / 'store')],
+                           preexec_fn=setup_child, check=True)
         with socket.socket() as available:
             available.bind(('127.0.0.1', 0))
             port = available.getsockname()[1]
         settings = f'''cache_purge_store {run}/store;
             cache_purge_state_zone purge 1m;
-            cache_purge_key_url http://bench.test$uri;
+            cache_purge_key_url {args.url_origin}$uri;
             cache_purge_tag $upstream_http_cache_tag;
             location /management/ {{ cache_purge_api; }}
             location = /control {{
@@ -225,7 +248,7 @@ http {{
             for i in range(args.rules):
                 group = f'{i:04d}/' if args.distinct_prefixes else ''
                 status, _, body = request('/control', 'PURGE', {
-                    'X-Target': 'http://bench.test/bulk/' + group,
+                    'X-Target': args.url_origin + '/bulk/' + group,
                     'X-Cache-Purge-Type': 'prefix'})
                 assert status == 202, (status, body)
                 operations.append(json.loads(body)['operation_id'])
@@ -375,7 +398,7 @@ http {{
                         assert fill_stats['files'] == args.fills, fill_stats
                     if active:
                         status, _, body = request('/control', 'PURGE', {
-                            'X-Target': 'http://bench.test/fill/', 'X-Cache-Purge-Type': 'prefix'})
+                            'X-Target': args.url_origin + '/fill/', 'X-Cache-Purge-Type': 'prefix'})
                         assert status == 202, (status, body)
                         identifier = json.loads(body)['operation_id']
                         deadline = time.monotonic() + max(30, args.fills / 50)
