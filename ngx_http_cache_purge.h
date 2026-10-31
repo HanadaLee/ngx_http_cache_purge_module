@@ -110,6 +110,15 @@ ngx_int_t ngx_http_cache_purge_client_validate_file(
     const int fds[2], ngx_msec_t timeout,
     ngx_http_cache_purge_client_done_pt done, void *data,
     ngx_http_cache_purge_call_t **call);
+ngx_int_t ngx_http_cache_purge_client_prepare_validation(
+    ngx_http_cache_purge_client_t *client, const ngx_str_t *payload,
+    const int fds[2], ngx_msec_t timeout,
+    ngx_http_cache_purge_client_done_pt done, void *data,
+    ngx_http_cache_purge_call_t **call);
+ngx_int_t ngx_http_cache_purge_client_finish_validation(
+    ngx_http_cache_purge_client_t *client, const ngx_str_t *payload,
+    int lease_fd, ngx_msec_t timeout, ngx_http_cache_purge_client_done_pt done,
+    void *data, ngx_http_cache_purge_call_t **call);
 
 /* Retire only the selected native header/instance, then let the existing
  * persistent retired-file collector finish physical deletion and accounting. */

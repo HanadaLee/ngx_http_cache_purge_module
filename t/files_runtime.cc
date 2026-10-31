@@ -332,6 +332,7 @@ validation(
     const std::string &mode, const std::string &path, bool with_origin = false)
 {
     bool recovering = mode.find("--validate-recover") == 0;
+    bool offloaded = mode.find("--validate-io") == 0;
     bool race = mode == "--validate-race-intent";
     with_origin = with_origin || race;
     std::filesystem::create_directories(path + "/cache");
@@ -446,7 +447,7 @@ validation(
     input.replace_tags = 1;
     input.origin = with_origin ? &origin : nullptr;
     ngx_http_cache_purge_index_match_t result{};
-    if (!recovering) {
+    if (!recovering && !offloaded) {
         Descriptor selected(open(target.c_str(), O_RDONLY | O_CLOEXEC));
         if (mode == "--validate-basic") {
             check(ngx_http_cache_purge_publications_validate_prepare(
@@ -638,6 +639,101 @@ validation(
             _exit(0);
         }
     }
+    if (offloaded) {
+        Descriptor selected(open(target.c_str(), O_RDONLY | O_CLOEXEC));
+        ngx_http_cache_purge_publication_wait_t wait{};
+        ngx_http_cache_purge_file_marker_t marker{};
+        auto prepare = [&]() {
+            return ngx_http_cache_purge_publications_validate_prepare_io(
+                publications.native(), store, &input, anchor.fd, lease.fd,
+                selected.fd, getuid(), &wait, validation_guard, nullptr,
+                &result, &error);
+        };
+        check(ngx_http_cache_purge_test_watch_file(
+                  selected.fd, 0, nullptr, nullptr) == 0,
+            "watch offloaded validation barriers");
+        check(prepare() == NGX_HTTP_CACHE_ROCKSDB_BUSY
+                  && wait.store == store && wait.ticket != 0,
+            "offloaded preparation waits for durable intent");
+        check(ngx_http_cache_rocksdb_sync(store, &error) == 0,
+            "synchronize offloaded preparation");
+        check(prepare() == 0 && wait.store == nullptr
+                  && result.revision == 3 && index.has_fill_intent(file.id)
+                  && index.get(file.id).tags == file.tags
+                  && ngx_http_cache_purge_test_file_sync_count() == 0
+                  && ngx_http_cache_purge_file_marker_read(
+                         selected.fd, &marker, &error) == 0
+                  && marker.state == NGX_HTTP_CACHE_PURGE_FILE_READY,
+            "prepared I/O leaves the old header and proof unchanged");
+        check(ngx_http_cache_purge_publications_validate_finish_synced(
+                  publications.native(), store, file.id.data(),
+                  input.transaction, 2, anchor.fd, lease.fd, getuid(),
+                  validation_guard, nullptr, &result, &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "completion cannot precede header I/O and revocation");
+        if (mode == "--validate-io-crash-before") {
+            _exit(0);
+        }
+        auto plan = index.get(file.id).metadata;
+        auto synchronize = [&]() {
+            return ngx_http_cache_purge_file_sync_validation(selected.fd,
+                file.id.data(), input.transaction, 2, bytes(plan),
+                bytes(target), file.root.size(), &error);
+        };
+        auto wrong = input;
+        wrong.transaction[0] ^= 1;
+        check(ngx_http_cache_purge_file_sync_validation(selected.fd,
+                  file.id.data(), wrong.transaction, 2, bytes(plan),
+                  bytes(target), file.root.size(), &error)
+                  == NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+            "file I/O rejects another transaction before mutation");
+        unsigned fail = mode == "--validate-io-revoke-failure" ? 1 :
+                        mode == "--validate-io-header-failure" ? 2 : 0;
+        check(ngx_http_cache_purge_test_watch_file(
+                  selected.fd, fail, nullptr, nullptr) == 0,
+            "arm offloaded file synchronization failure");
+        int rc = synchronize();
+        if (fail) {
+            std::string header(8, '\0');
+            check(rc == NGX_HTTP_CACHE_ROCKSDB_IO
+                      && pread(selected.fd, header.data(), header.size(), 0) == 8
+                      && header == (fail == 1 ? before : after)
+                      && index.get(file.id).revision == 3
+                      && ngx_http_cache_purge_file_marker_read(
+                             selected.fd, &marker, &error) == 0
+                      && marker.state == NGX_HTTP_CACHE_PURGE_FILE_REVOKED,
+                "failed I/O cannot publish READY or commit validation");
+            check(ngx_http_cache_purge_test_watch_file(
+                      selected.fd, 0, nullptr, nullptr) == 0,
+                "clear offloaded I/O failure");
+            rc = synchronize();
+        }
+        check(rc == 0 && index.get(file.id).revision == 3
+                  && index.has_fill_intent(file.id)
+                  && index.get(file.id).tags == file.tags
+                  && ngx_http_cache_purge_test_file_sync_count()
+                         == (fail == 2 ? 1u : 2u)
+                  && ngx_http_cache_purge_file_marker_read(
+                         selected.fd, &marker, &error) == 0
+                  && marker.state == NGX_HTTP_CACHE_PURGE_FILE_REVOKED,
+            "file pool performs durable I/O without publishing index or READY");
+        if (mode == "--validate-io-crash-after") {
+            _exit(0);
+        }
+        check(ngx_http_cache_purge_test_watch_file(
+                  selected.fd, 0, nullptr, nullptr) == 0,
+            "watch final validation transaction");
+        check(ngx_http_cache_purge_publications_validate_finish_synced(
+                  publications.native(), store, file.id.data(),
+                  input.transaction, 2, anchor.fd, lease.fd, getuid(),
+                  validation_guard,
+                  mode == "--validate-io-veto" ? &input : nullptr,
+                  &result, &error) == 0
+                  && ngx_http_cache_purge_test_file_sync_count() == 0,
+            "guarded final transaction does not repeat synchronized file I/O");
+        check(ngx_http_cache_purge_test_watch_file(-1, 0, nullptr, nullptr) == 0,
+            "release offloaded validation observation");
+    }
     if (mode == "--validate-recover-reject") {
         check(ngx_http_cache_purge_publications_validate_finish(
                   publications.native(), store, file.id.data(), nullptr, 0,
@@ -654,7 +750,9 @@ validation(
         return 0;
     }
     int completed;
-    if (mode == "--validate-deferred-veto") {
+    if (offloaded) {
+        completed = 0;
+    } else if (mode == "--validate-deferred-veto") {
         completed = ngx_http_cache_purge_publications_validate_finish_checked(
             publications.native(), store, file.id.data(), nullptr, 0,
             anchor.fd, lease.fd, getuid(), validation_guard, &input, &result,

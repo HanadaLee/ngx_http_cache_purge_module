@@ -230,6 +230,7 @@ location /rpc/ {{ cache_purge_test_rpc runtime; }}
 location /rpc-files/ {{ client_body_in_file_only on; cache_purge_test_rpc runtime; }}
 location /rpc-files-fake/ {{ client_body_in_file_only on; cache_purge_test_rpc {rpc_socket}; }}
 location /rpc-fake/ {{ cache_purge_test_rpc {rpc_socket}; }}
+location /rpc-priority/ {{ cache_purge_test_rpc {rpc_socket}; cache_purge_test_rpc_pending 16; }}
 location /rpc-wrong/ {{ cache_purge_test_rpc {rpc_socket}; cache_purge_test_rpc_wrong_uid on; }}
 location /rpc-missing/ {{ cache_purge_test_rpc {self.path}/missing.sock; }}
 '''

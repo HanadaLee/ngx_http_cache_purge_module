@@ -258,6 +258,14 @@ class Client:
             return reply[:-16]
         return reply
 
+    def validation_stage(self, operation, data, fds, code=0):
+        assert operation in (33, 34)
+        packet = self.packet(operation, data)
+        assert self.socket.sendmsg([packet[:1]], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                                  array.array('i', fds))]) == 1
+        self.socket.sendall(packet[1:])
+        return self.reply(operation, code)
+
     def admit_file(self, target, key, url, fd, code=0, host='business.test'):
         fields = (*target, key, url)
         if host is not None:
@@ -1098,6 +1106,76 @@ try:
     assert v.call(2, identity(608)) == original and target.read_bytes() == contents
     os.close(lease); os.close(selected)
     check(True, 'proposed TAGs are checked before preparation: newer 304 coverage satisfies Invalidate but cannot satisfy Delete for the old full entity')
+
+    def apply_validation_io(target):
+        # Model only the worker's filesystem step. The C helper itself is
+        # covered by files_runtime; these cases exercise the actual IPC owner.
+        marker = os.getxattr(target, 'user.ngx_cache_purge.id')
+        fd = os.open(target, os.O_RDWR | os.O_CLOEXEC)
+        try:
+            os.setxattr(fd, 'user.ngx_cache_purge.id', b'NCF1\0\0\0\4' + marker[8:40])
+            os.fsync(fd)
+            assert os.pwrite(fd, b'new-head', 0) == 8
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    current = validating.watermark()
+    target, lease, selected = make_validation_file(8612, '/offloaded', metadata=current)
+    packet = validation_packet(8612, tags=['io-new-tag'], origin=current)
+    prepared = v.validation_stage(33, packet, [lease, selected])
+    assert prepared[0] == 1 and int.from_bytes(prepared[1:5], 'big') == len(prepared) - 5
+    assert prepared[5:9] == b'NFV2'
+    assert target.read_bytes() == b'old-head' + b'body' * 16384
+    assert os.getxattr(target, 'user.ngx_cache_purge.id')[7] == 2
+    assert v.call(2, identity(8612))[:9] == b'\x02' + struct.pack('>Q', 3)
+    assert v.page(5, 'tag-8612', 'team')[0] == [8612]
+    assert v.page(5, 'io-new-tag', 'team')[0] == []
+    finish = identity(8612) + identity(1) + struct.pack('>Q', 2)
+    v.validation_stage(34, finish, [lease], code=7)
+    assert v.call(2, identity(8612))[:9] == b'\x02' + struct.pack('>Q', 3)
+    apply_validation_io(target)
+    v.validation_stage(34, finish, [lease])
+    assert v.call(2, identity(8612))[:9] == b'\x02' + struct.pack('>Q', 4)
+    assert v.page(5, 'io-new-tag', 'team')[0] == [8612]
+    assert v.page(5, 'tag-8612', 'team')[0] == []
+    assert os.getxattr(target, 'user.ngx_cache_purge.id')[7] == 2
+    writes = struct.unpack('>9Q', v.call(1))[1]
+    assert v.validation_stage(33, packet, [lease, selected]) == b'\0'
+    v.validation_stage(34, finish, [lease])
+    assert struct.unpack('>9Q', v.call(1))[1] == writes
+    os.close(lease); os.close(selected)
+    check(True, 'offloaded validation publishes only after durable I/O and replays both IPC stages without writes')
+
+    for n, proposed in ((8613, False), (8614, True)):
+        current = validating.watermark()
+        target, lease, selected = make_validation_file(n, f'/offloaded-{n}', metadata=current)
+        tag = f'io-proposed-{n}'
+        packet = validation_packet(n, tags=[tag], origin=current)
+        assert v.validation_stage(33, packet, [lease, selected])[0] == 1
+        apply_validation_io(target)
+        validation_operation(f'io-veto-{n}', 5, tag if proposed else f'tag-{n}',
+                             'team', mode=2 if proposed else 1)
+        wait_for(lambda: struct.unpack('>IQ', v.call(16))[0] == 6)
+        v.validation_stage(34, identity(n) + identity(1) + struct.pack('>Q', 2), [lease])
+        assert v.call(2, identity(n))[0] == 3
+        assert os.getxattr(target, 'user.ngx_cache_purge.id')[7] == 4
+        assert target.read_bytes() == b'new-head' + b'body' * 16384
+        os.close(lease); os.close(selected)
+        check(True, 'new rule after offloaded I/O vetoes ' + ('proposed TAGs' if proposed else 'old TAGs'))
+
+    current = validating.watermark()
+    target, lease, selected = make_validation_file(8615, '/offloaded-recovery', metadata=current)
+    detached = Client(validating.path)
+    assert detached.validation_stage(33, validation_packet(8615, origin=current),
+                                     [lease, selected])[0] == 1
+    detached.close()
+    assert target.read_bytes().startswith(b'old-head')
+    os.close(lease); os.close(selected)
+    wait_for(lambda: v.call(2, identity(8615))[:9] == b'\x02' + struct.pack('>Q', 4))
+    assert target.read_bytes() == b'new-head' + b'body' * 16384
+    assert os.getxattr(target, 'user.ngx_cache_purge.id')[7] == 2
+    check(True, 'orphan offloaded preparation recovers conservatively without a worker synchronization assertion')
 
     target, lease, selected = make_validation_file(601, '/validate')
     packet = validation_packet(601, tags=['new-tag'])

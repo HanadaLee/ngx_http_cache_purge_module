@@ -16,6 +16,7 @@ from pathlib import Path
 
 def run_client_cases(Run, root, checks):
     frames, lock = [], threading.Lock()
+    priority_order = []
     gate, waiting = threading.Event(), threading.Event()
 
     def count(op):
@@ -55,9 +56,13 @@ def run_client_cases(Run, root, checks):
                     magic, version, op, label, size, result = struct.unpack('>4sHHQII', first + self.take(23))
                     assert magic == b'NCP1' and version == 2 and result == 0 and size <= 524288
                     data = self.take(size)
-                    assert len(rights) == (2 if op == 18 else 1 if op == 21 else 0)
+                    assert len(rights) == (2 if op == 18 else 1 if op in (21, 34) else 0)
                     with lock:
                         frames.append(op)
+                        if data.startswith(b'priority-'):
+                            priority_order.append(data)
+                    if op == 34:
+                        os.close(rights.pop())
                     if op == 21:
                         body = os.pread(rights[0], 32, 0)
                         self.request.sendall(struct.pack('>4sHHQII', magic, version, op, label, len(body), 0) + body)
@@ -277,6 +282,47 @@ def run_client_cases(Run, root, checks):
         assert value[0] == 504 and value[1]['X-IPC-Ambiguous'] == '1'
         assert time.monotonic() - started < .6
         checks.append('partial progress does not extend the absolute call deadline')
+
+        def priority_stats():
+            status, _, data = rpc('/rpc-priority/?stats=1')
+            assert status == 200
+            return json.loads(data)
+
+        gate.clear(); waiting.clear()
+        with concurrent.futures.ThreadPoolExecutor(8) as pool:
+            active = pool.submit(rpc, '/rpc-priority/?op=110', b'priority-gate')
+            until(waiting.is_set)
+            ordinary = pool.submit(rpc, '/rpc-priority/?op=100', b'priority-ordinary')
+            until(lambda: priority_stats()['pending'] == 2)
+            finishes = []
+            for i in range(6):
+                finishes.append(pool.submit(rpc, '/rpc-priority/?op=34',
+                                             f'priority-finish-{i}'.encode()))
+                until(lambda: priority_stats()['pending'] == i + 3)
+            assert priority_order == [b'priority-gate']
+            gate.set()
+            assert active.result()[2] == b'priority-gate'
+            assert ordinary.result()[2] == b'priority-ordinary'
+            assert all(f.result()[2] == f'priority-finish-{i}'.encode()
+                       for i, f in enumerate(finishes))
+        expected = ([b'priority-gate'] + [f'priority-finish-{i}'.encode() for i in range(4)]
+                    + [b'priority-ordinary'] + [b'priority-finish-4', b'priority-finish-5'])
+        assert priority_order == expected, priority_order
+        assert priority_stats()['pending'] == 0
+        checks.append('validation completion overtakes queued preparation without preempting an active frame and yields to FIFO after four completions')
+        gate.clear(); waiting.clear()
+        sent = count(34)
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            active = pool.submit(rpc, '/rpc-priority/?op=110', b'priority-gate-timeout')
+            until(waiting.is_set)
+            value = rpc('/rpc-priority/?op=34&timeout=30', b'priority-expired')
+            assert value[0] == 504 and value[1]['X-IPC-Ambiguous'] == '0'
+            assert count(34) == sent and priority_stats()['pending'] == 1
+            gate.set()
+            assert active.result()[2] == b'priority-gate-timeout'
+        assert priority_stats()['pending'] == 0
+        gate.clear(); waiting.clear()
+        checks.append('an expired queued validation completion releases its rights without sending or disturbing the active frame')
 
         before = count(109)
         with concurrent.futures.ThreadPoolExecutor(1) as pool:

@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define NGX_HTTP_CACHE_PURGE_COMPONENT_ABI 13
+#define NGX_HTTP_CACHE_PURGE_COMPONENT_ABI 14
 #define NGX_HTTP_CACHE_PURGE_PROTOCOL_VERSION 2
 #define NGX_HTTP_CACHE_PURGE_FRAME_SIZE 24
 
@@ -85,7 +85,13 @@ typedef enum {
     /* Opcode 31 is retired and must not be reused.
      * key/URL/host/namespace strings, main[16], encoded request headers ->
      * Invalidate/Delete times and publication (three u64), asynchronously. */
-    NGX_HTTP_CACHE_PURGE_OP_OBJECT_PROPAGATION = 32
+    NGX_HTTP_CACHE_PURGE_OP_OBJECT_PROPAGATION = 32,
+    /* VALIDATE_FILE input/FDs -> pending byte, then a durable plan string.
+     * Completed receipt replay returns only a zero pending byte. */
+    NGX_HTTP_CACHE_PURGE_OP_PREPARE_VALIDATION,
+    /* ID, transaction, original revision; one lease FD. The live worker
+     * asserts completed file I/O under that lease. Returns a compact match. */
+    NGX_HTTP_CACHE_PURGE_OP_FINISH_VALIDATION
 } ngx_http_cache_purge_opcode_e;
 
 #define NGX_HTTP_CACHE_PURGE_ROOT_CACHE 1
@@ -158,7 +164,7 @@ typedef struct {
 void ngx_http_cache_purge_component_options(
     ngx_http_cache_purge_component_options_t *options);
 /* Link-time header/archive compatibility marker. */
-uint32_t ngx_http_cache_purge_component_abi_13(void);
+uint32_t ngx_http_cache_purge_component_abi_14(void);
 
 /* Only start after fork in the selected nginx worker, never while parsing
  * configuration or in master. Copies its inputs and starts one executor thread.
@@ -1461,6 +1467,26 @@ int ngx_http_cache_purge_publications_validate_prepare_deferred(
     ngx_http_cache_purge_validation_guard_pt guard, void *guard_data,
     ngx_http_cache_purge_index_match_t *out,
     ngx_http_cache_rocksdb_error_t *error);
+/* Persist the same bounded plan, but leave file mutation to the caller's
+ * filesystem pool after the WAL wait completes. The caller keeps its lease. */
+int ngx_http_cache_purge_publications_validate_prepare_io(
+    ngx_http_cache_purge_publications_t *publications,
+    ngx_http_cache_rocksdb_t *store,
+    const ngx_http_cache_purge_validation_t *validation,
+    int anchor_fd, int lease_fd, int selected_fd, uint32_t peer_uid,
+    ngx_http_cache_purge_publication_wait_t *wait,
+    ngx_http_cache_purge_validation_guard_pt guard, void *guard_data,
+    ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+/* The plan must come from successful durable preparation. Hold the same lease
+ * throughout this call and final completion. No index access or READY publish
+ * occurs here. The selected native descriptor is borrowed and may be read-only.
+ */
+int ngx_http_cache_purge_file_sync_validation(int selected_fd,
+    const unsigned char id[16], const unsigned char transaction[16],
+    uint64_t revision, ngx_http_cache_rocksdb_bytes_t metadata,
+    ngx_http_cache_rocksdb_bytes_t target, size_t target_root,
+    ngx_http_cache_rocksdb_error_t *error);
 /* NULL transaction and revision zero select the persisted plan for recovery.
  * A missing/replaced final file may return a RETIRED result. */
 int ngx_http_cache_purge_publications_validate_finish(
@@ -1474,6 +1500,17 @@ int ngx_http_cache_purge_publications_validate_finish(
  * the header. CONFLICT discards the pending instance instead of publishing it.
  * Completed receipt replay does not perform a new validation transaction. */
 int ngx_http_cache_purge_publications_validate_finish_checked(
+    ngx_http_cache_purge_publications_t *publications,
+    ngx_http_cache_rocksdb_t *store, const unsigned char id[16],
+    const unsigned char transaction[16], uint64_t revision,
+    int anchor_fd, int lease_fd, uint32_t peer_uid,
+    ngx_http_cache_purge_validation_guard_pt guard, void *guard_data,
+    ngx_http_cache_purge_index_match_t *out,
+    ngx_http_cache_rocksdb_error_t *error);
+/* Volatile assertion by the worker that file_sync_validation succeeded under
+ * this still-held lease. Recheck the exact header, revoked marker and current
+ * rules; never infer this assertion from disk or use it during recovery. */
+int ngx_http_cache_purge_publications_validate_finish_synced(
     ngx_http_cache_purge_publications_t *publications,
     ngx_http_cache_rocksdb_t *store, const unsigned char id[16],
     const unsigned char transaction[16], uint64_t revision,

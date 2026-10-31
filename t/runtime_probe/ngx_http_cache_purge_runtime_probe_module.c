@@ -6,6 +6,7 @@
 extern ngx_module_t ngx_http_cache_purge_runtime_probe_module;
 typedef struct {
     ngx_flag_t                     enabled, wrong_uid;
+    ngx_uint_t                     pending;
     ngx_str_t                      rpc;
     ngx_http_cache_purge_client_t *client;
 } ngx_http_cache_purge_probe_conf_t;
@@ -84,6 +85,13 @@ static ngx_command_t  ngx_http_cache_purge_probe_commands[] = {
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_cache_purge_probe_conf_t, wrong_uid),
+      NULL },
+
+    { ngx_string("cache_purge_test_rpc_pending"),
+      NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_cache_purge_probe_conf_t, pending),
       NULL },
 
     { ngx_string("cache_purge_test_enable_agent"),
@@ -252,7 +260,7 @@ ngx_http_cache_purge_probe_rpc_client(ngx_http_request_t *r)
         r, ngx_http_cache_purge_runtime_probe_module);
     ngx_http_cache_purge_client_options(&options);
     options.server_uid = main->owner_uid + (conf->wrong_uid == 1 ? 1 : 0);
-    options.max_pending = 4;
+    options.max_pending = conf->pending;
     options.max_payload = 524288;
     options.request_bytes = 524312;
     slot = ngx_array_push(&main->clients);
@@ -471,6 +479,7 @@ ngx_http_cache_purge_probe_rpc_body(ngx_http_request_t *r)
     ngx_str_t                         payload = ngx_null_string, value;
     ngx_int_t op = NGX_HTTP_CACHE_PURGE_OP_PING, timeout = 2000, rc;
     u_char   *p;
+    int       fd;
 
     client = ngx_http_cache_purge_probe_rpc_client(r);
     if (client == NULL) {
@@ -521,9 +530,21 @@ ngx_http_cache_purge_probe_rpc_body(ngx_http_request_t *r)
     ctx->request = r;
     cleanup->handler = ngx_http_cache_purge_probe_rpc_cleanup;
     cleanup->data = ctx;
-    rc = ngx_http_cache_purge_client_submit(
-        client, (uint16_t) op, &payload, timeout,
-        ngx_http_cache_purge_probe_rpc_done, ctx, &ctx->call);
+    if (op == NGX_HTTP_CACHE_PURGE_OP_FINISH_VALIDATION) {
+        fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            ngx_http_finalize_request(r, 500);
+            return;
+        }
+        rc = ngx_http_cache_purge_client_finish_validation(client, &payload,
+                 fd, timeout, ngx_http_cache_purge_probe_rpc_done, ctx,
+                 &ctx->call);
+        close(fd);
+    } else {
+        rc = ngx_http_cache_purge_client_submit(
+            client, (uint16_t) op, &payload, timeout,
+            ngx_http_cache_purge_probe_rpc_done, ctx, &ctx->call);
+    }
     if (rc != NGX_OK) {
         ngx_http_finalize_request(r, rc == NGX_BUSY ? 503 : 500);
     } else {
@@ -678,6 +699,7 @@ ngx_http_cache_purge_probe_create(ngx_conf_t *cf)
     if (conf) {
         conf->enabled = NGX_CONF_UNSET;
         conf->wrong_uid = NGX_CONF_UNSET;
+        conf->pending = NGX_CONF_UNSET_UINT;
     }
     return conf;
 }
@@ -732,6 +754,7 @@ ngx_http_cache_purge_probe_merge(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_cache_purge_probe_conf_t *conf = child;
     ngx_conf_merge_value(conf->enabled, prev->enabled, 0);
     ngx_conf_merge_value(conf->wrong_uid, prev->wrong_uid, 0);
+    ngx_conf_merge_uint_value(conf->pending, prev->pending, 4);
     ngx_conf_merge_str_value(conf->rpc, prev->rpc, "");
     return NGX_CONF_OK;
 }

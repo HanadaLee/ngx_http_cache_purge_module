@@ -1091,6 +1091,7 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
         break;
 
     case NGX_HTTP_CACHE_PURGE_OP_VALIDATE_FILE:
+    case NGX_HTTP_CACHE_PURGE_OP_PREPARE_VALIDATION:
         memset(&validation, 0, sizeof(validation));
         ngx_http_cache_purge_component_id(&d, validation.file.id);
         validation.file.revision =
@@ -1124,17 +1125,50 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
         validation_guard.operations = &c->operations;
         rc = ngx_http_cache_purge_component_anchor(c, error);
         if (rc == 0) {
-            rc = ngx_http_cache_purge_publications_validate_prepare_deferred(
-                c->publications, store, &validation, c->lease_anchor,
-                p->input_rights[0], p->input_rights[1], p->uid,
-                &p->publication_wait,
-                ngx_http_cache_purge_component_validation_guard,
-                &validation_guard, &matches[0], error);
+            if (p->request.opcode
+                == NGX_HTTP_CACHE_PURGE_OP_PREPARE_VALIDATION)
+            {
+                rc = ngx_http_cache_purge_publications_validate_prepare_io(
+                    c->publications, store, &validation, c->lease_anchor,
+                    p->input_rights[0], p->input_rights[1], p->uid,
+                    &p->publication_wait,
+                    ngx_http_cache_purge_component_validation_guard,
+                    &validation_guard, &matches[0], error);
+            } else {
+                rc =
+                    ngx_http_cache_purge_publications_validate_prepare_deferred(
+                        c->publications, store, &validation, c->lease_anchor,
+                        p->input_rights[0], p->input_rights[1], p->uid,
+                        &p->publication_wait,
+                        ngx_http_cache_purge_component_validation_guard,
+                        &validation_guard, &matches[0], error);
+            }
         }
         if (rc == NGX_HTTP_CACHE_ROCKSDB_BUSY
             && p->publication_wait.store != NULL)
         {
             rc = NGX_HTTP_CACHE_PURGE_COMPONENT_PENDING;
+            break;
+        }
+        if (p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_PREPARE_VALIDATION) {
+            if (rc == 0) {
+                rc = ngx_http_cache_purge_index_get_file(store, matches[0].id,
+                                                          &file, error);
+            }
+            if (rc == 0 && file.metadata.len >= 4
+                && memcmp(file.metadata.data, "NFV2", 4) == 0)
+            {
+                ngx_http_cache_purge_component_put_integer(e, 1, 1);
+                ngx_http_cache_purge_component_put_string(e, file.metadata);
+            } else if (rc == 0 && file.metadata.len >= 4
+                       && memcmp(file.metadata.data, "NFR1", 4) == 0)
+            {
+                ngx_http_cache_purge_component_put_integer(e, 0, 1);
+            } else if (rc == 0) {
+                rc = ngx_http_cache_purge_component_error(error,
+                    NGX_HTTP_CACHE_ROCKSDB_CORRUPT,
+                    "prepared validation plan is missing");
+            }
             break;
         }
         if (rc == 0) {
@@ -1166,6 +1200,28 @@ ngx_http_cache_purge_component_dispatch(ngx_http_cache_purge_component_t *c,
             ngx_http_cache_purge_component_put_file(e, &file);
             ngx_http_cache_purge_component_put_integer(e, publication, 8);
             ngx_http_cache_purge_component_put_integer(e, invalidate, 8);
+        }
+        break;
+
+    case NGX_HTTP_CACHE_PURGE_OP_FINISH_VALIDATION:
+        ngx_http_cache_purge_component_id(&d, validation.file.id);
+        ngx_http_cache_purge_component_id(&d, validation.transaction);
+        validation.file.revision =
+            ngx_http_cache_purge_component_integer(&d, 8);
+        if ((rc = ngx_http_cache_purge_component_end(&d)) != 0) {
+            break;
+        }
+        rc = ngx_http_cache_purge_component_anchor(c, error);
+        if (rc == 0) {
+            rc = ngx_http_cache_purge_publications_validate_finish_synced(
+                c->publications, store, validation.file.id,
+                validation.transaction, validation.file.revision,
+                c->lease_anchor, p->input_rights[0], p->uid,
+                ngx_http_cache_purge_component_validation_finish_guard, c,
+                &matches[0], error);
+        }
+        if (rc == 0) {
+            ngx_http_cache_purge_component_put_match(e, &matches[0]);
         }
         break;
 
@@ -2049,6 +2105,9 @@ ngx_http_cache_purge_component_read(ngx_http_cache_purge_component_t *c,
                 "invalid component request size/result");
         }
         expected =
+            p->request.opcode
+                        == NGX_HTTP_CACHE_PURGE_OP_PREPARE_VALIDATION ? 2 :
+            p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_FINISH_VALIDATION ? 1 :
             p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_VALIDATE_FILE ? 2 :
             p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_PREPARE_FILE ? 2 :
             p->request.opcode == NGX_HTTP_CACHE_PURGE_OP_FINISH_FILE  ? 1 :
@@ -3772,7 +3831,7 @@ ngx_http_cache_purge_component_options(
 }
 
 uint32_t
-ngx_http_cache_purge_component_abi_13(void)
+ngx_http_cache_purge_component_abi_14(void)
 {
     return NGX_HTTP_CACHE_PURGE_COMPONENT_ABI;
 }

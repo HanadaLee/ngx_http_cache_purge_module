@@ -94,7 +94,7 @@ ngx_http_cache_purge_runtime_create(ngx_conf_t *cf)
     layout->vary_capacity = sizeof(((ngx_http_file_cache_header_t *) 0)->vary);
     layout->variant_offset = offsetof(ngx_http_file_cache_header_t, variant);
     if (rt->options.abi != NGX_HTTP_CACHE_PURGE_COMPONENT_ABI
-        || ngx_http_cache_purge_component_abi_13()
+        || ngx_http_cache_purge_component_abi_14()
                != NGX_HTTP_CACHE_PURGE_COMPONENT_ABI
         || ngx_array_init(&rt->roots, cf->pool, 2, sizeof(ngx_str_t)) != NGX_OK
         || ngx_array_init(&rt->file_roots, cf->pool, 8,
@@ -1181,6 +1181,7 @@ struct ngx_http_cache_purge_client_s {
     uint32_t                               result;
     int                                    lease_fd;
     uint64_t                               next_id;
+    ngx_uint_t                             validation_pending, validation_run;
     unsigned                               connecting : 1;
     unsigned                               stopped : 1;
 };
@@ -1298,7 +1299,9 @@ ngx_http_cache_purge_client_submit_internal(
         || (payload->len && payload->data == NULL) || timeout == 0
         || timeout > 300000
         || fd_count
-               != (opcode == NGX_HTTP_CACHE_PURGE_OP_VALIDATE_FILE ? 2U :
+               != (opcode == NGX_HTTP_CACHE_PURGE_OP_PREPARE_VALIDATION ? 2U :
+                   opcode == NGX_HTTP_CACHE_PURGE_OP_FINISH_VALIDATION ? 1U :
+                   opcode == NGX_HTTP_CACHE_PURGE_OP_VALIDATE_FILE ? 2U :
                    opcode == NGX_HTTP_CACHE_PURGE_OP_PREPARE_FILE ? 2U :
                    opcode == NGX_HTTP_CACHE_PURGE_OP_FINISH_FILE  ? 1U :
                    opcode == NGX_HTTP_CACHE_PURGE_OP_INSPECT_FILE ? 1U :
@@ -1362,6 +1365,9 @@ ngx_http_cache_purge_client_submit_internal(
     call->deadline.handler = ngx_http_cache_purge_client_deadline;
     call->deadline.log = client->log;
     ngx_queue_insert_tail(&client->queue, &call->queue);
+    if (opcode == NGX_HTTP_CACHE_PURGE_OP_FINISH_VALIDATION) {
+        client->validation_pending++;
+    }
     client->stats.accepted++;
     client->stats.pending++;
     client->stats.request_bytes += length;
@@ -1447,6 +1453,29 @@ ngx_http_cache_purge_client_validate_file(ngx_http_cache_purge_client_t *client,
     return ngx_http_cache_purge_client_submit_internal(
         client, NGX_HTTP_CACHE_PURGE_OP_VALIDATE_FILE, payload, timeout, done,
         data, out, fds, 2);
+}
+
+ngx_int_t
+ngx_http_cache_purge_client_prepare_validation(
+    ngx_http_cache_purge_client_t *client, const ngx_str_t *payload,
+    const int fds[2], ngx_msec_t timeout,
+    ngx_http_cache_purge_client_done_pt done, void *data,
+    ngx_http_cache_purge_call_t **out)
+{
+    return ngx_http_cache_purge_client_submit_internal(
+        client, NGX_HTTP_CACHE_PURGE_OP_PREPARE_VALIDATION, payload, timeout,
+        done, data, out, fds, 2);
+}
+
+ngx_int_t
+ngx_http_cache_purge_client_finish_validation(
+    ngx_http_cache_purge_client_t *client, const ngx_str_t *payload,
+    int lease_fd, ngx_msec_t timeout, ngx_http_cache_purge_client_done_pt done,
+    void *data, ngx_http_cache_purge_call_t **out)
+{
+    return ngx_http_cache_purge_client_submit_internal(
+        client, NGX_HTTP_CACHE_PURGE_OP_FINISH_VALIDATION, payload, timeout,
+        done, data, out, &lease_fd, 1);
 }
 
 static ngx_int_t
@@ -1556,7 +1585,9 @@ static void
 ngx_http_cache_purge_client_pump(ngx_event_t *ev)
 {
     ngx_http_cache_purge_client_t  *client = ev->data;
+    ngx_http_cache_purge_call_t    *call;
     ngx_connection_t               *c;
+    ngx_queue_t                    *q;
     ngx_int_t                       rc;
 
     if (client->stopped || client->current || ev->timer_set
@@ -1574,6 +1605,20 @@ ngx_http_cache_purge_client_pump(ngx_event_t *ev)
     }
     client->current = ngx_queue_data(ngx_queue_head(&client->queue),
                                      ngx_http_cache_purge_call_t, queue);
+    if (client->validation_pending && client->validation_run < 4) {
+        /* Complete already-revoked files before starting more work. After
+         * four such calls, serve the FIFO head so other work still advances.
+         * Read/control clients without these calls do not scan their queue. */
+        for (q = ngx_queue_head(&client->queue);
+             q != ngx_queue_sentinel(&client->queue); q = ngx_queue_next(q))
+        {
+            call = ngx_queue_data(q, ngx_http_cache_purge_call_t, queue);
+            if (call->opcode == NGX_HTTP_CACHE_PURGE_OP_FINISH_VALIDATION) {
+                client->current = call;
+                break;
+            }
+        }
+    }
     if (c == NULL) {
         rc = ngx_http_cache_purge_client_connect(client);
         if (rc == NGX_BUSY) {
@@ -1834,6 +1879,13 @@ ngx_http_cache_purge_client_finish(ngx_http_cache_purge_call_t *call,
     reply.transport = result;
     reply.may_have_executed = call->sent != 0;
     if (client->current == call) {
+        if (call->opcode == NGX_HTTP_CACHE_PURGE_OP_FINISH_VALIDATION) {
+            if (client->validation_run < 4) {
+                client->validation_run++;
+            }
+        } else {
+            client->validation_run = 0;
+        }
         if (result != NGX_HTTP_CACHE_PURGE_CLIENT_OK) {
             ngx_http_cache_purge_client_close(client);
         } else {
@@ -1853,6 +1905,9 @@ ngx_http_cache_purge_client_finish(ngx_http_cache_purge_call_t *call,
         ngx_del_timer(&call->deadline);
     }
     ngx_queue_remove(&call->queue);
+    if (call->opcode == NGX_HTTP_CACHE_PURGE_OP_FINISH_VALIDATION) {
+        client->validation_pending--;
+    }
     while (call->fd_count) {
         close(call->fds[--call->fd_count]);
     }

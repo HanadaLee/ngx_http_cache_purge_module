@@ -200,6 +200,21 @@ for cut in ('basic', 'intent', 'prefix', 'torn', 'done', 'missing', 'replaced', 
         assert (root / 'cache/file').read_bytes() == b'unrelated replacement'
 
 for origin in (False, True):
+    for cut in ('', '-revoke-failure', '-header-failure', '-veto',
+                '-crash-before', '-crash-after'):
+        root = Path(tempfile.mkdtemp(prefix='cache-purge-validation-io-', dir='/tmp'))
+        roots.append(str(root))
+        prefix = '--validate-origin-' if origin else '--validate-'
+        checks.append(subprocess.check_output(
+            [str(a.binary), prefix + 'io' + cut, str(root)],
+            text=True, timeout=30).strip())
+        if cut.startswith('-crash'):
+            for _ in range(2):
+                checks.append(subprocess.check_output(
+                    [str(a.binary), prefix + 'recover', str(root)],
+                    text=True, timeout=30).strip())
+
+for origin in (False, True):
     for cut in ('', '-veto', '-sync-failure', '-crash-wait', '-crash-synced'):
         root = Path(tempfile.mkdtemp(prefix='cache-purge-validation-wal-', dir='/tmp'))
         roots.append(str(root))

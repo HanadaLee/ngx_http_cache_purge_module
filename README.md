@@ -82,7 +82,7 @@ file and TAG set stay unchanged until the preparation is durable; waiting keeps
 the path lease and recovery intent. Final validation still checks current rules
 and synchronizes its new header and final index transaction before publishing
 READY and acknowledging completion.
-304 preparation and Delete durably revoke the old proof before header mutation
+304 file I/O and Delete durably revoke the old proof before header mutation
 or unlink. Successful 304 validation publishes the new TAG set and watermarks
 after its index transaction commits. A reader checks the exact descriptor and
 both stat snapshots; legacy, revoked, replaced or unlinked instances do not
@@ -223,15 +223,22 @@ It reserves the existing path and persists an NFV2 plan while retaining the old
 TAG postings. Proposed TAGs remain in the bounded plan until completion. Both
 preparation and recovery check old and proposed TAGs against accepted controls;
 a conflicting recovery retires the instance before further header writes.
-Completion writes and fsyncs only the supplied prefix, then atomically publishes
-the new TAGs, physical proof and completed receipt. Inspection excludes the
-pending instance. Retries and automatic recovery
-share the same OFD lease protocol; completed receipts remain bounded across
-repeated validation. `VALIDATE_FILE` connects this transaction to native upstream
-304 handling. It transfers the lease and selected descriptor, verifies accepted
-controls before changing old TAG membership, and returns the durable record.
-Control publication must be ready. Validation checks the file's fixed URL,
-host, namespace and actual TAG membership without an alias scan.
+Native 304 jobs use `PREPARE_VALIDATION` to persist that plan and await its WAL
+barrier. The existing publication thread pool then revokes and synchronizes the
+proof, writes the bounded fixed header and synchronizes the file. Only a
+successful task still holding the same OFD lease sends `FINISH_VALIDATION`.
+Completion verifies the transaction, revision, exact header and file instance,
+rechecks old and proposed TAGs against current rules, and synchronizes the final
+index transaction before publishing READY. The executor still performs necessary
+file identity checks and publishes the READY xattr; only the file writes and
+synchronization move to the pool.
+The completion assertion is volatile, not inferred from a persisted REVOKED
+marker. Legacy `VALIDATE_FILE` and automatic recovery retain their conservative
+file barriers. Inspection excludes pending instances. Completed receipts remain
+bounded across repeated validation. Control publication must be ready.
+Validation checks the file's fixed URL, host, namespace and actual TAG membership
+without an alias scan. The plan is at most 16 KiB and counts against the existing
+per-worker 2 MiB / 64-job budget; no HTTP request is retained.
 
 `INSPECT_FILE` checks the actual cache descriptor on the executor through bounded
 IPC. It requires a READY marker, a committed current index record with no pending
@@ -584,8 +591,9 @@ separately bounded to 128 KiB; these limits exclude allocator overhead and nativ
 nginx buffers.
 The existing publication pool also performs file and directory synchronization;
 it remains separate from the proof-read pool. It uses owned paths and FDs,
-without reading RocksDB or retaining an HTTP request. The fixed job context
-keeps two root lengths and an instance ID; no new thread or index table is used.
+without reading RocksDB or retaining an HTTP request. The job context
+keeps bounded paths, file identities and optional 304 plan bytes; no new thread
+or index table is used.
 Cache-file publication uses up to four reusable IPC clients per worker. It
 selects the least busy client after the response body is complete, and keeps
 that client for ACQUIRE/PREPARE/FINISH and retries. Selection rotates equal-load
@@ -594,6 +602,10 @@ other jobs wait for file I/O. The component
 connection budget and worker count can reduce the pool size. Its approximately
 512 KiB request-byte budget is divided across the pool, and the existing 64
 publication slots bound aggregate pending work, including detached 304 jobs.
+To shorten the interval in which a validating file cannot serve HITs, a client
+prioritizes up to four queued `FINISH_VALIDATION` calls before serving its FIFO
+head. An active frame is never preempted. Clients with no such calls do not scan
+their queue; timeouts and resource limits remain unchanged.
 Configured cache roots may be symbolic links. Workers and cache helpers use
 the roots resolved during initialization, so native file names and admission
 proofs use the same canonical path. The master retains the configured paths
@@ -609,7 +621,8 @@ original control client. This lets other publications progress while one FINISH
 waits for WAL synchronization without adding threads, polling
 or a weaker READY condition. Idle publication connections close after one second.
 The jobs do not retain the HTTP request, so keepalive reuse does not wait for
-publication or 304 persistence. Adopted publication rename/stat and cleanup run
+publication or 304 persistence. Adopted publication rename/stat, 304 file writes
+and synchronization, and cleanup run
 on the configured publication thread pool; native cleanup of rejected fills and
 end-to-end performance remain separate validation work.
 Within a worker, complete fills for the same pinned native file and configured
@@ -710,7 +723,7 @@ long-lived HTTP responses do not keep the database owner indefinitely. Its
 writer finishes the current operation, stops and joins its reader, then closes
 the DB before the replacement opens it. The old worker can continue sending its
 response and joins the stopped
-executor when it exits. The component C ABI is 13 and the internal IPC version
+executor when it exits. The component C ABI is 14 and the internal IPC version
 is 2; rebuild its archives together with the addon. Upgrading from an earlier
 component ABI or shared-control ABI 5
 or earlier requires a full nginx restart; persisted cache files and indexes are

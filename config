@@ -96,7 +96,7 @@ ngx_feature_test='ngx_http_cache_purge_component_options_t o;
                                                    0, 0, 0);
                   ngx_http_cache_purge_file_proof_read_selected(-1,
                                                                empty, 0, 0);
-                  if (o.abi != ngx_http_cache_purge_component_abi_13()) return 1;
+                  if (o.abi != ngx_http_cache_purge_component_abi_14()) return 1;
                   if (ngx_http_cache_purge_index_schema_14() != 14) return 1;
                   if (ngx_http_cache_purge_control_abi_6() != 6) return 1;'
 . auto/feature
