@@ -114,7 +114,12 @@ ngx_http_cache_purge_test_scan(ngx_http_cache_purge_catalog_t *catalog,
             fprintf(stderr, "scan: %d %s\n", rc, error.message);
         }
 
-        ngx_expect(rc == 0 && count < 32 && entry.tag_count == 2);
+        ngx_expect(rc == 0 && count < 32 && entry.tag_count == 0);
+        ngx_expect(entry.url.data == NULL && entry.host.data == NULL
+                   && entry.namespace_value.data == NULL
+                   && entry.misc.data == NULL);
+        ngx_expect(entry.root.len != 0 && entry.zone.len != 0
+                   && entry.path.len != 0);
         if (ids != NULL) {
             memcpy(ids[count], entry.id, 24);
         }
@@ -233,9 +238,8 @@ ngx_http_cache_purge_test_main(void)
     ngx_expect(ngx_http_cache_purge_scan_open(catalog, &select,
         ngx_http_cache_purge_text(""), 0, 0, &scan, &error) == 0);
     ngx_expect(ngx_http_cache_purge_scan_next(scan, &current, &error) == 0);
-    ngx_expect(current.tag_count == 64 && current.url.len == 4096);
-    ngx_expect(current.misc.len == sizeof(misc)
-               && memcmp(current.misc.data, misc, sizeof(misc)) == 0);
+    ngx_expect(current.tag_count == 0 && current.url.data == NULL
+               && current.misc.data == NULL);
     memcpy(saved, current.id, 24);
     ngx_http_cache_purge_scan_close(scan);
     entry.tag_count = 65;
@@ -252,6 +256,8 @@ ngx_http_cache_purge_test_main(void)
     ngx_expect(ngx_http_cache_purge_catalog_get(catalog, saved, &current,
                                                &error) == 0);
     ngx_expect(current.tag_count == 64 && current.url.len == 4096);
+    ngx_expect(current.misc.len == sizeof(misc)
+               && memcmp(current.misc.data, misc, sizeof(misc)) == 0);
     ngx_expect(ngx_http_cache_purge_catalog_remove(catalog, saved, 0, &error)
                == 0);
 

@@ -68,6 +68,7 @@ int ngx_http_cache_purge_scan_open(ngx_http_cache_purge_catalog_t *catalog,
     const ngx_http_cache_purge_select_t *selector,
     ngx_http_cache_rocksdb_bytes_t after, int retained, uint64_t now,
     ngx_http_cache_purge_scan_t **scan, ngx_http_cache_rocksdb_error_t *error);
+/* Returns file identity and location, without selector strings or TAGs. */
 int ngx_http_cache_purge_scan_next(ngx_http_cache_purge_scan_t *scan,
     ngx_http_cache_purge_entry_t  *entry,
                                   ngx_http_cache_rocksdb_error_t *error);

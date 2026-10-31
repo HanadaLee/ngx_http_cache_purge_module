@@ -190,11 +190,14 @@ It requires Linux and `wrk`. It compares the same binary with purge disabled,
 enabled without rules, deleting unrelated objects in the background, and
 retaining a completed rule. It records latency, throughput and process PSS;
 `--fills` and `--fill-rate` add continuous fills and check their index coverage.
+`--request-delay` adds a delay in milliseconds between requests on each wrk
+connection to compare latency below saturation; it is not an open-loop load.
 `--seed-store` copies an offline, closed index before each enabled run; copied
 files are synchronized before measurement and charged to `--cgroup` when set.
 `--url-origin` selects the scheme and host of the configured purge URL identity.
 `--cgroup` uses an existing Linux memory cgroup; `--profile` samples worker main
-threads with perf and is for diagnosis, not latency acceptance. These focused
+threads with perf, while `--profile all` includes the cache manager and database
+threads. Profiling is for diagnosis, not latency acceptance. These focused
 measurements do not establish a production performance guarantee.
 
 The optional `--backend` file check runs persistent tasks through the actual

@@ -925,7 +925,7 @@ ngx_http_cache_purge_catalog_put(ngx_http_cache_purge_catalog_t *c,
 static int
 ngx_http_cache_purge_catalog_entry(ngx_http_cache_purge_catalog_t *c,
     ngx_http_cache_rocksdb_cursor_t *view, const unsigned char id[24],
-    ngx_http_cache_purge_entry_t *entry)
+    ngx_http_cache_purge_entry_t *entry, int file_only)
 {
     ngx_http_cache_purge_bytes_t  key, value, *fields[6];
     ngx_http_cache_purge_row_t    row;
@@ -958,7 +958,9 @@ ngx_http_cache_purge_catalog_entry(ngx_http_cache_purge_catalog_t *c,
     fields[3] = &entry->misc;
     fields[4] = &entry->root;
     fields[5] = &entry->zone;
-    for (i = 0; i < 6 + row.tag_count; i++) {
+
+    /* Selectors have already matched; file work only needs root and zone. */
+    for (i = file_only ? 4 : 0; i < (file_only ? 6 : 6 + row.tag_count); i++) {
         key = ngx_http_cache_purge_catalog_id(c, 'D',
                                   i < 6 ? row.fields[i] : row.tags[i - 6]);
         value = ngx_http_cache_purge_catalog_read(c, view,
@@ -984,7 +986,7 @@ ngx_http_cache_purge_catalog_entry(ngx_http_cache_purge_catalog_t *c,
     entry->uniq = row.uniq;
     entry->created = row.created;
     entry->retain_until = row.retain_until;
-    entry->tag_count = row.tag_count;
+    entry->tag_count = file_only ? 0 : row.tag_count;
     entry->path = row.path;
 
     return c->status;
@@ -998,7 +1000,7 @@ ngx_http_cache_purge_catalog_get(ngx_http_cache_purge_catalog_t *c,
 {
     ngx_http_cache_purge_catalog_begin(c, error);
 
-    return ngx_http_cache_purge_catalog_entry(c, NULL, id, entry);
+    return ngx_http_cache_purge_catalog_entry(c, NULL, id, entry, 0);
 }
 
 
@@ -1415,7 +1417,7 @@ ngx_http_cache_purge_scan_next(ngx_http_cache_purge_scan_t *scan,
         scan->inner_length = key.length;
         ngx_http_cache_purge_catalog_begin(c, error);
         rc = ngx_http_cache_purge_catalog_entry(c, scan->inner,
-                           scan->inner_key + key.length - 24, entry);
+                           scan->inner_key + key.length - 24, entry, 1);
         if (rc != 0) {
             return rc;
         }

@@ -27,10 +27,11 @@ parser.add_argument('--workers', type=int, default=2)
 parser.add_argument('--server-cores', type=int, default=2)
 parser.add_argument('--fills', type=int, default=0)
 parser.add_argument('--fill-rate', type=int, default=500)
+parser.add_argument('--request-delay', type=int, default=0, help='wrk delay in milliseconds between requests on each connection')
 parser.add_argument('--evict', action='store_true', help='Limit the native cache to 1 MiB during fill samples to exercise its cache manager')
 parser.add_argument('--seed-store', type=Path, help='Copy an offline, closed RocksDB store into each enabled run before nginx starts')
 parser.add_argument('--url-origin', default='http://bench.test', help='Scheme and host used by the configured purge URL identity')
-parser.add_argument('--profile', action='store_true', help='Sample worker main threads with perf; timing is diagnostic only')
+parser.add_argument('--profile', nargs='?', const='worker', choices=('worker', 'all'), help='Sample worker main threads or all nginx threads with perf; timing is diagnostic only')
 parser.add_argument('--owner-control', action='store_true', help='Also measure configured resources with the business location disabled')
 parser.add_argument('--hold-cleanup', action='store_true', help='Keep the first target unreadable to measure a rule without bulk file processing')
 parser.add_argument('--rules', type=int, default=1, help='Number of simultaneous prefix tasks')
@@ -39,6 +40,7 @@ parser.add_argument('--hot-path', default='/hot')
 parser.add_argument('--cgroup', type=Path, help='Preconfigured cgroup v1 memory directory; only nginx joins it')
 args = parser.parse_args()
 assert args.seconds > 0 and args.rounds >= 0 and args.bulk > 0
+assert args.request_delay >= 0
 assert 0 < args.rules <= 256 and args.hot_path.startswith('/hot')
 assert not args.distinct_prefixes or args.bulk >= args.rules
 assert not args.evict or args.fills > 512
@@ -79,12 +81,16 @@ threading.Thread(target=origin.serve_forever, daemon=True).start()
         summary.errors.timeout))
 end
 ''')
+if args.request_delay:
+    with (root / 'stats.lua').open('a') as script:
+        script.write(f'\ndelay = function() return {args.request_delay} end\n')
 report = {'root': str(root), 'binary': str(args.binary),
           'binary_sha256': hashlib.sha256(args.binary.read_bytes()).hexdigest(),
           'server_cpus': server_cpus, 'client_cpus': client_cpus,
           'origin_and_controller_pinned': True,
           'workers': args.workers,
           'connections': args.connections, 'seconds': args.seconds,
+          'request_delay_ms': args.request_delay,
           'fills': args.fills, 'fill_rate': args.fill_rate,
           'native_eviction': args.evict,
           'seed_store': str(args.seed_store) if args.seed_store else None,
@@ -95,6 +101,7 @@ report = {'root': str(root), 'binary': str(args.binary),
           'admission_before_load': args.hold_cleanup,
           'distinct_prefixes': args.distinct_prefixes,
           'rules': args.rules, 'hot_path': args.hot_path,
+          'profile': args.profile,
           'cgroup': str(args.cgroup) if args.cgroup else None,
           'bulk_objects': args.bulk, 'samples': [],
           'scope': 'Local closed-loop wrk comparison; an optional preconfigured memory cgroup contains only nginx and its children.'}
@@ -350,8 +357,15 @@ http {{
                     workers = [pid for pid in children
                                if Path(f'/proc/{pid}/cmdline').read_bytes().startswith(b'nginx: worker process')]
                     assert len(workers) == args.workers, workers
+                    targets = children + [str(process.pid)] if args.profile == 'all' else workers
+                    (run / (mode + '.tasks.json')).write_text(json.dumps({
+                        pid: {'command': Path(f'/proc/{pid}/cmdline').read_bytes().replace(b'\0', b' ').decode().strip(),
+                              'threads': {task.name: (task / 'comm').read_text().strip()
+                                          for task in Path(f'/proc/{pid}/task').iterdir()}}
+                        for pid in targets}, indent=2) + '\n')
                     profiler = subprocess.Popen(['perf', 'record', '-e', 'cpu-clock:u',
-                        '-F', '999', '-t', ','.join(workers), '-o', str(run / (mode + '.perf'))],
+                        '-F', '999', '-p' if args.profile == 'all' else '-t',
+                        ','.join(targets), '-o', str(run / (mode + '.perf'))],
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 load = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
                 progress = []
