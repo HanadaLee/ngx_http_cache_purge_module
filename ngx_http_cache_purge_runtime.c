@@ -1526,8 +1526,9 @@ ngx_http_cache_purge_owner_deliver(ngx_http_cache_purge_owner_t *o)
 static void
 ngx_http_cache_purge_owner_drive(ngx_http_cache_purge_owner_t *o)
 {
-    ngx_uint_t  complete;
+    ngx_uint_t  complete, queued;
     ngx_int_t   rc;
+    ngx_msec_t  delay;
     int         operation;
 
     if (o->timer.timer_set) {
@@ -1601,8 +1602,19 @@ ngx_http_cache_purge_owner_drive(ngx_http_cache_purge_owner_t *o)
             ngx_http_cache_purge_owner_deliver(o);
         }
     }
-    ngx_add_timer(&o->timer, operation != -1 && !o->threaded
-                             ? 1 : o->pending ? 10 : 100);
+    delay = o->pending ? 10 : 100;
+    if (operation != -1 && !o->threaded) {
+        ngx_shmtx_lock(&o->state->pool->mutex);
+        queued = !ngx_queue_empty(&o->state->shared->pending);
+        ngx_shmtx_unlock(&o->state->pool->mutex);
+        if (queued
+            || (o->pending
+                && (ngx_msec_int_t) (ngx_current_msec - o->next_at) >= 0))
+        {
+            delay = 1;
+        }
+    }
+    ngx_add_timer(&o->timer, delay);
 }
 
 

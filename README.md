@@ -119,6 +119,8 @@ database threads. The cache manager handles its queue through the existing pipe
 and timer, alongside native cache maintenance. RocksDB's internal threads stay
 inside that helper process. With `master_process off`, the existing in-process
 thread remains a debugging fallback and has a different performance profile.
+New queue messages wake the helper through the pipe. Once it drains the queue,
+it uses its idle timer instead of scheduling an extra immediate retry.
 
 The shared state reserves rule space before admission and exposes a successful
 completion only after publication. Its empty-rule path does not take the shared
