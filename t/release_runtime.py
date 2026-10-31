@@ -11,6 +11,7 @@ import pwd
 import grp
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -39,11 +40,16 @@ class Origin(http.server.BaseHTTPRequestHandler):
         global origin_calls
         origin_calls += 1
         body = ('entity-' + str(version)).encode()
-        self.send_response(200)
-        self.send_header('Content-Length', str(len(body)))
+        etag = '"entity-' + str(version) + '"'
+        validated = self.headers.get('If-None-Match') == etag
+        self.send_response(304 if validated else 200)
+        if not validated:
+            self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', 'max-age=3600')
+        self.send_header('ETag', etag)
         self.end_headers()
-        self.wfile.write(body)
+        if not validated:
+            self.wfile.write(body)
 
 
 origin = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Origin)
@@ -60,20 +66,29 @@ config = '\n'.join('load_module ' + str(path) + ';' for path in modules) + f'''
 {user}
 daemon off; master_process on; worker_processes 1;
 pid {root}/pid; error_log {root}/error.log notice;
+thread_pool proof threads=1 max_queue=64;
+thread_pool publish threads=1 max_queue=64;
 events {{ worker_connections 128; }}
 http {{
     access_log off;
     client_body_temp_path {root}/body;
     proxy_temp_path {root}/temp;
-    cache_purge_store {root}/index cache=16m write_buffer=4m;
+    cache_purge_store {root}/index cache=8m write_buffer=2m;
     cache_purge_state_zone release_control 4m;
+    cache_purge_read_pool proof;
+    cache_purge_publish_pool publish;
+    cache_purge_key_url $cache_key_url;
+    cache_purge_key_misc $cache_key_misc;
     proxy_cache_path {root}/cache levels=1:2 keys_zone=release:1m;
     server {{
         listen 127.0.0.1:{port};
         location / {{
             proxy_cache release;
             proxy_cache_key $cache_key_full;
+            proxy_cache_revalidate on;
+            proxy_cache_purge on;
             add_header X-Test-Cache $upstream_cache_status always;
+            add_header X-Test-Namespace "[$cache_key_namespace]" always;
             proxy_pass http://127.0.0.1:{origin.server_port};
         }}
         location /__cache_purge/ {{
@@ -85,7 +100,7 @@ http {{
 (root / 'nginx.conf').write_text(config)
 command = [str(a.nginx.resolve()), '-p', str(root) + '/', '-c', str(root / 'nginx.conf')]
 subprocess.run([*command, '-t'], check=True)
-checks = ['packaged modules load with the pinned key API and real business selectors']
+checks = ['packaged modules load with explicit persistent identity and protocol activation']
 
 
 def request(path, payload=None):
@@ -122,21 +137,23 @@ with (root / 'stdout.log').open('w') as log:
                        and json.loads(reply[2])['ready'] else None))
         first = request('/asset')
         assert first[0] == 200 and first[2] == b'entity-1', first
+        assert first[1].get('X-Test-Cache') == 'MISS' and first[1].get('X-Test-Namespace') == '[]', first
 
         def published():
             for path in (root / 'cache').rglob('*'):
                 if path.is_file():
                     try:
-                        if os.getxattr(path, 'user.ngx_cache_purge.id')[:8] in (b'NCF1\0\0\0\2', b'NCF2\0\0\0\2'):
-                            return True
+                        if (os.getxattr(path, 'user.ngx_cache_purge.id')[:8] == b'NCF2\0\0\0\2'
+                                and path.read_bytes().endswith(('entity-' + str(version)).encode())):
+                            return path
                     except OSError:
                         pass
             return False
 
         until(published)
-        hit = until(lambda: (reply if (reply := request('/asset'))[1].get('X-Test-Cache') == 'HIT' else None))
-        assert hit[2] == b'entity-1' and origin_calls == 1, (hit, origin_calls)
-        checks.append('native fill is indexed and reused as HIT without another origin request')
+        hit = request('/asset')
+        assert hit[1].get('X-Test-Cache') == 'HIT' and hit[2] == b'entity-1' and origin_calls == 1, (hit, origin_calls)
+        checks.append('default empty namespace fills a READY file and reuses HIT without another origin request')
         version = 2
         payload = {'version': 'ngx-http-cache-purge/v2', 'operation_id': 'release-check',
                    'mode': 'delete', 'selector': {'type': 'url', 'value': 'http://cache.test/asset'},
@@ -150,6 +167,40 @@ with (root / 'stdout.log').open('w') as log:
         checks.append('durable Delete acceptance prevents reuse of the old cached response')
         until(lambda: (state if (state := json.loads(request(receipt['status_url'])[2]))['cleanup']['state'] == 'done' else None))
         checks.append('the accepted operation completes background cleanup')
+
+        cached = until(published)
+        before = cached.stat()
+        proof = os.getxattr(cached, 'user.ngx_cache_purge.id')
+        assert origin_calls == 2, origin_calls
+        payload['operation_id'] = 'release-invalidate'
+        payload['mode'] = 'invalidate'
+        payload['event']['sequence'] = '2'
+        status, _, data = request('/__cache_purge/operations', payload)
+        receipt = json.loads(data)
+        assert status == 202 and receipt['mode'] == 'invalidate'
+        assert receipt['effective'] and receipt['durable'], receipt
+        validated = request('/asset')
+        assert validated[1].get('X-Test-Cache') == 'REVALIDATED' and validated[2] == b'entity-2', validated
+
+        def committed():
+            marker = os.getxattr(cached, 'user.ngx_cache_purge.id')
+            return (marker[:8] == b'NCF2\0\0\0\2' and marker[8:24] == proof[8:24]
+                    and struct.unpack_from('>Q', marker, 104)[0] >= int(receipt['sequence']))
+
+        until(committed)
+        assert (cached.stat().st_dev, cached.stat().st_ino) == (before.st_dev, before.st_ino)
+        hit = request('/asset')
+        assert hit[1].get('X-Test-Cache') == 'HIT' and hit[2] == b'entity-2' and origin_calls == 3, (hit, origin_calls)
+        checks.append('Invalidate uses a real 304 and persists validation without replacing the entity')
+
+        process.send_signal(signal.SIGQUIT)
+        assert process.wait(10) == 0
+        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
+        until(lambda: (reply if (reply := request('/__cache_purge/capabilities'))[0] == 200
+                       and json.loads(reply[2])['ready'] else None))
+        hit = request('/asset')
+        assert hit[1].get('X-Test-Cache') == 'HIT' and hit[2] == b'entity-2' and origin_calls == 3, (hit, origin_calls)
+        checks.append('a full restart reuses the persisted validated file without origin access')
     except Exception:
         if (root / 'error.log').exists():
             print((root / 'error.log').read_text()[-6000:], file=sys.stderr)

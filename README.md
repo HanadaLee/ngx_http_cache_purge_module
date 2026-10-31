@@ -1287,8 +1287,9 @@ The manual benchmark workflow measures the current control table only; its
 results do not represent HTTP or physical deletion throughput. PVS traces both
 the C backend/C++ bridge and configured HTTP objects. Release builds package
 both `.so` files, compile against the pinned key API, and exercise an actual
-fill, HIT and durable Delete using those packaged files before comparing
-repeat-build archive bytes. Set `CACHE_KEY_SOURCE` to a local key-module Git
+fill with the default empty namespace, HIT, durable Delete, Invalidate/304 and
+restart reuse using those packaged files before comparing repeat-build archive
+bytes. Set `CACHE_KEY_SOURCE` to a local key-module Git
 checkout for local package verification; otherwise the builder fetches the
 pinned revision. The key module remains a separate project's deliverable.
 The target host needs the RocksDB shared library recorded

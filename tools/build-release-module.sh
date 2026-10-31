@@ -28,7 +28,7 @@ trap 'rm -rf "$work"' EXIT
 name="ngx_http_cache_purge-${MODULE_VERSION}-nginx-${NGINX_VERSION}-linux-${arch}"
 stage="$work/$name"
 mkdir -p "$stage"
-key_revision=${CACHE_KEY_REVISION:-df6fbd33e201d2567fc6326c186ade6018b12747}
+key_revision=${CACHE_KEY_REVISION:-ae3584f589f1d048996c50a78b3015f1fcd36eed}
 [[ "$key_revision" =~ ^[0-9a-f]{40}$ ]]
 mkdir "$work/key"
 if [[ -n ${CACHE_KEY_SOURCE:-} ]]; then

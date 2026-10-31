@@ -4,7 +4,7 @@ set -euo pipefail
 : "${NGINX_VERSION:?Set an exact nginx version}"
 : "${TEST_SOURCE_DIR:?Set a new directory for test inputs}"
 [[ "$NGINX_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
-key_revision=${CACHE_KEY_REVISION:-df6fbd33e201d2567fc6326c186ade6018b12747}
+key_revision=${CACHE_KEY_REVISION:-ae3584f589f1d048996c50a78b3015f1fcd36eed}
 [[ "$key_revision" =~ ^[0-9a-f]{40}$ ]]
 key_repository=${CACHE_KEY_REPOSITORY:-https://git.hanada.info/hanada/ngx_http_cache_key_module.git}
 repo=$(cd "$(dirname "$0")/.." && pwd)

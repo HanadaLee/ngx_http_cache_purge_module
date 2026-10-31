@@ -77,7 +77,7 @@ jobs:
           file: t/Dockerfile
           target: integration
           build-args: NGINX_VERSION=${{ matrix.nginx }}
-          build-contexts: cache-key=https://git.hanada.info/hanada/ngx_http_cache_key_module.git#df6fbd33e201d2567fc6326c186ade6018b12747
+          build-contexts: cache-key=https://git.hanada.info/hanada/ngx_http_cache_key_module.git#ae3584f589f1d048996c50a78b3015f1fcd36eed
           secrets: ${{ steps.apt.outputs.buildkit_secret }}
           secret-files: apt_ca=/etc/ssl/certs/ca-certificates.crt
           tags: cache-purge-test:local
