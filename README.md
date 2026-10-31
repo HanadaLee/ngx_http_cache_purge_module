@@ -103,6 +103,10 @@ retention deadline can preserve known TAG associations after file removal;
 expired associations are collected in bounded batches. No file publication or
 validation proofs are stored by this index.
 
+RocksDB's target SST size and base-level capacity follow the write-buffer
+budget: 2 MiB and 8 MiB by default. They are compaction targets, not a limit on
+the total index size.
+
 Background tasks use a durable admission record and an ordered pending queue.
 The nginx executor processes at most 8 files per batch, with at least 50 ms
 between successful batches. Each batch closes its snapshot and stores a

@@ -361,6 +361,10 @@ ngx_http_cache_rocksdb_initialize(ngx_http_cache_rocksdb_t *store,
     options.write_buffer_manager = store->buffers;
     options.write_buffer_size = store->options.write_buffer_bytes / 2;
     options.max_write_buffer_number = 2;
+    /* Match SST and base-level sizes to the small write-buffer budget. */
+    options.target_file_size_base = options.write_buffer_size;
+    options.max_bytes_for_level_base = options.write_buffer_size
+        * options.level0_file_num_compaction_trigger;
     options.max_open_files = static_cast<int>(store->options.max_open_files);
     options.max_background_jobs =
         static_cast<int>(store->options.background_jobs);
