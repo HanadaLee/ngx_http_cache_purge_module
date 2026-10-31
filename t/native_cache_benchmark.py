@@ -26,11 +26,19 @@ parser.add_argument('--workers', type=int, default=2)
 parser.add_argument('--server-cores', type=int, default=2)
 parser.add_argument('--fills', type=int, default=0)
 parser.add_argument('--fill-rate', type=int, default=500)
+parser.add_argument('--evict', action='store_true', help='Limit the native cache to 1 MiB during fill samples to exercise its cache manager')
 parser.add_argument('--profile', action='store_true', help='Sample worker main threads with perf; timing is diagnostic only')
 parser.add_argument('--owner-control', action='store_true', help='Also measure configured resources with the business location disabled')
+parser.add_argument('--hold-cleanup', action='store_true', help='Keep the first target unreadable to measure a rule without bulk file processing')
+parser.add_argument('--rules', type=int, default=1, help='Number of simultaneous prefix tasks')
+parser.add_argument('--distinct-prefixes', action='store_true', help='Use a separate target prefix and blocked file for each task')
+parser.add_argument('--hot-path', default='/hot')
 parser.add_argument('--cgroup', type=Path, help='Preconfigured cgroup v1 memory directory; only nginx joins it')
 args = parser.parse_args()
 assert args.seconds > 0 and args.rounds >= 0 and args.bulk > 0
+assert 0 < args.rules <= 256 and args.hot_path.startswith('/hot')
+assert not args.distinct_prefixes or args.bulk >= args.rules
+assert not args.evict or args.fills > 512
 root = Path(tempfile.mkdtemp(prefix='cache-simple-benchmark-'))
 calls = hot_calls = 0
 
@@ -39,7 +47,7 @@ class Origin(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         global calls, hot_calls
         calls += 1
-        hot_calls += self.path == '/hot'
+        hot_calls += self.path == args.hot_path
         body = b'cached body\n' * 128
         self.send_response(200)
         self.send_header('Cache-Control', 'max-age=3600')
@@ -74,7 +82,12 @@ report = {'root': str(root), 'binary': str(args.binary),
           'workers': args.workers,
           'connections': args.connections, 'seconds': args.seconds,
           'fills': args.fills, 'fill_rate': args.fill_rate,
+          'native_eviction': args.evict,
           'owner_control': args.owner_control,
+          'hold_cleanup': args.hold_cleanup,
+          'admission_before_load': args.hold_cleanup,
+          'distinct_prefixes': args.distinct_prefixes,
+          'rules': args.rules, 'hot_path': args.hot_path,
           'cgroup': str(args.cgroup) if args.cgroup else None,
           'bulk_objects': args.bulk, 'samples': [],
           'scope': 'Local closed-loop wrk comparison; an optional preconfigured memory cgroup contains only nginx and its children.'}
@@ -165,7 +178,7 @@ error_log {run}/error.log notice;
 events {{ worker_connections 1024; }}
 http {{
     access_log off;
-    proxy_cache_path {run}/cache levels=1:2 keys_zone=cache:4m;
+    proxy_cache_path {run}/cache levels=1:2 keys_zone=cache:4m {'max_size=1m' if args.evict and not background else ''};
     server {{
         listen 127.0.0.1:{port};
         {settings}
@@ -192,6 +205,7 @@ http {{
         load = None
         profiler = None
         filler = None
+        held = []
         stop_fill = threading.Event()
         connection = http.client.HTTPConnection('127.0.0.1', port, timeout=15)
 
@@ -200,6 +214,22 @@ http {{
             response = connection.getresponse()
             data = response.read()
             return response.status, response.getheader('X-Cache'), data
+
+        def bulk_path(i):
+            group = f'{i % args.rules:04d}/' if args.distinct_prefixes else ''
+            return f'/bulk/{group}{i:08d}'
+
+        def submit():
+            submitted = time.monotonic()
+            operations = []
+            for i in range(args.rules):
+                group = f'{i:04d}/' if args.distinct_prefixes else ''
+                status, _, body = request('/control', 'PURGE', {
+                    'X-Target': 'http://bench.test/bulk/' + group,
+                    'X-Cache-Purge-Type': 'prefix'})
+                assert status == 202, (status, body)
+                operations.append(json.loads(body)['operation_id'])
+            return operations, (time.monotonic() - submitted) * 1000
 
         try:
             deadline = time.monotonic() + 10
@@ -210,7 +240,7 @@ http {{
                         status, _, body = request('/management/capabilities')
                         ready = status == 200 and json.loads(body)['ready']
                     else:
-                        ready = request('/hot')[0] == 200
+                        ready = request(args.hot_path)[0] == 200
                     if ready:
                         break
                 except OSError:
@@ -218,29 +248,47 @@ http {{
                 assert time.monotonic() < deadline, 'nginx startup timed out'
                 time.sleep(.02)
             for _ in range(10):
-                if request('/hot')[1] == 'HIT':
+                if request(args.hot_path)[1] == 'HIT':
                     break
-            assert request('/hot')[1] == 'HIT'
+            assert request(args.hot_path)[1] == 'HIT'
             if background:
                 for i in range(args.bulk):
-                    assert request(f'/bulk/{i:08d}')[0] == 200
+                    assert request(bulk_path(i))[0] == 200
                     if i % 64 == 63:
                         # A queued status read drains preceding fill messages.
                         assert request('/management/operations/barrier')[0] == 404
                 assert request('/management/operations/barrier')[0] == 404
                 time.sleep(1.05)
-            for mode in (('background-delete', 'retained-rule') if background else (mode,)):
-                deleting = mode == 'background-delete'
+            modes = ('held-rule', 'background-delete', 'retained-rule') if args.hold_cleanup else ('background-delete', 'retained-rule')
+            for mode in (modes if background else (mode,)):
+                deleting = mode in ('held-rule', 'background-delete')
+                submitting = background and mode == modes[0]
+                admission_ms = None
+                if mode == 'held-rule':
+                    for i in range(args.rules if args.distinct_prefixes else 1):
+                        digest = hashlib.md5(bulk_path(i).encode()).hexdigest()
+                        path = next((run / 'cache').rglob(digest))
+                        held.append((path, path.stat().st_mode))
+                        path.chmod(0)
+                    operations, admission_ms = submit()
+                    submitting = False
+                    operation = operations[-1]
+                elif mode == 'background-delete':
+                    for path, permissions in held:
+                        path.chmod(permissions)
+                    held = []
                 if mode == 'retained-rule':
                     deadline = time.monotonic() + 120
                     while True:
-                        status, _, body = request('/management/operations/' + operation)
-                        assert status == 200, (status, body)
-                        cleanup = json.loads(body)['cleanup']
-                        if cleanup['state'] == 'done':
-                            assert cleanup['affected'] == args.bulk, cleanup
+                        cleanups = []
+                        for operation in operations:
+                            status, _, body = request('/management/operations/' + operation)
+                            assert status == 200, (status, body)
+                            cleanups.append(json.loads(body)['cleanup'])
+                        if all(item['state'] == 'done' for item in cleanups):
+                            assert sum(item['affected'] for item in cleanups) == args.bulk, cleanups
                             break
-                        assert time.monotonic() < deadline, cleanup
+                        assert time.monotonic() < deadline, cleanups
                         time.sleep(.1)
                 before = resources(process.pid)
                 origin_before = hot_calls
@@ -273,7 +321,7 @@ http {{
                 command = ['taskset', '-c', ','.join(map(str, client_cpus)), 'wrk', '-t1',
                            '-c' + str(args.connections), '-d' + str(args.seconds) + 's',
                            '--latency', '-s', str(root / 'stats.lua'),
-                           '-H', 'Host: bench.test', f'http://127.0.0.1:{port}/hot']
+                           '-H', 'Host: bench.test', f'http://127.0.0.1:{port}{args.hot_path}']
                 if args.profile:
                     children = Path(f'/proc/{process.pid}/task/{process.pid}/children').read_text().split()
                     workers = [pid for pid in children
@@ -284,14 +332,10 @@ http {{
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 load = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
                 progress = []
-                admission_ms = None
+                if submitting:
+                    operations, admission_ms = submit()
+                    operation = operations[-1]
                 if deleting:
-                    submitted = time.monotonic()
-                    status, _, body = request('/control', 'PURGE', {
-                        'X-Target': 'http://bench.test/bulk/', 'X-Cache-Purge-Type': 'prefix'})
-                    assert status == 202, (status, body)
-                    admission_ms = (time.monotonic() - submitted) * 1000
-                    operation = json.loads(body)['operation_id']
                     started = time.monotonic()
                     while load.poll() is None:
                         status, _, body = request('/management/operations/' + operation)
@@ -299,6 +343,8 @@ http {{
                         progress.append({'seconds': time.monotonic() - started,
                                          **json.loads(body)['cleanup']})
                         time.sleep(.1)
+                    if mode == 'held-rule':
+                        assert progress and all(item['affected'] == 0 and item['state'] == 'pending' for item in progress), progress
                 stdout, _ = load.communicate(timeout=args.seconds + 10)
                 if profiler is not None:
                     profiler.send_signal(signal.SIGINT)
@@ -309,7 +355,7 @@ http {{
                 assert load.returncode == 0, stdout
                 sample = json.loads(next(line[7:] for line in stdout.splitlines() if line.startswith('RESULT ')))
                 assert not any(sample[field] for field in ('connect_errors', 'read_errors', 'write_errors', 'status_errors', 'timeouts')), sample
-                assert hot_calls == origin_before and request('/hot')[1] == 'HIT'
+                assert hot_calls == origin_before and request(args.hot_path)[1] == 'HIT'
                 sample.update(mode=mode, run=str(run), resources_before=before,
                               resources_after=resources(process.pid), progress=progress,
                               fill=fill_stats, admission_ms=admission_ms)
@@ -323,7 +369,10 @@ http {{
                     filler = None
                     time.sleep(1.05)
                     fill_stats['files'] = sum(path.is_file() for path in (run / 'cache').rglob('*')) - 1
-                    assert fill_stats['files'] == args.fills, fill_stats
+                    if args.evict:
+                        assert 0 < fill_stats['files'] < args.fills, fill_stats
+                    else:
+                        assert fill_stats['files'] == args.fills, fill_stats
                     if active:
                         status, _, body = request('/control', 'PURGE', {
                             'X-Target': 'http://bench.test/fill/', 'X-Cache-Purge-Type': 'prefix'})
@@ -336,11 +385,19 @@ http {{
                             cleanup = json.loads(body)['cleanup']
                             if cleanup['state'] == 'done':
                                 fill_stats['indexed_files'] = cleanup['affected']
-                                assert cleanup['affected'] == args.fills, fill_stats
+                                fill_stats['indexed_records'] = cleanup['visited']
+                                assert cleanup['visited'] == args.fills, fill_stats
+                                if args.evict:
+                                    assert 0 < cleanup['affected'] < args.fills, fill_stats
+                                else:
+                                    assert cleanup['affected'] == args.fills, fill_stats
                                 break
                             assert time.monotonic() < deadline, cleanup
                             time.sleep(.1)
         finally:
+            for path, permissions in held:
+                if path.exists():
+                    path.chmod(permissions)
             stop_fill.set()
             if filler is not None:
                 filler.join(5)

@@ -334,7 +334,7 @@ ngx_http_cache_purge_tags(ngx_str_t value, ngx_http_cache_purge_entry_t *entry)
 
 static ngx_int_t
 ngx_http_cache_purge_identity(ngx_http_request_t *r,
-    ngx_http_cache_purge_entry_t  *entry, ngx_uint_t tags)
+    ngx_http_cache_purge_entry_t  *entry, ngx_uint_t tags, ngx_str_t *url)
 {
     ngx_str_t                        value;
     ngx_http_cache_rocksdb_bytes_t  *fields[3];
@@ -344,7 +344,11 @@ ngx_http_cache_purge_identity(ngx_http_request_t *r,
     fields[0] = &entry->url;
     fields[1] = &entry->misc;
     fields[2] = &entry->namespace_value;
-    for (i = 0; i < 3; i++) {
+    if (url != NULL) {
+        entry->url.data = url->data;
+        entry->url.len = url->len;
+    }
+    for (i = url != NULL ? 1 : 0; i < 3; i++) {
         if (ngx_http_cache_purge_value(r, i, &value) != NGX_OK
             || value.len > 32768 || (i == 0 && value.len == 0))
         {
@@ -377,16 +381,44 @@ ngx_http_cache_purge_match(ngx_http_request_t *r,
     ngx_http_cache_purge_main_conf_t  *main;
     ngx_http_cache_purge_ctx_t        *ctx;
     uint64_t                          *local, *propagate;
+    ngx_str_t                          url, *resolved;
+    ngx_int_t                          rc;
 
     main = ngx_http_get_module_main_conf(r, ngx_http_cache_purge_module);
     ngx_memzero(entry, sizeof(*entry));
     ngx_memzero(match, sizeof(*match));
     if (ngx_http_cache_purge_state_active(&main->state)) {
-        if (ngx_http_cache_purge_identity(r, entry, tags) != NGX_OK) {
-            return NGX_ERROR;
+        rc = NGX_AGAIN;
+        resolved = NULL;
+        if (tags && !ngx_http_cache_purge_state_complex(&main->state)) {
+            if (ngx_http_cache_purge_value(r, NGX_HTTP_CACHE_PURGE_URL, &url)
+                != NGX_OK || url.len == 0 || url.len > 32768)
+            {
+                return NGX_ERROR;
+            }
+            entry->url.data = url.data;
+            entry->url.len = url.len;
+            resolved = &url;
+            rc = ngx_http_cache_purge_state_match_url(&main->state, entry,
+                                          (uint64_t) ngx_time(), match);
         }
-        (void) ngx_http_cache_purge_state_match(&main->state, entry,
-                                                (uint64_t) ngx_time(), match);
+        if (rc == NGX_AGAIN) {
+            if (ngx_http_cache_purge_identity(r, entry, tags,
+                                               resolved) != NGX_OK)
+            {
+                return NGX_ERROR;
+            }
+            if (tags) {
+                rc = ngx_http_cache_purge_state_match_local(&main->state, entry,
+                                              (uint64_t) ngx_time(), match);
+            } else {
+                rc = ngx_http_cache_purge_state_match(&main->state, entry,
+                                              (uint64_t) ngx_time(), match);
+            }
+        }
+        if (rc == NGX_ERROR) {
+            return rc;
+        }
     }
     ctx = ngx_http_get_module_ctx(r, ngx_http_cache_purge_module);
     if (ctx != NULL && ctx->incoming != 0) {
@@ -828,7 +860,7 @@ ngx_http_cache_purge_log(ngx_http_request_t *r)
     {
         return NGX_OK;
     }
-    if (ngx_http_cache_purge_identity(r, &entry, 1) != NGX_OK) {
+    if (ngx_http_cache_purge_identity(r, &entry, 1, NULL) != NGX_OK) {
         ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
                       "cache purge fill identity is invalid");
         return NGX_OK;
@@ -1204,7 +1236,7 @@ ngx_http_cache_purge_method(ngx_http_request_t *r)
         || ctx->job.select.host_scope)
     {
         if (ctx->job.select.type == NGX_HTTP_CACHE_PURGE_SELECT_KEY) {
-            if (ngx_http_cache_purge_identity(r, &entry, 0) != NGX_OK) {
+            if (ngx_http_cache_purge_identity(r, &entry, 0, NULL) != NGX_OK) {
                 return NGX_HTTP_BAD_REQUEST;
             }
         } else {

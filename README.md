@@ -123,8 +123,12 @@ thread remains a debugging fallback and has a different performance profile.
 The shared state reserves rule space before admission and exposes a successful
 completion only after publication. Its empty-rule path does not take the shared
 mutex. Completed rules retained only for propagation skip HIT filtering.
-Active matching currently uses a bounded rule list under that mutex;
-full HTTP latency and contention acceptance remain outstanding. Queues contain
+When local rules contain only URL and prefix selectors, HIT filtering evaluates
+only the URL and searches a sorted array of at most 256 rules, following prefix
+ancestors for overlapping matches. The array is rebuilt on rule changes under
+the shared mutex. Other selectors use full identity matching; outgoing requests
+still include retained propagation rules. Full HTTP latency and contention
+acceptance remain outstanding. Queues contain
 copied messages, with count and byte limits, rather than request pointers or
 an in-memory copy of the cache index.
 

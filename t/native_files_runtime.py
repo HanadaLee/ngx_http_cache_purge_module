@@ -146,6 +146,7 @@ if args.state:
                      repo / 't/ngx_http_cache_purge_state_test.c',
                      args.nginx / 'src/core/ngx_slab.c',
                      args.nginx / 'src/core/ngx_shmtx.c',
+                     args.nginx / 'src/core/ngx_string.c',
                      args.nginx / 'src/os/unix/ngx_alloc.c']
     state_backend = []
     if args.backend:

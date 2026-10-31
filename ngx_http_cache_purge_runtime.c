@@ -5,18 +5,22 @@
 #include <sched.h>
 
 
-#define NGX_HTTP_CACHE_PURGE_STATE_VERSION  3
+#define NGX_HTTP_CACHE_PURGE_STATE_VERSION  4
 #define NGX_HTTP_CACHE_PURGE_STATE_LIMIT    256
 #define NGX_HTTP_CACHE_PURGE_FILE_BATCH     8
 
 
-typedef struct {
+typedef struct ngx_http_cache_purge_rule_s  ngx_http_cache_purge_rule_t;
+
+
+struct ngx_http_cache_purge_rule_s {
     ngx_queue_t                    queue;
+    ngx_http_cache_purge_rule_t   *parent;
     u_char                         id[16];
     ngx_http_cache_purge_select_t  select;
     uint64_t                       issued, retain_until;
     ngx_uint_t                     action, references, published, local;
-} ngx_http_cache_purge_rule_t;
+};
 
 
 struct ngx_http_cache_purge_message_s {
@@ -30,15 +34,18 @@ struct ngx_http_cache_purge_message_s {
 
 
 struct ngx_http_cache_purge_shared_s {
-    ngx_uint_t    version;
-    ngx_atomic_t  published;
-    ngx_atomic_t  filtering;
-    ngx_atomic_t  ready;
-    ngx_pid_t     owner;
-    ngx_queue_t   rules, messages, pending;
-    ngx_uint_t    rule_count, message_count;
-    size_t        message_bytes, capacity;
-    uint64_t      collected;
+    ngx_uint_t                   version;
+    ngx_atomic_t                 published;
+    ngx_atomic_t                 filtering;
+    ngx_atomic_t                 complex;
+    ngx_atomic_t                 ready;
+    ngx_pid_t                    owner;
+    ngx_queue_t                  rules, messages, pending;
+    ngx_uint_t                   rule_count, message_count;
+    ngx_uint_t                   url_count;
+    ngx_http_cache_purge_rule_t *urls[NGX_HTTP_CACHE_PURGE_STATE_LIMIT];
+    size_t                       message_bytes, capacity;
+    uint64_t                     collected;
 };
 
 
@@ -249,6 +256,63 @@ ngx_http_cache_purge_state_reserve(ngx_http_cache_purge_state_t *state,
 }
 
 
+static int
+ngx_http_cache_purge_state_compare(const void *a, const void *b)
+{
+    ngx_http_cache_purge_rule_t  *left, *right;
+
+    left = *(ngx_http_cache_purge_rule_t * const *) a;
+    right = *(ngx_http_cache_purge_rule_t * const *) b;
+    return ngx_memn2cmp((u_char *) left->select.value.data,
+                       (u_char *) right->select.value.data,
+                       left->select.value.len, right->select.value.len);
+}
+
+
+static void
+ngx_http_cache_purge_state_index(ngx_http_cache_purge_state_t *state)
+{
+    ngx_http_cache_purge_rule_t  *rule, *parent, **urls;
+    ngx_queue_t                  *q;
+    ngx_uint_t                    i, n;
+
+    urls = state->shared->urls;
+    n = 0;
+    for (q = ngx_queue_head(&state->shared->rules);
+         q != ngx_queue_sentinel(&state->shared->rules);
+         q = ngx_queue_next(q))
+    {
+        rule = ngx_queue_data(q, ngx_http_cache_purge_rule_t, queue);
+        if (!rule->published || !rule->local
+            || (rule->select.type != NGX_HTTP_CACHE_PURGE_SELECT_URL
+                && rule->select.type != NGX_HTTP_CACHE_PURGE_SELECT_PREFIX))
+        {
+            continue;
+        }
+
+        urls[n++] = rule;
+    }
+    ngx_qsort(urls, n, sizeof(*urls), ngx_http_cache_purge_state_compare);
+
+    /* Sorted predecessors and their prefix ancestors cover every match. */
+    parent = NULL;
+    for (i = 0; i < n; i++) {
+        rule = urls[i];
+        while (parent != NULL
+               && (parent->select.value.len > rule->select.value.len
+                   || ngx_memcmp(parent->select.value.data,
+                                 rule->select.value.data,
+                                 parent->select.value.len) != 0))
+        {
+            parent = parent->parent;
+        }
+        rule->parent = parent;
+        parent = rule;
+    }
+    state->shared->url_count = n;
+}
+
+
 static void
 ngx_http_cache_purge_state_publish(ngx_http_cache_purge_state_t *state,
     ngx_http_cache_purge_rule_t  *rule, const ngx_http_cache_purge_job_t *job)
@@ -267,6 +331,14 @@ ngx_http_cache_purge_state_publish(ngx_http_cache_purge_state_t *state,
         ngx_memory_barrier();
         (void) ngx_atomic_fetch_add(&state->shared->filtering,
                                      rule->local ? 1 : -1);
+        if (rule->select.type != NGX_HTTP_CACHE_PURGE_SELECT_URL
+            && rule->select.type != NGX_HTTP_CACHE_PURGE_SELECT_PREFIX)
+        {
+            (void) ngx_atomic_fetch_add(&state->shared->complex,
+                                         rule->local ? 1 : -1);
+        } else {
+            ngx_http_cache_purge_state_index(state);
+        }
     }
 }
 
@@ -281,6 +353,13 @@ ngx_http_cache_purge_state_remove(ngx_http_cache_purge_state_t *state,
         (void) ngx_atomic_fetch_add(&state->shared->published, -1);
         if (rule->local) {
             (void) ngx_atomic_fetch_add(&state->shared->filtering, -1);
+            if (rule->select.type != NGX_HTTP_CACHE_PURGE_SELECT_URL
+                && rule->select.type != NGX_HTTP_CACHE_PURGE_SELECT_PREFIX)
+            {
+                (void) ngx_atomic_fetch_add(&state->shared->complex, -1);
+            } else {
+                ngx_http_cache_purge_state_index(state);
+            }
         }
     }
 
@@ -611,6 +690,13 @@ ngx_http_cache_purge_state_finish(ngx_http_cache_purge_state_t *state,
         rule->local = 0;
         if (rule->published) {
             (void) ngx_atomic_fetch_add(&state->shared->filtering, -1);
+            if (rule->select.type != NGX_HTTP_CACHE_PURGE_SELECT_URL
+                && rule->select.type != NGX_HTTP_CACHE_PURGE_SELECT_PREFIX)
+            {
+                (void) ngx_atomic_fetch_add(&state->shared->complex, -1);
+            } else {
+                ngx_http_cache_purge_state_index(state);
+            }
         }
     }
 
@@ -659,14 +745,46 @@ ngx_http_cache_purge_state_matches(const ngx_http_cache_purge_select_t *s,
 }
 
 
-ngx_int_t
-ngx_http_cache_purge_state_match(ngx_http_cache_purge_state_t *state,
+static void
+ngx_http_cache_purge_state_apply(ngx_http_cache_purge_rule_t *rule,
+    const ngx_http_cache_purge_entry_t *entry, uint64_t now,
+    ngx_http_cache_purge_match_t *match, ngx_uint_t local_only)
+{
+    uint64_t  *local, *propagate;
+
+    if (!rule->published
+        || (!rule->local && (local_only || rule->retain_until <= now))
+        || !ngx_http_cache_purge_state_matches(&rule->select, entry))
+    {
+        return;
+    }
+
+    if (rule->action == NGX_HTTP_CACHE_PURGE_DELETE) {
+        local = &match->delete_before;
+        propagate = &match->propagate_delete;
+    } else {
+        local = &match->invalidate_before;
+        propagate = &match->propagate_invalidate;
+    }
+
+    if (rule->local) {
+        *local = ngx_max(*local, rule->issued);
+    }
+    if (rule->retain_until > now) {
+        *propagate = ngx_max(*propagate, rule->issued);
+    }
+}
+
+
+static ngx_int_t
+ngx_http_cache_purge_state_select(ngx_http_cache_purge_state_t *state,
     const ngx_http_cache_purge_entry_t  *entry, uint64_t now,
-    ngx_http_cache_purge_match_t *match)
+    ngx_http_cache_purge_match_t *match, ngx_uint_t url_only,
+    ngx_uint_t local_only)
 {
     ngx_http_cache_purge_rule_t  *rule;
     ngx_queue_t                  *q;
-    uint64_t                     *local, *propagate;
+    ngx_uint_t                    low, high, middle;
 
     ngx_memzero(match, sizeof(*match));
     if (state->shared->published == 0) {
@@ -678,31 +796,37 @@ ngx_http_cache_purge_state_match(ngx_http_cache_purge_state_t *state,
     }
 
     ngx_shmtx_lock(&state->pool->mutex);
-    for (q = ngx_queue_head(&state->shared->rules);
-         q != ngx_queue_sentinel(&state->shared->rules);
-         q = ngx_queue_next(q))
-    {
-        rule = ngx_queue_data(q, ngx_http_cache_purge_rule_t, queue);
-        if (!rule->published || (!rule->local && rule->retain_until <= now)
-            || !ngx_http_cache_purge_state_matches(&rule->select, entry))
+    if (url_only) {
+        if (state->shared->complex != 0) {
+            ngx_shmtx_unlock(&state->pool->mutex);
+            return NGX_AGAIN;
+        }
+        low = 0;
+        high = state->shared->url_count;
+        while (low < high) {
+            middle = (low + high) / 2;
+            rule = state->shared->urls[middle];
+            if (ngx_memn2cmp((u_char *) rule->select.value.data,
+                            (u_char *) entry->url.data,
+                            rule->select.value.len, entry->url.len) <= 0)
+            {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        rule = low == 0 ? NULL : state->shared->urls[low - 1];
+        for ( /* void */; rule != NULL; rule = rule->parent) {
+            ngx_http_cache_purge_state_apply(rule, entry, now, match, 1);
+        }
+    } else {
+        for (q = ngx_queue_head(&state->shared->rules);
+             q != ngx_queue_sentinel(&state->shared->rules);
+             q = ngx_queue_next(q))
         {
-            continue;
-        }
-
-        if (rule->action == NGX_HTTP_CACHE_PURGE_DELETE) {
-            local = &match->delete_before;
-            propagate = &match->propagate_delete;
-        } else {
-            local = &match->invalidate_before;
-            propagate = &match->propagate_invalidate;
-        }
-
-        if (rule->local) {
-            *local = ngx_max(*local, rule->issued);
-        }
-
-        if (rule->retain_until > now) {
-            *propagate = ngx_max(*propagate, rule->issued);
+            rule = ngx_queue_data(q, ngx_http_cache_purge_rule_t, queue);
+            ngx_http_cache_purge_state_apply(rule, entry, now, match,
+                                              local_only);
         }
     }
 
@@ -711,6 +835,34 @@ ngx_http_cache_purge_state_match(ngx_http_cache_purge_state_t *state,
     return match->delete_before || match->invalidate_before
            || match->propagate_delete || match->propagate_invalidate
            ? NGX_OK : NGX_DECLINED;
+}
+
+
+ngx_int_t
+ngx_http_cache_purge_state_match(ngx_http_cache_purge_state_t *state,
+    const ngx_http_cache_purge_entry_t  *entry, uint64_t now,
+    ngx_http_cache_purge_match_t *match)
+{
+    return ngx_http_cache_purge_state_select(state, entry, now, match, 0, 0);
+}
+
+
+ngx_int_t
+ngx_http_cache_purge_state_match_local(ngx_http_cache_purge_state_t *state,
+    const ngx_http_cache_purge_entry_t  *entry, uint64_t now,
+    ngx_http_cache_purge_match_t *match)
+{
+    return ngx_http_cache_purge_state_select(state, entry, now, match, 0, 1);
+}
+
+
+/* NGX_AGAIN requires the caller to supply the remaining identity fields. */
+ngx_int_t
+ngx_http_cache_purge_state_match_url(ngx_http_cache_purge_state_t *state,
+    const ngx_http_cache_purge_entry_t  *entry, uint64_t now,
+    ngx_http_cache_purge_match_t *match)
+{
+    return ngx_http_cache_purge_state_select(state, entry, now, match, 1, 1);
 }
 
 
@@ -974,6 +1126,14 @@ ngx_uint_t
 ngx_http_cache_purge_state_filtering(ngx_http_cache_purge_state_t *state)
 {
     return state->shared->filtering;
+}
+
+
+/* Local rules that require fields other than the URL. */
+ngx_uint_t
+ngx_http_cache_purge_state_complex(ngx_http_cache_purge_state_t *state)
+{
+    return state->shared->complex;
 }
 
 

@@ -99,6 +99,14 @@ void ngx_http_cache_purge_state_finish(ngx_http_cache_purge_state_t *state,
 ngx_int_t ngx_http_cache_purge_state_match(ngx_http_cache_purge_state_t *state,
     const ngx_http_cache_purge_entry_t  *identity, uint64_t now,
     ngx_http_cache_purge_match_t *match);
+ngx_int_t ngx_http_cache_purge_state_match_local(
+    ngx_http_cache_purge_state_t        *state,
+    const ngx_http_cache_purge_entry_t  *identity, uint64_t now,
+    ngx_http_cache_purge_match_t *match);
+ngx_int_t ngx_http_cache_purge_state_match_url(
+    ngx_http_cache_purge_state_t        *state,
+    const ngx_http_cache_purge_entry_t  *identity, uint64_t now,
+    ngx_http_cache_purge_match_t *match);
 void ngx_http_cache_purge_state_collect(ngx_http_cache_purge_state_t *state,
     uint64_t now);
 
@@ -181,6 +189,8 @@ ngx_int_t ngx_http_cache_purge_value(ngx_http_request_t *r, ngx_uint_t n,
 ngx_uint_t ngx_http_cache_purge_state_active(
     ngx_http_cache_purge_state_t *state);
 ngx_uint_t ngx_http_cache_purge_state_filtering(
+    ngx_http_cache_purge_state_t *state);
+ngx_uint_t ngx_http_cache_purge_state_complex(
     ngx_http_cache_purge_state_t *state);
 ngx_uint_t ngx_http_cache_purge_state_tagged(
     ngx_http_cache_purge_state_t *state,
