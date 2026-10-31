@@ -295,6 +295,11 @@ RCU waits when request-side descriptor duplication first expands a table shared
 with background threads. The kernel rounds capacity upward; 1,024 entries need
 about 8 KiB for file pointers plus bitmaps and allocator overhead per worker.
 Other modules or workloads exceeding the reserved budget can still expand it.
+Set the worker's descriptor limit for retained `open_file_cache` entries,
+client/upstream sockets, RocksDB files, and transient proof/publication
+descriptors together. `worker_connections` does not include every open file.
+Startup reservation does not prevent `EMFILE` when the soft limit is too small;
+configure `worker_rlimit_nofile` and the service's allowed limit accordingly.
 
 The RocksDB bridge exposes owner-local batch durability tickets. Reading them
 only inspects counters and never synchronizes the WAL. A later deferred batch
