@@ -42,7 +42,7 @@ export CACHE_PURGE_ROCKSDB_LIB_DIR="$backend"
 cd "$nginx"
 configure=./configure
 [ -f "$configure" ] || configure=./auto/configure
-"$configure" --with-threads --with-debug \
+"$configure" --with-debug \
     --without-http_rewrite_module --without-http_auth_basic_module \
     "--add-module=$module"
 # Use the module manifest and NGINX's generated rules, including their actual

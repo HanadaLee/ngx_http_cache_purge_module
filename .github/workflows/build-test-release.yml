@@ -85,7 +85,7 @@ jobs:
           cache-from: type=gha,scope=persistent-${{ matrix.nginx }}
           cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,mode=min,ignore-error=true,scope=persistent-{0}', matrix.nginx) || '' }}
           provenance: false
-      - name: Backend, worker lifecycle, native fill and HTTP API
+      - name: Backend, native cache, four protocols and one-way propagation
         env:
           TEST_DYNAMIC: ${{ matrix.dynamic }}
           TEST_SANITIZE: ${{ matrix.sanitize }}
@@ -121,7 +121,7 @@ jobs:
           cmake -S . -B /tmp/cache-valgrind -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCACHE_PURGE_STORE_TESTS=ON
           cmake --build /tmp/cache-valgrind --parallel 2
           mkdir -p t/test-results
-          for suite in store index; do
+          for suite in store catalog jobs; do
             valgrind --error-exitcode=99 --leak-check=full --errors-for-leak-kinds=definite,indirect \
               --xml=yes --xml-file="t/test-results/$suite-valgrind.xml" \
               "/tmp/cache-valgrind/cache_purge_${suite}_test"

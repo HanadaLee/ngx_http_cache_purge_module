@@ -22,6 +22,7 @@ my @integration = (
     {name => 'mainline-static', nginx => '1.31.7', dynamic => 'false', sanitize => 'false', cc => 'gcc', cxx => 'g++'},
     {name => 'mainline-dynamic', nginx => '1.31.7', dynamic => 'true', sanitize => 'false', cc => 'gcc', cxx => 'g++'},
     {name => 'mainline-asan', nginx => '1.31.7', dynamic => 'false', sanitize => 'true', cc => 'gcc', cxx => 'g++'},
+    {name => 'stable-dynamic', nginx => '1.26.3', dynamic => 'true', sanitize => 'false', cc => 'gcc', cxx => 'g++'},
 );
 if ($full) {
     push @integration,

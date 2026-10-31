@@ -10,7 +10,7 @@ ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 help:
 	@echo "build          Build embedded backend libraries and tests"
 	@echo "test           Run backend tests (BUILD_DIR, REPORT_DIR, JOBS)"
-	@echo "test-http      Run backend, lifecycle, fill and HTTP suites; set NGINX_SOURCE and CACHE_KEY_SOURCE"
+	@echo "test-http      Run backend, native, four-protocol and propagation suites; set NGINX_SOURCE, optionally CACHE_KEY_SOURCE"
 	@echo "test-sanitize  Run the same suites with ASan/UBSan"
 	@echo "Choose a new REPORT_DIR for each run; stale reports are rejected."
 
@@ -22,7 +22,7 @@ test:
 	python3 "$(ROOT)/t/persistent_runtime.py" --backend-only --build "$(BUILD_DIR)" --reports "$(REPORT_DIR)" --jobs $(JOBS)
 
 test-http:
-	python3 "$(ROOT)/t/persistent_runtime.py" --nginx "$(NGINX_SOURCE)" --key "$(CACHE_KEY_SOURCE)" --build "$(BUILD_DIR)" --reports "$(REPORT_DIR)" --jobs $(JOBS) $(HTTP_OPTIONS)
+	python3 "$(ROOT)/t/persistent_runtime.py" --nginx "$(NGINX_SOURCE)" $(if $(CACHE_KEY_SOURCE),--key "$(CACHE_KEY_SOURCE)") --build "$(BUILD_DIR)" --reports "$(REPORT_DIR)" --jobs $(JOBS) $(HTTP_OPTIONS)
 
 test-sanitize:
 	$(MAKE) test-http BUILD_DIR="$(BUILD_DIR)-asan" REPORT_DIR="$(REPORT_DIR)-asan" HTTP_OPTIONS="$(HTTP_OPTIONS) --sanitize"

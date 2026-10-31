@@ -17,6 +17,8 @@ def main():
     parser.add_argument('--nginx-ref', default='HEAD')
     parser.add_argument('--key', type=Path, default=os.getenv('CACHE_KEY_SOURCE'))
     parser.add_argument('--expr', type=Path)
+    parser.add_argument('--proxy-filter', type=Path)
+    parser.add_argument('--extension', type=int, choices=(0, 1), default=0)
     parser.add_argument('--build', type=Path)
     parser.add_argument('--reports', type=Path, required=True)
     parser.add_argument('--jobs', type=int, default=2)
@@ -29,8 +31,8 @@ def main():
     if args.jobs < 1 or args.jobs > 32:
         parser.error('--jobs must be between 1 and 32')
     if not args.backend_only:
-        if not args.nginx or not args.key:
-            parser.error('HTTP checks require --nginx and --key source trees')
+        if not args.nginx:
+            parser.error('HTTP checks require an --nginx source tree')
         if os.geteuid() == 0:
             parser.error('run HTTP checks as an ordinary user, including inside test containers')
     repo = Path(__file__).resolve().parents[1]
@@ -75,27 +77,45 @@ def main():
                 for kind in ('failure', 'error', 'skipped')):
             raise RuntimeError('backend report is empty or contains unsuccessful tests')
         if not args.backend_only:
-            common = ['--nginx', args.nginx.resolve(), '--nginx-ref', args.nginx_ref,
-                      '--libraries', build]
-            flags = (['--dynamic'] if args.dynamic else []) + (['--sanitize'] if args.sanitize else [])
-            suites = [
-                ('lifecycle', 'runtime_nginx.py', ['--shared-rocksdb']),
-                ('native-fill', 'native_fill_runtime.py', []),
-                ('capture', 'capture_runtime.py', ['--key', args.key.resolve()]
-                 + (['--expr', args.expr.resolve()] if args.expr else [])),
-            ]
-            for name, script, extra in suites:
+            def suite(name, script, arguments):
                 output = reports / (name + '.json')
-                run(name, [sys.executable, repo / 't' / script, *common,
-                           *flags, *extra, '--output', output])
+                run(name, [sys.executable, repo / 't' / script,
+                           *arguments, '--output', output])
                 report = json.loads(output.read_text())
                 checks = report.get('checks', [])
-                if not checks:
-                    raise RuntimeError(name + ' returned no checks')
-                suite = ET.Element('testsuite', name=name, tests=str(len(checks)), failures='0')
+                if report.get('status') != 'passed' or not checks:
+                    raise RuntimeError(name + ' returned no successful checks')
+                junit = ET.Element('testsuite', name=name, tests=str(len(checks)), failures='0')
                 for check in checks:
-                    ET.SubElement(suite, 'testcase', classname=name, name=check)
-                ET.ElementTree(suite).write(reports / (name + '.xml'), encoding='utf-8', xml_declaration=True)
+                    ET.SubElement(junit, 'testcase', classname=name, name=check)
+                ET.ElementTree(junit).write(reports / (name + '.xml'), encoding='utf-8', xml_declaration=True)
+                return report
+
+            flags = ['--sanitize'] if args.sanitize else []
+            public_args = ['--nginx', args.nginx.resolve(), '--nginx-ref', args.nginx_ref,
+                           '--backend', build, '--extension', args.extension,
+                           '--public-module', '--no-thread-pool', '--slice', '--protocols', '--ssl', *flags]
+            for option, path in (('--key', args.key), ('--expr', args.expr), ('--proxy-filter', args.proxy_filter)):
+                if path:
+                    public_args += [option, path.resolve()]
+            if args.dynamic:
+                public_args += ['--dynamic']
+            public = suite('public', 'native_cache_runtime.py', public_args)
+            nginx = Path(public['root']) / 'nginx'
+            # This standalone primitive harness does not import expr headers.
+            if not args.expr:
+                suite('native', 'native_files_runtime.py', [
+                    '--nginx', nginx, '--backend', build, '--state', *flags])
+            propagation = ['--binary', nginx / 'objs/nginx']
+            if args.dynamic:
+                propagation += ['--modules', nginx / 'objs']
+            if args.proxy_filter and args.extension:
+                propagation += ['--framework']
+            if args.expr:
+                propagation += ['--expr']
+            suite('propagation', 'native_propagation_runtime.py', propagation)
+            suite('propagation-streaming', 'native_propagation_runtime.py',
+                  [*propagation, '--tls', '--streaming', '--custom-headers'])
         result['status'] = 'passed'
     except Exception as error:
         result['status'] = 'failed'

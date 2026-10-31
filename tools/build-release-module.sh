@@ -8,11 +8,6 @@ if [[ ! "$MODULE_VERSION" =~ ^4\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]
     echo "Invalid MODULE_VERSION: expected 4.x.y[-prerelease] without a v prefix" >&2
     exit 1
 fi
-IFS=. read -r nginx_major nginx_minor nginx_patch <<< "$NGINX_VERSION"
-if (( 10#$nginx_major * 1000000 + 10#$nginx_minor * 1000 + 10#$nginx_patch < 1031007 )); then
-    echo "The persistent modules require nginx 1.31.7 or newer" >&2
-    exit 1
-fi
 module_dir=$(pwd)
 export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}
 [[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]]
@@ -28,18 +23,6 @@ trap 'rm -rf "$work"' EXIT
 name="ngx_http_cache_purge-${MODULE_VERSION}-nginx-${NGINX_VERSION}-linux-${arch}"
 stage="$work/$name"
 mkdir -p "$stage"
-key_revision=${CACHE_KEY_REVISION:-ae3584f589f1d048996c50a78b3015f1fcd36eed}
-[[ "$key_revision" =~ ^[0-9a-f]{40}$ ]]
-mkdir "$work/key"
-if [[ -n ${CACHE_KEY_SOURCE:-} ]]; then
-    git -C "$CACHE_KEY_SOURCE" archive "$key_revision" | tar -xf - -C "$work/key"
-else
-    git -C "$work/key" init -q
-    git -C "$work/key" remote add origin "${CACHE_KEY_REPOSITORY:-https://git.hanada.info/hanada/ngx_http_cache_key_module.git}"
-    git -C "$work/key" fetch --depth=1 origin "$key_revision"
-    git -C "$work/key" checkout --detach -q FETCH_HEAD
-    test "$(git -C "$work/key" rev-parse HEAD)" = "$key_revision"
-fi
 sh t/download.sh "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" "$work/nginx.tar.gz"
 tar --no-same-owner -xzf "$work/nginx.tar.gz" -C "$work"
 cmake -S "$module_dir" -B "$work/backend" -DCMAKE_BUILD_TYPE=RelWithDebInfo \
@@ -48,8 +31,7 @@ cmake -S "$module_dir" -B "$work/backend" -DCMAKE_BUILD_TYPE=RelWithDebInfo \
 cmake --build "$work/backend" --parallel "${BUILD_JOBS:-2}"
 export CACHE_PURGE_ROCKSDB_LIB_DIR="$work/backend"
 cd "$work/nginx-$NGINX_VERSION"
-./configure --with-compat --with-threads --with-http_ssl_module \
-    --add-dynamic-module="$work/key" \
+./configure --with-compat --with-http_ssl_module \
     --add-dynamic-module="$module_dir" \
     --with-cc-opt="-ffile-prefix-map=$work=/usr/src/build -ffile-prefix-map=$module_dir=/usr/src/ngx_http_cache_purge"
 make -j"${BUILD_JOBS:-2}"
@@ -67,7 +49,7 @@ error_log stderr;
 events {}
 http {
     access_log off;
-    cache_purge_store $work/runtime/index cache=16m write_buffer=4m;
+    cache_purge_store $work/runtime/index cache=16m buffer=4m;
     cache_purge_state_zone release_control 4m;
     proxy_cache_path $work/runtime/cache keys_zone=release:1m;
     server {
@@ -78,7 +60,7 @@ http {
 EOF
 objs/nginx -p "$work/runtime/" -c nginx.conf -t
 python3 "$module_dir/t/release_runtime.py" --nginx "$PWD/objs/nginx" \
-    --modules "$stage" --key-module "$PWD/objs/ngx_http_cache_key_module.so" \
+    --modules "$stage" \
     --root "$work/package-test" --output "$work/package-test.json"
 cp "$module_dir/LICENSE" "$stage/"
 cp "$module_dir/README.md" "$stage/README.md"
@@ -86,7 +68,7 @@ cp "$module_dir/README.md" "$stage/README.md"
     printf 'Module: %s\nCommit: %s\nNGINX: %s\nArchitecture: %s\n' \
         "$MODULE_VERSION" "$(git -C "$module_dir" rev-parse HEAD)" "$NGINX_VERSION" "$arch"
     printf 'SOURCE_DATE_EPOCH: %s\n' "$SOURCE_DATE_EPOCH"
-    printf 'Cache key API revision: %s\n' "$key_revision"
+    printf 'Tracked source changes: %s\n' "$(git -C "$module_dir" status --porcelain --untracked-files=no | wc -l)"
     cat "$work/package-test.json"
     cat /etc/os-release
     getconf GNU_LIBC_VERSION

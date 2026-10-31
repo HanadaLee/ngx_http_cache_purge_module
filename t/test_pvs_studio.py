@@ -98,7 +98,7 @@ class AnalysisPipeline(unittest.TestCase):
                 self.assertEqual(args['credentials'],
                                  ['credentials', 'fixture-name', 'fixture-key'])
                 self.assertIn('--add-module=' + str(ROOT), args['configure'])
-                self.assertIn('--with-threads', args['configure'])
+                self.assertNotIn('--with-threads', args['configure'])
                 self.assertEqual(args['make'][:4], ['-f', 'objs/Makefile', '-B', '-j2'])
                 config = (ROOT / 'config').read_text()
                 sources = re.search(r'CACHE_PURGE_SRCS="([^"]+)"', config, re.S).group(1)
