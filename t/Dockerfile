@@ -1,4 +1,4 @@
-# Test-only images. The production runtime is embedded in nginx worker 0.
+# Test-only images. The production runtime uses the native nginx cache manager.
 ARG UBUNTU_VERSION=24.04
 FROM ubuntu:${UBUNTU_VERSION} AS tools
 ENV DEBIAN_FRONTEND=noninteractive

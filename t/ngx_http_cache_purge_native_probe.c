@@ -418,7 +418,7 @@ ngx_http_cache_purge_probe_process(ngx_cycle_t *cycle)
         ngx_http_cache_rocksdb_options(&options);
         return ngx_http_cache_purge_owner_start(cycle, &main->state,
                 &main->store, &options, main->caches.elts, main->caches.nelts,
-                &main->owner);
+                1, &main->owner);
     }
     if (main->state.channel[0] != -1) {
         (void) close(main->state.channel[0]);

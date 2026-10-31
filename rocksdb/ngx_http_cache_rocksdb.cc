@@ -365,8 +365,7 @@ ngx_http_cache_rocksdb_initialize(ngx_http_cache_rocksdb_t *store,
     options.max_background_jobs =
         static_cast<int>(store->options.background_jobs);
 #if (defined(__linux__))
-    /* The default Env pools are shared inside this worker. Keep their flush
-     * and compaction CPU work below HTTP and proof-read threads. */
+    /* Keep shared Env flush and compaction work at background priority. */
     options.env->LowerThreadPoolCPUPriority(rocksdb::Env::LOW);
     options.env->LowerThreadPoolCPUPriority(rocksdb::Env::HIGH);
 #endif

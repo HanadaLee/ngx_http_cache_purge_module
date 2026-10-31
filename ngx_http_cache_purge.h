@@ -117,7 +117,7 @@ ngx_int_t ngx_http_cache_purge_owner_start(ngx_cycle_t *cycle,
     ngx_http_cache_purge_state_t            *state, const ngx_str_t *path,
     const ngx_http_cache_rocksdb_options_t  *options,
     ngx_http_file_cache_t                  **caches, ngx_uint_t count,
-    ngx_http_cache_purge_owner_t **owner);
+    ngx_uint_t threaded, ngx_http_cache_purge_owner_t **owner);
 void ngx_http_cache_purge_owner_stop(ngx_http_cache_purge_owner_t *owner);
 
 #if (NGX_EXPR)

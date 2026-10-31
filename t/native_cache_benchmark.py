@@ -52,12 +52,13 @@ class Origin(http.server.BaseHTTPRequestHandler):
         pass
 
 
-origin = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Origin)
-threading.Thread(target=origin.serve_forever, daemon=True).start()
 cpus = sorted(os.sched_getaffinity(0))
 assert args.workers > 0 and 0 < args.server_cores <= len(cpus)
 server_cpus = cpus[:args.server_cores]
 client_cpus = cpus[args.server_cores:] or cpus
+os.sched_setaffinity(0, client_cpus)
+origin = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Origin)
+threading.Thread(target=origin.serve_forever, daemon=True).start()
 (root / 'stats.lua').write_text('''done = function(summary, latency, requests)
     io.write(string.format('RESULT {"requests":%d,"duration_us":%d,"p50_us":%d,"p95_us":%d,"p99_us":%d,"connect_errors":%d,"read_errors":%d,"write_errors":%d,"status_errors":%d,"timeouts":%d}\\n',
         summary.requests, summary.duration, latency:percentile(50),
@@ -69,6 +70,7 @@ end
 report = {'root': str(root), 'binary': str(args.binary),
           'binary_sha256': hashlib.sha256(args.binary.read_bytes()).hexdigest(),
           'server_cpus': server_cpus, 'client_cpus': client_cpus,
+          'origin_and_controller_pinned': True,
           'workers': args.workers,
           'connections': args.connections, 'seconds': args.seconds,
           'fills': args.fills, 'fill_rate': args.fill_rate,
@@ -89,6 +91,8 @@ def setup_child():
 def resources(pid):
     pending, seen = [pid], set()
     pss = rss = ticks = 0
+    user_ticks = system_ticks = minor_faults = 0
+    threads = {}
     policies = {}
     policy_ticks = {}
     while pending:
@@ -101,6 +105,9 @@ def resources(pid):
             pending.extend(map(int, (directory / 'task' / str(current) / 'children').read_text().split()))
             stat = (directory / 'stat').read_text().rsplit(')', 1)[1].split()
             ticks += int(stat[11]) + int(stat[12])
+            user_ticks += int(stat[11])
+            system_ticks += int(stat[12])
+            minor_faults += int(stat[7])
             memory = dict(re.findall(r'^(Pss|Rss):\s+(\d+)',
                                      (directory / 'smaps_rollup').read_text(), re.M))
             pss += int(memory['Pss'])
@@ -110,11 +117,18 @@ def resources(pid):
                 policies[policy] = policies.get(policy, 0) + 1
                 stat = (task / 'stat').read_text().rsplit(')', 1)[1].split()
                 policy_ticks[policy] = policy_ticks.get(policy, 0) + int(stat[11]) + int(stat[12])
+                status = (task / 'status').read_text()
+                threads[task.name] = dict(name=(task / 'comm').read_text().strip(),
+                    policy=int(policy), nice=int(stat[16]), user_ticks=int(stat[11]),
+                    system_ticks=int(stat[12]), minor_faults=int(stat[7]),
+                    **{key: int(value) for key, value in re.findall(
+                        r'^(voluntary_ctxt_switches|nonvoluntary_ctxt_switches):\s+(\d+)', status, re.M)})
         except FileNotFoundError:
             pass
     result = {'pss_kib': pss, 'rss_kib': rss, 'cpu_ticks': ticks,
               'processes': len(seen), 'scheduler_policies': policies,
-              'scheduler_cpu_ticks': policy_ticks}
+              'scheduler_cpu_ticks': policy_ticks, 'user_ticks': user_ticks,
+              'system_ticks': system_ticks, 'minor_faults': minor_faults, 'threads': threads}
     if args.cgroup:
         result['cgroup'] = {name: (args.cgroup / name).read_text().strip()
                            for name in ('memory.limit_in_bytes', 'memory.usage_in_bytes',

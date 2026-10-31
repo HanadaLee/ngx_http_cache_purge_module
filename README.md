@@ -6,7 +6,7 @@ Production code is C; only the RocksDB bridge uses C++.
 
 The simplified implementation builds as an nginx addon. Public PURGE requests
 persist a background task and publish a shared rule before returning 202.
-Worker 0 owns RocksDB on one background thread and processes files in bounded
+The native nginx cache manager owns RocksDB and processes files in bounded
 batches. Full feature and performance acceptance is still pending; this working
 tree is not a release.
 
@@ -23,14 +23,19 @@ tree is not a release.
 - Keep active purge rules in bounded shared memory while background processing
   is pending. Preserve proxy propagation for its configured window.
 - Maintain URL and TAG relationships in RocksDB without loading the entire
-  index into memory. RocksDB runs inside nginx worker 0, with bounded background
-  work; no separate database service or container is required.
+  index into memory. RocksDB runs inside the native cache manager, with bounded
+  background work; no separate database service or container is required.
 
 No module metadata belongs in nginx cache files, extended attributes, hidden
 response headers or sidecar files. Ordinary HITs must not read module file
 proofs, query the index on every request or wait for background file maintenance.
 The removed transaction and recovery mechanisms are not optional compatibility
 modes.
+
+Indexing starts with managed cache fills. Existing unindexed files require an
+explicit index migration or a fresh cache-key namespace when first enabling
+this mode. The module does not infer historical identities from native keys or
+rebuild the index on ordinary HITs. Normal restarts reuse the persistent index.
 
 ## Configuration contract
 
@@ -103,9 +108,17 @@ The nginx executor processes at most 8 files per batch, with at least 50 ms
 between successful batches. Each batch closes its snapshot and stores a
 continuation bookmark. Ordinary progress uses deferred WAL; admission and
 completion are synchronous. File errors preserve the unfinished entry for a
-later background retry. The worker must publish its shared rule before replying
+later background retry. The executor must publish its shared rule before replying
 202, and apply native-node updates before withdrawing that rule. The owner
 and public PURGE handler implement this ordering.
+
+The store registers a normal nginx path-manager callback. nginx starts,
+reloads and respawns the cache manager; the module does not add a process
+supervisor or change nginx core. HTTP workers neither open RocksDB nor create
+database threads. The cache manager handles its queue through the existing pipe
+and timer, alongside native cache maintenance. RocksDB's internal threads stay
+inside that helper process. With `master_process off`, the existing in-process
+thread remains a debugging fallback and has a different performance profile.
 
 The shared state reserves rule space before admission and exposes a successful
 completion only after publication. Its empty-rule path does not take the shared
@@ -137,8 +150,9 @@ restart degradation and Delete with `open_file_cache`. `--extension 0` checks
 the existing native stale fallback without extension behavior. With
 `--public-module --backend`, the runner builds the actual addon and exercises
 PURGE and task status in a two-worker nginx instance. It covers cross-zone
-deletion, background retry, reload handoff and request enforcement while a
-512-object prefix task is still pending. Omitting `--public-module` selects a
+deletion, background retry, reload handoff, native helper respawn and request
+enforcement while a 512-object prefix task is still pending. Omitting
+`--public-module` selects a
 native-operation test adapter. `--sanitize` enables ASan/UBSan and requires
 matching backend archives; leak detection is disabled for nginx's process-exit
 allocation model.

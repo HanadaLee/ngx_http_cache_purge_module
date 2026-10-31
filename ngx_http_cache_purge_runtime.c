@@ -844,7 +844,9 @@ ngx_http_cache_purge_state_stats(ngx_http_cache_purge_state_t *state,
 }
 
 
-/* The owner is a worker-local executor, not another nginx process. */
+/*
+ * Production work runs in the native cache manager; single mode uses a thread.
+ */
 typedef struct {
     ngx_http_cache_rocksdb_bytes_t  root, zone;
 } ngx_http_cache_purge_target_t;
@@ -877,7 +879,7 @@ struct ngx_http_cache_purge_owner_s {
     ngx_http_cache_purge_message_t  *ticket;
     ngx_msec_t                       next_at, maintain_at;
     ngx_uint_t                       opened, restoring, restored, pending;
-    ngx_uint_t                       selected, after_set, quota;
+    ngx_uint_t                       selected, after_set, quota, threaded;
     int                              last_error;
 
     pthread_t                         thread;
@@ -902,6 +904,9 @@ struct ngx_http_cache_purge_owner_s {
 static void ngx_http_cache_purge_owner_drive(ngx_http_cache_purge_owner_t *o);
 static void ngx_http_cache_purge_owner_notify(ngx_event_t *event);
 static void ngx_http_cache_purge_owner_timer(ngx_event_t *event);
+static void ngx_http_cache_purge_owner_exit(void);
+
+static ngx_http_cache_purge_owner_t *ngx_http_cache_purge_manager_owner;
 
 
 ngx_int_t
@@ -1415,10 +1420,29 @@ ngx_http_cache_purge_owner_drive(ngx_http_cache_purge_owner_t *o)
         o->operation = operation;
         o->now = (uint64_t) ngx_time();
         o->phase = 1;
-        pthread_cond_signal(&o->condition);
+        if (o->threaded) {
+            pthread_cond_signal(&o->condition);
+        }
         pthread_mutex_unlock(&o->mutex);
+        if (!o->threaded) {
+            o->result = ngx_http_cache_purge_owner_execute(o);
+            if (o->store != NULL && ngx_http_cache_purge_manager_owner == NULL)
+            {
+                /* Register after RocksDB initializes its process globals. */
+                if (atexit(ngx_http_cache_purge_owner_exit) != 0) {
+                    ngx_log_error(NGX_LOG_ALERT, o->log, 0,
+                                  "cache purge manager cleanup failed");
+                    ngx_http_cache_purge_owner_close(o);
+                    exit(2);
+                }
+                ngx_http_cache_purge_manager_owner = o;
+            }
+            o->phase = 0;
+            ngx_http_cache_purge_owner_deliver(o);
+        }
     }
-    ngx_add_timer(&o->timer, o->pending ? 10 : 100);
+    ngx_add_timer(&o->timer, operation != -1 && !o->threaded
+                             ? 1 : o->pending ? 10 : 100);
 }
 
 
@@ -1452,7 +1476,7 @@ ngx_http_cache_purge_owner_start(ngx_cycle_t *cycle,
     ngx_http_cache_purge_state_t            *state, const ngx_str_t *path,
     const ngx_http_cache_rocksdb_options_t  *options,
     ngx_http_file_cache_t                  **caches, ngx_uint_t count,
-    ngx_http_cache_purge_owner_t **out)
+    ngx_uint_t threaded, ngx_http_cache_purge_owner_t **out)
 {
     ngx_http_cache_purge_owner_t    *o;
     ngx_str_t                        names[2];
@@ -1468,6 +1492,7 @@ ngx_http_cache_purge_owner_start(ngx_cycle_t *cycle,
         return NGX_ERROR;
     }
     o->state = state;
+    o->threaded = threaded;
     o->log = cycle->log;
     o->options = *options;
     o->notify_fd = state->channel[1];
@@ -1510,17 +1535,19 @@ ngx_http_cache_purge_owner_start(ngx_cycle_t *cycle,
         ngx_free(o->work);
         return NGX_ERROR;
     }
-    if (pthread_attr_init(&attr) != 0) {
-        goto failed;
-    }
-    rc = pthread_attr_setstacksize(&attr, 1024 * 1024);
-    if (rc == 0) {
-        rc = pthread_create(&o->thread, &attr,
-                             ngx_http_cache_purge_owner_thread, o);
-    }
-    pthread_attr_destroy(&attr);
-    if (rc != 0) {
-        goto failed;
+    if (threaded) {
+        if (pthread_attr_init(&attr) != 0) {
+            goto failed;
+        }
+        rc = pthread_attr_setstacksize(&attr, 1024 * 1024);
+        if (rc == 0) {
+            rc = pthread_create(&o->thread, &attr,
+                                 ngx_http_cache_purge_owner_thread, o);
+        }
+        pthread_attr_destroy(&attr);
+        if (rc != 0) {
+            goto failed;
+        }
     }
 
     o->connection = ngx_get_connection(state->channel[0], cycle->log);
@@ -1565,7 +1592,11 @@ ngx_http_cache_purge_owner_stop(ngx_http_cache_purge_owner_t *o)
     o->stopping = 1;
     pthread_cond_signal(&o->condition);
     pthread_mutex_unlock(&o->mutex);
-    pthread_join(o->thread, NULL);
+    if (o->threaded) {
+        pthread_join(o->thread, NULL);
+    } else {
+        ngx_http_cache_purge_owner_close(o);
+    }
     if (o->phase == 3) {
         ngx_http_cache_purge_owner_deliver(o);
     }
@@ -1582,4 +1613,12 @@ ngx_http_cache_purge_owner_stop(ngx_http_cache_purge_owner_t *o)
     pthread_cond_destroy(&o->condition);
     pthread_mutex_destroy(&o->mutex);
     ngx_free(o->work);
+}
+
+
+static void
+ngx_http_cache_purge_owner_exit(void)
+{
+    ngx_http_cache_purge_owner_stop(ngx_http_cache_purge_manager_owner);
+    ngx_http_cache_purge_manager_owner = NULL;
 }

@@ -56,6 +56,7 @@ static char *ngx_http_cache_purge_api_conf(ngx_conf_t *cf, ngx_command_t *cmd,
 static ngx_int_t ngx_http_cache_purge_post(ngx_conf_t *cf);
 static ngx_int_t ngx_http_cache_purge_init(ngx_cycle_t *cycle);
 static ngx_int_t ngx_http_cache_purge_worker(ngx_cycle_t *cycle);
+static ngx_msec_t ngx_http_cache_purge_manager(void *data);
 static void ngx_http_cache_purge_exit(ngx_cycle_t *cycle);
 
 
@@ -318,6 +319,8 @@ ngx_http_cache_purge_store(ngx_conf_t *cf, ngx_command_t *cmd, void *data)
         return NGX_CONF_ERROR;
     }
     main->path->name = value[1];
+    main->path->manager = ngx_http_cache_purge_manager;
+    main->path->data = main;
     while (main->path->name.len > 1
            && main->path->name.data[main->path->name.len - 1] == '/')
     {
@@ -547,18 +550,38 @@ ngx_http_cache_purge_worker(ngx_cycle_t *cycle)
     if (main == NULL || main->path == NULL) {
         return NGX_OK;
     }
-    if (ngx_process == NGX_PROCESS_SINGLE
-        || (ngx_process == NGX_PROCESS_WORKER && ngx_worker == 0))
+    if (ngx_process == NGX_PROCESS_SINGLE)
     {
         return ngx_http_cache_purge_owner_start(cycle, &main->state,
                 &main->path->name, &main->options, main->caches.elts,
-                main->caches.nelts, &main->owner);
+                main->caches.nelts, 1, &main->owner);
     }
-    if (main->state.channel[0] != -1) {
+    if (ngx_process != NGX_PROCESS_HELPER && main->state.channel[0] != -1) {
         (void) close(main->state.channel[0]);
         main->state.channel[0] = -1;
     }
     return NGX_OK;
+}
+
+
+static ngx_msec_t
+ngx_http_cache_purge_manager(void *data)
+{
+    ngx_http_cache_purge_main_conf_t  *main = data;
+
+    if (main->owner == NULL) {
+        if (ngx_http_cache_purge_owner_start((ngx_cycle_t *) ngx_cycle,
+                &main->state, &main->path->name, &main->options,
+                main->caches.elts, main->caches.nelts, 0, &main->owner)
+            != NGX_OK)
+        {
+            ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
+                          "cache purge manager initialization failed");
+            exit(2);
+        }
+    }
+
+    return 1000;
 }
 
 

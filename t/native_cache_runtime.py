@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Verify native expiry, in-memory purged, and restart degradation."""
 import argparse
+import fcntl
 import hashlib
 import http.client
 import http.server
@@ -26,7 +27,7 @@ parser.add_argument('--extension', type=int, choices=(0, 1), required=True)
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--reuse-build', type=Path)
 parser.add_argument('--backend', type=Path,
-                    help='Enable the actual worker-0 owner using these CMake archives')
+                    help='Enable the embedded backend using these CMake archives')
 parser.add_argument('--sanitize', action='store_true')
 parser.add_argument('--public-module', action='store_true')
 parser.add_argument('--no-thread-pool', action='store_true')
@@ -425,6 +426,7 @@ binary = build / 'objs/nginx'
 process = None
 output = (root / 'runtime.log').open('w')
 checks, responses = [], []
+expected_manager_exits = []
 
 def start():
     proc = subprocess.Popen([str(binary), '-p', str(run), '-c', str(run / 'nginx.conf')],
@@ -476,7 +478,29 @@ def ready():
                 if args.public_module else response['status'] == 204):
                 return
             time.sleep(.02)
-        raise AssertionError('worker owner did not become ready')
+        raise AssertionError('cache index owner did not become ready')
+
+
+def owner_placement():
+    children = Path(f'/proc/{process.pid}/task/{process.pid}/children').read_text().split()
+    owners = []
+    for pid in children:
+        directory = Path('/proc') / pid
+        try:
+            name = (directory / 'cmdline').read_bytes()
+            files = [str(path.resolve()) for path in (directory / 'fd').iterdir()]
+            owns_store = any(path.startswith(str(run / 'store') + '/') for path in files)
+            if name.startswith(b'nginx: worker process'):
+                assert not owns_store, (pid, files)
+                if args.no_thread_pool:
+                    assert len(list((directory / 'task').iterdir())) == 1, pid
+            if owns_store:
+                assert name.startswith(b'nginx: cache manager process'), (pid, name)
+                owners.append(pid)
+        except FileNotFoundError:
+            pass
+    assert len(owners) == 1, owners
+    return owners[0]
 
 def purge(action, target, identifier):
     if not args.backend:
@@ -519,8 +543,20 @@ def progress(identifier):
                    else f'/control?action=status&id={identifier}')
 
 try:
-    process = start()
+    if args.public_module:
+        with (run / 'store/index.lock').open('a+b') as lease:
+            fcntl.flock(lease, fcntl.LOCK_EX)
+            process = start()
+            time.sleep(1.1)
+            response = request('/management/capabilities')
+            assert response['status'] == 200 and not json.loads(response['body'])['ready'], response
+        checks.append('initial database lease conflict is retried and does not break manager cleanup at exit')
+    else:
+        process = start()
     ready()
+    if args.public_module:
+        owner_placement()
+        checks.append('only the native cache manager owns database descriptors; HTTP workers remain single-threaded without nginx thread pools')
     assert request()['body'] == 'body-v1'
     hit()
     paths = files()
@@ -581,7 +617,7 @@ try:
         for headers in ({}, {'X-Zone': 'second'}):
             assert request('/multi', headers)['cache'] == 'MISS'
             hit('/multi', headers)
-        checks.append('worker-0 owner drains two-worker queues and deletes one URL across two cache zones')
+        checks.append('background owner drains two-worker queues and deletes one URL across two cache zones')
         assert os.geteuid() != 0, 'permission-failure check requires an unprivileged worker'
         assert request('/hold')['cache'] == 'MISS'
         hit('/hold')
@@ -636,6 +672,18 @@ try:
         else:
             raise AssertionError('old workers did not finish reload handoff')
         ready()
+        if args.public_module:
+            owner = owner_placement()
+            before = (run / 'error.log').read_text().count('start cache manager process ')
+            os.kill(int(owner), signal.SIGKILL)
+            expected_manager_exits.append(owner)
+            deadline = time.monotonic() + 10
+            while (run / 'error.log').read_text().count('start cache manager process ') <= before:
+                assert time.monotonic() < deadline, 'master did not respawn cache manager'
+                time.sleep(.02)
+            ready()
+            assert owner_placement() != owner
+            checks.append('nginx master respawns a killed cache manager without restarting HTTP workers')
         assert purge('delete', '/multi', 6)['affected'] == 2
         checks.append('reload transfers the single RocksDB owner and retains cross-zone index data')
         if args.public_module:
@@ -820,9 +868,11 @@ finally:
     output.close()
 
 errors = (run / 'error.log').read_text()
+for pid in expected_manager_exits:
+    errors = re.sub(r'^.*\[alert\].*cache manager process ' + pid + r' exited on signal 9\n', '', errors, flags=re.M)
 assert '[alert]' not in errors and '[crit]' not in errors and '[emerg]' not in errors, errors
 report = {'status': 'passed', 'root': str(root), 'run': str(run),
-          'worker_owner': bool(args.backend),
+          'executor': 'cache-manager' if args.public_module else 'worker-thread' if args.backend else None,
           'public_module': args.public_module,
           'expr': str(args.expr) if args.expr else None,
           'proxy_filter': str(args.proxy_filter) if args.proxy_filter else None,
@@ -839,7 +889,7 @@ report = {'status': 'passed', 'root': str(root), 'run': str(run),
           'module_sha256': {name: hashlib.sha256((build / 'objs' / name).read_bytes()).hexdigest()
                             for name in ('ngx_http_cache_rocksdb_module.so', 'ngx_http_cache_purge_module.so')}
                            if args.dynamic else {},
-          'scope': ('Public PURGE, task status, native operations, shared request rules and worker-0 owner; this is not full feature or performance acceptance.'
+          'scope': ('Public PURGE, task status, native operations, shared request rules and the native cache manager; this is not full feature or performance acceptance.'
                     if args.public_module else
                     'Native operations and optional worker-0 owner through a test HTTP adapter; public HTTP integration is outside this run.')}
 args.output.write_text(json.dumps(report, indent=2) + '\n')
