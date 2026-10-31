@@ -13,6 +13,12 @@
 typedef struct ngx_http_cache_purge_rule_s  ngx_http_cache_purge_rule_t;
 
 
+typedef struct {
+    uint64_t    bits[8];
+    ngx_uint_t  checked;
+} ngx_http_cache_purge_tags_t;
+
+
 struct ngx_http_cache_purge_rule_s {
     ngx_queue_t                    queue;
     ngx_http_cache_purge_rule_t   *parent;
@@ -706,9 +712,11 @@ ngx_http_cache_purge_state_finish(ngx_http_cache_purge_state_t *state,
 
 static ngx_uint_t
 ngx_http_cache_purge_state_matches(const ngx_http_cache_purge_select_t *s,
-    const ngx_http_cache_purge_entry_t *entry)
+    const ngx_http_cache_purge_entry_t *entry,
+    ngx_http_cache_purge_tags_t *tags)
 {
-    size_t  i;
+    size_t      i;
+    ngx_uint_t  key;
 
     switch (s->type) {
     case NGX_HTTP_CACHE_PURGE_SELECT_URL:
@@ -734,6 +742,22 @@ ngx_http_cache_purge_state_matches(const ngx_http_cache_purge_select_t *s,
             return 0;
         }
 
+        /* Avoid bitmap setup when only one scoped TAG rule needs this set. */
+        if (entry->tag_count > 1 && tags->checked++) {
+            if (tags->checked == 2) {
+                ngx_memzero(tags->bits, sizeof(tags->bits));
+                for (i = 0; i < entry->tag_count; i++) {
+                    key = ngx_hash_key((u_char *) entry->tags[i].data,
+                                       entry->tags[i].len) & 511;
+                    tags->bits[key / 64] |= (uint64_t) 1 << (key % 64);
+                }
+            }
+            key = ngx_hash_key((u_char *) s->value.data, s->value.len) & 511;
+            if (!(tags->bits[key / 64] & ((uint64_t) 1 << (key % 64)))) {
+                return 0;
+            }
+        }
+
         for (i = 0; i < entry->tag_count; i++) {
             if (ngx_http_cache_purge_state_equal(s->value, entry->tags[i])) {
                 return 1;
@@ -748,13 +772,14 @@ ngx_http_cache_purge_state_matches(const ngx_http_cache_purge_select_t *s,
 static void
 ngx_http_cache_purge_state_apply(ngx_http_cache_purge_rule_t *rule,
     const ngx_http_cache_purge_entry_t *entry, uint64_t now,
-    ngx_http_cache_purge_match_t *match, ngx_uint_t local_only)
+    ngx_http_cache_purge_match_t *match, ngx_uint_t local_only,
+    ngx_http_cache_purge_tags_t *tags)
 {
     uint64_t  *local, *propagate;
 
     if (!rule->published
         || (!rule->local && (local_only || rule->retain_until <= now))
-        || !ngx_http_cache_purge_state_matches(&rule->select, entry))
+        || !ngx_http_cache_purge_state_matches(&rule->select, entry, tags))
     {
         return;
     }
@@ -783,6 +808,7 @@ ngx_http_cache_purge_state_select(ngx_http_cache_purge_state_t *state,
     ngx_uint_t local_only)
 {
     ngx_http_cache_purge_rule_t  *rule;
+    ngx_http_cache_purge_tags_t   tags;
     ngx_queue_t                  *q;
     ngx_uint_t                    low, high, middle;
 
@@ -795,6 +821,7 @@ ngx_http_cache_purge_state_select(ngx_http_cache_purge_state_t *state,
         return NGX_ERROR;
     }
 
+    tags.checked = 0;
     ngx_shmtx_lock(&state->pool->mutex);
     if (url_only) {
         if (state->shared->complex != 0) {
@@ -817,7 +844,7 @@ ngx_http_cache_purge_state_select(ngx_http_cache_purge_state_t *state,
         }
         rule = low == 0 ? NULL : state->shared->urls[low - 1];
         for ( /* void */; rule != NULL; rule = rule->parent) {
-            ngx_http_cache_purge_state_apply(rule, entry, now, match, 1);
+            ngx_http_cache_purge_state_apply(rule, entry, now, match, 1, &tags);
         }
     } else {
         for (q = ngx_queue_head(&state->shared->rules);
@@ -826,7 +853,7 @@ ngx_http_cache_purge_state_select(ngx_http_cache_purge_state_t *state,
         {
             rule = ngx_queue_data(q, ngx_http_cache_purge_rule_t, queue);
             ngx_http_cache_purge_state_apply(rule, entry, now, match,
-                                              local_only);
+                                              local_only, &tags);
         }
     }
 

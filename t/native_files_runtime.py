@@ -147,6 +147,7 @@ if args.state:
                      args.nginx / 'src/core/ngx_slab.c',
                      args.nginx / 'src/core/ngx_shmtx.c',
                      args.nginx / 'src/core/ngx_string.c',
+                     args.nginx / 'src/core/ngx_hash.c',
                      args.nginx / 'src/os/unix/ngx_alloc.c']
     state_backend = []
     if args.backend:

@@ -132,6 +132,54 @@ ngx_http_cache_purge_test_urls(ngx_http_cache_purge_state_t *state)
 
 
 static void
+ngx_http_cache_purge_test_tags(ngx_http_cache_purge_state_t *state)
+{
+    ngx_http_cache_purge_job_t    job, other;
+    ngx_http_cache_purge_entry_t  entry;
+    ngx_http_cache_purge_match_t  match;
+    ngx_uint_t                    i;
+
+    memset(&entry, 0, sizeof(entry));
+    other = ngx_http_cache_purge_job(1, NGX_HTTP_CACHE_PURGE_SELECT_TAG,
+                                   "unmatched");
+    ngx_expect(ngx_http_cache_purge_state_install(state, &other) == NGX_OK);
+    job = ngx_http_cache_purge_job(0, NGX_HTTP_CACHE_PURGE_SELECT_TAG, "Aa");
+    ngx_expect(ngx_hash_key((u_char *) "Aa", 2)
+               == ngx_hash_key((u_char *) "BB", 2));
+    ngx_expect(ngx_http_cache_purge_state_install(state, &job) == NGX_OK);
+    for (i = 0; i < 64; i++) {
+        entry.tags[i] = ngx_http_cache_purge_text("BB");
+    }
+    for (i = 0; i <= 64; i++) {
+        entry.tag_count = i;
+        ngx_expect(ngx_http_cache_purge_state_match(state, &entry, 201, &match)
+                   == NGX_DECLINED);
+        if (i != 0) {
+            entry.tags[i - 1] = ngx_http_cache_purge_text("Aa");
+            ngx_expect(ngx_http_cache_purge_state_match(state, &entry, 201,
+                                                          &match)
+                       == NGX_OK && match.delete_before == 200);
+            entry.tags[i - 1] = ngx_http_cache_purge_text("BB");
+        }
+    }
+    entry.tags[63] = ngx_http_cache_purge_text("Aa");
+    entry.namespace_value = ngx_http_cache_purge_text("other");
+    ngx_expect(ngx_http_cache_purge_state_match(state, &entry, 201, &match)
+               == NGX_DECLINED);
+    entry.namespace_value = ngx_http_cache_purge_text("");
+    ngx_http_cache_purge_state_finish(state, job.id);
+    ngx_expect(ngx_http_cache_purge_state_match_local(state, &entry, 201,
+                                                        &match)
+               == NGX_DECLINED);
+    ngx_expect(ngx_http_cache_purge_state_match(state, &entry, 201, &match)
+               == NGX_OK && !match.delete_before
+               && match.propagate_delete == 200);
+    ngx_http_cache_purge_state_finish(state, other.id);
+    ngx_http_cache_purge_state_collect(state, 321);
+}
+
+
+static void
 ngx_http_cache_purge_empty(ngx_http_cache_purge_state_t *state)
 {
     ngx_uint_t  rules, messages;
@@ -554,6 +602,8 @@ ngx_http_cache_purge_test_main(void)
     ngx_http_cache_purge_state_collect(&state, 507);
     ngx_http_cache_purge_empty(&state);
     ngx_http_cache_purge_test_urls(&state);
+    ngx_http_cache_purge_empty(&state);
+    ngx_http_cache_purge_test_tags(&state);
     ngx_http_cache_purge_empty(&state);
     ngx_expect(pool->pfree == baseline);
     ngx_shmtx_destroy(&pool->mutex);
