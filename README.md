@@ -20,6 +20,10 @@ On Linux, the executor names its writer `cache_index` and its lookup thread
 `cache_lookup`. After creating the lookup thread, the writer sets its own
 nice value to 19 as a best-effort scheduling hint. The HTTP worker,
 lookup thread and nginx I/O pools retain their inherited priorities.
+The RocksDB bridge also requests low CPU priority for the default Env's
+flush and compaction pools on Linux. These pools are shared by RocksDB
+databases in the same worker process; this scheduling hint leaves the caller
+and nginx thread pools unchanged. It does not change I/O priority or durability.
 
 The writer dispatches at most four queued commands between background
 maintenance steps, visiting each connection once and rotating the starting

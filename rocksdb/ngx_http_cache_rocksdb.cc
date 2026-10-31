@@ -6,6 +6,7 @@
 #include <rocksdb/advanced_cache.h>
 #endif
 #include <rocksdb/db.h>
+#include <rocksdb/env.h>
 #include <rocksdb/filter_policy.h>
 #include <rocksdb/table.h>
 #include <rocksdb/write_buffer_manager.h>
@@ -363,6 +364,12 @@ ngx_http_cache_rocksdb_initialize(ngx_http_cache_rocksdb_t *store,
     options.max_open_files = static_cast<int>(store->options.max_open_files);
     options.max_background_jobs =
         static_cast<int>(store->options.background_jobs);
+#if (defined(__linux__))
+    /* The default Env pools are shared inside this worker. Keep their flush
+     * and compaction CPU work below HTTP and proof-read threads. */
+    options.env->LowerThreadPoolCPUPriority(rocksdb::Env::LOW);
+    options.env->LowerThreadPoolCPUPriority(rocksdb::Env::HIGH);
+#endif
     /* Keep bulk SST rewrites from displacing native cache pages. Point reads
      * retain buffered I/O; unsupported filesystems retain the old behavior. */
     options.use_direct_io_for_flush_and_compaction =

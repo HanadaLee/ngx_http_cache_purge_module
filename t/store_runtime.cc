@@ -1,6 +1,8 @@
 #include "rocksdb/ngx_http_cache_rocksdb.h"
 #include <rocksdb/db.h>
+#include <rocksdb/env.h>
 #include <unistd.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <algorithm>
 #include <array>
@@ -13,6 +15,7 @@
 #include <future>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -36,6 +39,29 @@ require(bool ok, const char *message)
     }
     ++checks;
 }
+
+#if (defined(__linux__))
+static void
+ngx_http_cache_purge_test_background_priority(int inherited)
+{
+    for (auto pool : { rocksdb::Env::LOW, rocksdb::Env::HIGH }) {
+        auto *result = new std::promise<int>;
+        auto future = result->get_future();
+        rocksdb::Env::Default()->Schedule(
+            [](void *data) {
+                std::unique_ptr<std::promise<int>> result(
+                    static_cast<std::promise<int> *>(data));
+                result->set_value(getpriority(PRIO_PROCESS, 0));
+            },
+            result, pool);
+        require(future.get() == 19,
+            "RocksDB background pool uses the lowest nice priority");
+    }
+    require(getpriority(PRIO_PROCESS, 0) == inherited,
+        "RocksDB scheduling leaves the caller priority unchanged");
+}
+#endif
+
 static void
 expect(int result, int wanted, const char *operation)
 {
@@ -601,7 +627,13 @@ main(int argc, char **argv)
         char path[] = "/tmp/cache-purge-store-test-XXXXXX";
         require(mkdtemp(path) != nullptr, "create test directory");
         options.max_cursors = 2;
+#if (defined(__linux__))
+        int inherited = getpriority(PRIO_PROCESS, 0);
+#endif
         auto *store = open(path, options);
+#if (defined(__linux__))
+        ngx_http_cache_purge_test_background_priority(inherited);
+#endif
         ngx_http_cache_purge_test_reader(store);
         ngx_http_cache_purge_test_cached_cursor(store);
         write(store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, "C:abi", "C ABI");
