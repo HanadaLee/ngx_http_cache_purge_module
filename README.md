@@ -449,18 +449,16 @@ TAG names are not sent upstream. Known TAG associations remain available for the
 
 Both variables are empty when propagation is disabled or no applicable requirement exists. Internal `$cache_purge_*_guard` variables are installed by the module and do not need manual configuration.
 
-## Implementation
+## Runtime behavior
 
-The native nginx cache manager owns the RocksDB index and processes tasks in bounded batches. HTTP workers use shared memory and an internal queue; they do not open RocksDB or load the entire index into memory. Ordinary cache HITs do not perform index I/O or wait for background file maintenance.
-
-The index stores URL and TAG relationships with shared values and compact file references. Invalidate updates the native expiry field and the existing in-memory `purged` flag; no module-specific metadata is added to cache files, extended attributes, sidecars, or response headers. Only the RocksDB bridge uses C++; the purge implementation is C.
+Purge tasks are processed in the background. Ordinary cache HITs do not wait for background file maintenance.
 
 Normal restarts reuse the persistent index and pending tasks. Missing-file records are collected in the background, retaining known TAG relationships for propagation. The management API exposes cumulative `index_cleanup.checked`, `index_cleanup.retained`, and `index_cleanup.errors` counters; these counters survive reloads and reset on a full restart.
 
 ### Limits
 
 - Indexing starts with managed cache fills. Existing unindexed files require an explicit migration or a fresh cache-key namespace when enabling the module.
-- A full restart loses the in-memory `purged` flag. Expired files then follow ordinary nginx stale policy.
+- After a full restart, previously invalidated entries follow ordinary nginx stale policy.
 - Cache dates have second precision. An entry dated in the same second as a purge is treated as refreshed.
 - A parent request started before a purge may finish afterward and receive a newer native cache date. This in-flight boundary is accepted.
 - A first MISS can be stored after a purge has already completed without finding an indexed file. Preventing that response from becoming a later HIT is not implemented.
