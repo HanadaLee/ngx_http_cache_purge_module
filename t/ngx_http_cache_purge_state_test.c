@@ -106,7 +106,7 @@ ngx_http_cache_purge_reference(const ngx_http_cache_purge_job_t *jobs,
     uint64_t                             *local, *propagate;
     const ngx_http_cache_purge_job_t     *job;
     const ngx_http_cache_purge_select_t  *s;
-    ngx_http_cache_rocksdb_bytes_t        value, scope;
+    ngx_http_cache_rocksdb_bytes_t        value;
 
     memset(match, 0, sizeof(*match));
 
@@ -118,15 +118,22 @@ ngx_http_cache_purge_reference(const ngx_http_cache_purge_job_t *jobs,
             continue;
         }
 
+        if (s->namespace_value.len != entry->namespace_value.len
+            || (s->namespace_value.len
+                && memcmp(s->namespace_value.data, entry->namespace_value.data,
+                          s->namespace_value.len)))
+        {
+            continue;
+        }
+
         value = s->type == NGX_HTTP_CACHE_PURGE_SELECT_HOST ? entry->host :
                                                               entry->url;
 
         if (s->type == NGX_HTTP_CACHE_PURGE_SELECT_TAG) {
-            scope = s->host_scope ? entry->host : entry->namespace_value;
-
-            if (scope.len != s->namespace_value.len
-                || (scope.len
-                    && memcmp(scope.data, s->namespace_value.data, scope.len)))
+            if (s->host_scope
+                && (s->host.len != entry->host.len
+                    || (s->host.len && memcmp(s->host.data, entry->host.data,
+                                              s->host.len))))
             {
                 continue;
             }
@@ -206,6 +213,8 @@ ngx_http_cache_purge_test_urls(ngx_http_cache_purge_state_t *state)
         jobs[i].issued = 600 + i;
         jobs[i].retain_until = 1200;
         jobs[i].action = i % 2;
+        jobs[i].select.namespace_value =
+            ngx_http_cache_purge_text(i % 3 ? "scope" : "");
         jobs[i].select.value.data = values[i];
         jobs[i].select.value.len = i % 7 + 1;
 
@@ -237,6 +246,8 @@ ngx_http_cache_purge_test_urls(ngx_http_cache_purge_state_t *state)
 
             entry.url.data = query;
             entry.url.len = j;
+            entry.namespace_value =
+                ngx_http_cache_purge_text(i % 3 ? "scope" : "");
             a = ngx_http_cache_purge_state_match_url(state, &entry, 1000,
                                                      &fast);
             b = ngx_http_cache_purge_state_match_local(state, &entry, 1000,
@@ -253,6 +264,7 @@ ngx_http_cache_purge_test_urls(ngx_http_cache_purge_state_t *state)
 
     for (i = 0; i < 128; i++) {
         entry.url = jobs[i].select.value;
+        entry.namespace_value = jobs[i].select.namespace_value;
         a = ngx_http_cache_purge_state_match_url(state, &entry, 1201, &fast);
         b = ngx_http_cache_purge_state_match_local(state, &entry, 1201, &full);
         ngx_expect(a == b && memcmp(&fast, &full, sizeof(fast)) == 0);
@@ -297,7 +309,7 @@ ngx_http_cache_purge_test_mixed(ngx_http_cache_purge_state_t *state)
         jobs[i].select.misc = ngx_http_cache_purge_text(i % 3 ? "" : "misc");
 
         if (i % 6 == 5) {
-            jobs[i].select.namespace_value = jobs[i].select.value;
+            jobs[i].select.host = jobs[i].select.value;
         }
     }
 
@@ -834,13 +846,16 @@ ngx_http_cache_purge_test_main(void)
     ngx_expect(ngx_http_cache_purge_state_match(&state, &entry, 201, &match)
                == NGX_OK);
     job.select.host_scope = 1;
-    job.select.namespace_value = ngx_http_cache_purge_text("a.test");
+    job.select.host = ngx_http_cache_purge_text("a.test");
     ngx_expect(ngx_http_cache_purge_state_install(&state, &job)
                == NGX_DECLINED);
     ngx_http_cache_purge_state_finish(&state, job.id);
     ngx_http_cache_purge_state_collect(&state, 323);
     ngx_expect(ngx_http_cache_purge_state_install(&state, &job) == NGX_OK);
     entry.namespace_value = ngx_http_cache_purge_text("other");
+    ngx_expect(ngx_http_cache_purge_state_match(&state, &entry, 201, &match)
+               == NGX_DECLINED);
+    entry.namespace_value = ngx_http_cache_purge_text("");
     ngx_expect(ngx_http_cache_purge_state_match(&state, &entry, 201, &match)
                == NGX_OK);
     entry.host = ngx_http_cache_purge_text("b.test");

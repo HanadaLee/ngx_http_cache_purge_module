@@ -11,10 +11,10 @@
 
 
 #define NGX_HTTP_CACHE_PURGE_JOB_TEXT    NGX_HTTP_CACHE_PURGE_TAG_LIST_MAX
-#define NGX_HTTP_CACHE_PURGE_JOB_TOKEN   32822
-#define NGX_HTTP_CACHE_PURGE_JOB_HEADER  68
+#define NGX_HTTP_CACHE_PURGE_JOB_TOKEN   32830
+#define NGX_HTTP_CACHE_PURGE_JOB_HEADER  72
 #define NGX_HTTP_CACHE_PURGE_JOB_SIZE                                         \
-    (NGX_HTTP_CACHE_PURGE_JOB_HEADER + 3 * NGX_HTTP_CACHE_PURGE_JOB_TEXT      \
+    (NGX_HTTP_CACHE_PURGE_JOB_HEADER + 4 * NGX_HTTP_CACHE_PURGE_JOB_TEXT      \
      + NGX_HTTP_CACHE_PURGE_JOB_TOKEN)
 
 
@@ -92,7 +92,7 @@ ngx_http_cache_purge_job_valid(const ngx_http_cache_purge_job_t *job)
 {
     size_t                                i, maximum, count;
     const ngx_http_cache_purge_select_t  *s;
-    ngx_http_cache_rocksdb_bytes_t        text[4];
+    ngx_http_cache_rocksdb_bytes_t        text[5];
     ngx_http_cache_rocksdb_bytes_t        tags[NGX_HTTP_CACHE_PURGE_TAG_SELECT];
 
     s = &job->select;
@@ -100,7 +100,8 @@ ngx_http_cache_purge_job_valid(const ngx_http_cache_purge_job_t *job)
     if (job->issued == 0 || job->action > NGX_HTTP_CACHE_PURGE_INVALIDATE
         || job->done > 1 || s->type > NGX_HTTP_CACHE_PURGE_SELECT_TAG
         || s->host_scope > 1 || s->value.len == 0
-        || (s->host_scope && s->type != NGX_HTTP_CACHE_PURGE_SELECT_TAG))
+        || (s->host_scope && (s->type != NGX_HTTP_CACHE_PURGE_SELECT_TAG
+                              || s->host.len == 0)))
     {
         return 0;
     }
@@ -114,10 +115,11 @@ ngx_http_cache_purge_job_valid(const ngx_http_cache_purge_job_t *job)
     text[0] = s->value;
     text[1] = s->namespace_value;
     text[2] = s->misc;
-    text[3] = job->bookmark;
+    text[3] = s->host;
+    text[4] = job->bookmark;
 
-    for (i = 0; i < 4; i++) {
-        maximum = i == 3 ? NGX_HTTP_CACHE_PURGE_JOB_TOKEN : 32768;
+    for (i = 0; i < 5; i++) {
+        maximum = i == 4 ? NGX_HTTP_CACHE_PURGE_JOB_TOKEN : 32768;
 
         if (i == 0 && s->type == NGX_HTTP_CACHE_PURGE_SELECT_TAG) {
             maximum = NGX_HTTP_CACHE_PURGE_TAG_LIST_MAX;
@@ -140,10 +142,10 @@ ngx_http_cache_purge_job_encode(ngx_http_cache_purge_jobs_t *jobs,
 {
     size_t                          i;
     unsigned char                  *p;
-    ngx_http_cache_rocksdb_bytes_t  text[4];
+    ngx_http_cache_rocksdb_bytes_t  text[5];
 
     p = jobs->output;
-    memcpy(p, "PJ1", 4);
+    memcpy(p, "PJ2", 4);
     p += 4;
     *p++ = (unsigned char) job->select.type;
     *p++ = (unsigned char) job->select.host_scope;
@@ -158,13 +160,14 @@ ngx_http_cache_purge_job_encode(ngx_http_cache_purge_jobs_t *jobs,
     text[0] = job->select.value;
     text[1] = job->select.namespace_value;
     text[2] = job->select.misc;
-    text[3] = job->bookmark;
+    text[3] = job->select.host;
+    text[4] = job->bookmark;
 
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < 5; i++) {
         p = ngx_http_cache_purge_job_number(p, text[i].len, 4);
     }
 
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < 5; i++) {
         if (text[i].len != 0) {
             memcpy(p, text[i].data, text[i].len);
             p += text[i].len;
@@ -258,7 +261,7 @@ ngx_http_cache_purge_job_get(ngx_http_cache_purge_jobs_t *jobs,
     const unsigned char             *p;
     ngx_http_cache_rocksdb_buffer_t  value;
     unsigned char                    raw[17];
-    ngx_http_cache_rocksdb_bytes_t   key, text[4];
+    ngx_http_cache_rocksdb_bytes_t   key, text[5];
 
     raw[0] = 'J';
     memcpy(raw + 1, id, 16);
@@ -274,7 +277,7 @@ ngx_http_cache_purge_job_get(ngx_http_cache_purge_jobs_t *jobs,
     }
 
     if (value.length < NGX_HTTP_CACHE_PURGE_JOB_HEADER
-        || memcmp(value.data, "PJ1", 4) != 0)
+        || memcmp(value.data, "PJ2", 4) != 0)
     {
         goto corrupt;
     }
@@ -294,7 +297,7 @@ ngx_http_cache_purge_job_get(ngx_http_cache_purge_jobs_t *jobs,
     job->error = (uint32_t) ngx_http_cache_purge_job_decode(p + 48, 4);
     offset = NGX_HTTP_CACHE_PURGE_JOB_HEADER;
 
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < 5; i++) {
         length = (size_t) ngx_http_cache_purge_job_decode(p + 52 + i * 4, 4);
 
         if (length > value.length - offset) {
@@ -309,7 +312,8 @@ ngx_http_cache_purge_job_get(ngx_http_cache_purge_jobs_t *jobs,
     job->select.value = text[0];
     job->select.namespace_value = text[1];
     job->select.misc = text[2];
-    job->bookmark = text[3];
+    job->select.host = text[3];
+    job->bookmark = text[4];
 
     if (offset == value.length && ngx_http_cache_purge_job_valid(job)) {
         return 0;
@@ -366,7 +370,8 @@ ngx_http_cache_purge_job_submit(ngx_http_cache_purge_jobs_t *jobs,
         || !ngx_http_cache_purge_job_equal(job.select.value, old.select.value)
         || !ngx_http_cache_purge_job_equal(job.select.namespace_value,
                                            old.select.namespace_value)
-        || !ngx_http_cache_purge_job_equal(job.select.misc, old.select.misc))
+        || !ngx_http_cache_purge_job_equal(job.select.misc, old.select.misc)
+        || !ngx_http_cache_purge_job_equal(job.select.host, old.select.host))
     {
         return ngx_http_cache_purge_job_error(error,
                                               NGX_HTTP_CACHE_ROCKSDB_CONFLICT,

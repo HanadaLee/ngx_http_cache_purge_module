@@ -61,6 +61,7 @@ constexpr const char  *ngx_http_cache_rocksdb_cf_names[] = {
     "tag"
 };
 
+
 int
 ngx_http_cache_rocksdb_error(ngx_http_cache_rocksdb_error_t *error, int code,
     const char *message) noexcept
@@ -180,6 +181,7 @@ ngx_http_cache_rocksdb_copy(const rocksdb::Slice &source,
 }
 } /* namespace */
 
+
 struct ngx_http_cache_rocksdb_s {
     ngx_http_cache_rocksdb_options_t                options{};
     pid_t                                           pid = getpid();
@@ -234,6 +236,7 @@ struct ngx_http_cache_rocksdb_s {
     void expire();
 };
 
+
 struct ngx_http_cache_rocksdb_snapshot_s {
     ngx_http_cache_rocksdb_t                   *store;
     const rocksdb::Snapshot                    *snapshot = nullptr;
@@ -250,6 +253,7 @@ struct ngx_http_cache_rocksdb_snapshot_s {
         }
     }
 };
+
 
 struct ngx_http_cache_rocksdb_cursor_s {
     ngx_http_cache_rocksdb_t                           *store;
@@ -278,6 +282,7 @@ struct ngx_http_cache_rocksdb_cursor_s {
         release();
     }
 };
+
 
 void
 ngx_http_cache_rocksdb_s::expire()
@@ -572,7 +577,7 @@ ngx_http_cache_rocksdb_initialize(ngx_http_cache_rocksdb_t *store,
     }
 
     const rocksdb::Slice  marker(ngx_http_cache_rocksdb_schema_key,
-                                sizeof(ngx_http_cache_rocksdb_schema_key) - 1);
+                                 sizeof(ngx_http_cache_rocksdb_schema_key) - 1);
     std::string           version;
     status = db->Get(rocksdb::ReadOptions(), store->cf[0], marker, &version);
 
@@ -637,6 +642,7 @@ ngx_http_cache_rocksdb_initialize(ngx_http_cache_rocksdb_t *store,
         error);
 }
 } /* namespace */
+
 
 static int ngx_http_cache_rocksdb_write_internal(
     ngx_http_cache_rocksdb_t *store,

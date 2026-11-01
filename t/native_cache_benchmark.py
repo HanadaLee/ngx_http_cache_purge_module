@@ -238,12 +238,14 @@ os.close(descriptor)
             port = available.getsockname()[1]
         settings = f'''cache_purge_index_store {run}/store{store_options};
             cache_purge_state_zone zone=purge:1m;
-            cache_purge_key_url {args.url_origin}$uri;
-            cache_purge_tag $upstream_http_cache_tag;
+            cache_key_scheme {args.url_origin.split('://')[0]};
+            cache_key_host {args.url_origin.split('://')[1]};
+            cache_key_uri $uri;
+            cache_purge_tags $upstream_http_cache_tag;
             location /management/ {{ cache_purge_api; }}
             location = /control {{
                 proxy_cache_purge on;
-                cache_purge_key_url $http_x_target;
+                cache_key_uri $http_x_target;
             }}''' if enabled else ''
         config = f'''daemon off;
 master_process on;
@@ -311,7 +313,7 @@ http {{
             for i in range(args.rules):
                 group = f'{i:04d}/' if args.distinct_prefixes else ''
                 status, _, body = request('/control', 'PURGE', {
-                    'X-Target': args.url_origin + '/bulk/' + group,
+                    'X-Target': '/bulk/' + group,
                     'X-Cache-Purge-Type': 'prefix'})
                 assert status == 202, (status, body)
                 operations.append(json.loads(body)['operation_id'])
@@ -486,7 +488,7 @@ http {{
                         assert fill_stats['files'] == args.fills, fill_stats
                     if active:
                         status, _, body = request('/control', 'PURGE', {
-                            'X-Target': args.url_origin + '/fill/', 'X-Cache-Purge-Type': 'prefix'})
+                            'X-Target': '/fill/', 'X-Cache-Purge-Type': 'prefix'})
                         assert status == 202, (status, body)
                         identifier = json.loads(body)['operation_id']
                         deadline = time.monotonic() + max(30, args.fills / 50)

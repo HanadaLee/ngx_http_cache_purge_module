@@ -24,13 +24,14 @@ extern "C" {
 typedef struct ngx_http_cache_purge_catalog_s  ngx_http_cache_purge_catalog_t;
 typedef struct ngx_http_cache_purge_scan_s     ngx_http_cache_purge_scan_t;
 
-enum {
+typedef enum {
     NGX_HTTP_CACHE_PURGE_SELECT_URL = 0,
     NGX_HTTP_CACHE_PURGE_SELECT_PREFIX,
     NGX_HTTP_CACHE_PURGE_SELECT_KEY,
     NGX_HTTP_CACHE_PURGE_SELECT_HOST,
     NGX_HTTP_CACHE_PURGE_SELECT_TAG
-};
+} ngx_http_cache_purge_select_type_e;
+
 
 typedef struct {
     unsigned char                   id[24];
@@ -51,11 +52,12 @@ typedef struct {
 
 
 typedef struct {
-    unsigned                        type;
-    unsigned                        host_scope;
-    ngx_http_cache_rocksdb_bytes_t  value;
-    ngx_http_cache_rocksdb_bytes_t  namespace_value;
-    ngx_http_cache_rocksdb_bytes_t  misc;
+    ngx_http_cache_purge_select_type_e  type;
+    unsigned                            host_scope;
+    ngx_http_cache_rocksdb_bytes_t      value;
+    ngx_http_cache_rocksdb_bytes_t      namespace_value;
+    ngx_http_cache_rocksdb_bytes_t      misc;
+    ngx_http_cache_rocksdb_bytes_t      host;
 } ngx_http_cache_purge_select_t;
 
 
@@ -117,14 +119,15 @@ void ngx_http_cache_purge_scan_close(ngx_http_cache_purge_scan_t *scan);
 /* Single-owner background jobs. All calls may block; never call on a HIT. */
 typedef struct ngx_http_cache_purge_jobs_s  ngx_http_cache_purge_jobs_t;
 
-enum {
+typedef enum {
     NGX_HTTP_CACHE_PURGE_DELETE = 0,
     NGX_HTTP_CACHE_PURGE_INVALIDATE
-};
+} ngx_http_cache_purge_action_e;
+
 
 typedef struct {
     unsigned char                   id[16];
-    unsigned                        action;
+    ngx_http_cache_purge_action_e   action;
     unsigned                        done;
     uint64_t                        issued;
     uint64_t                        retain_until;

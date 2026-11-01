@@ -84,7 +84,7 @@ ngx_http_cache_purge_test_entry(ngx_http_cache_purge_entry_t *entry,
     }
 
     if (number == 7) {
-        entry->namespace_value = ngx_http_cache_purge_text("tenant");
+        entry->namespace_value = ngx_http_cache_purge_text("scope");
     }
 
     if (number == 8 || number == 9) {
@@ -117,6 +117,12 @@ ngx_http_cache_purge_test_scan(ngx_http_cache_purge_catalog_t *catalog,
     select.namespace_value = ngx_http_cache_purge_text(scope);
     select.misc = ngx_http_cache_purge_text(misc);
     select.host_scope = host_scope;
+
+    if (host_scope) {
+        select.host = select.namespace_value;
+        select.namespace_value = ngx_http_cache_purge_text("");
+    }
+
     after = ngx_http_cache_purge_text("");
     scan = NULL;
     ngx_expect(ngx_http_cache_purge_scan_open(catalog, &select, after,
@@ -349,7 +355,7 @@ ngx_http_cache_purge_test_main(void)
     ngx_http_cache_rocksdb_error_t     error;
     ngx_http_cache_rocksdb_options_t   options;
     ngx_http_cache_rocksdb_mutation_t  legacy;
-    unsigned char                      ids[32][24], token[32822], saved[24];
+    unsigned char                      ids[32][24], token[32830], saved[24];
     char                               path[] = "/tmp/cache-catalog-XXXXXX";
     char                               old_path[128];
     char                               tag_values[128][16], long_url[4097];
@@ -463,15 +469,15 @@ ngx_http_cache_purge_test_main(void)
     ngx_expect(ngx_http_cache_purge_test_scan(
                    catalog, NGX_HTTP_CACHE_PURGE_SELECT_URL,
                    "http://a.test/docs/a", "", "", 0, 0, 0, ids)
-               == 7);
+               == 6);
 
-    for (i = 0; i < 7; i++) {
+    for (i = 0; i < 6; i++) {
         if (ids[i][23] == 1) { /* Select fixture file 1. */
             break;
         }
     }
 
-    ngx_expect(i < 7);
+    ngx_expect(i < 6);
     memcpy(saved, ids[i], 24);
     ngx_expect(ngx_http_cache_purge_test_scan(
                    catalog, NGX_HTTP_CACHE_PURGE_SELECT_KEY,
@@ -483,35 +489,35 @@ ngx_http_cache_purge_test_main(void)
                == 2);
     ngx_expect(ngx_http_cache_purge_test_scan(
                    catalog, NGX_HTTP_CACHE_PURGE_SELECT_KEY,
-                   "http://a.test/docs/a", "tenant", "", 0, 0, 0, NULL)
+                   "http://a.test/docs/a", "scope", "", 0, 0, 0, NULL)
                == 1);
     ngx_expect(ngx_http_cache_purge_test_scan(catalog,
                                               NGX_HTTP_CACHE_PURGE_SELECT_HOST,
                                               "a.test", "", "", 0, 0, 0, NULL)
-               == 9);
+               == 8);
     ngx_expect(ngx_http_cache_purge_test_scan(catalog,
                                               NGX_HTTP_CACHE_PURGE_SELECT_TAG,
                                               "news", "", "", 0, 0, 0, NULL)
                == 9);
     ngx_expect(ngx_http_cache_purge_test_scan(
-                   catalog, NGX_HTTP_CACHE_PURGE_SELECT_TAG, "news", "tenant",
+                   catalog, NGX_HTTP_CACHE_PURGE_SELECT_TAG, "news", "scope",
                    "", 0, 0, 0, NULL)
                == 1);
     ngx_expect(ngx_http_cache_purge_test_scan(
                    catalog, NGX_HTTP_CACHE_PURGE_SELECT_TAG, "news", "a.test",
                    "", 1, 0, 0, NULL)
-               == 9);
+               == 8);
     ngx_expect(ngx_http_cache_purge_test_scan(catalog,
                                               NGX_HTTP_CACHE_PURGE_SELECT_TAG,
                                               "absent", "", "", 0, 0, 0, NULL)
                == 0);
 
     ngx_expect(ngx_http_cache_purge_test_rows(
-                   store, NGX_HTTP_CACHE_ROCKSDB_URL, "A", 49)
+                   store, NGX_HTTP_CACHE_ROCKSDB_URL, "A", 41)
                == 10);
     ngx_expect(ngx_http_cache_purge_test_rows(
                    store, NGX_HTTP_CACHE_ROCKSDB_URL, "dU", 0)
-               == 3);
+               == 4);
     ngx_expect(ngx_http_cache_purge_test_rows(
                    store, NGX_HTTP_CACHE_ROCKSDB_TAG, "N", 41)
                == 20);
@@ -519,7 +525,7 @@ ngx_http_cache_purge_test_main(void)
                    store, NGX_HTTP_CACHE_ROCKSDB_TAG, "H", 41)
                == 20);
     ngx_expect(ngx_http_cache_purge_test_rows(
-                   store, NGX_HTTP_CACHE_ROCKSDB_TAG, "K", 33)
+                   store, NGX_HTTP_CACHE_ROCKSDB_TAG, "K", 25)
                == 10);
 
     memset(&select, 0, sizeof(select));
@@ -540,7 +546,7 @@ ngx_http_cache_purge_test_main(void)
             break;
         }
 
-        ngx_expect(rc == 0 && count < 9);
+        ngx_expect(rc == 0 && count < 8);
 
         for (i = 0; i < count; i++) {
             ngx_expect(memcmp(ids[i], current.id, 24) != 0);
@@ -553,7 +559,7 @@ ngx_http_cache_purge_test_main(void)
         ngx_http_cache_purge_scan_close(scan);
     }
 
-    ngx_expect(count == 9);
+    ngx_expect(count == 8);
     ngx_expect(
         ngx_http_cache_purge_catalog_get(catalog, saved, &current, &error)
         == 0);
@@ -566,15 +572,15 @@ ngx_http_cache_purge_test_main(void)
     ngx_expect(ngx_http_cache_purge_test_scan(
                    catalog, NGX_HTTP_CACHE_PURGE_SELECT_PREFIX, "", "", "", 0,
                    0, 2000, NULL)
-               == 9);
+               == 8);
     ngx_expect(ngx_http_cache_purge_test_scan(
                    catalog, NGX_HTTP_CACHE_PURGE_SELECT_PREFIX, "", "", "", 0,
                    1, 2000, NULL)
-               == 10);
+               == 9);
     ngx_expect(ngx_http_cache_purge_test_scan(
                    catalog, NGX_HTTP_CACHE_PURGE_SELECT_PREFIX, "", "", "", 0,
                    1, 3000, NULL)
-               == 9);
+               == 8);
     ngx_expect(ngx_http_cache_purge_catalog_collect(catalog, 2999, 32,
                                                     &removed, &error)
                == 0);
@@ -594,7 +600,7 @@ ngx_http_cache_purge_test_main(void)
     count = ngx_http_cache_purge_test_scan(
         catalog, NGX_HTTP_CACHE_PURGE_SELECT_PREFIX, "http://a.test/docs/a",
         "", "", 0, 0, 0, NULL);
-    ngx_expect(count == 7);
+    ngx_expect(count == 6);
 
     ngx_http_cache_purge_catalog_close(catalog);
     ngx_expect(ngx_http_cache_rocksdb_close(&store, &error) == 0);
@@ -604,7 +610,7 @@ ngx_http_cache_purge_test_main(void)
                == 0);
     count = ngx_http_cache_purge_test_scan(
         catalog, NGX_HTTP_CACHE_PURGE_SELECT_PREFIX, "", "", "", 0, 0, 0, ids);
-    ngx_expect(count == 10);
+    ngx_expect(count == 9);
 
     select.value = ngx_http_cache_purge_text("");
     ngx_expect(ngx_http_cache_purge_scan_open(catalog, &select,
@@ -623,6 +629,13 @@ ngx_http_cache_purge_test_main(void)
 
     ngx_expect(rc == NGX_HTTP_CACHE_ROCKSDB_DONE && removed == count);
     ngx_http_cache_purge_scan_close(scan);
+
+    /* Empty scope deletion leaves other namespaces intact. */
+    ngx_expect(ngx_http_cache_purge_test_scan(
+                   catalog, NGX_HTTP_CACHE_PURGE_SELECT_PREFIX, "", "scope",
+                   "", 0, 0, 0, ids) == 1);
+    ngx_expect(ngx_http_cache_purge_catalog_remove(catalog, ids[0], 0, &error)
+               == 0);
 
     ngx_expect(ngx_http_cache_purge_test_rows(
                    store, NGX_HTTP_CACHE_ROCKSDB_URL, "", 0)
@@ -720,6 +733,20 @@ ngx_http_cache_purge_test_main(void)
     ngx_expect(ngx_http_cache_purge_test_rows(
                    store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, "M:catalog", 0)
                == 0);
+    ngx_expect(ngx_http_cache_rocksdb_close(&store, &error) == 0);
+
+    snprintf(old_path, sizeof(old_path), "%s/version-one", path);
+    ngx_expect(mkdir(old_path, 0700) == 0);
+    ngx_expect(ngx_http_cache_rocksdb_open(old_path, &options, &store, &error)
+               == 0);
+    memset(&legacy, 0, sizeof(legacy));
+    legacy.key = ngx_http_cache_purge_text("M:catalog");
+    legacy.value = ngx_http_cache_purge_text("1");
+    ngx_expect(ngx_http_cache_rocksdb_write(store, &legacy, 1, NULL, 0, &error)
+               == 0);
+    ngx_expect(ngx_http_cache_purge_catalog_open(store, &catalog, &error)
+               == NGX_HTTP_CACHE_ROCKSDB_SCHEMA);
+    ngx_expect(catalog == NULL);
     ngx_expect(ngx_http_cache_rocksdb_close(&store, &error) == 0);
 
     printf("{\"status\":\"passed\",\"checks\":%u,\"root\":\"%s\"}\n",

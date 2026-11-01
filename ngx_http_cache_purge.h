@@ -25,16 +25,18 @@ ngx_int_t ngx_http_cache_purge_native_file(const char *name,
     ngx_uint_t invalidate, ngx_file_uniq_t expected,
     ngx_http_cache_purge_native_file_t *result);
 
-enum {
+typedef enum {
     NGX_HTTP_CACHE_PURGE_NODE_READ = 0,
     NGX_HTTP_CACHE_PURGE_NODE_INVALIDATE,
     NGX_HTTP_CACHE_PURGE_NODE_DELETE,
     NGX_HTTP_CACHE_PURGE_NODE_CLEAR,
     NGX_HTTP_CACHE_PURGE_NODE_CLEAR_ERROR
-};
+} ngx_http_cache_purge_node_action_e;
+
 
 ngx_int_t ngx_http_cache_purge_native_node(ngx_http_file_cache_t *cache,
-    const u_char *key, ngx_file_uniq_t expected, ngx_uint_t action);
+    const u_char *key, ngx_file_uniq_t expected,
+    ngx_http_cache_purge_node_action_e action);
 ngx_int_t ngx_http_cache_purge_native_identity(ngx_http_file_cache_t *cache,
     const u_char *key, ngx_file_uniq_t *uniq);
 
@@ -56,12 +58,13 @@ typedef struct {
 } ngx_http_cache_purge_match_t;
 
 
-enum {
+typedef enum {
     NGX_HTTP_CACHE_PURGE_RECORD = 0,
     NGX_HTTP_CACHE_PURGE_SUBMIT,
     NGX_HTTP_CACHE_PURGE_STATUS,
     NGX_HTTP_CACHE_PURGE_LOOKUP
-};
+} ngx_http_cache_purge_work_type_e;
+
 
 #define NGX_HTTP_CACHE_PURGE_MESSAGE_MAX  (256 * 1024)
 
@@ -154,20 +157,39 @@ typedef ngx_http_complex_value_t  ngx_http_cache_purge_value_t;
 typedef ngx_flag_t                ngx_http_cache_purge_flag_t;
 #endif
 
-enum {
-    NGX_HTTP_CACHE_PURGE_URL = 0,
-    NGX_HTTP_CACHE_PURGE_MISC,
+typedef enum {
+    NGX_HTTP_CACHE_PURGE_MISC = 0,
     NGX_HTTP_CACHE_PURGE_NAMESPACE,
-    NGX_HTTP_CACHE_PURGE_TAG,
-    NGX_HTTP_CACHE_PURGE_TYPE_HEADER,
-    NGX_HTTP_CACHE_PURGE_ACTION_HEADER,
-    NGX_HTTP_CACHE_PURGE_TAGS_HEADER,
-    NGX_HTTP_CACHE_PURGE_ID_HEADER,
-    NGX_HTTP_CACHE_PURGE_ISSUED_HEADER,
-    NGX_HTTP_CACHE_PURGE_TIME_HEADER,
-    NGX_HTTP_CACHE_PURGE_PROPAGATION_ACTION_HEADER,
+    NGX_HTTP_CACHE_PURGE_HOST,
+    NGX_HTTP_CACHE_PURGE_KEYS
+} ngx_http_cache_purge_key_e;
+
+
+typedef enum {
+    NGX_HTTP_CACHE_PURGE_TYPE = 0,
+    NGX_HTTP_CACHE_PURGE_ACTION,
     NGX_HTTP_CACHE_PURGE_VALUES
-};
+} ngx_http_cache_purge_value_e;
+
+
+typedef enum {
+    NGX_HTTP_CACHE_PURGE_TAGS = 0,
+    NGX_HTTP_CACHE_PURGE_OPERATION,
+    NGX_HTTP_CACHE_PURGE_HEADERS,
+    NGX_HTTP_CACHE_PURGE_GROUPS
+} ngx_http_cache_purge_group_e;
+
+
+typedef enum {
+    NGX_HTTP_CACHE_PURGE_PROXY = 0,
+    NGX_HTTP_CACHE_PURGE_FASTCGI,
+    NGX_HTTP_CACHE_PURGE_SCGI,
+    NGX_HTTP_CACHE_PURGE_UWSGI,
+    NGX_HTTP_CACHE_PURGE_PROPAGATION,
+    NGX_HTTP_CACHE_PURGE_IGNORE_PROPAGATION,
+    NGX_HTTP_CACHE_PURGE_FLAGS
+} ngx_http_cache_purge_flag_e;
+
 
 typedef void (*ngx_http_cache_purge_finalize_pt)(ngx_http_request_t *r,
     ngx_int_t rc);
@@ -182,7 +204,9 @@ typedef struct {
     ngx_http_cache_rocksdb_options_t  options;
     ngx_array_t                       caches;
     ngx_array_t                       locations;
+    ngx_int_t                         keys[NGX_HTTP_CACHE_PURGE_KEYS];
     ngx_http_complex_value_t          defaults[NGX_HTTP_CACHE_PURGE_VALUES];
+    ngx_array_t                       groups[NGX_HTTP_CACHE_PURGE_GROUPS];
     ngx_http_complex_value_t          guard[4];
     ngx_buf_tag_t                     protocol[4];
     ngx_http_cache_purge_finalize_pt  finalize[4];
@@ -191,21 +215,31 @@ typedef struct {
 
 
 typedef struct {
-    ngx_http_cache_purge_value_t  *value[NGX_HTTP_CACHE_PURGE_VALUES];
-    ngx_http_cache_purge_flag_t    flag[6];
-    ngx_uint_t                     url_set;
-    ngx_str_t                      api;
+    ngx_http_cache_purge_value_t   *value[NGX_HTTP_CACHE_PURGE_VALUES];
+    ngx_array_t                    *group[NGX_HTTP_CACHE_PURGE_GROUPS];
+    ngx_http_cache_purge_flag_t     flag[NGX_HTTP_CACHE_PURGE_FLAGS];
+    ngx_str_t                       api;
 } ngx_http_cache_purge_loc_conf_t;
 
 
 extern ngx_module_t  ngx_http_cache_purge_module;
 
+ngx_int_t ngx_http_cache_key_get_url(ngx_http_request_t *r, ngx_str_t *value);
 ngx_int_t ngx_http_cache_purge_add_variables(ngx_conf_t *cf);
 ngx_int_t ngx_http_cache_purge_init_handlers(ngx_conf_t *cf);
 ngx_int_t ngx_http_cache_purge_api_handler(ngx_http_request_t *r);
 ngx_flag_t ngx_http_cache_purge_get_flag(ngx_http_request_t *r, ngx_uint_t n);
-ngx_int_t ngx_http_cache_purge_get_value(ngx_http_request_t *r, ngx_uint_t n,
+ngx_int_t ngx_http_cache_purge_get_value(ngx_http_request_t *r,
+    ngx_http_cache_purge_value_e n,
     ngx_str_t *value);
+ngx_int_t ngx_http_cache_purge_get_key(ngx_http_request_t *r,
+    ngx_http_cache_purge_key_e n,
+    ngx_str_t *value);
+ngx_array_t *ngx_http_cache_purge_get_group(ngx_http_request_t *r,
+    ngx_http_cache_purge_group_e n);
+ngx_int_t ngx_http_cache_purge_get_pair(ngx_http_request_t *r,
+    ngx_http_cache_purge_group_e n,
+    ngx_str_t value[2]);
 ngx_uint_t ngx_http_cache_purge_state_active(
     ngx_http_cache_purge_state_t *state);
 ngx_uint_t ngx_http_cache_purge_state_filtering(

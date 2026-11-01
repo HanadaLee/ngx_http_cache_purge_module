@@ -76,7 +76,8 @@ ngx_http_cache_purge_native_identity(ngx_http_file_cache_t *cache,
 /* Node state is touched only by a worker, under the native cache-zone lock. */
 ngx_int_t
 ngx_http_cache_purge_native_node(ngx_http_file_cache_t *cache,
-    const u_char *key, ngx_file_uniq_t expected, ngx_uint_t action)
+    const u_char *key, ngx_file_uniq_t expected,
+    ngx_http_cache_purge_node_action_e action)
 {
     ngx_int_t                    rc;
     ngx_http_file_cache_node_t  *file;

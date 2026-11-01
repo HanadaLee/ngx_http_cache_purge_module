@@ -84,6 +84,7 @@ static ngx_command_t  ngx_http_cache_purge_probe_commands[] = {
       ngx_null_command
 };
 
+
 static ngx_http_module_t  ngx_http_cache_purge_probe_module_ctx = {
     ngx_http_cache_purge_probe_add_variables,
     ngx_http_cache_purge_probe_init,
@@ -98,6 +99,7 @@ static ngx_http_module_t  ngx_http_cache_purge_probe_module_ctx = {
     NULL,
     NULL
 };
+
 
 ngx_module_t  ngx_http_cache_purge_native_probe_module = {
     NGX_MODULE_V1,

@@ -20,6 +20,7 @@ import tempfile
 import tarfile
 import threading
 import time
+from urllib.parse import urlsplit
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--nginx', type=Path, required=True)
@@ -305,17 +306,19 @@ if args.public_module:
     state_parameter = f' state={run}/purge.zone' if args.state else ''
     owner_config = f'''cache_purge_index_store {run}/store;
     cache_purge_state_zone zone=purge:1m{state_parameter};
-    map $http_x_test_identity $native_purge_url {{
-        default http://cache.test$uri;
-        invalid "";
+    map $http_x_test_identity $test_namespace {{
+        default "";
+        invalid "bad namespace";
     }}
-    cache_purge_key_url $native_purge_url;
-    cache_purge_tag $upstream_http_cache_tag inherited;'''
-    control_config = 'proxy_cache_purge on; cache_purge_key_url $http_x_target;'
+    cache_key_namespace $test_namespace;
+    cache_key_host cache.test;
+    cache_key_uri $uri;
+    cache_purge_tags $upstream_http_cache_tag inherited;'''
+    control_config = 'proxy_cache_purge on; cache_key_uri $http_x_target_uri;'
     business_config = '''proxy_cache_purge on;
             proxy_set_header X-Cache-Purge-Time $cache_purge_propagation_time;
             proxy_set_header X-Cache-Purge-Action $cache_purge_propagation_action;'''
-    api_config = 'location /management/ { cache_purge_api; }'
+    api_config = 'location /management/ { cache_purge_api; cache_key_namespace $http_x_test_namespace; }'
     api_config += f'''
         location = /memory-error {{
             proxy_cache_purge on;
@@ -347,37 +350,54 @@ if args.public_module:
     if args.expr:
         owner_config += '''
     expr is_purge str_eq $request_method PURGE;
-    expr is_get str_eq $request_method GET;'''
+    expr is_get str_eq $request_method GET;
+    expr custom_operation str_eq $http_x_pair 1;'''
         control_config = '''
             when is_purge {
                 proxy_cache_purge on;
-                cache_purge_key_url $http_x_target;
-                cache_purge_type_header X-Test-Purge-Type;
-                cache_purge_action_header X-Test-Purge-Action;
+                cache_key_uri $http_x_target_uri;
+                cache_purge_type $http_x_test_purge_type;
+                cache_purge_action $http_x_test_purge_action;
             }
             proxy_cache_purge off;
-            cache_purge_key_url http://unused.test/;'''
+            cache_key_uri /unused;'''
         business_config = business_config.replace('proxy_cache_purge on;', '''
             when is_get { proxy_cache_purge on; }
             proxy_cache_purge off;''')
     control_config += '''
-        cache_purge_key_misc $http_x_test_misc;
-        cache_purge_key_namespace $http_x_test_namespace;'''
+        cache_purge_tags $http_x_cache_purge_tags;
+        cache_key_misc $http_x_test_misc;
+        cache_key_scheme $http_x_target_scheme;
+        cache_key_host $http_x_target_host;
+        cache_key_namespace $http_x_test_namespace;'''
+    if args.expr:
+        control_config += '''
+        when custom_operation {
+            cache_purge_operation_headers
+                issued_at=$http_x_pair_time id=$http_x_pair_id;
+        }'''
     variant_identity = '''cache_key_host variants.test;
             cache_key_uri $uri;
             cache_key_misc $http_x_test_misc;
-            cache_key_namespace $http_x_test_namespace;
-            cache_purge_key_url $cache_key_url;
-            cache_purge_key_misc $cache_key_misc;
-            cache_purge_key_namespace $cache_key_namespace;'''
-    tag_config = 'cache_purge_tag $upstream_http_cache_tag $http_x_extra_tag extra-a extra-b;'
+            cache_key_namespace $http_x_test_namespace;'''
+    tag_config = 'cache_purge_tags $upstream_http_cache_tag $http_x_extra_tag extra-a extra-b;'
     if args.expr:
-        tag_config = 'when is_get { ' + tag_config + ' } cache_purge_tag fallback;'
+        tag_config = 'when is_get { ' + tag_config + ' } cache_purge_tags fallback;'
     api_config += f'''
+        location /opaque/ {{
+            proxy_cache_purge on;
+            cache_key_scheme custom;
+            cache_key_host opaque.test;
+            proxy_cache test;
+            proxy_cache_key $uri;
+            proxy_cache_valid 200 1h;
+            proxy_pass http://127.0.0.1:{origin.server_port};
+            add_header X-Cache $upstream_cache_status always;
+        }}
         location /tag-input/ {{
             proxy_cache_purge on;
-            cache_purge_key_url http://tags.test$uri;
-            cache_purge_key_namespace tag-input;
+            cache_key_host tags.test;
+            cache_key_namespace tag-input;
             {tag_config}
             proxy_cache test;
             proxy_cache_key $uri;
@@ -396,10 +416,7 @@ if args.public_module:
             add_header X-Cache $upstream_cache_status always;
         }}'''
     if args.slice:
-        slice_identity = ('cache_key_uri $uri; cache_key_range $slice_range; '
-                          'cache_purge_key_url $cache_key_url; '
-                          'cache_purge_key_misc $cache_key_misc; '
-                          'cache_purge_key_namespace $cache_key_namespace;')
+        slice_identity = 'cache_key_uri $uri; cache_key_range $slice_range;'
         api_config += f'''
         location /slice/ {{
             {'slice on; slice_size 1k;' if args.extension else 'slice 1k;'}
@@ -515,6 +532,34 @@ if args.public_module:
         assert (result.returncode == 0) == valid, (value, result.stderr)
     checks.append('state zone uses zone=name:size and rejects malformed, undersized and duplicate definitions')
 
+    for directive, values in (
+        ('cache_purge_operation_headers', (
+            ('id= issued_at=', True),
+            ('issued_at=$http_x_pair_time id=$http_x_pair_id', True),
+            ('id=one', False), ('id=one id=two', False),
+            ('id=one unknown=two', False))),
+        ('cache_purge_propagation_headers', (
+            ('action=X-Action time=X-Time', True),
+            ('time=X-Time', False), ('time= action=X-Action', False),
+            ('time=X-Time time=X-Other', False),
+            ('time=X-Time unknown=X-Action', False),
+            ('time=X-Time action=x-time', False),
+            ('time=$http_x_time action=X-Action', False),
+            ('time=X:Time action=X-Action', False))),
+        ('cache_key_scheme', (('arbitrary-value', True), ('custom', True))),
+        ('cache_purge_propagation_time', (('$http_x_cache_purge_time', False),)),
+        ('cache_purge_key_url', (('$cache_key_url', False),))):
+        for value, valid in values:
+            candidate = config.replace('location = /control {',
+                f'location = /config-test {{ {directive} {value}; }}\n'
+                '        location = /control {')
+            candidate = candidate.replace(str(run / 'error.log'), str(run / 'config-check.log'))
+            (run / 'config-check.conf').write_text(candidate)
+            result = subprocess.run([str(binary), '-t', '-p', str(run),
+                '-c', str(run / 'config-check.conf')], capture_output=True, text=True)
+            assert (result.returncode == 0) == valid, (directive, value, result.returncode, result.stderr)
+    checks.append('paired directives reject incomplete, duplicate and invalid parameters; purge identities use only cache_key directives')
+
 def start():
     proc = subprocess.Popen([str(binary), '-p', str(run), '-c', str(run / 'nginx.conf')],
                             stdout=output, stderr=subprocess.STDOUT)
@@ -599,7 +644,7 @@ def purge(action, target, identifier):
     assert response['status'] == 202, response
     return finished(identifier)
 
-def finished(identifier):
+def finished(identifier, expected=True):
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         response = progress(identifier)
@@ -609,15 +654,22 @@ def finished(identifier):
             status = status['cleanup']
             status['done'] = status['state'] == 'done'
         if status['done']:
-            assert status['affected'] > 0, status
+            if expected:
+                assert status['affected'] > 0, status
             return status
         time.sleep(.02)
     raise AssertionError('background operation did not finish')
 
+operation_namespaces = {}
+
 def accepted(action, target, identifier, kind='url', headers=None):
+    operation_namespaces[identifier] = (headers or {}).get("X-Test-Namespace", "")
     if args.public_module:
+        identity = urlsplit(target if '://' in target else 'http://cache.test' + target)
         return request('/control', {
-            'X-Target': target if target.startswith('http') else 'http://cache.test' + target,
+            'X-Target-Scheme': identity.scheme,
+            'X-Target-Host': identity.netloc,
+            'X-Target-Uri': identity.path + ('?' + identity.query if identity.query else ''),
             ('X-Test-Purge-Action' if args.expr else 'X-Cache-Purge-Action'): action,
             ('X-Test-Purge-Type' if args.expr else 'X-Cache-Purge-Type'): kind,
             'X-Cache-Purge-Operation-Id': f'test-{identifier}',
@@ -625,9 +677,11 @@ def accepted(action, target, identifier, kind='url', headers=None):
             **(headers or {})}, method='PURGE')
     return request(f'/control?action={action}&target={target}&id={identifier}')
 
-def progress(identifier):
+def progress(identifier, namespace=None):
     return request(f'/management/operations/test-{identifier}' if args.public_module
-                   else f'/control?action=status&id={identifier}')
+                   else f'/control?action=status&id={identifier}',
+                   headers={'X-Test-Namespace': operation_namespaces.get(identifier, '')
+                            if namespace is None else namespace})
 
 try:
     if args.public_module:
@@ -906,17 +960,67 @@ try:
                 hit(target, headers)
             checks.append('namespace TAG purge matches only that namespace and does not require a target URL')
 
-            for identifier, kind in [(22, 'host-tag'), (23, 'url'), (24, 'host')]:
+            for identifier, kind in [(22, 'host-tag'), (23, 'url'), (24, 'host'), (25, 'prefix')]:
                 time.sleep(1.05)
                 hit('/item')
                 assert accepted('delete', url, identifier, kind, {
+                    'X-Test-Namespace': 'a',
                     'X-Cache-Purge-Tags': 'native'})['status'] == 202
-                assert finished(identifier)['affected'] == 4
+                assert finished(identifier)['affected'] == 2
                 assert request('/item')['cache'] == 'HIT'
                 for headers in variants:
-                    assert request(target, headers)['cache'] == 'MISS'
+                    assert request(target, headers)['cache'] == ('MISS' if headers['X-Test-Namespace'] == 'a' else 'HIT')
                     hit(target, headers)
-            checks.append('URL, host and host-TAG purge cover all misc/namespace variants using configured URL authority instead of management Host')
+            checks.append('URL, prefix, host and host-TAG purge stay within the selected namespace while covering its misc variants')
+
+            assert progress(20, 'b')['status'] == 404
+            assert progress(20, '')['status'] == 404
+            time.sleep(1.05)
+            assert accepted('invalidate', url, 20, 'key', variants[3])['status'] == 202
+            assert finished(20)['affected'] == 1
+            assert progress(20, 'a')['status'] == 200
+            assert request(target, variants[3])['cache'] == 'EXPIRED'
+            assert request(target, variants[1])['cache'] == 'HIT'
+            checks.append('operation identifiers and status lookups are isolated by namespace')
+
+            for identifier, kind in enumerate(('key', 'url', 'prefix', 'host', 'tag', 'host-tag'), 60):
+                for headers in variants:
+                    hit(target, headers)
+                time.sleep(1.05)
+                assert accepted('invalidate', url, identifier, kind, {
+                    **variants[1], 'X-Cache-Purge-Tags': 'native'})['status'] == 202
+                assert finished(identifier)['affected'] == (1 if kind == 'key' else 2)
+                for i, headers in enumerate(variants):
+                    selected = i == 1 or (kind != 'key' and i == 2)
+                    assert request(target, headers)['cache'] == ('EXPIRED' if selected else 'HIT')
+            checks.append('all six Invalidate selectors preserve other namespaces including the empty namespace')
+
+            for headers in ({'X-Cache-Purge-Operation-Id': ''},
+                            {'X-Cache-Purge-Issued-At': ''}):
+                assert accepted('delete', url, 70, headers=headers)['status'] == 400
+            response = accepted('delete', url, 70, headers={
+                'X-Cache-Purge-Operation-Id': '', 'X-Cache-Purge-Issued-At': ''})
+            assert response['status'] == 202
+            assert json.loads(response['body'])['operation_id'] != 'test-70'
+            if args.expr:
+                response = accepted('delete', url, 71, headers={
+                    'X-Pair': '1', 'X-Pair-Id': 'test-72',
+                    'X-Pair-Time': str(int(time.time() * 1000)),
+                    'X-Cache-Purge-Issued-At': 'invalid'})
+                assert response['status'] == 202, response
+                assert json.loads(response['body'])['operation_id'] == 'test-72'
+                assert progress(71)['status'] == 404
+                assert progress(72)['status'] == 200
+            checks.append('operation input pairs support automatic generation, reject partial values and select a complete when candidate')
+
+            for identifier, kind in enumerate(('url', 'key', 'prefix', 'host', 'host-tag'), 80):
+                hit('/opaque/item')
+                time.sleep(1.05)
+                assert accepted('delete', 'custom://opaque.test/opaque/item', identifier, kind,
+                    {'X-Cache-Purge-Tags': 'native'})['status'] == 202
+                assert finished(identifier)['affected'] == 1
+                assert request('/opaque/item')['cache'] == 'MISS'
+            checks.append('non-HTTP key components support URL, key, prefix and independent host selection')
 
             target = '/variants/vary'
             before = set(files())
@@ -954,6 +1058,43 @@ try:
             assert request('/tag-input/limit')['cache'] == 'MISS'
             checks.append('128 response TAGs combine upstream, variable and literal arguments and overlapping selectors affect a file once')
 
+            before_log = (run / 'error.log').read_text()
+            capped = ','.join(f'cap-{i}' for i in range(129))
+            assert request('/tag-input/capped', {'X-Test-Tags': capped})['status'] == 200
+            deadline = time.monotonic() + 2
+            while True:
+                new_log = (run / 'error.log').read_text()[len(before_log):]
+                if 'TAG list truncated to 128 items' in new_log:
+                    break
+                assert time.monotonic() < deadline, new_log
+                time.sleep(.01)
+            assert new_log.count('TAG list truncated to 128 items') == 1, new_log
+            assert '[notice]' in new_log
+            hit('/tag-input/capped', {'X-Test-Tags': capped})
+            time.sleep(1.05)
+            assert accepted('delete', '', 90, 'tag', {
+                **scoped, 'X-Cache-Purge-Tags': 'cap-128'})['status'] == 202
+            assert finished(90, expected=False)['affected'] == 0
+            assert request('/tag-input/capped')['cache'] == 'HIT'
+            assert accepted('delete', '', 91, 'tag', {
+                **scoped, 'X-Cache-Purge-Tags': 'cap-127'})['status'] == 202
+            assert finished(91)['affected'] == 1
+            checks.append('cache registration keeps the first 128 TAGs, ignores later parameters and logs notice without interrupting the response')
+
+            for path, tag in (('keep', 'truncate-keep'), ('tail', 'truncate-tail')):
+                hit('/tag-input/' + path, {'X-Test-Tags': tag})
+            time.sleep(1.05)
+            before_log = (run / 'error.log').read_text()
+            assert accepted('delete', '', 92, 'tag', {
+                **scoped, 'X-Cache-Purge-Tags': ','.join(['truncate-keep'] * 32
+                    + ['truncate-tail', 'x' * 1025])})['status'] == 202
+            assert finished(92)['affected'] == 1
+            assert request('/tag-input/tail')['cache'] == 'HIT'
+            new_log = (run / 'error.log').read_text()[len(before_log):]
+            assert new_log.count('TAG list truncated to 32 items') == 1, new_log
+            assert '[notice]' in new_log
+            checks.append('TAG purge truncates before deduplication at 32 items and does not validate discarded tail items')
+
             for path, tags in [('a', 'batch-0,batch-1'), ('b', 'batch-31'), ('c', 'unselected')]:
                 hit('/tag-input/' + path, {'X-Test-Tags': tags})
             time.sleep(1.05)
@@ -970,14 +1111,14 @@ try:
             assert request('/tag-input/b')['cache'] == 'EXPIRED'
             assert request('/tag-input/c')['cache'] == 'HIT'
             checks.append('32-TAG Invalidate uses OR semantics, preserves unrelated files and replays reordered selectors idempotently')
-            for value in (','.join(batch + ['overflow']), ' , , ', 'x' * 1025):
+            for value in (' , , ', 'x' * 1025):
                 assert accepted('delete', '', 42, 'tag', {
                     **scoped, 'X-Cache-Purge-Tags': value})['status'] == 400
             time.sleep(1.05)
             assert accepted('delete', '', 42, 'tag', {
                 **scoped, 'X-Cache-Purge-Tags': ' extra-b, extra-b, , '})['status'] == 202
-            assert finished(42)['affected'] == 4
-            checks.append('TAG submission rejects 33 items and overlong or empty lists, while duplicates and empty comma fields are canonicalized')
+            assert finished(42)['affected'] == 5
+            checks.append('TAG submission rejects malformed retained items, while duplicates and empty comma fields are canonicalized')
             for number, protocol in enumerate(protocol_servers):
                 target = '/' + protocol + '/item'
                 hit(target)

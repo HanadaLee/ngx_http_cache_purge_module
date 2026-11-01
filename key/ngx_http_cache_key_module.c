@@ -68,6 +68,7 @@ static ngx_int_t ngx_http_cache_key_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_cache_key_eval(ngx_http_request_t *r,
     ngx_http_cache_key_ctx_t *ctx, ngx_uint_t field);
+ngx_int_t ngx_http_cache_key_get_url(ngx_http_request_t *r, ngx_str_t *value);
 
 
 static ngx_command_t  ngx_http_cache_key_commands[] = {
@@ -403,6 +404,10 @@ ngx_http_cache_key_add_variables(ngx_conf_t *cf)
     ngx_http_variable_t  *var;
 
     for (i = 0; i < NGX_HTTP_CACHE_KEY_COUNT; i++) {
+        if (i == NGX_HTTP_CACHE_KEY_URL) {
+            continue;
+        }
+
         var = ngx_http_add_variable(cf, &ngx_http_cache_key_names[i],
                                     NGX_HTTP_VAR_NOCACHEABLE);
 
@@ -627,4 +632,11 @@ ngx_http_cache_key_variable(ngx_http_request_t *r,
     v->not_found = 0;
 
     return NGX_OK;
+}
+
+
+ngx_int_t
+ngx_http_cache_key_get_url(ngx_http_request_t *r, ngx_str_t *value)
+{
+    return ngx_http_cache_key_get_value(r, NGX_HTTP_CACHE_KEY_URL, value);
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise cache-key variables using bundled or standalone nginx builds."""
+"""Exercise cache-key variables in the combined module build."""
 import argparse
 import hashlib
 import json
@@ -14,14 +14,9 @@ import urllib.error
 import urllib.request
 
 parser = argparse.ArgumentParser(description=__doc__)
-source = parser.add_mutually_exclusive_group(required=True)
-source.add_argument('--binary', type=Path)
-source.add_argument('--nginx', type=Path, help='Build only key/ from this nginx repository')
+parser.add_argument('--binary', type=Path, required=True)
 parser.add_argument('--modules', type=Path)
 parser.add_argument('--expr', action='store_true')
-parser.add_argument('--expr-source', type=Path)
-parser.add_argument('--without-cache', action='store_true')
-parser.add_argument('--dynamic', action='store_true')
 parser.add_argument('--output', type=Path, required=True)
 args = parser.parse_args()
 repo = Path(__file__).resolve().parents[1]
@@ -32,31 +27,12 @@ run.mkdir()
 os.environ['ASAN_OPTIONS'] = 'detect_leaks=0:abort_on_error=1'
 os.environ['UBSAN_OPTIONS'] = 'halt_on_error=1:print_stacktrace=1'
 
-if args.nginx:
-    build = root / 'nginx'
-    build.mkdir()
-    archive = subprocess.check_output(['git', '-C', str(args.nginx), 'archive', 'HEAD'])
-    subprocess.run(['tar', '-xf', '-', '-C', str(build)], input=archive, check=True)
-    configure = 'auto/configure' if (build / 'auto/configure').exists() else 'configure'
-    command = ['sh', configure, '--prefix=' + str(run), '--without-http_gzip_module']
-    if args.without_cache:
-        command.append('--without-http-cache')
-    if args.expr_source:
-        command.append('--add-module=' + str(args.expr_source))
-        args.expr = True
-    command.append(('--add-dynamic-module=' if args.dynamic else '--add-module=') + str(repo / 'key'))
-    print('BUILD', root, flush=True)
-    with (root / 'build.log').open('w') as log:
-        subprocess.run(command, cwd=build, stdout=log, stderr=subprocess.STDOUT, check=True)
-        subprocess.run(['make', '-j2'], cwd=build, stdout=log, stderr=subprocess.STDOUT, check=True)
-    args.binary = build / 'objs/nginx'
-    if args.dynamic:
-        args.modules = build / 'objs'
-
 with socket.socket() as sock:
     sock.bind(('127.0.0.1', 0))
     port = sock.getsockname()[1]
-load = f'load_module {args.modules}/ngx_http_cache_key_module.so;\n' if args.modules else ''
+load = (''.join(f'load_module {args.modules}/{name}.so;\n' for name in (
+    'ngx_http_cache_key_module', 'ngx_http_cache_rocksdb_module',
+    'ngx_http_cache_purge_module')) if args.modules else '')
 prefix = load + f'''daemon off;
 master_process on;
 worker_processes 2;
@@ -68,10 +44,10 @@ http = '''map $arg_loop $loop_value { default $cache_key_misc; }
 map $arg_valid $invalid_namespace { default "bad,comma"; }
 '''
 locations = '''
-location /default { return 200 "$cache_key_namespace|$cache_key_scheme|$cache_key_host|$cache_key_uri|$cache_key_misc|$cache_key_range|$cache_key_url"; }
+location /default { return 200 "$cache_key_namespace|$cache_key_scheme|$cache_key_host|$cache_key_uri|$cache_key_misc|$cache_key_range"; }
 location /full { return 200 "$cache_key_full"; }
 location /base { return 200 "$cache_key_base"; }
-location /custom { cache_key_namespace tenant; cache_key_scheme http; cache_key_host shared.test; cache_key_uri /asset?b=2&a=1; cache_key_misc ""; cache_key_range "bytes=0-99"; return 200 "$cache_key_full"; }
+location /custom { cache_key_namespace scope; cache_key_scheme http; cache_key_host shared.test; cache_key_uri /asset?b=2&a=1; cache_key_misc ""; cache_key_range "bytes=0-99"; return 200 "$cache_key_full"; }
 location /ns { cache_key_namespace $arg_ns; return 200 "$cache_key_base"; }
 location /empty { cache_key_namespace ""; return 200 "$cache_key_base"; }
 location /cycle { cache_key_misc $loop_value; return 200 "[$cache_key_full]"; }
@@ -144,11 +120,11 @@ with (root / 'stderr.log').open('w') as error:
                 break
             except OSError:
                 time.sleep(.05)
-        equal('/default?b=2&a=1', b'|http|example.test|/default?b=2&a=1|||http://example.test/default?b=2&a=1')
+        equal('/default?b=2&a=1', b'|http|example.test|/default?b=2&a=1||')
         equal('/full?x=1', key(b'', b'http', b'example.test', b'/full?x=1', b'', b''))
         equal('/base', key(b'', b'http', b'example.test', b'/base', b''))
         equal('/empty', key(b'', b'http', b'example.test', b'/empty', b''))
-        equal('/custom', key(b'tenant', b'http', b'shared.test', b'/asset?b=2&a=1', b'', b'bytes=0-99'))
+        equal('/custom', key(b'scope', b'http', b'shared.test', b'/asset?b=2&a=1', b'', b'bytes=0-99'))
         equal('/escape', key(b'', b'http', b'example.test', b'/escape', b'a\\b\x1f', b''))
         equal('/rewrite', b'/rewrite|/final')
         equal('/changed', b'/before|/after')
@@ -187,7 +163,7 @@ assert proc.returncode == 0, proc.returncode
 log = (run / 'error.log').read_text() + (root / 'stderr.log').read_text()
 assert not any(marker in log for marker in ('exited on signal', '[alert]', 'AddressSanitizer', 'runtime error:')), log
 result = {'status': 'passed', 'root': str(root), 'expr': args.expr,
-          'without_cache': args.without_cache, 'checks': checks,
+          'checks': checks,
           'source_sha256': hashlib.sha256((repo / 'key/ngx_http_cache_key_module.c').read_bytes()).hexdigest()}
 if args.modules:
     name = 'ngx_http_cache_key_module.so'

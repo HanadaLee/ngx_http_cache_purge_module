@@ -114,10 +114,10 @@ def request(tier, path, method='GET', headers=None, body=None, chunked=False):
     return result
 
 
-def hit(tier, path):
+def hit(tier, path, headers=None):
     deadline = time.monotonic() + 3
     while True:
-        result = request(tier, path)
+        result = request(tier, path, headers=headers)
         assert result['status'] == 200, result
         if result['cache'] == 'HIT':
             return result
@@ -125,17 +125,19 @@ def hit(tier, path):
         time.sleep(.01)
 
 
-def submit(path, action, kind='url'):
+def submit(path, action, kind='url', namespace=''):
     time.sleep(1.05)
     result = request('l1', '/control', 'PURGE', {
-        'X-Target': 'http://cache.test' + path,
+        'X-Target': path,
+        'X-Test-Namespace': namespace,
         'X-Cache-Purge-Action': action, 'X-Cache-Purge-Type': kind,
         'X-Cache-Purge-Tags': 'aaa-absent, known'})
     assert result['status'] == 202, result
     operation = json.loads(result['body'])
     deadline = time.monotonic() + 5
     while True:
-        result = request('l1', '/management/operations/' + operation['operation_id'])
+        result = request('l1', '/management/operations/' + operation['operation_id'],
+                         headers={'X-Test-Namespace': namespace})
         cleanup = json.loads(result['body'])['cleanup']
         if cleanup['state'] == 'done':
             assert cleanup['affected'] >= 1, cleanup
@@ -177,6 +179,8 @@ try:
             proxy_ssl_name cache.test;'''
         propagation = 'on' if tier == 'l1' else 'off'
         conditions = ''
+        header_names = (f'cache_purge_propagation_headers time={time_header} action={action_header};'
+                        if args.custom_headers else '')
         flags = f'proxy_cache_purge_propagation {propagation};'
         if args.expr:
             conditions = '''expr allow_propagation str_eq $http_x_origin "";
@@ -186,8 +190,12 @@ try:
             flags += '''
             when ignore_propagation { cache_purge_ignore_propagation on; }
             cache_purge_ignore_propagation off;'''
+            if args.custom_headers:
+                conditions += '\n    expr custom_headers str_eq $request_method GET;'
+                header_names = ('when custom_headers { ' + header_names + ' }\n'
+                    '    cache_purge_propagation_headers time=X-Unselected-Time action=X-Unselected-Action;')
         loads = ('\n'.join(f'load_module {args.modules.resolve() / name};'
-                          for name in ('ngx_http_cache_rocksdb_module.so', 'ngx_http_cache_purge_module.so'))
+                          for name in ('ngx_http_cache_key_module.so', 'ngx_http_cache_rocksdb_module.so', 'ngx_http_cache_purge_module.so'))
                  if args.modules else '')
         user = ('user ' + pwd.getpwuid(0).pw_name + ' ' + grp.getgrgid(os.getegid()).gr_name + ';') if os.geteuid() == 0 else ''
         config = f'''{loads}
@@ -203,11 +211,13 @@ http {{
     access_log {run}/access.log trace;
     cache_purge_index_store {run}/store;
     cache_purge_state_zone zone=purge:1m{' state=' + str(run / 'purge.zone') if args.state else ''};
-    cache_purge_propagation_time_header {time_header};
-    cache_purge_propagation_action_header {action_header};
+    {header_names}
+    cache_purge_action unused-management-action;
     {f'cache_purge_propagation_timeout {propagation_seconds}s;' if tier == 'l1' else ''}
-    cache_purge_key_url http://cache.test$uri;
-    cache_purge_tag $upstream_http_cache_tag;
+    cache_key_host cache.test;
+    cache_key_uri $uri;
+    cache_key_namespace $http_x_test_namespace;
+    cache_purge_tags $upstream_http_cache_tag;
     proxy_cache_path {run}/cache levels=1:2 keys_zone=cache:1m;
     {f'proxy_cache_path {run}/cleanup levels=1:2 keys_zone=cleanup:1m inactive=1s;' if tier == 'l1' else ''}
     {'map $uri $test_cache_zone { default cache; ~^/cleanup/ cleanup; }' if tier == 'l1' else ''}
@@ -218,14 +228,16 @@ http {{
         location /management/ {{ cache_purge_api; }}
         location = /control {{
             proxy_cache_purge on;
-            cache_purge_key_url $http_x_target;
+            cache_key_uri $http_x_target;
+            cache_purge_tags $http_x_cache_purge_tags;
+            cache_purge_action $http_x_cache_purge_action;
         }}
         location / {{
             proxy_cache_purge on;
             {flags}
             {header_config}
             proxy_cache {'$test_cache_zone' if tier == 'l1' else 'cache'};
-            proxy_cache_key $uri;
+            proxy_cache_key "$http_x_test_namespace$uri";
             proxy_cache_bypass $http_x_bypass;
             proxy_cache_revalidate on;
             proxy_hide_header X-Test-Cache;
@@ -257,6 +269,33 @@ http {{
                 pass
             assert time.monotonic() < deadline
             time.sleep(.02)
+
+    path = '/header-input'
+    hit('l2', path)
+    time.sleep(1.05)
+    stamp = str(int(time.time() * 1000))
+    previous = len(state['calls'])
+    result = request('l2', path, headers={time_header.lower(): stamp,
+                                         action_header.upper(): 'invalidate'})
+    assert result['cache'] == 'REVALIDATED' and result['body'] == 'body-v1', result
+    assert len(state['calls']) == previous + 1
+    previous = len(state['calls'])
+    assert request('l2', path, headers={action_header: 'invalid'})['cache'] == 'HIT'
+    assert len(state['calls']) == previous
+    future = str(int(stamp) + 2000)
+    for headers in ({time_header: future},
+                    {time_header: future, action_header: 'invalid'},
+                    {time_header: future, time_header.lower(): future,
+                     action_header: 'delete'}):
+        result = request('l2', path, headers=headers)
+        assert result['cache'] == 'HIT' and result['body'] == 'body-v1', result
+    assert len(state['calls']) == previous
+    if args.custom_headers:
+        result = request('l2', path, headers={
+            'X-Cache-Purge-Time': str(int(time.time() * 1000) + 3600000),
+            'X-Cache-Purge-Action': 'delete'})
+        assert result['cache'] == 'HIT' and len(state['calls']) == previous, result
+    checks.append('the configured header pair controls case-insensitive input and output independently of management action; malformed requirements do not invalidate a HIT')
 
     path = '/invalidate'
     hit('l2', path)
@@ -421,6 +460,23 @@ http {{
         assert not cached[0].exists()
         checks.append('filesystem permission errors preserve the cache file and its index entry for a later explicit purge')
 
+    for kind in ('url', 'tag'):
+        path = '/namespace/' + kind
+        original = state['version']
+        for namespace in ('a', 'b'):
+            assert hit('l1', path, {'X-Test-Namespace': namespace})['body'] == f'body-v{original}'
+        operation = submit(path, 'delete', kind, namespace='a')
+        state['version'] += 1
+        result = request('l1', path, headers={'X-Test-Namespace': 'b'})
+        assert result['cache'] == 'HIT' and result['body'] == f'body-v{original}', result
+        result = request('l1', path, headers={'X-Test-Namespace': 'b', 'X-Bypass': '1'})
+        seen = parent_log(path)
+        assert result['status'] == 200 and seen['time'] == '' and seen['action'] == '', (result, seen)
+        result = request('l1', path, headers={'X-Test-Namespace': 'a'})
+        seen = parent_log(path)
+        assert result['body'] == f'body-v{state["version"]}' and seen['time'] == str(operation['effective_at']), (result, seen)
+    checks.append('URL and retained TAG propagation respect the request namespace while other namespaces keep HITs and send no purge headers')
+
     assert all(time_header not in call and action_header not in call for call in state['calls']), state['calls']
     checks.append('parent with propagation off sends no control headers to origin; business responses contain no purge receipt')
     if args.tls:
@@ -440,7 +496,7 @@ for tier in ports:
 args.output.write_text(json.dumps({'status': 'passed', 'root': str(root),
     'binary_sha256': hashlib.sha256(args.binary.read_bytes()).hexdigest(),
     'modules': {name: hashlib.sha256((args.modules / name).read_bytes()).hexdigest()
-                for name in ('ngx_http_cache_rocksdb_module.so', 'ngx_http_cache_purge_module.so')}
+                for name in ('ngx_http_cache_key_module.so', 'ngx_http_cache_rocksdb_module.so', 'ngx_http_cache_purge_module.so')}
                if args.modules else {},
     'framework': args.framework, 'expr': args.expr, 'tls': args.tls, 'streaming': args.streaming,
     'state': args.state,

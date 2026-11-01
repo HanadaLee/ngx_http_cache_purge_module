@@ -29,10 +29,7 @@ http {
             proxy_cache_key $cache_key_full;
             proxy_cache_revalidate on;
 
-            cache_purge_key_url $cache_key_url;
-            cache_purge_key_misc $cache_key_misc;
-            cache_purge_key_namespace $cache_key_namespace;
-            cache_purge_tag $upstream_http_cache_tag;
+            cache_purge_tags $upstream_http_cache_tag;
             proxy_cache_purge on;
 
             proxy_pass http://127.0.0.1:8081;
@@ -57,14 +54,16 @@ A `202 Accepted` response confirms that the task is durable and its shared rule 
 
 Releases are source tags. Build the modules against the nginx or OpenResty source and dependencies used by your server. GitHub Actions checks branch updates, pull requests, and `5.*` tags; it does not publish prebuilt modules.
 
-## Upgrading to 5.0.0
+## Upgrading to 5.1.0
 
-Version 5 replaces the previous purge implementation and configuration interface. It does not preserve generation namespaces, REFRESH profiles, or the legacy zone/key arguments of the purge directives.
+Version 5.1.0 uses `cache_key_*` for both indexing and purge selection. All selectors are scoped to the configured namespace, including URL, prefix, host, and host-TAG. An empty namespace selects only the empty namespace.
 
-- Configure `cache_purge_index_store`, `cache_purge_state_zone`, and the URL/misc/namespace expressions shown above. Enable each cache protocol with its `*_cache_purge on;` switch.
-- Submit `PURGE` requests for Delete or Invalidate. Successful submissions return `202 Accepted`; poll the operation endpoint when completion of background cleanup is required.
-- Restrict management locations through nginx access controls. The module does not perform authentication.
-- Start with fresh index and state paths, rebuild all three modules together, and perform a full nginx restart. Do not reuse index or shared-state files from the previous implementation.
+- Remove `cache_purge_key_*` directives and configure the corresponding `cache_key_*` components. Use `$cache_key_base` for zone selection and `$cache_key_full` as the native cache key.
+- Rename `cache_purge_tag` to `cache_purge_tags`. Select response or PURGE inputs with locations or `when` blocks.
+- Replace management header-name directives with value expressions. Configure operation inputs with `cache_purge_operation_headers` and incoming/outgoing propagation header names with `cache_purge_propagation_headers`.
+- Rebuild all three modules together. Stop nginx, remove old cache contents and index/state files, then start with empty cache, index, and state paths. A reload is insufficient for this upgrade.
+
+Releases before version 5 also use a different purge interface. Enable each protocol with `*_cache_purge on;` and submit PURGE requests for Delete or Invalidate. Restrict management locations through nginx access controls.
 
 ## Installation
 
@@ -85,21 +84,21 @@ load_module modules/ngx_http_cache_rocksdb_module.so;
 load_module modules/ngx_http_cache_purge_module.so;
 ```
 
-Load RocksDB before purge. The examples use the bundled key module. It is optional when your configuration supplies the identity values through other variables. Build the modules and backend libraries from the same source revision.
-
-For the key module alone, use `--add-module=/path/to/ngx_cache_purge/key` or `--add-dynamic-module=/path/to/ngx_cache_purge/key`. This build needs neither RocksDB nor HTTP cache support. Do not add `key/` separately when adding the repository root.
+Load the key and RocksDB modules before purge, in the order shown above. All three modules build through the repository's root `config`; there is no separate key-module build. Build the modules and backend libraries from the same source revision.
 
 The addon links with `-lrocksdb -lstdc++ -lm -pthread` by default. Set `CACHE_PURGE_ROCKSDB_LIBS` when a different link configuration is needed, such as static RocksDB with its compression dependencies.
 
-Build `ngx_expr_module` statically before this addon in the nginx configure arguments to enable `when` blocks. Use the purge identity directives to select values from the bundled key module or your own variables.
+Build `ngx_expr_module` statically before this addon in the nginx configure arguments to enable `when` blocks. Use `cache_key_*` to select identity components from variables.
 
 `NGX_RESTY_EXT` enables strict Invalidate handling. Automatic proxy request-header integration additionally requires `NGX_HTTP_PROXY_FILTER`. Ordinary nginx uses its native stale policy and the propagation variables described below.
 
 ## Conditional configuration
 
-Location-level switches, identity expressions, TAG expressions, and control-header names support the expr module's `when` blocks in `http`, `server`, and `location`. `when` is a configuration block, not an extra directive parameter.
+Location-level switches, key components, input expressions, and propagation header names support the expr module's `when` blocks in `http`, `server`, and `location`. `when` is a configuration block, not an extra directive parameter.
 
-For example, select the misc value from a management header for PURGE requests:
+The first matching candidate wins. A child containing only conditional candidates falls back to its parent. Place conditional candidates before an unconditional value.
+
+For example, select the misc and TAG values from management headers for PURGE requests:
 
 ```nginx
 http {
@@ -109,25 +108,24 @@ http {
         location / {
             when purge_request {
                 cache_key_misc $http_x_cache_purge_misc;
+                cache_purge_tags $http_x_cache_purge_tags;
             }
 
             cache_key_misc $cookie_variant;
+            cache_purge_tags $upstream_http_cache_tag;
             proxy_cache_key $cache_key_full;
-            cache_purge_key_url $cache_key_url;
-            cache_purge_key_misc $cache_key_misc;
-            cache_purge_key_namespace $cache_key_namespace;
         }
     }
 }
 ```
 
-The native cache key must represent the same variant as the configured purge identity. These directives describe index fields; they do not change `proxy_cache_key` or the corresponding key of another protocol.
+Purge reads the same key components as cache lookup. Configure `proxy_cache_key $cache_key_full;` or the corresponding key directive for another protocol.
 
-Values are inherited unless overridden. A child `cache_purge_tag` replaces the inherited list; `when` selects a complete list using the expr module's candidate order. `cache_purge_index_store`, `cache_purge_state_zone`, `cache_purge_propagation_timeout`, and `cache_purge_api` do not support `when`. None of these directives supports nginx rewrite `if` blocks.
+Values are inherited unless overridden. A child `cache_purge_tags` replaces the inherited list; `when` selects a complete list. The two parameters of `cache_purge_operation_headers` and `cache_purge_propagation_headers` are also inherited and selected as complete pairs. `cache_purge_index_store`, `cache_purge_state_zone`, `cache_purge_propagation_timeout`, and `cache_purge_api` do not support `when`. None of these directives supports nginx rewrite `if` blocks.
 
 ## Cache key components
 
-The six directives accept one complex value in `http`, `server`, and `location`. With `ngx_expr_module`, all six also support `when` blocks. The first matching candidate wins; a child containing only conditional candidates falls back to its parent. Place conditional candidates before an unconditional value.
+The six directives each accept one complex value.
 
 ### cache_key_namespace
 
@@ -136,7 +134,7 @@ The six directives accept one complex value in `http`, `server`, and `location`.
 | Default: | `cache_key_namespace "";` |
 | Context: | `http`, `server`, `location`, `when` |
 
-Sets the namespace used to isolate cache keys. An empty namespace is valid and stays empty. Nonempty values accept up to 255 printable ASCII bytes, excluding spaces and commas.
+Sets the namespace used to isolate cache keys, purge rules, TAGs, and operation identifiers. An empty namespace is valid and stays empty. Nonempty values accept up to 255 printable ASCII bytes, excluding spaces and commas.
 
 The selected value is available through the read-only variable `$cache_key_namespace`.
 
@@ -197,9 +195,16 @@ The selected value is available through the read-only variable `$cache_key_range
 
 ### Variables
 
-| Derived variable | Value |
+All eight variables are read-only. The six component variables expose the evaluated values of their corresponding directives, before key encoding.
+
+| Variable | Value |
 | :--- | :--- |
-| `$cache_key_url` | Scheme, `://`, host, and URI |
+| `$cache_key_namespace` | Namespace selected by `cache_key_namespace` |
+| `$cache_key_scheme` | Scheme selected by `cache_key_scheme` |
+| `$cache_key_host` | Host selected by `cache_key_host` |
+| `$cache_key_uri` | URI selected by `cache_key_uri` |
+| `$cache_key_misc` | Variant value selected by `cache_key_misc` |
+| `$cache_key_range` | Range selected by `cache_key_range` |
 | `$cache_key_base` | Encoded namespace, scheme, host, URI, and misc |
 | `$cache_key_full` | The base fields followed by the encoded range, including an empty range |
 
@@ -214,12 +219,9 @@ cache_key_misc $cookie_variant;
 cache_key_range $slice_range;
 
 proxy_cache_key $cache_key_full;
-cache_purge_key_url $cache_key_url;
-cache_purge_key_misc $cache_key_misc;
-cache_purge_key_namespace $cache_key_namespace;
 ```
 
-Omit the range directive when the slice module is unavailable. The purge expressions explicitly associate the two modules; purge can use other business variables instead.
+Omit the range directive when the slice module is unavailable. Purge derives its URL identity from scheme, `://`, host, and URI; range does not narrow purge selection.
 
 Use stable component values throughout each request so that cache lookup, indexing, and displayed values identify the same response.
 
@@ -280,7 +282,7 @@ With the same compatible build, zone sizes, paths, and preserved files, this ret
 | Default: | `proxy_cache_purge off;` |
 | Context: | `http`, `server`, `location`, `when` |
 
-Enables indexing and purge handling for proxy cache requests. Requires `cache_purge_index_store`, `cache_purge_state_zone`, and an explicit `cache_purge_key_url` expression.
+Enables indexing and purge handling for proxy cache requests. Requires `cache_purge_index_store` and `cache_purge_state_zone`. Cache identity comes from the effective `cache_key_*` values.
 
 Also accepts PURGE requests in the location. A dedicated purge location can enable this switch without `proxy_pass` or a selected cache zone; selection uses the shared index across zones.
 
@@ -311,100 +313,61 @@ Enables the same indexing and purge behavior for uwsgi caches, with the same con
 
 Enables the same indexing and purge behavior for scgi caches, with the same configuration requirements as `proxy_cache_purge`. Parent propagation is not supported for scgi.
 
-### cache_purge_key_url
+### cache_purge_tags
 
-| Syntax: | **cache_purge_key_url** `value`; |
+| Syntax: | **cache_purge_tags** `value ...`; |
 | :--- | :--- |
-| Default: | — |
+| Default: | `cache_purge_tags "";` |
 | Context: | `http`, `server`, `location`, `when` |
 
-Defines the URL identity used for indexing and PURGE selection. It must evaluate to an absolute HTTP or HTTPS URL, at most 32,768 bytes. An explicit expression is required wherever purge handling can be enabled; it does not inherit the native cache-key expression automatically.
-
-Use consistent URL normalization for cache fills and purge requests. URL and prefix comparisons use the configured bytes; host selection uses the lowercase host extracted from the URL. The identity must exclude slice/range suffixes so that all slices share the same selection scope.
-
-### cache_purge_key_misc
-
-| Syntax: | **cache_purge_key_misc** `value`; |
-| :--- | :--- |
-| Default: | `cache_purge_key_misc "";` |
-| Context: | `http`, `server`, `location`, `when` |
-
-Defines the additional variant identity, at most 32,768 bytes. A `key` purge matches URL, misc, and namespace exactly, then covers their indexed slice and Vary files. The module does not accept a serialized native key or an MD5 cache filename.
-
-### cache_purge_key_namespace
-
-| Syntax: | **cache_purge_key_namespace** `value`; |
-| :--- | :--- |
-| Default: | `cache_purge_key_namespace "";` |
-| Context: | `http`, `server`, `location`, `when` |
-
-Defines the namespace stored with an indexed object and used by `key` and `tag` purges. Indexed namespace values may contain at most 32,768 bytes. An empty namespace is an exact scope; it does not fall back to the request host.
-
-For a header-supplied namespace, configure an expression such as `$http_x_cache_purge_namespace`. There is no separate built-in namespace control header.
-
-### cache_purge_tag
-
-| Syntax: | **cache_purge_tag** `value ...`; |
-| :--- | :--- |
-| Default: | `cache_purge_tag "";` |
-| Context: | `http`, `server`, `location`, `when` |
-
-Defines TAGs associated with cached responses. Arguments can contain variables and are joined into one comma-separated list:
+Defines TAGs for cached responses or a TAG purge. Each argument accepts variables and comma-separated values:
 
 ```nginx
-cache_purge_tag $upstream_http_cache_tag extratag1 extratag2;
+cache_purge_tags $upstream_http_cache_tag extratag1 extratag2;
 ```
 
-Each response may have up to 128 nonempty items, each at most 1,024 bytes. Empty items are ignored and surrounding spaces and tabs are trimmed. The count limit applies before deduplication. TAG names are compared exactly and must not contain commas, NUL, CR, or LF.
+A PURGE location can use `cache_purge_tags $http_x_cache_purge_tags;`.
 
-### cache_purge_type_header
+Cached responses retain the first 128 nonempty items; TAG purges retain the first 32. Additional items are ignored with a notice-level log, without interrupting the response or rejecting the purge. Limits apply before deduplication, in argument and comma order. Spaces and tabs around items are trimmed; empty items are ignored. Retained items may contain at most 1,024 bytes and cannot contain NUL, CR, or LF. Comparison is case-sensitive.
 
-| Syntax: | **cache_purge_type_header** `name`; |
+A TAG purge matches any retained item. Repeated or overlapping TAGs affect each file once within the task.
+
+### cache_purge_type
+
+| Syntax: | **cache_purge_type** `value`; |
 | :--- | :--- |
-| Default: | `cache_purge_type_header X-Cache-Purge-Type;` |
+| Default: | `cache_purge_type $http_x_cache_purge_type;` |
 | Context: | `http`, `server`, `location`, `when` |
 
-Names the PURGE selector header. Accepted values are `url`, `key`, `prefix`, `host`, `tag`, and `host-tag`; the default selector is `url`.
+Sets the PURGE selector from a variable or literal: `url`, `key`, `prefix`, `host`, `tag`, or `host-tag`. An empty value selects `url`.
 
-All header-name directives below accept a literal name of 1–255 ASCII letters, digits, hyphens, or underscores. Names cannot contain variables. Duplicate instances of a consumed control header are rejected.
+### cache_purge_action
 
-### cache_purge_action_header
-
-| Syntax: | **cache_purge_action_header** `name`; |
+| Syntax: | **cache_purge_action** `value`; |
 | :--- | :--- |
-| Default: | `cache_purge_action_header X-Cache-Purge-Action;` |
+| Default: | `cache_purge_action $http_x_cache_purge_action;` |
 | Context: | `http`, `server`, `location`, `when` |
 
-Names the PURGE action header. Accepted values are `delete` and `invalidate`; the default action is `delete`.
+Sets the PURGE action from a variable or literal: `delete` or `invalidate`. An empty value defaults to `delete`.
 
-### cache_purge_tags_header
+### cache_purge_operation_headers
 
-| Syntax: | **cache_purge_tags_header** `name`; |
+| Syntax: | **cache_purge_operation_headers** `id=value issued_at=value`; |
 | :--- | :--- |
-| Default: | `cache_purge_tags_header X-Cache-Purge-Tags;` |
+| Default: | See below. |
 | Context: | `http`, `server`, `location`, `when` |
 
-Names the comma-separated TAG selector header for `tag` and `host-tag` purges. A request accepts 1–32 nonempty items, each at most 1,024 bytes. Trimming and empty-item handling follow `cache_purge_tag`; the 32-item limit applies before deduplication. Nginx's request-header buffer limits also apply.
+```nginx
+cache_purge_operation_headers
+    id=$http_x_cache_purge_operation_id
+    issued_at=$http_x_cache_purge_issued_at;
+```
 
-A file matches when it has any listed TAG. Repeated or overlapping TAGs affect each file once within the task.
+Both named parameters are required, in either order, and accept variables.
 
-### cache_purge_operation_id_header
+When both values are empty, the module generates an operation ID and timestamp. Supplying only one value is rejected. IDs contain 1–128 ASCII letters, digits, hyphens, underscores, or periods. The timestamp is decimal Unix epoch milliseconds, at least `1000`, compared at native cache second precision.
 
-| Syntax: | **cache_purge_operation_id_header** `name`; |
-| :--- | :--- |
-| Default: | `cache_purge_operation_id_header X-Cache-Purge-Operation-Id;` |
-| Context: | `http`, `server`, `location`, `when` |
-
-Names the operation identifier header for idempotent retries. Supply it together with the issued-at header, keeping both and the selector/action unchanged when retrying. IDs contain 1–128 ASCII letters, digits, hyphens, underscores, or periods. Reusing an ID for different work returns `409 Conflict`.
-
-### cache_purge_issued_at_header
-
-| Syntax: | **cache_purge_issued_at_header** `name`; |
-| :--- | :--- |
-| Default: | `cache_purge_issued_at_header X-Cache-Purge-Issued-At;` |
-| Context: | `http`, `server`, `location`, `when` |
-
-Names the purge timestamp header. The value is decimal Unix epoch milliseconds, at least `1000`, and is compared at native cache second precision. Omit both this header and the operation identifier to generate a new operation automatically. Supplying only one is rejected.
+Keep both values and the selector/action unchanged when retrying. Reusing an ID for different work in the same namespace returns `409 Conflict`; different namespaces may use the same ID independently.
 
 ### proxy_cache_purge_propagation
 
@@ -413,7 +376,7 @@ Names the purge timestamp header. The value is decimal Unix epoch milliseconds, 
 | Default: | `proxy_cache_purge_propagation off;` |
 | Context: | `http`, `server`, `location`, `when` |
 
-Enables outgoing purge headers for managed proxy requests. Enable it when the target is a CDN parent and leave it off when the target is the origin. Use `when` to select this behavior if routing depends on a condition. It does not control whether incoming propagation headers are honored.
+Enables outgoing purge headers for managed proxy requests. Enable it when the target is a CDN parent and leave it off when the target is the origin.
 
 ### cache_purge_ignore_propagation
 
@@ -422,7 +385,7 @@ Enables outgoing purge headers for managed proxy requests. Enable it when the ta
 | Default: | `cache_purge_ignore_propagation off;` |
 | Context: | `http`, `server`, `location`, `when` |
 
-When enabled, ignores incoming purge propagation headers. This can be selected conditionally with `when`. It does not disable locally submitted purge tasks or their rules.
+Ignores incoming purge propagation headers when enabled.
 
 ### cache_purge_propagation_timeout
 
@@ -433,23 +396,24 @@ When enabled, ignores incoming purge propagation headers. This can be selected c
 
 Sets how long a locally accepted purge contributes outgoing parent headers. The window is intended to allow invalidation to reach other cache tiers; it is not a deadline for background file processing. The parent compares cache timestamps without applying another propagation-age window.
 
-### cache_purge_propagation_time_header
+### cache_purge_propagation_headers
 
-| Syntax: | **cache_purge_propagation_time_header** `name`; |
+| Syntax: | **cache_purge_propagation_headers** `time=name action=name`; |
 | :--- | :--- |
-| Default: | `cache_purge_propagation_time_header X-Cache-Purge-Time;` |
+| Default: | See below. |
 | Context: | `http`, `server`, `location`, `when` |
 
-Names the incoming and outgoing parent purge timestamp header, in Unix epoch milliseconds. It is separate from the issued-at header used to submit a management operation.
+```nginx
+cache_purge_propagation_headers
+    time=X-Cache-Purge-Time
+    action=X-Cache-Purge-Action;
+```
 
-### cache_purge_propagation_action_header
+Sets the two proxy propagation header names for both incoming and outgoing requests. Both named parameters are required, in either order. Names must differ, case-insensitively, and contain 1–255 ASCII letters, digits, hyphens, or underscores. Names are literal and cannot contain variables.
 
-| Syntax: | **cache_purge_propagation_action_header** `name`; |
-| :--- | :--- |
-| Default: | `cache_purge_propagation_action_header X-Cache-Purge-Action;` |
-| Context: | `http`, `server`, `location`, `when` |
+The time header carries Unix epoch milliseconds; the action header carries `delete` or `invalidate`. An absent or empty time header means no incoming requirement. A nonempty time requires one valid action header. Header names are matched case-insensitively.
 
-Names the incoming and outgoing parent purge action header: `delete` or `invalidate`. This is configured independently of `cache_purge_action_header`, although both default to the same name.
+On ordinary nginx, use these names in both `proxy_set_header` directives shown below.
 
 ### cache_purge_api
 
@@ -465,22 +429,22 @@ Provides status endpoints in a prefix location. It accepts GET and HEAD requests
 | `capabilities` | Readiness, propagation timeout, and index-cleanup counters. |
 | `operations/ID` | Admission and background-processing status for an operation. |
 
-Task responses include `operation_id`, `effective`, `durable`, `effective_at`, `propagation_until`, and a `cleanup` object with `state`, `scan_done`, `visited`, `affected`, and `error`. Processing is complete when `cleanup.state` is `done`. Unknown IDs return `404`; unavailable admission or status processing returns `503`.
+Task responses include `operation_id`, `effective`, `durable`, `effective_at`, `propagation_until`, and a `cleanup` object with `state`, `scan_done`, `visited`, `affected`, and `error`. Processing is complete when `cleanup.state` is `done`. Lookup uses the location's `cache_key_namespace`. Unknown IDs and IDs belonging only to another namespace return `404`; unavailable admission or status processing returns `503`.
 
 This handler does not accept JSON POST submissions. Use PURGE in an enabled location to submit work. The module performs no authentication; configure access control with nginx.
 
 ## Purge requests
 
-PURGE requests have no body and can be sent to the original business location or a dedicated purge location. All selectors search the configured index across cache zones.
+PURGE requests have no body and can be sent to the original business location or a dedicated purge location. All selectors search across cache zones within `cache_key_namespace`. An empty namespace matches only the empty namespace. URL identity is formed as scheme, `://`, host, and URI from `cache_key_*`. Host selection reads the host component directly. No URL parsing or protocol restriction is applied.
 
 | Type | Matching scope |
 | :--- | :--- |
-| `url` | Exact configured URL, across all misc and namespace variants. |
+| `url` | Exact URL, across all misc, slice, and Vary variants in the namespace. |
 | `key` | Exact configured URL, misc, and namespace, covering all indexed slice/Vary files. |
-| `prefix` | Literal prefix of the configured URL, across all misc and namespace variants. |
-| `host` | Host extracted from the configured URL, across paths, misc values, and namespaces. |
+| `prefix` | Literal URL prefix, across all misc variants in the namespace. |
+| `host` | Exact `cache_key_host`, across paths and misc variants in the namespace. |
 | `tag` | Any listed TAG within the configured namespace. |
-| `host-tag` | Any listed TAG within the host extracted from the configured URL. |
+| `host-tag` | Any listed TAG within the namespace and exact `cache_key_host`. |
 
 For prefix purges, supply the prefix itself without a trailing wildcard. Regex selectors and physical cache-filename selectors are not supported.
 
@@ -491,19 +455,24 @@ A dedicated endpoint can obtain identity fields from configured headers:
 ```nginx
 location = /purge {
     proxy_cache_purge on;
-    cache_purge_key_url $http_x_cache_purge_url;
-    cache_purge_key_misc $http_x_cache_purge_misc;
-    cache_purge_key_namespace $http_x_cache_purge_namespace;
+    cache_key_scheme $http_x_cache_purge_scheme;
+    cache_key_host $http_x_cache_purge_host;
+    cache_key_uri $http_x_cache_purge_uri;
+    cache_key_misc $http_x_cache_purge_misc;
+    cache_key_namespace $http_x_cache_purge_namespace;
+    cache_purge_tags $http_x_cache_purge_tags;
 }
 ```
 
-Use this location in a server with the store and shared zone configured. These URL, misc, and namespace header names are chosen by the expressions; they are not built-in control headers.
+Use this location in a server with the store and shared zone configured. These component header names are chosen by the expressions. Configure the status location with the same namespace source.
 
 ```sh
 curl -i -X PURGE http://127.0.0.1:8080/purge \
     -H 'X-Cache-Purge-Type: key' \
     -H 'X-Cache-Purge-Action: invalidate' \
-    -H 'X-Cache-Purge-Url: http://example.test/asset' \
+    -H 'X-Cache-Purge-Scheme: http' \
+    -H 'X-Cache-Purge-Host: example.test' \
+    -H 'X-Cache-Purge-Uri: /asset' \
     -H 'X-Cache-Purge-Misc: language=en' \
     -H 'X-Cache-Purge-Namespace: assets'
 ```
@@ -522,7 +491,7 @@ proxy_set_header X-Cache-Purge-Time $cache_purge_propagation_time;
 proxy_set_header X-Cache-Purge-Action $cache_purge_propagation_action;
 ```
 
-Use the configured propagation header names on both tiers and in these `proxy_set_header` directives. Incoming time and action headers must be present together. `cache_purge_ignore_propagation on` bypasses their interpretation.
+Use the configured propagation header names on both tiers and in these `proxy_set_header` directives. A nonempty incoming time requires a valid action. Without an incoming time, no propagated requirement is applied. `cache_purge_ignore_propagation on` bypasses their interpretation.
 
 TAG propagation uses the edge node's known URL-to-TAG associations, which remain available for the propagation window after a local file is removed. The parent receives the applicable timestamp and action. URLs with no known TAG association follow normal upstream handling.
 
@@ -547,7 +516,7 @@ Missing-file records are collected in the background, retaining known TAG relati
 
 ### Limits
 
-- Indexing starts with managed cache fills. Existing unindexed files require an explicit migration or a fresh cache-key namespace when enabling the module.
+- Indexing starts with managed cache fills. Start with empty cache directories when enabling the module.
 - Cache dates have second precision. An entry dated in the same second as a purge is treated as refreshed.
 - A parent request started before a purge may finish afterward with a cache timestamp newer than the purge. Subsequent timestamp checks can treat that response as refreshed.
 - A first cache fill still in progress when a purge completes can become a later HIT if the purge found no indexed entry for it.
@@ -589,7 +558,7 @@ Use `--extension 1` with nginx-ext to test strict Invalidate handling. `--dynami
 
 With a persistence-capable nginx-ext build, `--state` also verifies saved native cache zones, the first request after restart, and retained propagation rules. The combined runner `t/persistent_runtime.py` accepts the same option with `--extension 1`.
 
-`t/persistent_runtime.py` also runs the key variable suite against the combined build. To verify a standalone key build, run `python3 t/key_runtime.py --nginx /path/to/nginx --output /tmp/key.json`; add `--without-cache`, `--dynamic`, or `--expr-source /path/to/expr` as needed.
+`t/persistent_runtime.py` also runs the key variable suite against the combined build. To run it against an existing combined binary, use `python3 t/key_runtime.py --binary /path/to/nginx --output /tmp/key.json`; add `--modules /path/to/modules` for a dynamic build and `--expr` when enabled.
 
 `t/native_propagation_runtime.py` checks two cache tiers, propagation headers, retained TAG relationships, and the outgoing timeout using an already built nginx binary. `t/native_cache_benchmark.py` compares foreground latency, throughput, and process memory with and without indexing and background purges. Run either with `--help` for its options; benchmark results depend on workload and resource limits.
 
