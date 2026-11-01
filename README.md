@@ -19,10 +19,12 @@ http {
 
         location / {
             proxy_cache content;
-            proxy_cache_key "$scheme://$host$request_uri";
+            proxy_cache_key $cache_key_full;
             proxy_cache_revalidate on;
 
-            cache_purge_key_url "$scheme://$host$request_uri";
+            cache_purge_key_url $cache_key_url;
+            cache_purge_key_misc $cache_key_misc;
+            cache_purge_key_namespace $cache_key_namespace;
             cache_purge_tag $upstream_http_cache_tag;
             proxy_cache_purge on;
 
@@ -35,6 +37,8 @@ http {
     }
 }
 ```
+
+This example uses the bundled key module's defaults: `$scheme`, `$host`, and `$request_uri`, with empty namespace, misc, and range components. Configure `cache_key_*` directives when those inputs need to change.
 
 Delete all indexed variants of `/asset`:
 
@@ -63,7 +67,7 @@ load_module modules/ngx_http_cache_rocksdb_module.so;
 load_module modules/ngx_http_cache_purge_module.so;
 ```
 
-Load RocksDB before purge. The key module is optional at runtime and has no link dependency on either module. Build the modules and backend libraries from the same source revision. The initial RocksDB bridge ABI and private storage formats are version 1. This implementation has not yet been released; development snapshots do not define an upgrade compatibility contract.
+Load RocksDB before purge. The examples use the bundled key module; it has no link dependency on either module and can be omitted when configuration does not reference it. Build the modules and backend libraries from the same source revision. The initial RocksDB bridge ABI and private storage formats are version 1. This implementation has not yet been released; development snapshots do not define an upgrade compatibility contract.
 
 For the key module alone, use `--add-module=/path/to/ngx_cache_purge/key` or `--add-dynamic-module=/path/to/ngx_cache_purge/key`. This build needs neither RocksDB nor HTTP cache support. Do not add `key/` separately when adding the repository root.
 
@@ -86,10 +90,14 @@ http {
     server {
         location / {
             when purge_request {
-                cache_purge_key_misc $http_x_cache_purge_misc;
+                cache_key_misc $http_x_cache_purge_misc;
             }
 
-            cache_purge_key_misc $cookie_variant;
+            cache_key_misc $cookie_variant;
+            proxy_cache_key $cache_key_full;
+            cache_purge_key_url $cache_key_url;
+            cache_purge_key_misc $cache_key_misc;
+            cache_purge_key_namespace $cache_key_namespace;
         }
     }
 }
