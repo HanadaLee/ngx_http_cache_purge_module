@@ -122,6 +122,7 @@ jobs:
           mkdir -p t/test-results
           for suite in store catalog jobs; do
             valgrind --error-exitcode=99 --leak-check=full --errors-for-leak-kinds=definite,indirect \
+              --child-silent-after-fork=yes \
               --xml=yes --xml-file="t/test-results/$suite-valgrind.xml" \
               "/tmp/cache-valgrind/cache_purge_${suite}_test"
           done
