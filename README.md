@@ -426,7 +426,7 @@ Acceptance waits for task persistence and shared-rule publication, not file enum
 
 ## Proxy propagation
 
-Propagation is one-way: L1 sends a timestamp and action to L2 on an upstream request. L2 compares them with its native cache date and either serves the cache or applies Delete/Invalidate before obtaining a response. Responses carry no receipt or other propagation metadata. FastCGI, uwsgi, and scgi do not use this protocol.
+Propagation is one-way: L1 sends a timestamp and action to L2 on an upstream request. L2 compares them with its native cache date and either serves the cache or applies Delete/Invalidate before obtaining a response. Responses carry no receipt or other propagation metadata. This protocol applies only to proxy caches.
 
 With both `NGX_RESTY_EXT` and `NGX_HTTP_PROXY_FILTER`, the module sets outgoing headers through the proxy request-header framework. Otherwise, configure `proxy_set_header` in the managed parent-facing location:
 
