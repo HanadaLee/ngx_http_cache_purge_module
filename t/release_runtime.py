@@ -18,6 +18,14 @@ subprocess.run([sys.executable, str(Path(__file__).with_name('native_propagation
                 '--root', str(args.root), '--output', str(details)], check=True)
 report = json.loads(details.read_text())
 assert report['status'] == 'passed' and report['checks'] and len(report['modules']) == 2
+key_details = args.root.with_suffix('.key.json')
+subprocess.run([sys.executable, str(Path(__file__).with_name('key_runtime.py')),
+                '--binary', str(args.nginx), '--modules', str(args.modules),
+                '--output', str(key_details)], check=True)
+key = json.loads(key_details.read_text())
+assert key['status'] == 'passed' and key['checks'] and len(key['modules']) == 1
+report['checks'] += key['checks']
+report['modules'].update(key['modules'])
 args.output.write_text(json.dumps({'status': 'passed', 'checks': report['checks'],
                                  'modules': report['modules']}, indent=2) + '\n')
 print('PASS', len(report['checks']), 'packaged module checks', flush=True)

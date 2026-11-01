@@ -37,6 +37,8 @@ if stage == 'configure':
     units = re.findall(r'\$ngx_addon_dir/(ngx_http_cache_purge_\w+)\.c', sources)
     if '$ngx_addon_dir/rocksdb/ngx_http_cache_rocksdb_module.c' in config:
         units.append('ngx_http_cache_rocksdb_module')
+    if '$ngx_addon_dir/key/ngx_http_cache_key_module.c' in config:
+        units.append('ngx_http_cache_key_module')
     rules = ['objs/addon/fixture/' + unit + '.o: ' + module + '/' + unit + '.c'
              for unit in units]
     if os.environ.get('PVS_TEST_MISSING_TARGET'):
@@ -104,6 +106,7 @@ class AnalysisPipeline(unittest.TestCase):
                 sources = re.search(r'CACHE_PURGE_SRCS="([^"]+)"', config, re.S).group(1)
                 units = re.findall(r'\$ngx_addon_dir/(ngx_http_cache_purge_\w+)\.c', sources)
                 units.append('ngx_http_cache_rocksdb_module')
+                units.append('ngx_http_cache_key_module')
                 self.assertEqual(args['make'][4:],
                                  ['objs/addon/fixture/' + unit + '.o' for unit in units])
                 excluded = args['analyze'][args['analyze'].index('-e') + 1]

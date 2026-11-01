@@ -33,7 +33,6 @@ parser.add_argument('--public-module', action='store_true')
 parser.add_argument('--no-thread-pool', action='store_true')
 parser.add_argument('--expr', type=Path)
 parser.add_argument('--proxy-filter', type=Path)
-parser.add_argument('--key', type=Path)
 parser.add_argument('--slice', action='store_true')
 parser.add_argument('--dynamic', action='store_true')
 parser.add_argument('--protocols', action='store_true')
@@ -51,7 +50,7 @@ cache_io = '''sendfile on;
     open_file_cache_min_uses 1;'''
 if args.public_module:
     assert args.backend, '--public-module requires --backend'
-if args.slice or args.key or args.dynamic or args.protocols:
+if args.slice or args.dynamic or args.protocols:
     assert args.public_module, 'extended HTTP checks require --public-module'
 repo = Path(__file__).resolve().parent.parent
 root = args.reuse_build or Path(tempfile.mkdtemp(prefix='cache-native-runtime-'))
@@ -79,7 +78,8 @@ if args.backend:
     inputs += ('ngx_http_cache_purge_runtime.c',)
 if args.public_module:
     inputs += ('ngx_http_cache_purge_module.c', 'ngx_http_cache_purge_request.c',
-               'rocksdb/ngx_http_cache_rocksdb_module.c', 'config')
+               'rocksdb/ngx_http_cache_rocksdb_module.c',
+               'key/ngx_http_cache_key_module.c', 'config')
 hashes = {}
 for name in inputs:
     target = addon / name
@@ -118,7 +118,7 @@ if args.slice:
     command.append('--with-http_slice_module')
 if args.ssl:
     command.append('--with-http_ssl_module')
-for dependency in (args.expr, args.proxy_filter, args.key):
+for dependency in (args.expr, args.proxy_filter):
     if dependency:
         command.insert(-1, '--add-module=' + str(dependency))
 if args.sanitize:
@@ -142,7 +142,7 @@ with (root / 'build.log').open('a' if args.reuse_build else 'w') as log:
         assert ('ngx_http_ssl_module' in
                 (build / 'objs/ngx_modules.c').read_text()) == args.ssl
         assert ('ngx_http_cache_key_module' in
-                (build / 'objs/ngx_modules.c').read_text()) == bool(args.key)
+                (build / 'objs/ngx_modules.c').read_text()) == (args.public_module and not args.dynamic)
         assert ('--add-dynamic-module=' + str(addon) in
                 (build / 'objs/ngx_auto_config.h').read_text()) == args.dynamic
     reconfigure = not args.reuse_build or (args.backend and any(
@@ -350,16 +350,13 @@ if args.public_module:
     control_config += '''
         cache_purge_key_misc $http_x_test_misc;
         cache_purge_key_namespace $http_x_test_namespace;'''
-    variant_identity = ('''cache_key_host variants.test;
+    variant_identity = '''cache_key_host variants.test;
             cache_key_uri $uri;
             cache_key_misc $http_x_test_misc;
             cache_key_namespace $http_x_test_namespace;
             cache_purge_key_url $cache_key_url;
             cache_purge_key_misc $cache_key_misc;
-            cache_purge_key_namespace $cache_key_namespace;''' if args.key else '''
-            cache_purge_key_url http://variants.test$uri;
-            cache_purge_key_misc $http_x_test_misc;
-            cache_purge_key_namespace $http_x_test_namespace;''')
+            cache_purge_key_namespace $cache_key_namespace;'''
     tag_config = 'cache_purge_tag $upstream_http_cache_tag $http_x_extra_tag extra-a extra-b;'
     if args.expr:
         tag_config = 'when is_get { ' + tag_config + ' } cache_purge_tag fallback;'
@@ -379,7 +376,7 @@ if args.public_module:
             proxy_cache_purge on;
             {variant_identity}
             proxy_cache test;
-            proxy_cache_key {'$cache_key_full' if args.key else '"$uri|$http_x_test_misc|$http_x_test_namespace"'};
+            proxy_cache_key $cache_key_full;
             proxy_cache_valid 200 1h;
             proxy_cache_use_stale error http_500;
             proxy_pass http://127.0.0.1:{origin.server_port};
@@ -389,8 +386,7 @@ if args.public_module:
         slice_identity = ('cache_key_uri $uri; cache_key_range $slice_range; '
                           'cache_purge_key_url $cache_key_url; '
                           'cache_purge_key_misc $cache_key_misc; '
-                          'cache_purge_key_namespace $cache_key_namespace;'
-                          if args.key else '')
+                          'cache_purge_key_namespace $cache_key_namespace;')
         api_config += f'''
         location /slice/ {{
             {'slice on; slice_size 1k;' if args.extension else 'slice 1k;'}
@@ -398,7 +394,7 @@ if args.public_module:
             proxy_cache_purge on;
             {slice_identity}
             proxy_cache test;
-            proxy_cache_key {'$cache_key_full' if args.key else '"$uri$slice_range"'};
+            proxy_cache_key $cache_key_full;
             proxy_set_header Range $slice_range;
             proxy_cache_valid 200 206 1h;
             proxy_pass http://127.0.0.1:{origin.server_port};
@@ -425,7 +421,8 @@ second_cache = (f'proxy_cache_path {run}/cache2 levels=1:2 keys_zone=test2:1m;\n
                 'map $http_x_zone $native_cache_zone { default test; second test2; }'
                 if args.backend else '')
 loads = ('\n'.join(f'load_module {build}/objs/{name}.so;'
-                  for name in ('ngx_http_cache_rocksdb_module', 'ngx_http_cache_purge_module'))
+                  for name in ('ngx_http_cache_key_module', 'ngx_http_cache_rocksdb_module',
+                               'ngx_http_cache_purge_module'))
          if args.dynamic else '')
 config = f'''{loads}
 daemon off;
@@ -985,7 +982,7 @@ report = {'status': 'passed', 'root': str(root), 'run': str(run),
           'public_module': args.public_module,
           'expr': str(args.expr) if args.expr else None,
           'proxy_filter': str(args.proxy_filter) if args.proxy_filter else None,
-          'key_module': str(args.key) if args.key else None,
+          'key_module': str(repo / 'key') if args.public_module else None,
           'slice': args.slice,
           'dynamic': args.dynamic,
           'protocols': list(protocol_servers),
@@ -997,7 +994,8 @@ report = {'status': 'passed', 'root': str(root), 'run': str(run),
           'checks': checks, 'responses': responses,
           'sources': hashes, 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
           'module_sha256': {name: hashlib.sha256((build / 'objs' / name).read_bytes()).hexdigest()
-                            for name in ('ngx_http_cache_rocksdb_module.so', 'ngx_http_cache_purge_module.so')}
+                            for name in ('ngx_http_cache_key_module.so', 'ngx_http_cache_rocksdb_module.so',
+                                         'ngx_http_cache_purge_module.so')}
                            if args.dynamic else {},
           'scope': ('Public PURGE, task status, native operations, shared request rules and the native cache manager; this is not full feature or performance acceptance.'
                     if args.public_module else

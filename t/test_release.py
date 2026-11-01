@@ -101,16 +101,6 @@ class ReleasePublication(unittest.TestCase):
 
 
 class ReleaseTagContract(unittest.TestCase):
-    def test_key_source_pins_agree(self):
-        pins = []
-        for name in ('t/prepare_sources.sh',):
-            pins.append(re.search(r'CACHE_KEY_REVISION:-([0-9a-f]{40})',
-                                  (ROOT / name).read_text()).group(1))
-        for name in ('.github/workflows/build-test-release.yml', 't/docker-compose.test.yml'):
-            pins.append(re.search(r'ngx_http_cache_key_module\.git#([0-9a-f]{40})',
-                                  (ROOT / name).read_text()).group(1))
-        self.assertEqual(len(set(pins)), 1, pins)
-
     def test_builder_rejects_malformed_core_before_download(self):
         env = dict(os.environ, MODULE_VERSION='4.0.0-test', NGINX_VERSION='mainline')
         result = subprocess.run(['bash', str(ROOT / 'tools/build-release-module.sh')],

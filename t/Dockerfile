@@ -26,13 +26,11 @@ WORKDIR /src
 COPY t/download.sh t/prepare_sources.sh /src/t/
 ARG NGINX_VERSION=1.31.7
 RUN NGINX_VERSION="$NGINX_VERSION" \
-    SKIP_KEY=1 TEST_SOURCE_DIR=/opt/cache-test-sources bash t/prepare_sources.sh
+    TEST_SOURCE_DIR=/opt/cache-test-sources bash t/prepare_sources.sh
 ENV NGINX_SOURCE=/opt/cache-test-sources/nginx \
-    CACHE_KEY_SOURCE=/opt/cache-test-sources/key \
     PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
 FROM core-source AS integration
-COPY --from=cache-key / /opt/cache-test-sources/key/
 COPY . /src/
 RUN mkdir /reports && chown 1000:1000 /reports
 USER 1000:1000

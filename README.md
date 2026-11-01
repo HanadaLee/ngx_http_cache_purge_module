@@ -2,7 +2,7 @@
 
 Delete or invalidate HTTP cache entries across nginx cache zones. A persistent RocksDB index locates matching files, while shared rules take effect before background file processing completes.
 
-The repository includes `ngx_http_cache_purge_module` and `ngx_http_cache_rocksdb_module`. It supports proxy, FastCGI, uwsgi, and scgi caches. Proxy caches can also propagate purge requirements to a CDN parent.
+The repository includes `ngx_http_cache_purge_module`, `ngx_http_cache_rocksdb_module`, and `ngx_http_cache_key_module`. It supports proxy, FastCGI, uwsgi, and scgi caches. Proxy caches can also propagate purge requirements to a CDN parent. The key module builds cache keys from explicit components and exposes their values independently.
 
 ## Synopsis
 
@@ -55,18 +55,21 @@ cmake --build "$module/build"
 export CACHE_PURGE_ROCKSDB_LIB_DIR="$module/build"
 ```
 
-Build nginx statically with `--add-module=/path/to/ngx_cache_purge`, or dynamically with `--add-dynamic-module=/path/to/ngx_cache_purge`. A dynamic build produces two modules; load them in this order:
+Build nginx statically with `--add-module=/path/to/ngx_cache_purge`, or dynamically with `--add-dynamic-module=/path/to/ngx_cache_purge`. A dynamic build produces three modules:
 
 ```nginx
+load_module modules/ngx_http_cache_key_module.so;
 load_module modules/ngx_http_cache_rocksdb_module.so;
 load_module modules/ngx_http_cache_purge_module.so;
 ```
 
-Both modules and the backend libraries must come from the same source revision. The initial RocksDB bridge ABI and private storage formats are version 1. This implementation has not yet been released; development snapshots do not define an upgrade compatibility contract.
+Load RocksDB before purge. The key module is optional at runtime and has no link dependency on either module. Build the modules and backend libraries from the same source revision. The initial RocksDB bridge ABI and private storage formats are version 1. This implementation has not yet been released; development snapshots do not define an upgrade compatibility contract.
+
+For the key module alone, use `--add-module=/path/to/ngx_cache_purge/key` or `--add-dynamic-module=/path/to/ngx_cache_purge/key`. This build needs neither RocksDB nor HTTP cache support. Do not add `key/` separately when adding the repository root.
 
 The addon links with `-lrocksdb -lstdc++ -lm -pthread` by default. Set `CACHE_PURGE_ROCKSDB_LIBS` when a different link configuration is needed, such as static RocksDB with its compression dependencies.
 
-Build `ngx_expr_module` statically in the same nginx configuration to enable `when` blocks. The separate `ngx_http_cache_key_module` is optional: purge identities are configured through expressions, without linking to that module or parsing its key format.
+Build `ngx_expr_module` statically before this addon in the nginx configure arguments to enable `when` blocks. Purge identities are configured through expressions, without linking to the key module or parsing its key format.
 
 `NGX_RESTY_EXT` enables strict Invalidate handling. Automatic proxy request-header integration additionally requires `NGX_HTTP_PROXY_FILTER`. Ordinary nginx uses its native stale policy and the propagation variables described below.
 
@@ -96,7 +99,50 @@ The native cache key must represent the same variant as the configured purge ide
 
 Values are inherited unless overridden. A child `cache_purge_tag` replaces the inherited list; `when` selects a complete list using the expr module's candidate order. `cache_purge_index_store`, `cache_purge_state_zone`, `cache_purge_propagation_timeout`, and `cache_purge_api` do not support `when`. None of these directives supports nginx rewrite `if` blocks.
 
-## Directives
+## Cache key components
+
+The six directives accept one complex value in `http`, `server`, and `location`. With `ngx_expr_module`, all six also support `when` blocks. The first matching candidate wins; a child containing only conditional candidates falls back to its parent. Place conditional candidates before an unconditional value.
+
+| Directive syntax | Default | Read-only output |
+| :--- | :--- | :--- |
+| `cache_key_namespace value;` | `""` | `$cache_key_namespace` |
+| `cache_key_scheme value;` | `$scheme` | `$cache_key_scheme` |
+| `cache_key_host value;` | `$host` | `$cache_key_host` |
+| `cache_key_uri value;` | `$request_uri` | `$cache_key_uri` |
+| `cache_key_misc value;` | `""` | `$cache_key_misc` |
+| `cache_key_range value;` | `""` | `$cache_key_range` |
+
+An empty namespace is valid and never falls back to the host. Nonempty namespaces accept up to 255 printable ASCII bytes, excluding spaces and commas. Other components preserve their input bytes. Argument filtering and URL normalization belong in the configured expressions; the module does not perform them automatically.
+
+| Derived variable | Value |
+| :--- | :--- |
+| `$cache_key_url` | Scheme, `://`, host, and URI |
+| `$cache_key_base` | Encoded namespace, scheme, host, URI, and misc |
+| `$cache_key_full` | The base fields followed by the encoded range, including an empty range |
+
+Base and full keys separate fields with the byte `0x1f`. A backslash inside a field becomes two backslashes; a field's own `0x1f` becomes the four printable bytes `\x1F`. These keys are binary. Use the individual component variables when constructing display strings or response headers.
+
+```nginx
+cache_key_namespace "";
+cache_key_scheme $scheme;
+cache_key_host $host;
+cache_key_uri $request_uri;
+cache_key_misc $cookie_variant;
+cache_key_range $slice_range;
+
+proxy_cache_key $cache_key_full;
+cache_purge_key_url $cache_key_url;
+cache_purge_key_misc $cache_key_misc;
+cache_purge_key_namespace $cache_key_namespace;
+```
+
+Omit the range directive when the slice module is unavailable. The purge expressions explicitly associate the two modules; purge can use other business variables instead.
+
+Outputs evaluate the current input values when nginx reads them. One assembled output evaluates each needed component once; values are not frozen across request phases. Use stable inputs for a cached representation, especially when the same values are read later for indexing or display. The module does not capture native cache state, install bypass predicates, or expose a snapshot C API.
+
+Direct references from component expressions to this module's outputs are rejected during configuration. Indirect cycles and invalid dynamic namespaces log an error and fail variable evaluation. As with ordinary nginx variables, a caller may treat that failure as an empty value; it does not guarantee an HTTP error or prevent caching. Validate dynamic inputs in configuration rather than relying on this module as a request guard.
+
+## Purge directives
 
 ### cache_purge_index_store
 
@@ -425,7 +471,9 @@ python3 t/native_cache_runtime.py \
     --output /tmp/native-cache.json
 ```
 
-Use `--extension 1` with nginx-ext to test strict Invalidate handling. `--dynamic`, `--slice`, and `--protocols` add separate-module loading, sliced caches, and FastCGI/uwsgi/scgi coverage. `--expr`, `--proxy-filter`, and `--key` take paths to optional modules. Sanitizer runs require `--sanitize` and backend libraries built with `CACHE_PURGE_STORE_SANITIZE=ON`.
+Use `--extension 1` with nginx-ext to test strict Invalidate handling. `--dynamic`, `--slice`, and `--protocols` add separate-module loading, sliced caches, and FastCGI/uwsgi/scgi coverage. `--expr` and `--proxy-filter` take paths to optional modules. The public suite uses the bundled key module for variant and slice identities. Sanitizer runs require `--sanitize` and backend libraries built with `CACHE_PURGE_STORE_SANITIZE=ON`.
+
+`t/persistent_runtime.py` also runs the key variable suite against the combined build. To verify a standalone key build, run `python3 t/key_runtime.py --nginx /path/to/nginx --output /tmp/key.json`; add `--without-cache`, `--dynamic`, or `--expr-source /path/to/expr` as needed.
 
 `t/native_propagation_runtime.py` checks two cache tiers, propagation headers, retained TAG relationships, and the outgoing timeout using an already built nginx binary. `t/native_cache_benchmark.py` compares foreground latency, throughput, and process memory with and without indexing and background purges. Run either with `--help` for its options; benchmark results depend on workload and resource limits.
 

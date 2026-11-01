@@ -5,8 +5,6 @@ x-test-base: &test-base
     context: ..
     dockerfile: t/Dockerfile
     target: integration
-    additional_contexts:
-      cache-key: ${CACHE_KEY_CONTEXT:-https://git.hanada.info/hanada/ngx_http_cache_key_module.git#ae3584f589f1d048996c50a78b3015f1fcd36eed}
     args:
       NGINX_VERSION: ${NGINX_VERSION:-1.31.7}
       UBUNTU_VERSION: ${UBUNTU_VERSION:-24.04}

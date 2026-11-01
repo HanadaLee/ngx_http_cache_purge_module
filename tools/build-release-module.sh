@@ -35,13 +35,14 @@ cd "$work/nginx-$NGINX_VERSION"
     --add-dynamic-module="$module_dir" \
     --with-cc-opt="-ffile-prefix-map=$work=/usr/src/build -ffile-prefix-map=$module_dir=/usr/src/ngx_http_cache_purge"
 make -j"${BUILD_JOBS:-2}"
-cp objs/ngx_http_cache_rocksdb_module.so objs/ngx_http_cache_purge_module.so "$stage/"
+cp objs/ngx_http_cache_key_module.so objs/ngx_http_cache_rocksdb_module.so objs/ngx_http_cache_purge_module.so "$stage/"
 # Exercise the delivered .so, rather than a statically linked module.
 mkdir -p "$work/runtime/logs" "$work/runtime/cache"
 user_directive=
 if [[ $(id -u) == 0 ]]; then user_directive="user $(id -un) $(id -gn);"; fi
 cat > "$work/runtime/nginx.conf" <<EOF
 $user_directive
+load_module $stage/ngx_http_cache_key_module.so;
 load_module $stage/ngx_http_cache_rocksdb_module.so;
 load_module $stage/ngx_http_cache_purge_module.so;
 pid logs/nginx.pid;
@@ -63,6 +64,7 @@ python3 "$module_dir/t/release_runtime.py" --nginx "$PWD/objs/nginx" \
     --modules "$stage" \
     --root "$work/package-test" --output "$work/package-test.json"
 cp "$module_dir/LICENSE" "$stage/"
+cp "$module_dir/key/LICENSE" "$stage/LICENSE-key"
 cp "$module_dir/README.md" "$stage/README.md"
 {
     printf 'Module: %s\nCommit: %s\nNGINX: %s\nArchitecture: %s\n' \
@@ -93,7 +95,7 @@ path = pathlib.Path(sys.argv[1])
 text = path.read_text().replace(sys.argv[2], '/usr/src/build')
 path.write_text(text.replace(sys.argv[3], '/usr/src/ngx_http_cache_purge'))
 PYTHON
-(cd "$stage" && sha256sum ngx_http_cache_rocksdb_module.so ngx_http_cache_purge_module.so > SHA256SUMS)
+(cd "$stage" && sha256sum ngx_http_cache_key_module.so ngx_http_cache_rocksdb_module.so ngx_http_cache_purge_module.so > SHA256SUMS)
 chmod 644 "$stage"/*
 tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 \
     --numeric-owner --format=gnu -cf - -C "$work" "$name" \

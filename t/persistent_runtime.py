@@ -15,7 +15,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--nginx', type=Path, default=os.getenv('NGINX_SOURCE'))
     parser.add_argument('--nginx-ref', default='HEAD')
-    parser.add_argument('--key', type=Path, default=os.getenv('CACHE_KEY_SOURCE'))
     parser.add_argument('--expr', type=Path)
     parser.add_argument('--proxy-filter', type=Path)
     parser.add_argument('--extension', type=int, choices=(0, 1), default=0)
@@ -95,13 +94,19 @@ def main():
             public_args = ['--nginx', args.nginx.resolve(), '--nginx-ref', args.nginx_ref,
                            '--backend', build, '--extension', args.extension,
                            '--public-module', '--no-thread-pool', '--slice', '--protocols', '--ssl', *flags]
-            for option, path in (('--key', args.key), ('--expr', args.expr), ('--proxy-filter', args.proxy_filter)):
+            for option, path in (('--expr', args.expr), ('--proxy-filter', args.proxy_filter)):
                 if path:
                     public_args += [option, path.resolve()]
             if args.dynamic:
                 public_args += ['--dynamic']
             public = suite('public', 'native_cache_runtime.py', public_args)
             nginx = Path(public['root']) / 'nginx'
+            key_args = ['--binary', nginx / 'objs/nginx']
+            if args.dynamic:
+                key_args += ['--modules', nginx / 'objs']
+            if args.expr:
+                key_args += ['--expr']
+            suite('key', 'key_runtime.py', key_args)
             # This standalone primitive harness does not import expr headers.
             if not args.expr:
                 suite('native', 'native_files_runtime.py', [

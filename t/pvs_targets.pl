@@ -20,6 +20,8 @@ my @units = map {
 } @paths;
 push @units, 'ngx_http_cache_rocksdb_module'
     if $manifest =~ m{\$ngx_addon_dir/rocksdb/ngx_http_cache_rocksdb_module\.c};
+push @units, 'ngx_http_cache_key_module'
+    if $manifest =~ m{\$ngx_addon_dir/key/ngx_http_cache_key_module\.c};
 my $makefile = read_file($ARGV[1]);
 my @targets;
 for my $unit (@units) {
