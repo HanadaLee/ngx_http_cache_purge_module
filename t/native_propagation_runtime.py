@@ -192,7 +192,7 @@ events {{ worker_connections 128; }}
 http {{
     log_format trace escape=json '{{"uri":"$uri","time":"$http_{time_header.lower().replace('-', '_')}","action":"$http_{action_header.lower().replace('-', '_')}","tag":"$http_x_cache_purge_tags","cache":"$upstream_cache_status"}}';
     access_log {run}/access.log trace;
-    cache_purge_store {run}/store;
+    cache_purge_index_store {run}/store;
     cache_purge_state_zone purge 1m;
     cache_purge_propagation_time_header {time_header};
     cache_purge_propagation_action_header {action_header};

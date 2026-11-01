@@ -1,4 +1,8 @@
-/* Copyright (C) Hanada */
+
+/*
+ * Copyright (C) Hanada
+ */
+
 
 #ifndef _NGX_HTTP_CACHE_PURGE_INTERNAL_H_INCLUDED_
 #define _NGX_HTTP_CACHE_PURGE_INTERNAL_H_INCLUDED_
@@ -45,6 +49,7 @@ typedef struct {
     size_t                          tag_count;
 } ngx_http_cache_purge_entry_t;
 
+
 typedef struct {
     unsigned                        type;
     unsigned                        host_scope;
@@ -53,38 +58,42 @@ typedef struct {
     ngx_http_cache_rocksdb_bytes_t  misc;
 } ngx_http_cache_purge_select_t;
 
+
 int ngx_http_cache_purge_select_tags(ngx_http_cache_rocksdb_bytes_t value,
     ngx_http_cache_rocksdb_bytes_t *tags, size_t *count);
 
 int ngx_http_cache_purge_catalog_open(ngx_http_cache_rocksdb_t *store,
-    ngx_http_cache_purge_catalog_t  **catalog,
+    ngx_http_cache_purge_catalog_t **catalog,
     ngx_http_cache_rocksdb_error_t *error);
 void ngx_http_cache_purge_catalog_close(
     ngx_http_cache_purge_catalog_t *catalog);
 int ngx_http_cache_purge_catalog_put(ngx_http_cache_purge_catalog_t *catalog,
-    const ngx_http_cache_purge_entry_t  *entry,
+    const ngx_http_cache_purge_entry_t *entry,
     ngx_http_cache_rocksdb_error_t *error);
-/* Entry strings are borrowed until the next catalog operation. Mutation
- * inputs must be caller-owned. The fixed id/hash members are copied. */
+/*
+ * Entry strings are borrowed until the next catalog operation. Mutation
+ * inputs must be caller-owned. The fixed id/hash members are copied.
+ */
 int ngx_http_cache_purge_catalog_get(ngx_http_cache_purge_catalog_t *catalog,
-    const unsigned char  id[24], ngx_http_cache_purge_entry_t *entry,
+    const unsigned char id[24], ngx_http_cache_purge_entry_t *entry,
     ngx_http_cache_rocksdb_error_t *error);
 typedef int (*ngx_http_cache_purge_check_pt)(void *data,
     const ngx_http_cache_purge_entry_t *entry,
     ngx_http_cache_rocksdb_error_t *error);
-/* Walk one configured root. Start with a zero bookmark; DONE ends the range.
+/*
+ * Walk one configured root. Start with a zero bookmark; DONE ends the range.
  * A failed callback leaves that row for retry. Each call closes its snapshot.
- * */
+ */
 int ngx_http_cache_purge_catalog_walk(ngx_http_cache_purge_catalog_t *catalog,
     ngx_http_cache_rocksdb_bytes_t root, unsigned char after[24], size_t limit,
     ngx_http_cache_purge_check_pt check, void *data,
     ngx_http_cache_rocksdb_error_t *error);
-int ngx_http_cache_purge_catalog_remove(ngx_http_cache_purge_catalog_t *catalog,
-    const unsigned char  id[24], uint64_t expected,
-    ngx_http_cache_rocksdb_error_t *error);
-int ngx_http_cache_purge_catalog_retain(ngx_http_cache_purge_catalog_t *catalog,
-    const unsigned char  id[24], uint64_t expected, uint64_t until,
-    ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_catalog_remove(
+    ngx_http_cache_purge_catalog_t *catalog, const unsigned char id[24],
+    uint64_t expected, ngx_http_cache_rocksdb_error_t *error);
+int ngx_http_cache_purge_catalog_retain(
+    ngx_http_cache_purge_catalog_t *catalog, const unsigned char id[24],
+    uint64_t expected, uint64_t until, ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_catalog_collect(
     ngx_http_cache_purge_catalog_t *catalog, uint64_t now, size_t limit,
     size_t *removed, ngx_http_cache_rocksdb_error_t *error);
@@ -100,8 +109,7 @@ int ngx_http_cache_purge_scan_open(ngx_http_cache_purge_catalog_t *catalog,
     ngx_http_cache_purge_scan_t **scan, ngx_http_cache_rocksdb_error_t *error);
 /* Returns file identity and location, without selector strings or TAGs. */
 int ngx_http_cache_purge_scan_next(ngx_http_cache_purge_scan_t *scan,
-    ngx_http_cache_purge_entry_t  *entry,
-                                  ngx_http_cache_rocksdb_error_t *error);
+    ngx_http_cache_purge_entry_t *entry, ngx_http_cache_rocksdb_error_t *error);
 ngx_http_cache_rocksdb_bytes_t ngx_http_cache_purge_scan_bookmark(
     ngx_http_cache_purge_scan_t *scan);
 void ngx_http_cache_purge_scan_close(ngx_http_cache_purge_scan_t *scan);
@@ -128,36 +136,40 @@ typedef struct {
     ngx_http_cache_rocksdb_bytes_t  bookmark;
 } ngx_http_cache_purge_job_t;
 
-/* Apply one native file operation and arrange its native-node update.
+
+/*
+ * Apply one native file operation and arrange its native-node update.
  * NOT_FOUND means absent; CONFLICT means a replaced file was preserved.
- * Other errors leave this entry pending for a later background retry. */
+ * Other errors leave this entry pending for a later background retry.
+ */
 typedef int (*ngx_http_cache_purge_apply_pt)(void *data,
-    const ngx_http_cache_purge_entry_t  *entry, unsigned action,
+    const ngx_http_cache_purge_entry_t *entry, unsigned action,
     ngx_http_cache_rocksdb_error_t *error);
 
 int ngx_http_cache_purge_jobs_open(ngx_http_cache_rocksdb_t *store,
-    ngx_http_cache_purge_catalog_t  *catalog,
-    ngx_http_cache_purge_jobs_t    **jobs,
-    ngx_http_cache_rocksdb_error_t *error);
+    ngx_http_cache_purge_catalog_t *catalog,
+    ngx_http_cache_purge_jobs_t **jobs, ngx_http_cache_rocksdb_error_t *error);
 void ngx_http_cache_purge_jobs_close(ngx_http_cache_purge_jobs_t *jobs);
 
-/* Submit inputs are caller-owned. Returned strings are borrowed until the
+/*
+ * Submit inputs are caller-owned. Returned strings are borrowed until the
  * next jobs operation. A duplicate does not restart work or extend retention.
  * Successful submission is durable; the caller must publish its shared rule
- * before returning 202 or starting background file processing. */
+ * before returning 202 or starting background file processing.
+ */
 int ngx_http_cache_purge_job_submit(ngx_http_cache_purge_jobs_t *jobs,
-    const ngx_http_cache_purge_job_t  *job, int *duplicate,
+    const ngx_http_cache_purge_job_t *job, int *duplicate,
     ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_job_get(ngx_http_cache_purge_jobs_t *jobs,
-    const unsigned char  id[16], ngx_http_cache_purge_job_t *job,
+    const unsigned char id[16], ngx_http_cache_purge_job_t *job,
     ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_job_next(ngx_http_cache_purge_jobs_t *jobs,
-    const unsigned char  *after, ngx_http_cache_purge_job_t *job,
+    const unsigned char *after, ngx_http_cache_purge_job_t *job,
     ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_job_step(ngx_http_cache_purge_jobs_t *jobs,
-    const unsigned char            id[16], uint64_t now, size_t limit,
-    ngx_http_cache_purge_apply_pt  apply, void *data,
-    ngx_http_cache_purge_job_t    *job, ngx_http_cache_rocksdb_error_t *error);
+    const unsigned char id[16], uint64_t now, size_t limit,
+    ngx_http_cache_purge_apply_pt apply, void *data,
+    ngx_http_cache_purge_job_t *job, ngx_http_cache_rocksdb_error_t *error);
 
 #ifdef __cplusplus
 }

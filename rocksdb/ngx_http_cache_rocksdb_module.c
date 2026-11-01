@@ -1,6 +1,8 @@
+
 /*
  * Copyright (C) Hanada
  */
+
 
 #include <ngx_config.h>
 #include <ngx_core.h>
@@ -46,9 +48,10 @@ ngx_module_t  ngx_http_cache_rocksdb_module = {
 static ngx_int_t
 ngx_http_cache_rocksdb_preconfiguration(ngx_conf_t *cf)
 {
-    if (ngx_http_cache_rocksdb_abi_2() != NGX_HTTP_CACHE_ROCKSDB_ABI) {
+    if (ngx_http_cache_rocksdb_abi_1() != NGX_HTTP_CACHE_ROCKSDB_ABI) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "incompatible cache RocksDB library");
+
         return NGX_ERROR;
     }
 

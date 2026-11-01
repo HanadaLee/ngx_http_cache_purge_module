@@ -1,4 +1,8 @@
-/* Copyright (C) Hanada */
+
+/*
+ * Copyright (C) Hanada
+ */
+
 
 #ifndef _NGX_HTTP_CACHE_PURGE_H_INCLUDED_
 #define _NGX_HTTP_CACHE_PURGE_H_INCLUDED_
@@ -15,9 +19,10 @@ typedef struct {
     ngx_err_t        error;
 } ngx_http_cache_purge_native_file_t;
 
+
 /* Background-only native file operations. No module metadata is stored. */
 ngx_int_t ngx_http_cache_purge_native_file(const char *name,
-    ngx_uint_t  invalidate, ngx_file_uniq_t expected,
+    ngx_uint_t invalidate, ngx_file_uniq_t expected,
     ngx_http_cache_purge_native_file_t *result);
 
 enum {
@@ -29,9 +34,9 @@ enum {
 };
 
 ngx_int_t ngx_http_cache_purge_native_node(ngx_http_file_cache_t *cache,
-    const u_char  *key, ngx_file_uniq_t expected, ngx_uint_t action);
+    const u_char *key, ngx_file_uniq_t expected, ngx_uint_t action);
 ngx_int_t ngx_http_cache_purge_native_identity(ngx_http_file_cache_t *cache,
-    const u_char  *key, ngx_file_uniq_t *uniq);
+    const u_char *key, ngx_file_uniq_t *uniq);
 
 typedef struct ngx_http_cache_purge_shared_s   ngx_http_cache_purge_shared_t;
 typedef struct ngx_http_cache_purge_message_s  ngx_http_cache_purge_message_t;
@@ -42,12 +47,14 @@ typedef struct {
     ngx_socket_t                    channel[2];
 } ngx_http_cache_purge_state_t;
 
+
 typedef struct {
     uint64_t  delete_before;
     uint64_t  invalidate_before;
     uint64_t  propagate_delete;
     uint64_t  propagate_invalidate;
 } ngx_http_cache_purge_match_t;
+
 
 enum {
     NGX_HTTP_CACHE_PURGE_RECORD = 0,
@@ -58,8 +65,10 @@ enum {
 
 #define NGX_HTTP_CACHE_PURGE_MESSAGE_MAX  (256 * 1024)
 
-/* Queued work owns its strings in the trailing allocation. It contains no
- * request, cache-node, shared-memory or database pointers. */
+/*
+ * Queued work owns its strings in the trailing allocation. It contains no
+ * request, cache-node, shared-memory or database pointers.
+ */
 typedef struct {
     ngx_uint_t                    type;
     size_t                        size;
@@ -70,50 +79,50 @@ typedef struct {
     } data;
 } ngx_http_cache_purge_work_t;
 
+
 /* zone->data points to a cycle-owned state context. */
 ngx_int_t ngx_http_cache_purge_state_init(ngx_shm_zone_t *zone, void *old);
 ngx_int_t ngx_http_cache_purge_state_enqueue(
-    ngx_http_cache_purge_state_t  *state, ngx_uint_t type, const void *input,
+    ngx_http_cache_purge_state_t *state, ngx_uint_t type, const void *input,
     ngx_http_cache_purge_message_t **message);
 
-/* Only the database owner consumes work. The caller supplies an
+/*
+ * Only the database owner consumes work. The caller supplies an
  * aligned MESSAGE_MAX-byte private buffer; task completion runs on its event
  * loop. Record-only batches may complete on the database thread.
  * Detached submissions remain accepted and continue in the background.
- * Completion/poll output is a match for LOOKUP, otherwise a job. */
+ * Completion/poll output is a match for LOOKUP, otherwise a job.
+ */
 ngx_int_t ngx_http_cache_purge_state_take(ngx_http_cache_purge_state_t *state,
-    ngx_http_cache_purge_work_t  *work,
+    ngx_http_cache_purge_work_t *work,
     ngx_http_cache_purge_message_t **message);
 void ngx_http_cache_purge_state_complete(ngx_http_cache_purge_state_t *state,
-    ngx_http_cache_purge_message_t  *message, int result,
-    const void *output);
+    ngx_http_cache_purge_message_t *message, int result, const void *output);
 ngx_int_t ngx_http_cache_purge_state_poll(ngx_http_cache_purge_state_t *state,
-    ngx_http_cache_purge_message_t  **message, int *result,
-    void *output);
+    ngx_http_cache_purge_message_t **message, int *result, void *output);
 void ngx_http_cache_purge_state_detach(ngx_http_cache_purge_state_t *state,
     ngx_http_cache_purge_message_t **message);
 
 ngx_int_t ngx_http_cache_purge_state_install(
-    ngx_http_cache_purge_state_t  *state,
-    const ngx_http_cache_purge_job_t *job);
+    ngx_http_cache_purge_state_t *state, const ngx_http_cache_purge_job_t *job);
 void ngx_http_cache_purge_state_finish(ngx_http_cache_purge_state_t *state,
-    const u_char  id[16]);
+    const u_char id[16]);
 ngx_int_t ngx_http_cache_purge_state_match(ngx_http_cache_purge_state_t *state,
-    const ngx_http_cache_purge_entry_t  *identity, uint64_t now,
+    const ngx_http_cache_purge_entry_t *identity, uint64_t now,
     ngx_http_cache_purge_match_t *match);
 ngx_int_t ngx_http_cache_purge_state_match_local(
-    ngx_http_cache_purge_state_t        *state,
-    const ngx_http_cache_purge_entry_t  *identity, uint64_t now,
+    ngx_http_cache_purge_state_t *state,
+    const ngx_http_cache_purge_entry_t *identity, uint64_t now,
     ngx_http_cache_purge_match_t *match);
 ngx_int_t ngx_http_cache_purge_state_match_url(
-    ngx_http_cache_purge_state_t        *state,
-    const ngx_http_cache_purge_entry_t  *identity, uint64_t now,
+    ngx_http_cache_purge_state_t *state,
+    const ngx_http_cache_purge_entry_t *identity, uint64_t now,
     ngx_http_cache_purge_match_t *match);
 void ngx_http_cache_purge_state_collect(ngx_http_cache_purge_state_t *state,
     uint64_t now);
 
 void ngx_http_cache_purge_state_stats(ngx_http_cache_purge_state_t *state,
-    ngx_uint_t  *rules, ngx_uint_t *messages, size_t *bytes);
+    ngx_uint_t *rules, ngx_uint_t *messages, size_t *bytes);
 void ngx_http_cache_purge_state_cleanup_stats(
     ngx_http_cache_purge_state_t *state, uint64_t stats[3]);
 
@@ -126,11 +135,10 @@ void ngx_http_cache_purge_channel_close(void *data);
 ngx_uint_t ngx_http_cache_purge_state_ready(
     ngx_http_cache_purge_state_t *state);
 ngx_int_t ngx_http_cache_purge_owner_start(ngx_cycle_t *cycle,
-    ngx_http_cache_purge_state_t            *state, const ngx_str_t *path,
-    const ngx_http_cache_rocksdb_options_t  *options,
-    ngx_http_file_cache_t                  **caches, ngx_uint_t count,
-    ngx_msec_t propagation, ngx_uint_t threaded,
-    ngx_http_cache_purge_owner_t **owner);
+    ngx_http_cache_purge_state_t *state, const ngx_str_t *path,
+    const ngx_http_cache_rocksdb_options_t *options,
+    ngx_http_file_cache_t **caches, ngx_uint_t count, ngx_msec_t propagation,
+    ngx_uint_t threaded, ngx_http_cache_purge_owner_t **owner);
 void ngx_http_cache_purge_owner_stop(ngx_http_cache_purge_owner_t *owner);
 
 #if (NGX_EXPR)
@@ -162,20 +170,21 @@ typedef void (*ngx_http_cache_purge_finalize_pt)(ngx_http_request_t *r,
 typedef ngx_int_t (*ngx_http_cache_purge_create_pt)(ngx_http_request_t *r);
 
 typedef struct {
-    ngx_http_cache_purge_state_t       state;
-    ngx_http_cache_purge_owner_t      *owner;
-    ngx_path_t                        *path;
-    ngx_shm_zone_t                    *zone;
-    ngx_msec_t                         propagation;
-    ngx_http_cache_rocksdb_options_t   options;
-    ngx_array_t                        caches;
-    ngx_array_t                        locations;
-    ngx_http_complex_value_t           defaults[NGX_HTTP_CACHE_PURGE_VALUES];
-    ngx_http_complex_value_t           guard[4];
-    ngx_buf_tag_t                      protocol[4];
-    ngx_http_cache_purge_finalize_pt   finalize[4];
-    ngx_http_cache_purge_create_pt     create[4];
+    ngx_http_cache_purge_state_t      state;
+    ngx_http_cache_purge_owner_t     *owner;
+    ngx_path_t                       *path;
+    ngx_shm_zone_t                   *zone;
+    ngx_msec_t                        propagation;
+    ngx_http_cache_rocksdb_options_t  options;
+    ngx_array_t                       caches;
+    ngx_array_t                       locations;
+    ngx_http_complex_value_t          defaults[NGX_HTTP_CACHE_PURGE_VALUES];
+    ngx_http_complex_value_t          guard[4];
+    ngx_buf_tag_t                     protocol[4];
+    ngx_http_cache_purge_finalize_pt  finalize[4];
+    ngx_http_cache_purge_create_pt    create[4];
 } ngx_http_cache_purge_main_conf_t;
+
 
 typedef struct {
     ngx_http_cache_purge_value_t  *value[NGX_HTTP_CACHE_PURGE_VALUES];
@@ -184,13 +193,14 @@ typedef struct {
     ngx_str_t                      api;
 } ngx_http_cache_purge_loc_conf_t;
 
+
 extern ngx_module_t  ngx_http_cache_purge_module;
 
-ngx_int_t ngx_http_cache_purge_variables(ngx_conf_t *cf);
-ngx_int_t ngx_http_cache_purge_request_init(ngx_conf_t *cf);
-ngx_int_t ngx_http_cache_purge_api(ngx_http_request_t *r);
-ngx_flag_t ngx_http_cache_purge_flag(ngx_http_request_t *r, ngx_uint_t n);
-ngx_int_t ngx_http_cache_purge_value(ngx_http_request_t *r, ngx_uint_t n,
+ngx_int_t ngx_http_cache_purge_add_variables(ngx_conf_t *cf);
+ngx_int_t ngx_http_cache_purge_init_handlers(ngx_conf_t *cf);
+ngx_int_t ngx_http_cache_purge_api_handler(ngx_http_request_t *r);
+ngx_flag_t ngx_http_cache_purge_get_flag(ngx_http_request_t *r, ngx_uint_t n);
+ngx_int_t ngx_http_cache_purge_get_value(ngx_http_request_t *r, ngx_uint_t n,
     ngx_str_t *value);
 ngx_uint_t ngx_http_cache_purge_state_active(
     ngx_http_cache_purge_state_t *state);

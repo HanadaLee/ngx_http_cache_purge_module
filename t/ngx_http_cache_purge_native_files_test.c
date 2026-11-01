@@ -1,4 +1,8 @@
-/* Copyright (C) Hanada */
+
+/*
+ * Copyright (C) Hanada
+ */
+
 
 #include <ngx_config.h>
 #include <ngx_core.h>
@@ -14,8 +18,8 @@ ngx_http_cache_purge_test_main(int argc, char **argv)
     struct stat                         info;
     ngx_http_file_cache_header_t        header;
     ngx_http_cache_purge_native_file_t  result;
-    static const char                    key[] = "\nKEY: native-test\n";
-    static const char                    response[] =
+    static const char                   key[] = "\nKEY: native-test\n";
+    static const char                   response[] =
         "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n"
         "Cache-Tag: first\r\n\r\nentity!";
 
@@ -23,6 +27,7 @@ ngx_http_cache_purge_test_main(int argc, char **argv)
         printf("{\"offset\":%zu,\"size\":%zu,\"header\":%zu}\n",
                offsetof(ngx_http_file_cache_header_t, valid_sec),
                sizeof(header.valid_sec), sizeof(header));
+
         return 0;
     }
 
@@ -39,6 +44,7 @@ ngx_http_cache_purge_test_main(int argc, char **argv)
         header.body_start = header.header_start + sizeof(response) - 1 - 7;
 
         fd = open(argv[2], O_WRONLY | O_CREAT | O_EXCL, 0600);
+
         if (fd == -1) {
             return 2;
         }
@@ -53,6 +59,7 @@ ngx_http_cache_purge_test_main(int argc, char **argv)
         }
 
         printf("{\"inode\":%llu}\n", (unsigned long long) info.st_ino);
+
         return 0;
     }
 
@@ -60,8 +67,9 @@ ngx_http_cache_purge_test_main(int argc, char **argv)
         return 2;
     }
 
-    rc = ngx_http_cache_purge_native_file(argv[2], atoi(argv[3]),
-                   (ngx_file_uniq_t) strtoull(argv[4], NULL, 10), &result);
+    rc = ngx_http_cache_purge_native_file(
+        argv[2], atoi(argv[3]), (ngx_file_uniq_t) strtoull(argv[4], NULL, 10),
+        &result);
 
     printf("{\"rc\":%ld,\"error\":%d,\"inode\":%llu,\"size\":%lld}\n",
            (long) rc, result.error, (unsigned long long) result.uniq,

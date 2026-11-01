@@ -1,3 +1,4 @@
+
 /*
  * Copyright (C) Hanada
  */
@@ -39,23 +40,26 @@ int ngx_http_cache_rocksdb_error(ngx_http_cache_rocksdb_error_t *error,
 template <class Function>
 int ngx_http_cache_rocksdb_boundary(ngx_http_cache_rocksdb_error_t *error,
     Function function) noexcept;
-int ngx_http_cache_rocksdb_result(const rocksdb::Status          &status,
+int ngx_http_cache_rocksdb_result(const rocksdb::Status &status,
     ngx_http_cache_rocksdb_error_t *error);
-rocksdb::Slice
-ngx_http_cache_rocksdb_slice(ngx_http_cache_rocksdb_bytes_t value);
+rocksdb::Slice ngx_http_cache_rocksdb_slice(
+    ngx_http_cache_rocksdb_bytes_t value);
 bool ngx_http_cache_rocksdb_bytes_valid(ngx_http_cache_rocksdb_bytes_t value,
-    size_t                         maximum);
+    size_t maximum);
 bool ngx_http_cache_rocksdb_cf_valid(ngx_http_cache_rocksdb_cf_e cf);
 bool ngx_http_cache_rocksdb_buffer_valid(
     const ngx_http_cache_rocksdb_buffer_t *buffer);
-int ngx_http_cache_rocksdb_copy(const rocksdb::Slice            &source,
+int ngx_http_cache_rocksdb_copy(const rocksdb::Slice &source,
     ngx_http_cache_rocksdb_buffer_t *destination);
 
-constexpr char ngx_http_cache_rocksdb_schema_key[] =
+constexpr char         ngx_http_cache_rocksdb_schema_key[] =
     "\0ngx_http_cache_purge/store";
-constexpr char        ngx_http_cache_rocksdb_schema_value[] = "1";
-constexpr const char *ngx_http_cache_rocksdb_cf_names[] = { "default", "url",
-                                                            "tag" };
+constexpr char         ngx_http_cache_rocksdb_schema_value[] = "1";
+constexpr const char  *ngx_http_cache_rocksdb_cf_names[] = {
+    "default",
+    "url",
+    "tag"
+};
 
 int
 ngx_http_cache_rocksdb_error(ngx_http_cache_rocksdb_error_t *error, int code,
@@ -63,10 +67,11 @@ ngx_http_cache_rocksdb_error(ngx_http_cache_rocksdb_error_t *error, int code,
 {
     if (error) {
         error->code = code;
-        size_t n = std::min(std::strlen(message), sizeof(error->message) - 1);
+        size_t  n = std::min(std::strlen(message), sizeof(error->message) - 1);
         std::memcpy(error->message, message, n);
         error->message[n] = 0;
     }
+
     return code;
 }
 
@@ -80,29 +85,34 @@ ngx_http_cache_rocksdb_boundary(ngx_http_cache_rocksdb_error_t *error,
         error->code = NGX_HTTP_CACHE_ROCKSDB_OK;
         error->message[0] = 0;
     }
+
     try {
         return function();
     } catch (const std::bad_alloc &) {
-        return ngx_http_cache_rocksdb_error(error, NGX_HTTP_CACHE_ROCKSDB_LIMIT,
-    "cache index allocation failed");
+        return ngx_http_cache_rocksdb_error(error,
+                                            NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+                                            "cache index allocation failed");
     } catch (const std::exception &e) {
         return ngx_http_cache_rocksdb_error(error, NGX_HTTP_CACHE_ROCKSDB_IO,
-    e.what());
+                                            e.what());
     } catch (...) {
-        return ngx_http_cache_rocksdb_error(error, NGX_HTTP_CACHE_ROCKSDB_IO,
-    "cache index unexpected exception");
+        return ngx_http_cache_rocksdb_error(
+            error, NGX_HTTP_CACHE_ROCKSDB_IO,
+            "cache index unexpected exception");
     }
 }
 
 
 int
-ngx_http_cache_rocksdb_result(const rocksdb::Status          &status,
+ngx_http_cache_rocksdb_result(const rocksdb::Status &status,
     ngx_http_cache_rocksdb_error_t *error)
 {
     if (status.ok()) {
         return NGX_HTTP_CACHE_ROCKSDB_OK;
     }
-    int code = NGX_HTTP_CACHE_ROCKSDB_IO;
+
+    int  code = NGX_HTTP_CACHE_ROCKSDB_IO;
+
     if (status.IsNotFound()) {
         code = NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND;
     } else if (status.IsCorruption()) {
@@ -114,7 +124,9 @@ ngx_http_cache_rocksdb_result(const rocksdb::Status          &status,
     } else if (status.IsBusy() || status.IsTryAgain()) {
         code = NGX_HTTP_CACHE_ROCKSDB_BUSY;
     }
-    return ngx_http_cache_rocksdb_error(error, code, status.ToString().c_str());
+
+    return ngx_http_cache_rocksdb_error(error, code,
+                                        status.ToString().c_str());
 }
 
 
@@ -122,13 +134,14 @@ rocksdb::Slice
 ngx_http_cache_rocksdb_slice(ngx_http_cache_rocksdb_bytes_t value)
 {
     return rocksdb::Slice(
-        value.len ? reinterpret_cast<const char *>(value.data) : "", value.len);
+        value.len ? reinterpret_cast<const char *>(value.data) : "",
+        value.len);
 }
 
 
 bool
 ngx_http_cache_rocksdb_bytes_valid(ngx_http_cache_rocksdb_bytes_t value,
-    size_t                         maximum)
+    size_t maximum)
 {
     return value.len <= maximum && (value.len == 0 || value.data != nullptr);
 }
@@ -150,40 +163,44 @@ ngx_http_cache_rocksdb_buffer_valid(
 
 
 int
-ngx_http_cache_rocksdb_copy(const rocksdb::Slice            &source,
+ngx_http_cache_rocksdb_copy(const rocksdb::Slice &source,
     ngx_http_cache_rocksdb_buffer_t *destination)
 {
     destination->length = source.size();
+
     if (destination->capacity < source.size()) {
         return NGX_HTTP_CACHE_ROCKSDB_BUFFER;
     }
+
     if (!source.empty()) {
         std::memcpy(destination->data, source.data(), source.size());
     }
+
     return NGX_HTTP_CACHE_ROCKSDB_OK;
 }
 } /* namespace */
 
 struct ngx_http_cache_rocksdb_s {
-    ngx_http_cache_rocksdb_options_t options{};
-    pid_t                            pid = getpid();
-    std::thread::id                  thread = std::this_thread::get_id();
-    int                              lease = -1;
-    std::unique_ptr<rocksdb::DB>     database;
-    rocksdb::DB                     *db = nullptr;
-    ngx_http_cache_rocksdb_t        *parent = nullptr;
-    std::atomic<unsigned>            readers{ 0 };
-    bool                             attached = true;
+    ngx_http_cache_rocksdb_options_t                options{};
+    pid_t                                           pid = getpid();
+    std::thread::id                                 thread =
+        std::this_thread::get_id();
+    int                                             lease = -1;
+    std::unique_ptr<rocksdb::DB>                    database;
+    rocksdb::DB                                    *db = nullptr;
+    ngx_http_cache_rocksdb_t                       *parent = nullptr;
+    std::atomic<unsigned>                           readers{ 0 };
+    bool                                            attached = true;
     std::array<rocksdb::ColumnFamilyHandle *, NGX_HTTP_CACHE_ROCKSDB_CF_COUNT>
-                                                   cf{};
-    std::shared_ptr<rocksdb::Cache>                cache;
-    std::shared_ptr<rocksdb::WriteBufferManager>   buffers;
-    std::vector<ngx_http_cache_rocksdb_cursor_t *> cursors;
-    uint64_t                                       writes = 0;
-    uint64_t                                       synced_writes = 0;
-    uint64_t                                       conflicts = 0;
-    size_t                                         pending_bytes = 0;
-    unsigned                                       pending_writes = 0;
+                                                    cf{};
+    std::shared_ptr<rocksdb::Cache>                 cache;
+    std::shared_ptr<rocksdb::WriteBufferManager>    buffers;
+    std::vector<ngx_http_cache_rocksdb_cursor_t *>  cursors;
+    uint64_t                                        writes = 0;
+    uint64_t                                        synced_writes = 0;
+    uint64_t                                        conflicts = 0;
+    size_t                                          pending_bytes = 0;
+    unsigned                                        pending_writes = 0;
 
     ~ngx_http_cache_rocksdb_s()
     {
@@ -193,31 +210,39 @@ struct ngx_http_cache_rocksdb_s {
                     db->DestroyColumnFamilyHandle(handle);
                 }
             }
+
             database.reset();
         }
+
         if (lease >= 0) {
             close(lease);
         }
+
         if (parent) {
             parent->readers.fetch_sub(1);
         }
     }
+
 
     bool
     owner() const noexcept
     {
         return pid == getpid() && thread == std::this_thread::get_id();
     }
+
+
     void expire();
 };
 
 struct ngx_http_cache_rocksdb_snapshot_s {
-    ngx_http_cache_rocksdb_t                  *store;
-    const rocksdb::Snapshot                   *snapshot = nullptr;
-    ngx_http_cache_rocksdb_clock_t::time_point deadline;
+    ngx_http_cache_rocksdb_t                   *store;
+    const rocksdb::Snapshot                    *snapshot = nullptr;
+    ngx_http_cache_rocksdb_clock_t::time_point  deadline;
     explicit ngx_http_cache_rocksdb_snapshot_s(ngx_http_cache_rocksdb_t *s)
         : store(s)
     {}
+
+
     ~ngx_http_cache_rocksdb_snapshot_s()
     {
         if (snapshot) {
@@ -227,23 +252,27 @@ struct ngx_http_cache_rocksdb_snapshot_s {
 };
 
 struct ngx_http_cache_rocksdb_cursor_s {
-    ngx_http_cache_rocksdb_t                          *store;
-    std::shared_ptr<ngx_http_cache_rocksdb_snapshot_s> view;
-    std::string                                        prefix;
-    std::string                                        upper;
-    rocksdb::Slice                                     bound;
-    std::unique_ptr<rocksdb::Iterator>                 iterator;
-    bool                                               expired = false;
+    ngx_http_cache_rocksdb_t                           *store;
+    std::shared_ptr<ngx_http_cache_rocksdb_snapshot_s>  view;
+    std::string                                         prefix;
+    std::string                                         upper;
+    rocksdb::Slice                                      bound;
+    std::unique_ptr<rocksdb::Iterator>                  iterator;
+    bool                                                expired = false;
 
     explicit ngx_http_cache_rocksdb_cursor_s(ngx_http_cache_rocksdb_t *s)
         : store(s)
     {}
+
+
     void
     release() noexcept
     {
         iterator.reset();
         view.reset();
     }
+
+
     ~ngx_http_cache_rocksdb_cursor_s()
     {
         release();
@@ -253,7 +282,8 @@ struct ngx_http_cache_rocksdb_cursor_s {
 void
 ngx_http_cache_rocksdb_s::expire()
 {
-    const auto now = ngx_http_cache_rocksdb_clock_t::now();
+    const auto  now = ngx_http_cache_rocksdb_clock_t::now();
+
     for (auto *cursor : cursors) {
         if (!cursor->expired && now >= cursor->view->deadline) {
             cursor->release();
@@ -265,68 +295,71 @@ ngx_http_cache_rocksdb_s::expire()
 
 namespace {
 
-int  ngx_http_cache_rocksdb_check(ngx_http_cache_rocksdb_t       *store,
+int ngx_http_cache_rocksdb_check(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_error_t *error);
-int  ngx_http_cache_rocksdb_check(ngx_http_cache_rocksdb_cursor_t *cursor,
-    ngx_http_cache_rocksdb_error_t  *error);
+int ngx_http_cache_rocksdb_check(ngx_http_cache_rocksdb_cursor_t *cursor,
+    ngx_http_cache_rocksdb_error_t *error);
 bool ngx_http_cache_rocksdb_key_valid(const ngx_http_cache_rocksdb_t *store,
-    ngx_http_cache_rocksdb_bytes_t  key);
-bool ngx_http_cache_rocksdb_budget(size_t                        &remaining,
-    ngx_http_cache_rocksdb_bytes_t key,
-    ngx_http_cache_rocksdb_bytes_t value);
-int  ngx_http_cache_rocksdb_read(ngx_http_cache_rocksdb_t        *store,
-    const rocksdb::Snapshot         *snapshot,
-    ngx_http_cache_rocksdb_cf_e      cf,
-    ngx_http_cache_rocksdb_bytes_t   key,
-    ngx_http_cache_rocksdb_buffer_t *value,
-    ngx_http_cache_rocksdb_error_t  *error);
-bool ngx_http_cache_rocksdb_direct_io(const std::string &path);
-int  ngx_http_cache_rocksdb_initialize(ngx_http_cache_rocksdb_t       *store,
-    const std::string              &path,
+    ngx_http_cache_rocksdb_bytes_t key);
+bool ngx_http_cache_rocksdb_budget(size_t &remaining,
+    ngx_http_cache_rocksdb_bytes_t key, ngx_http_cache_rocksdb_bytes_t value);
+int ngx_http_cache_rocksdb_read(ngx_http_cache_rocksdb_t *store,
+    const rocksdb::Snapshot *snapshot, ngx_http_cache_rocksdb_cf_e cf,
+    ngx_http_cache_rocksdb_bytes_t key, ngx_http_cache_rocksdb_buffer_t *value,
     ngx_http_cache_rocksdb_error_t *error);
+bool ngx_http_cache_rocksdb_direct_io(const std::string &path);
+int ngx_http_cache_rocksdb_initialize(ngx_http_cache_rocksdb_t *store,
+    const std::string &path, ngx_http_cache_rocksdb_error_t *error);
 
 int
-ngx_http_cache_rocksdb_check(ngx_http_cache_rocksdb_t       *store,
+ngx_http_cache_rocksdb_check(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_error_t *error)
 {
     if (!store) {
         return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_INVALID, "null cache index handle");
+            error, NGX_HTTP_CACHE_ROCKSDB_INVALID, "null cache index handle");
     }
+
     if (!store->owner() || !store->attached) {
         return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_OWNER,
-    "cache index process/thread owner mismatch");
+            error, NGX_HTTP_CACHE_ROCKSDB_OWNER,
+            "cache index process/thread owner mismatch");
     }
+
     store->expire();
+
     return NGX_HTTP_CACHE_ROCKSDB_OK;
 }
 
 
 int
 ngx_http_cache_rocksdb_check(ngx_http_cache_rocksdb_cursor_t *cursor,
-    ngx_http_cache_rocksdb_error_t  *error)
+    ngx_http_cache_rocksdb_error_t *error)
 {
     if (!cursor) {
         return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_INVALID, "null cache index cursor");
+            error, NGX_HTTP_CACHE_ROCKSDB_INVALID, "null cache index cursor");
     }
-    int code = ngx_http_cache_rocksdb_check(cursor->store, error);
+
+    int  code = ngx_http_cache_rocksdb_check(cursor->store, error);
+
     if (code != NGX_HTTP_CACHE_ROCKSDB_OK) {
         return code;
     }
+
     if (cursor->expired) {
         return ngx_http_cache_rocksdb_error(
             error, NGX_HTTP_CACHE_ROCKSDB_EXPIRED,
             "cache index cursor expired; resume with a new snapshot");
     }
+
     return NGX_HTTP_CACHE_ROCKSDB_OK;
 }
 
 
 bool
 ngx_http_cache_rocksdb_key_valid(const ngx_http_cache_rocksdb_t *store,
-    ngx_http_cache_rocksdb_bytes_t  key)
+    ngx_http_cache_rocksdb_bytes_t key)
 {
     return key.len
            && ngx_http_cache_rocksdb_bytes_valid(key,
@@ -336,52 +369,58 @@ ngx_http_cache_rocksdb_key_valid(const ngx_http_cache_rocksdb_t *store,
 
 
 bool
-ngx_http_cache_rocksdb_budget(size_t                        &remaining,
-    ngx_http_cache_rocksdb_bytes_t key,
-    ngx_http_cache_rocksdb_bytes_t value)
+ngx_http_cache_rocksdb_budget(size_t &remaining,
+    ngx_http_cache_rocksdb_bytes_t key, ngx_http_cache_rocksdb_bytes_t value)
 {
     if (remaining < 64 || key.len > remaining - 64) {
         return false;
     }
+
     remaining -= 64 + key.len;
+
     if (value.len > remaining) {
         return false;
     }
+
     remaining -= value.len;
+
     return true;
 }
 
 
 int
-ngx_http_cache_rocksdb_read(ngx_http_cache_rocksdb_t        *store,
-    const rocksdb::Snapshot         *snapshot,
-    ngx_http_cache_rocksdb_cf_e      cf,
-    ngx_http_cache_rocksdb_bytes_t   key,
-    ngx_http_cache_rocksdb_buffer_t *value,
-    ngx_http_cache_rocksdb_error_t  *error)
+ngx_http_cache_rocksdb_read(ngx_http_cache_rocksdb_t *store,
+    const rocksdb::Snapshot *snapshot, ngx_http_cache_rocksdb_cf_e cf,
+    ngx_http_cache_rocksdb_bytes_t key, ngx_http_cache_rocksdb_buffer_t *value,
+    ngx_http_cache_rocksdb_error_t *error)
 {
     if (!ngx_http_cache_rocksdb_cf_valid(cf)
         || !ngx_http_cache_rocksdb_key_valid(store, key)
         || !ngx_http_cache_rocksdb_buffer_valid(value))
     {
         return ngx_http_cache_rocksdb_error(error,
-    NGX_HTTP_CACHE_ROCKSDB_INVALID,
-    "invalid cache index get input");
+                                            NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                                            "invalid cache index get input");
     }
+
     value->length = 0;
-    rocksdb::ReadOptions read;
+    rocksdb::ReadOptions  read;
     read.snapshot = snapshot;
-    rocksdb::PinnableSlice found;
-    auto status = store->db->Get(read, store->cf[cf],
-                                 ngx_http_cache_rocksdb_slice(key), &found);
+    rocksdb::PinnableSlice  found;
+    auto                    status =
+        store->db->Get(read, store->cf[cf],
+                       ngx_http_cache_rocksdb_slice(key), &found);
+
     if (!status.ok()) {
         return ngx_http_cache_rocksdb_result(status, error);
     }
+
     if (found.size() > store->options.max_value_bytes) {
         return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_LIMIT,
-    "cache index value exceeds configured limit");
+            error, NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+            "cache index value exceeds configured limit");
     }
+
     return ngx_http_cache_rocksdb_copy(found, value);
 }
 
@@ -390,37 +429,40 @@ bool
 ngx_http_cache_rocksdb_direct_io(const std::string &path)
 {
 #if (defined(__linux__) && defined(O_TMPFILE))
-    alignas(4096) unsigned char data[4096] = { 0 };
-    bool                        supported;
-    int                         fd;
+    alignas(4096) unsigned char  data[4096] = { 0 };
+    bool                         supported;
+    int                          fd;
 
     /* Probe under the owner lock without leaving a named file behind. */
     fd = open(path.c_str(), O_TMPFILE | O_RDWR | O_DIRECT | O_CLOEXEC, 0600);
+
     if (fd < 0) {
         return false;
     }
+
     supported =
         pwrite(fd, data, sizeof(data), 0) == static_cast<ssize_t>(sizeof(data))
         && pread(fd, data, sizeof(data), 0)
-               == static_cast<ssize_t>(sizeof(data));
+           == static_cast<ssize_t>(sizeof(data));
     close(fd);
+
     return supported;
 #else
     (void) path;
+
     return false;
 #endif
 }
 
 
 int
-ngx_http_cache_rocksdb_initialize(ngx_http_cache_rocksdb_t       *store,
-    const std::string              &path,
-    ngx_http_cache_rocksdb_error_t *error)
+ngx_http_cache_rocksdb_initialize(ngx_http_cache_rocksdb_t *store,
+    const std::string &path, ngx_http_cache_rocksdb_error_t *error)
 {
     store->cache = rocksdb::NewLRUCache(store->options.cache_bytes, 2, true);
     store->buffers = std::make_shared<rocksdb::WriteBufferManager>(
         store->options.write_buffer_bytes, store->cache, true);
-    rocksdb::Options options;
+    rocksdb::Options  options;
     options.create_if_missing = true;
     options.create_missing_column_families = false;
     options.write_buffer_manager = store->buffers;
@@ -430,11 +472,13 @@ ngx_http_cache_rocksdb_initialize(ngx_http_cache_rocksdb_t       *store,
     options.target_file_size_base = options.write_buffer_size;
     options.max_bytes_for_level_base =
         options.write_buffer_size * options.level0_file_num_compaction_trigger;
+
     if (store->options.io_rate != 0) {
         options.rate_limiter.reset(rocksdb::NewGenericRateLimiter(
             static_cast<int64_t>(store->options.io_rate), 1000, 10,
             rocksdb::RateLimiter::Mode::kAllIo));
     }
+
     options.max_open_files = static_cast<int>(store->options.max_open_files);
     /* Avoid fragmenting the small file-handle budget across 64 shards. */
     options.table_cache_numshardbits = 2;
@@ -444,15 +488,17 @@ ngx_http_cache_rocksdb_initialize(ngx_http_cache_rocksdb_t       *store,
     /* Compaction yields CPU; flushes must release the bounded write buffer. */
     options.env->LowerThreadPoolCPUPriority(rocksdb::Env::LOW);
 #endif
-    /* Keep bulk SST rewrites from displacing native cache pages. Point reads
-     * retain buffered I/O; unsupported filesystems retain the old behavior. */
+    /*
+     * Keep bulk SST rewrites from displacing native cache pages. Point reads
+     * retain buffered I/O; unsupported filesystems retain the old behavior.
+     */
     options.use_direct_io_for_flush_and_compaction =
         ngx_http_cache_rocksdb_direct_io(path);
     options.compression = rocksdb::kSnappyCompression;
     options.max_log_file_size = 1 << 20;
     options.keep_log_file_num = 2;
     options.info_log_level = rocksdb::WARN_LEVEL;
-    rocksdb::BlockBasedTableOptions table;
+    rocksdb::BlockBasedTableOptions  table;
     table.block_cache = store->cache;
     table.cache_index_and_filter_blocks = true;
     table.cache_index_and_filter_blocks_with_high_priority = true;
@@ -465,10 +511,12 @@ ngx_http_cache_rocksdb_initialize(ngx_http_cache_rocksdb_t       *store,
     table.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10, false));
     options.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table));
 
-    std::vector<std::string> names;
-    struct stat              info;
+    std::vector<std::string>  names;
+    struct stat               info;
+
     if (stat((path + "/CURRENT").c_str(), &info) == 0) {
-        auto status = rocksdb::DB::ListColumnFamilies(options, path, &names);
+        auto  status = rocksdb::DB::ListColumnFamilies(options, path, &names);
+
         if (!status.ok()) {
             return ngx_http_cache_rocksdb_result(status, error);
         }
@@ -476,57 +524,70 @@ ngx_http_cache_rocksdb_initialize(ngx_http_cache_rocksdb_t       *store,
         names.emplace_back("default");
     } else {
         return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_IO,
-    "cannot inspect cache index CURRENT");
+            error, NGX_HTTP_CACHE_ROCKSDB_IO,
+            "cannot inspect cache index CURRENT");
     }
+
     for (const auto &name : names) {
         if (std::find(std::begin(ngx_http_cache_rocksdb_cf_names),
                       std::end(ngx_http_cache_rocksdb_cf_names), name)
             == std::end(ngx_http_cache_rocksdb_cf_names))
         {
             return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_SCHEMA,
-    "unexpected cache index column family");
+                error, NGX_HTTP_CACHE_ROCKSDB_SCHEMA,
+                "unexpected cache index column family");
         }
     }
-    std::vector<rocksdb::ColumnFamilyDescriptor> descriptions;
+
+    std::vector<rocksdb::ColumnFamilyDescriptor>  descriptions;
+
     for (const auto &name : names) {
         descriptions.emplace_back(name, options);
     }
-    std::vector<rocksdb::ColumnFamilyHandle *> handles;
-    rocksdb::DB                               *db = nullptr;
-    auto status = rocksdb::DB::Open(options, path, descriptions, &handles, &db);
+
+    std::vector<rocksdb::ColumnFamilyHandle *>  handles;
+    rocksdb::DB                                *db = nullptr;
+    auto                                        status =
+        rocksdb::DB::Open(options, path, descriptions, &handles, &db);
+
     if (!status.ok()) {
         return ngx_http_cache_rocksdb_result(status, error);
     }
+
     store->database.reset(db);
     store->db = db;
-    for (size_t i = 0; i < names.size(); ++i) {
-        for (unsigned n = 0; n < NGX_HTTP_CACHE_ROCKSDB_CF_COUNT; ++n) {
+
+    for (size_t  i = 0; i < names.size(); ++i) {
+        for (unsigned  n = 0; n < NGX_HTTP_CACHE_ROCKSDB_CF_COUNT; ++n) {
             if (names[i] == ngx_http_cache_rocksdb_cf_names[n]) {
                 store->cf[n] = handles[i];
             }
         }
     }
+
     if (!store->cf[0]) {
         return ngx_http_cache_rocksdb_error(error,
-    NGX_HTTP_CACHE_ROCKSDB_SCHEMA,
-    "missing default column family");
+                                            NGX_HTTP_CACHE_ROCKSDB_SCHEMA,
+                                            "missing default column family");
     }
-    const rocksdb::Slice marker(ngx_http_cache_rocksdb_schema_key,
+
+    const rocksdb::Slice  marker(ngx_http_cache_rocksdb_schema_key,
                                 sizeof(ngx_http_cache_rocksdb_schema_key) - 1);
-    std::string          version;
+    std::string           version;
     status = db->Get(rocksdb::ReadOptions(), store->cf[0], marker, &version);
+
     if (status.ok()) {
         if (version != ngx_http_cache_rocksdb_schema_value
             || names.size() != NGX_HTTP_CACHE_ROCKSDB_CF_COUNT)
         {
             return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_SCHEMA,
-    "unsupported cache index storage schema");
+                error, NGX_HTTP_CACHE_ROCKSDB_SCHEMA,
+                "unsupported cache index storage schema");
         }
+
         return NGX_HTTP_CACHE_ROCKSDB_OK;
     }
+
     if (!status.IsNotFound()) {
         return ngx_http_cache_rocksdb_result(status, error);
     }
@@ -535,59 +596,68 @@ ngx_http_cache_rocksdb_initialize(ngx_http_cache_rocksdb_t       *store,
      * Recover an interrupted first open only while all existing CFs are empty.
      * Never adopt a non-empty database or rebuild it by silently dropping data.
      */
+
     for (auto *handle : store->cf) {
         if (!handle) {
             continue;
         }
-        std::unique_ptr<rocksdb::Iterator> iterator(
+
+        std::unique_ptr<rocksdb::Iterator>  iterator(
             db->NewIterator(rocksdb::ReadOptions(), handle));
         iterator->SeekToFirst();
+
         if (!iterator->status().ok()) {
             return ngx_http_cache_rocksdb_result(iterator->status(), error);
         }
+
         if (iterator->Valid()) {
             return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_SCHEMA,
-    "non-empty cache index has no storage schema");
+                error, NGX_HTTP_CACHE_ROCKSDB_SCHEMA,
+                "non-empty cache index has no storage schema");
         }
     }
-    for (unsigned i = 0; i < NGX_HTTP_CACHE_ROCKSDB_CF_COUNT; ++i) {
+
+    for (unsigned  i = 0; i < NGX_HTTP_CACHE_ROCKSDB_CF_COUNT; ++i) {
         if (!store->cf[i]) {
             status = db->CreateColumnFamily(
                 options, ngx_http_cache_rocksdb_cf_names[i], &store->cf[i]);
+
             if (!status.ok()) {
                 return ngx_http_cache_rocksdb_result(status, error);
             }
         }
     }
-    rocksdb::WriteOptions write;
+
+    rocksdb::WriteOptions  write;
     write.sync = true;
+
     return ngx_http_cache_rocksdb_result(
-    db->Put(write, store->cf[0], marker,
-    ngx_http_cache_rocksdb_schema_value),
-    error);
+        db->Put(write, store->cf[0], marker,
+                ngx_http_cache_rocksdb_schema_value),
+        error);
 }
 } /* namespace */
 
 static int ngx_http_cache_rocksdb_write_internal(
-    ngx_http_cache_rocksdb_t                *store,
+    ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_rocksdb_mutation_t *mutations, size_t count,
     const ngx_http_cache_rocksdb_condition_t *conditions,
     size_t condition_count, int durable, ngx_http_cache_rocksdb_error_t *error);
-static int ngx_http_cache_rocksdb_open_cursor(
-    ngx_http_cache_rocksdb_t *store, ngx_http_cache_rocksdb_cf_e cf,
-    ngx_http_cache_rocksdb_bytes_t prefix, ngx_http_cache_rocksdb_bytes_t after,
-    bool fill_cache, std::shared_ptr<ngx_http_cache_rocksdb_snapshot_s> view,
+static int ngx_http_cache_rocksdb_open_cursor(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_rocksdb_cf_e cf, ngx_http_cache_rocksdb_bytes_t prefix,
+    ngx_http_cache_rocksdb_bytes_t after, bool fill_cache,
+    std::shared_ptr<ngx_http_cache_rocksdb_snapshot_s> view,
     ngx_http_cache_rocksdb_cursor_t **output,
-    ngx_http_cache_rocksdb_error_t   *error);
+    ngx_http_cache_rocksdb_error_t *error);
 
 
 extern "C" void
-ngx_http_cache_rocksdb_options(ngx_http_cache_rocksdb_options_t *options)
+ngx_http_cache_rocksdb_init_options(ngx_http_cache_rocksdb_options_t *options)
 {
     if (!options) {
         return;
     }
+
     std::memset(options, 0, sizeof(*options));
     options->abi = NGX_HTTP_CACHE_ROCKSDB_ABI;
     options->cache_bytes = 16 << 20;
@@ -605,62 +675,68 @@ ngx_http_cache_rocksdb_options(ngx_http_cache_rocksdb_options_t *options)
 
 
 extern "C" uint32_t
-ngx_http_cache_rocksdb_abi_2(void)
+ngx_http_cache_rocksdb_abi_1(void)
 {
     return NGX_HTTP_CACHE_ROCKSDB_ABI;
 }
 
 
 extern "C" int
-ngx_http_cache_rocksdb_open(const char                             *path,
+ngx_http_cache_rocksdb_open(const char *path,
     const ngx_http_cache_rocksdb_options_t *options,
-    ngx_http_cache_rocksdb_t              **output,
-    ngx_http_cache_rocksdb_error_t         *error)
+    ngx_http_cache_rocksdb_t **output, ngx_http_cache_rocksdb_error_t *error)
 {
     if (output) {
         *output = nullptr;
     }
+
     return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
         if (!output || !path || !*path || std::strlen(path) > 4096 || !options
             || options->abi != NGX_HTTP_CACHE_ROCKSDB_ABI
             || (options->io_rate != 0 && options->io_rate < 1024)
-            || options->io_rate > INT64_MAX || options->cache_bytes < (4U << 20)
+            || options->io_rate > INT64_MAX
+            || options->cache_bytes < (4U << 20)
             || options->write_buffer_bytes < (1U << 20)
             || options->write_buffer_bytes > options->cache_bytes / 2
             || !options->max_key_bytes || !options->max_value_bytes
             || options->max_key_bytes > options->max_batch_bytes
             || options->max_value_bytes > options->max_batch_bytes
-            || !options->max_batch_entries || options->max_batch_entries > 65536
-            || !options->max_cursors || options->max_cursors > 64
-            || !options->cursor_lifetime_ms
+            || !options->max_batch_entries
+            || options->max_batch_entries > 65536 || !options->max_cursors
+            || options->max_cursors > 64 || !options->cursor_lifetime_ms
             || options->cursor_lifetime_ms > 60000
             || options->max_open_files < 16 || options->max_open_files > 4096
             || !options->background_jobs || options->background_jobs > 8)
         {
             return ngx_http_cache_rocksdb_error(error,
-    NGX_HTTP_CACHE_ROCKSDB_INVALID,
-    "invalid cache index options");
+                                                NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                                                "invalid cache index options");
         }
-        auto store = std::make_unique<ngx_http_cache_rocksdb_t>();
+
+        auto  store = std::make_unique<ngx_http_cache_rocksdb_t>();
         store->options = *options;
         store->cursors.reserve(options->max_cursors);
         const std::string name(path);
         store->lease = open((name + "/index.lock").c_str(),
                             O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+
         if (store->lease < 0) {
             return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_IO,
-    "cannot open cache index owner lock");
+                error, NGX_HTTP_CACHE_ROCKSDB_IO,
+                "cannot open cache index owner lock");
         }
+
         if (flock(store->lease, LOCK_EX | LOCK_NB) != 0) {
             return ngx_http_cache_rocksdb_error(
-    error,
-    (errno == EWOULDBLOCK || errno == EINTR) ?
-    NGX_HTTP_CACHE_ROCKSDB_BUSY :
-    NGX_HTTP_CACHE_ROCKSDB_IO,
-    "cache index owner lock unavailable");
+                error,
+                (errno == EWOULDBLOCK || errno == EINTR) ?
+                    NGX_HTTP_CACHE_ROCKSDB_BUSY :
+                    NGX_HTTP_CACHE_ROCKSDB_IO,
+                "cache index owner lock unavailable");
         }
-        int code = ngx_http_cache_rocksdb_initialize(store.get(), name, error);
+
+        int  code = ngx_http_cache_rocksdb_initialize(store.get(), name, error);
+
         if (code == NGX_HTTP_CACHE_ROCKSDB_OK) {
             /*
              * Establish the recovered prefix before exposing local tickets.
@@ -668,40 +744,47 @@ ngx_http_cache_rocksdb_open(const char                             *path,
              */
             code = ngx_http_cache_rocksdb_result(store->db->SyncWAL(), error);
         }
+
         if (code == NGX_HTTP_CACHE_ROCKSDB_OK) {
             *output = store.release();
         }
+
         return code;
     });
 }
 
 
 extern "C" int
-ngx_http_cache_rocksdb_reader_create(ngx_http_cache_rocksdb_t  *store,
-    uint32_t                   max_cursors,
-    ngx_http_cache_rocksdb_t **output,
+ngx_http_cache_rocksdb_reader_create(ngx_http_cache_rocksdb_t *store,
+    uint32_t max_cursors, ngx_http_cache_rocksdb_t **output,
     ngx_http_cache_rocksdb_error_t *error)
 {
     if (output) {
         *output = nullptr;
     }
+
     return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
-        int code = ngx_http_cache_rocksdb_check(store, error);
+        int  code = ngx_http_cache_rocksdb_check(store, error);
+
         if (code != 0) {
             return code;
         }
+
         if (!output || store->parent || !max_cursors
             || max_cursors > store->options.max_cursors)
         {
-            return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid reader handle");
+            return ngx_http_cache_rocksdb_error(error,
+                                                NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                                                "invalid reader handle");
         }
+
         if (store->readers.load() != 0) {
             return ngx_http_cache_rocksdb_error(error,
-    NGX_HTTP_CACHE_ROCKSDB_BUSY,
-    "cache index reader exists");
+                                                NGX_HTTP_CACHE_ROCKSDB_BUSY,
+                                                "cache index reader exists");
         }
-        auto reader = std::make_unique<ngx_http_cache_rocksdb_t>();
+
+        auto  reader = std::make_unique<ngx_http_cache_rocksdb_t>();
         reader->options = store->options;
         reader->options.max_cursors = max_cursors;
         reader->cursors.reserve(max_cursors);
@@ -713,132 +796,155 @@ ngx_http_cache_rocksdb_reader_create(ngx_http_cache_rocksdb_t  *store,
         store->readers.fetch_add(1);
         reader->parent = store;
         *output = reader.release();
+
         return 0;
     });
 }
 
 
 extern "C" int
-ngx_http_cache_rocksdb_reader_attach(ngx_http_cache_rocksdb_t       *reader,
+ngx_http_cache_rocksdb_reader_attach(ngx_http_cache_rocksdb_t *reader,
     ngx_http_cache_rocksdb_error_t *error)
 {
     return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
         if (!reader || !reader->parent || reader->attached) {
             return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_INVALID,
-    "reader is not awaiting handoff");
+                error, NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                "reader is not awaiting handoff");
         }
+
         if (reader->pid != getpid()) {
             return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_OWNER,
-    "reader process owner mismatch");
+                error, NGX_HTTP_CACHE_ROCKSDB_OWNER,
+                "reader process owner mismatch");
         }
+
         reader->thread = std::this_thread::get_id();
         reader->attached = true;
+
         return 0;
     });
 }
 
 
 extern "C" int
-ngx_http_cache_rocksdb_close(ngx_http_cache_rocksdb_t      **pointer,
+ngx_http_cache_rocksdb_close(ngx_http_cache_rocksdb_t **pointer,
     ngx_http_cache_rocksdb_error_t *error)
 {
     return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
         if (!pointer || !*pointer) {
             return ngx_http_cache_rocksdb_error(error,
-    NGX_HTTP_CACHE_ROCKSDB_INVALID,
-    "null cache index handle");
+                                                NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                                                "null cache index handle");
         }
-        auto *store = *pointer;
-        int   code = store->parent && !store->attached && store->owner() ?
-                         0 :
-                         ngx_http_cache_rocksdb_check(store, error);
+
+        auto  *store = *pointer;
+        int    code = store->parent && !store->attached && store->owner() ?
+                       0 :
+                       ngx_http_cache_rocksdb_check(store, error);
+
         if (code != NGX_HTTP_CACHE_ROCKSDB_OK) {
             return code;
         }
+
         if (!store->cursors.empty() || store->readers.load() != 0) {
             return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_BUSY,
-    "close cache index cursors and reader before the store");
+                error, NGX_HTTP_CACHE_ROCKSDB_BUSY,
+                "close cache index cursors and reader before the store");
         }
+
         if (store->parent) {
             delete store;
             *pointer = nullptr;
+
             return 0;
         }
-        auto status = store->pending_writes ? store->db->SyncWAL() :
+
+        auto  status = store->pending_writes ? store->db->SyncWAL() :
                                               rocksdb::Status::OK();
+
         for (auto *&handle : store->cf) {
             store->db->DestroyColumnFamilyHandle(handle);
             handle = nullptr;
         }
-        auto closed = store->db->Close();
+
+        auto  closed = store->db->Close();
+
         if (status.ok()) {
             status = closed;
         }
+
         delete store;
         *pointer = nullptr;
+
         return ngx_http_cache_rocksdb_result(status, error);
     });
 }
 
 
 extern "C" int
-ngx_http_cache_rocksdb_get(ngx_http_cache_rocksdb_t        *store,
-    ngx_http_cache_rocksdb_cf_e      cf,
-    ngx_http_cache_rocksdb_bytes_t   key,
+ngx_http_cache_rocksdb_get(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_rocksdb_cf_e cf, ngx_http_cache_rocksdb_bytes_t key,
     ngx_http_cache_rocksdb_buffer_t *value,
-    ngx_http_cache_rocksdb_error_t  *error)
+    ngx_http_cache_rocksdb_error_t *error)
 {
     return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
-        int code = ngx_http_cache_rocksdb_check(store, error);
+        int  code = ngx_http_cache_rocksdb_check(store, error);
+
         if (code != NGX_HTTP_CACHE_ROCKSDB_OK) {
             return code;
         }
+
         return ngx_http_cache_rocksdb_read(store, nullptr, cf, key, value,
-    error);
+                                           error);
     });
 }
 
 
 static int
-ngx_http_cache_rocksdb_write_internal(
-    ngx_http_cache_rocksdb_t                *store,
+ngx_http_cache_rocksdb_write_internal(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_rocksdb_mutation_t *mutations, size_t count,
     const ngx_http_cache_rocksdb_condition_t *conditions,
     size_t condition_count, int durable, ngx_http_cache_rocksdb_error_t *error)
 {
     return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
-        int code = ngx_http_cache_rocksdb_check(store, error);
+        int  code = ngx_http_cache_rocksdb_check(store, error);
+
         if (code != NGX_HTTP_CACHE_ROCKSDB_OK) {
             return code;
         }
+
         if (store->parent) {
-            return ngx_http_cache_rocksdb_error(error,
-    NGX_HTTP_CACHE_ROCKSDB_INVALID,
-    "read-only cache index handle");
+            return ngx_http_cache_rocksdb_error(
+                error, NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                "read-only cache index handle");
         }
+
         if (!count || !mutations || (condition_count && !conditions)) {
             return ngx_http_cache_rocksdb_error(error,
-    NGX_HTTP_CACHE_ROCKSDB_INVALID,
-    "invalid cache index batch");
+                                                NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                                                "invalid cache index batch");
         }
+
         if (store->writes == UINT64_MAX) {
             return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_LIMIT,
-    "cache index batch ticket overflow");
+                error, NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+                "cache index batch ticket overflow");
         }
+
         if (count > store->options.max_batch_entries
             || condition_count > store->options.max_batch_entries - count)
         {
             return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_LIMIT,
-    "cache index batch entry limit");
+                error, NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+                "cache index batch entry limit");
         }
-        size_t remaining = store->options.max_batch_bytes;
-        for (size_t i = 0; i < count; ++i) {
+
+        size_t  remaining = store->options.max_batch_bytes;
+
+        for (size_t  i = 0; i < count; ++i) {
             const auto &op = mutations[i];
+
             if (!ngx_http_cache_rocksdb_cf_valid(op.cf)
                 || !ngx_http_cache_rocksdb_key_valid(store, op.key)
                 || !ngx_http_cache_rocksdb_bytes_valid(
@@ -848,17 +954,20 @@ ngx_http_cache_rocksdb_write_internal(
                 || (op.type == NGX_HTTP_CACHE_ROCKSDB_DELETE && op.value.len))
             {
                 return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_INVALID,
-    "invalid cache index mutation");
+                    error, NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                    "invalid cache index mutation");
             }
+
             if (!ngx_http_cache_rocksdb_budget(remaining, op.key, op.value)) {
                 return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_LIMIT,
-    "cache index batch byte limit");
+                    error, NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+                    "cache index batch byte limit");
             }
         }
-        for (size_t i = 0; i < condition_count; ++i) {
+
+        for (size_t  i = 0; i < condition_count; ++i) {
             const auto &condition = conditions[i];
+
             if (!ngx_http_cache_rocksdb_cf_valid(condition.cf)
                 || !ngx_http_cache_rocksdb_key_valid(store, condition.key)
                 || !ngx_http_cache_rocksdb_bytes_valid(
@@ -867,64 +976,77 @@ ngx_http_cache_rocksdb_write_internal(
                 || (!condition.exists && condition.value.len))
             {
                 return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_INVALID,
-    "invalid cache index precondition");
+                    error, NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                    "invalid cache index precondition");
             }
+
             if (!ngx_http_cache_rocksdb_budget(remaining, condition.key,
                                                condition.value))
             {
                 return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_LIMIT,
-    "cache index batch byte limit");
+                    error, NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+                    "cache index batch byte limit");
             }
         }
-        for (size_t i = 0; i < condition_count; ++i) {
-            const auto            &condition = conditions[i];
-            rocksdb::PinnableSlice found;
-            auto                   status = store->db->Get(
+
+        for (size_t  i = 0; i < condition_count; ++i) {
+            const auto &condition = conditions[i];
+            rocksdb::PinnableSlice  found;
+            auto                    status = store->db->Get(
                 rocksdb::ReadOptions(), store->cf[condition.cf],
                 ngx_http_cache_rocksdb_slice(condition.key), &found);
+
             if (!status.ok() && !status.IsNotFound()) {
                 return ngx_http_cache_rocksdb_result(status, error);
             }
+
             if (status.ok() && found.size() > store->options.max_value_bytes) {
                 return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_LIMIT,
-    "cache index precondition record exceeds configured "
-    "limits");
+                    error, NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+                    "cache index precondition record exceeds configured "
+                    "limits");
             }
+
             if ((condition.exists
                  && (!status.ok()
-                     || found != ngx_http_cache_rocksdb_slice(condition.value)))
+                     || found
+                        != ngx_http_cache_rocksdb_slice(condition.value)))
                 || (!condition.exists && !status.IsNotFound()))
             {
                 ++store->conflicts;
+
                 return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
-    "cache index precondition changed");
+                    error, NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+                    "cache index precondition changed");
             }
         }
-        rocksdb::WriteBatch batch;
-        for (size_t i = 0; i < count; ++i) {
+
+        rocksdb::WriteBatch  batch;
+
+        for (size_t  i = 0; i < count; ++i) {
             const auto &op = mutations[i];
+
             if (op.type == NGX_HTTP_CACHE_ROCKSDB_PUT) {
                 batch.Put(store->cf[op.cf],
                           ngx_http_cache_rocksdb_slice(op.key),
-    ngx_http_cache_rocksdb_slice(op.value));
+                          ngx_http_cache_rocksdb_slice(op.value));
             } else {
                 batch.Delete(store->cf[op.cf],
                              ngx_http_cache_rocksdb_slice(op.key));
             }
         }
-        rocksdb::WriteOptions write;
-        size_t                bytes = batch.GetDataSize();
+
+        rocksdb::WriteOptions  write;
+        size_t                 bytes = batch.GetDataSize();
         write.sync =
             durable || store->pending_writes >= 63
             || bytes >= store->options.max_batch_bytes
             || store->pending_bytes >= store->options.max_batch_bytes - bytes;
-        auto status = store->db->Write(write, &batch);
+        auto  status = store->db->Write(write, &batch);
+
         if (status.ok()) {
             ++store->writes;
+
             if (write.sync) {
                 store->synced_writes = store->writes;
                 store->pending_bytes = 0;
@@ -934,58 +1056,63 @@ ngx_http_cache_rocksdb_write_internal(
                 store->pending_writes++;
             }
         }
+
         return ngx_http_cache_rocksdb_result(status, error);
     });
 }
 
 
 extern "C" int
-ngx_http_cache_rocksdb_write(
-    ngx_http_cache_rocksdb_t                *store,
+ngx_http_cache_rocksdb_write(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_rocksdb_mutation_t *mutations, size_t count,
     const ngx_http_cache_rocksdb_condition_t *conditions,
     size_t condition_count, ngx_http_cache_rocksdb_error_t *error)
 {
     return ngx_http_cache_rocksdb_write_internal(
-    store, mutations, count, conditions, condition_count, 1, error);
+        store, mutations, count, conditions, condition_count, 1, error);
 }
 
 
 extern "C" int
-ngx_http_cache_rocksdb_write_deferred(
-    ngx_http_cache_rocksdb_t                *store,
+ngx_http_cache_rocksdb_write_deferred(ngx_http_cache_rocksdb_t *store,
     const ngx_http_cache_rocksdb_mutation_t *mutations, size_t count,
     const ngx_http_cache_rocksdb_condition_t *conditions,
     size_t condition_count, ngx_http_cache_rocksdb_error_t *error)
 {
     return ngx_http_cache_rocksdb_write_internal(
-    store, mutations, count, conditions, condition_count, 0, error);
+        store, mutations, count, conditions, condition_count, 0, error);
 }
 
 
 extern "C" int
-ngx_http_cache_rocksdb_sync(ngx_http_cache_rocksdb_t       *store,
+ngx_http_cache_rocksdb_sync(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_error_t *error)
 {
     return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
-        int rc = ngx_http_cache_rocksdb_check(store, error);
+        int  rc = ngx_http_cache_rocksdb_check(store, error);
+
         if (rc != 0) {
             return rc;
         }
+
         if (store->parent) {
-            return ngx_http_cache_rocksdb_error(error,
-    NGX_HTTP_CACHE_ROCKSDB_INVALID,
-    "read-only cache index handle");
+            return ngx_http_cache_rocksdb_error(
+                error, NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                "read-only cache index handle");
         }
+
         if (!store->pending_writes) {
             return 0;
         }
-        auto status = store->db->SyncWAL();
+
+        auto  status = store->db->SyncWAL();
+
         if (status.ok()) {
             store->synced_writes = store->writes;
             store->pending_bytes = 0;
             store->pending_writes = 0;
         }
+
         return ngx_http_cache_rocksdb_result(status, error);
     });
 }
@@ -993,44 +1120,51 @@ ngx_http_cache_rocksdb_sync(ngx_http_cache_rocksdb_t       *store,
 
 extern "C" int
 ngx_http_cache_rocksdb_durability(ngx_http_cache_rocksdb_t *store,
-    uint64_t *written, uint64_t *synced,
-    ngx_http_cache_rocksdb_error_t *error)
+    uint64_t *written, uint64_t *synced, ngx_http_cache_rocksdb_error_t *error)
 {
     if (written) {
         *written = 0;
     }
+
     if (synced) {
         *synced = 0;
     }
+
     return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
-        int rc = ngx_http_cache_rocksdb_check(store, error);
+        int  rc = ngx_http_cache_rocksdb_check(store, error);
+
         if (rc != 0) {
             return rc;
         }
+
         if (!written || !synced || written == synced || store->parent) {
             return ngx_http_cache_rocksdb_error(error,
-    NGX_HTTP_CACHE_ROCKSDB_INVALID,
-    "invalid durability output");
+                                                NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                                                "invalid durability output");
         }
+
         *written = store->writes;
         *synced = store->synced_writes;
+
         return NGX_HTTP_CACHE_ROCKSDB_OK;
     });
 }
 
 
 static int
-ngx_http_cache_rocksdb_open_cursor(
-    ngx_http_cache_rocksdb_t *store, ngx_http_cache_rocksdb_cf_e cf,
-    ngx_http_cache_rocksdb_bytes_t prefix, ngx_http_cache_rocksdb_bytes_t after,
-    bool fill_cache, std::shared_ptr<ngx_http_cache_rocksdb_snapshot_s> view,
+ngx_http_cache_rocksdb_open_cursor(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_rocksdb_cf_e cf, ngx_http_cache_rocksdb_bytes_t prefix,
+    ngx_http_cache_rocksdb_bytes_t after, bool fill_cache,
+    std::shared_ptr<ngx_http_cache_rocksdb_snapshot_s> view,
     ngx_http_cache_rocksdb_cursor_t **output,
-    ngx_http_cache_rocksdb_error_t   *error)
+    ngx_http_cache_rocksdb_error_t *error)
 {
-    int code = ngx_http_cache_rocksdb_check(store, error);
+    int  code = ngx_http_cache_rocksdb_check(store, error);
+
     if (code != NGX_HTTP_CACHE_ROCKSDB_OK) {
         return code;
     }
+
     if (!output || !ngx_http_cache_rocksdb_cf_valid(cf)
         || !ngx_http_cache_rocksdb_bytes_valid(prefix,
                                                store->options.max_key_bytes)
@@ -1040,122 +1174,143 @@ ngx_http_cache_rocksdb_open_cursor(
             && !ngx_http_cache_rocksdb_slice(after).starts_with(
                 ngx_http_cache_rocksdb_slice(prefix))))
     {
-        return ngx_http_cache_rocksdb_error(error,
-    NGX_HTTP_CACHE_ROCKSDB_INVALID,
-    "invalid cache index cursor range");
+        return ngx_http_cache_rocksdb_error(
+            error, NGX_HTTP_CACHE_ROCKSDB_INVALID,
+            "invalid cache index cursor range");
     }
+
     if (store->cursors.size() >= store->options.max_cursors) {
-        return ngx_http_cache_rocksdb_error(error, NGX_HTTP_CACHE_ROCKSDB_LIMIT,
-    "cache index cursor handle limit");
+        return ngx_http_cache_rocksdb_error(error,
+                                            NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+                                            "cache index cursor handle limit");
     }
+
     if (view && ngx_http_cache_rocksdb_clock_t::now() >= view->deadline) {
         return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_EXPIRED,
-    "cache index parent snapshot expired");
+            error, NGX_HTTP_CACHE_ROCKSDB_EXPIRED,
+            "cache index parent snapshot expired");
     }
-    auto cursor = std::make_unique<ngx_http_cache_rocksdb_cursor_t>(store);
+
+    auto  cursor = std::make_unique<ngx_http_cache_rocksdb_cursor_t>(store);
     cursor->prefix = ngx_http_cache_rocksdb_slice(prefix).ToString();
     cursor->upper = cursor->prefix;
+
     while (!cursor->upper.empty()
            && static_cast<unsigned char>(cursor->upper.back()) == 255)
     {
         cursor->upper.pop_back();
     }
+
     if (!cursor->upper.empty()) {
         ++cursor->upper.back();
     }
+
     cursor->bound = cursor->upper;
+
     if (!view) {
         view = std::make_shared<ngx_http_cache_rocksdb_snapshot_s>(store);
         view->snapshot = store->db->GetSnapshot();
+
         if (!view->snapshot) {
             return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_IO,
-    "cache index snapshot unavailable");
+                error, NGX_HTTP_CACHE_ROCKSDB_IO,
+                "cache index snapshot unavailable");
         }
+
         view->deadline =
             ngx_http_cache_rocksdb_clock_t::now()
             + std::chrono::milliseconds(store->options.cursor_lifetime_ms);
     }
+
     cursor->view = std::move(view);
-    rocksdb::ReadOptions read;
+    rocksdb::ReadOptions  read;
     read.snapshot = cursor->view->snapshot;
     read.fill_cache = fill_cache;
     read.total_order_seek = true;
+
     if (!cursor->upper.empty()) {
         read.iterate_upper_bound = &cursor->bound;
     }
+
     cursor->iterator.reset(store->db->NewIterator(read, store->cf[cf]));
     cursor->iterator->Seek(after.len ? ngx_http_cache_rocksdb_slice(after) :
                                        ngx_http_cache_rocksdb_slice(prefix));
+
     if (after.len && cursor->iterator->Valid()
         && cursor->iterator->key() == ngx_http_cache_rocksdb_slice(after))
     {
         cursor->iterator->Next();
     }
+
     if (!cursor->iterator->status().ok()) {
-        return ngx_http_cache_rocksdb_result(cursor->iterator->status(), error);
+        return ngx_http_cache_rocksdb_result(cursor->iterator->status(),
+                                             error);
     }
+
     store->cursors.push_back(cursor.get());
     *output = cursor.release();
+
     return NGX_HTTP_CACHE_ROCKSDB_OK;
 }
 
 
 extern "C" int
-ngx_http_cache_rocksdb_cursor_open(ngx_http_cache_rocksdb_t         *store,
-    ngx_http_cache_rocksdb_cf_e       cf,
-    ngx_http_cache_rocksdb_bytes_t    prefix,
-    ngx_http_cache_rocksdb_bytes_t    after,
+ngx_http_cache_rocksdb_cursor_open(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_rocksdb_cf_e cf, ngx_http_cache_rocksdb_bytes_t prefix,
+    ngx_http_cache_rocksdb_bytes_t after,
     ngx_http_cache_rocksdb_cursor_t **output,
-    ngx_http_cache_rocksdb_error_t   *error)
+    ngx_http_cache_rocksdb_error_t *error)
 {
     if (output) {
         *output = nullptr;
     }
+
     return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
         return ngx_http_cache_rocksdb_open_cursor(
-    store, cf, prefix, after, false, nullptr, output, error);
+            store, cf, prefix, after, false, nullptr, output, error);
     });
 }
 
 
 extern "C" int
-ngx_http_cache_rocksdb_cursor_open_cached(
-    ngx_http_cache_rocksdb_t *store, ngx_http_cache_rocksdb_cf_e cf,
-    ngx_http_cache_rocksdb_bytes_t prefix, ngx_http_cache_rocksdb_bytes_t after,
+ngx_http_cache_rocksdb_cursor_open_cached(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_rocksdb_cf_e cf, ngx_http_cache_rocksdb_bytes_t prefix,
+    ngx_http_cache_rocksdb_bytes_t after,
     ngx_http_cache_rocksdb_cursor_t **output,
-    ngx_http_cache_rocksdb_error_t   *error)
+    ngx_http_cache_rocksdb_error_t *error)
 {
     if (output) {
         *output = nullptr;
     }
+
     return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
-        return ngx_http_cache_rocksdb_open_cursor(store, cf, prefix, after,
-    true, nullptr, output, error);
+        return ngx_http_cache_rocksdb_open_cursor(
+            store, cf, prefix, after, true, nullptr, output, error);
     });
 }
 
 
 extern "C" int
-ngx_http_cache_rocksdb_cursor_fork(ngx_http_cache_rocksdb_cursor_t  *parent,
-    ngx_http_cache_rocksdb_cf_e       cf,
-    ngx_http_cache_rocksdb_bytes_t    prefix,
-    ngx_http_cache_rocksdb_bytes_t    after,
+ngx_http_cache_rocksdb_cursor_fork(ngx_http_cache_rocksdb_cursor_t *parent,
+    ngx_http_cache_rocksdb_cf_e cf, ngx_http_cache_rocksdb_bytes_t prefix,
+    ngx_http_cache_rocksdb_bytes_t after,
     ngx_http_cache_rocksdb_cursor_t **output,
-    ngx_http_cache_rocksdb_error_t   *error)
+    ngx_http_cache_rocksdb_error_t *error)
 {
     if (output) {
         *output = nullptr;
     }
+
     return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
-        int code = ngx_http_cache_rocksdb_check(parent, error);
+        int  code = ngx_http_cache_rocksdb_check(parent, error);
+
         if (code != NGX_HTTP_CACHE_ROCKSDB_OK) {
             return code;
         }
+
         return ngx_http_cache_rocksdb_open_cursor(parent->store, cf, prefix,
-    after, false, parent->view,
-    output, error);
+                                                  after, false, parent->view,
+                                                  output, error);
     });
 }
 
@@ -1164,47 +1319,58 @@ extern "C" int
 ngx_http_cache_rocksdb_cursor_next(ngx_http_cache_rocksdb_cursor_t *cursor,
     ngx_http_cache_rocksdb_buffer_t *key,
     ngx_http_cache_rocksdb_buffer_t *value,
-    ngx_http_cache_rocksdb_error_t  *error)
+    ngx_http_cache_rocksdb_error_t *error)
 {
     return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
-        int code = ngx_http_cache_rocksdb_check(cursor, error);
+        int  code = ngx_http_cache_rocksdb_check(cursor, error);
+
         if (code != NGX_HTTP_CACHE_ROCKSDB_OK) {
             return code;
         }
+
         if (!ngx_http_cache_rocksdb_buffer_valid(key)
             || !ngx_http_cache_rocksdb_buffer_valid(value))
         {
             return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_INVALID,
-    "invalid cache index cursor buffers");
+                error, NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                "invalid cache index cursor buffers");
         }
+
         key->length = 0;
         value->length = 0;
+
         if (!cursor->iterator->status().ok()) {
             return ngx_http_cache_rocksdb_result(cursor->iterator->status(),
-    error);
+                                                 error);
         }
+
         if (!cursor->iterator->Valid()
             || !cursor->iterator->key().starts_with(cursor->prefix))
         {
             return NGX_HTTP_CACHE_ROCKSDB_DONE;
         }
-        auto k = cursor->iterator->key(), v = cursor->iterator->value();
+
+        auto  k = cursor->iterator->key(), v = cursor->iterator->value();
+
         if (k.size() > cursor->store->options.max_key_bytes
             || v.size() > cursor->store->options.max_value_bytes)
         {
             return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_LIMIT,
-    "cache index cursor record exceeds configured limits");
+                error, NGX_HTTP_CACHE_ROCKSDB_LIMIT,
+                "cache index cursor record exceeds configured limits");
         }
+
         key->length = k.size();
         value->length = v.size();
+
         if (key->capacity < k.size() || value->capacity < v.size()) {
             return NGX_HTTP_CACHE_ROCKSDB_BUFFER;
         }
+
         ngx_http_cache_rocksdb_copy(k, key);
         ngx_http_cache_rocksdb_copy(v, value);
         cursor->iterator->Next();
+
         return NGX_HTTP_CACHE_ROCKSDB_OK;
     });
 }
@@ -1212,26 +1378,30 @@ ngx_http_cache_rocksdb_cursor_next(ngx_http_cache_rocksdb_cursor_t *cursor,
 
 extern "C" int
 ngx_http_cache_rocksdb_cursor_seek_le(ngx_http_cache_rocksdb_cursor_t *cursor,
-    ngx_http_cache_rocksdb_bytes_t   target,
+    ngx_http_cache_rocksdb_bytes_t target,
     ngx_http_cache_rocksdb_buffer_t *key,
     ngx_http_cache_rocksdb_buffer_t *value,
-    ngx_http_cache_rocksdb_error_t  *error)
+    ngx_http_cache_rocksdb_error_t *error)
 {
     return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
-        int code = ngx_http_cache_rocksdb_check(cursor, error);
+        int  code = ngx_http_cache_rocksdb_check(cursor, error);
+
         if (code != NGX_HTTP_CACHE_ROCKSDB_OK) {
             return code;
         }
+
         if (!ngx_http_cache_rocksdb_bytes_valid(
                 target, cursor->store->options.max_key_bytes)
             || !ngx_http_cache_rocksdb_slice(target).starts_with(
                 cursor->prefix))
         {
             return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_INVALID,
-    "invalid predecessor target outside cursor prefix");
+                error, NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                "invalid predecessor target outside cursor prefix");
         }
+
         cursor->iterator->SeekForPrev(ngx_http_cache_rocksdb_slice(target));
+
         return ngx_http_cache_rocksdb_cursor_next(cursor, key, value, error);
     });
 }
@@ -1239,80 +1409,93 @@ ngx_http_cache_rocksdb_cursor_seek_le(ngx_http_cache_rocksdb_cursor_t *cursor,
 
 extern "C" int
 ngx_http_cache_rocksdb_cursor_get(ngx_http_cache_rocksdb_cursor_t *cursor,
-    ngx_http_cache_rocksdb_cf_e      cf,
-    ngx_http_cache_rocksdb_bytes_t   key,
+    ngx_http_cache_rocksdb_cf_e cf, ngx_http_cache_rocksdb_bytes_t key,
     ngx_http_cache_rocksdb_buffer_t *value,
-    ngx_http_cache_rocksdb_error_t  *error)
+    ngx_http_cache_rocksdb_error_t *error)
 {
     return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
-        int code = ngx_http_cache_rocksdb_check(cursor, error);
+        int  code = ngx_http_cache_rocksdb_check(cursor, error);
+
         if (code != NGX_HTTP_CACHE_ROCKSDB_OK) {
             return code;
         }
+
         return ngx_http_cache_rocksdb_read(
-    cursor->store, cursor->view->snapshot, cf, key, value, error);
+            cursor->store, cursor->view->snapshot, cf, key, value, error);
     });
 }
 
 
 extern "C" int
 ngx_http_cache_rocksdb_cursor_close(ngx_http_cache_rocksdb_cursor_t **pointer,
-    ngx_http_cache_rocksdb_error_t   *error)
+    ngx_http_cache_rocksdb_error_t *error)
 {
     return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
         if (!pointer || !*pointer) {
             return ngx_http_cache_rocksdb_error(error,
-    NGX_HTTP_CACHE_ROCKSDB_INVALID,
-    "null cache index cursor");
+                                                NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                                                "null cache index cursor");
         }
-        auto *cursor = *pointer;
-        int   code = ngx_http_cache_rocksdb_check(cursor->store, error);
+
+        auto  *cursor = *pointer;
+        int    code = ngx_http_cache_rocksdb_check(cursor->store, error);
+
         if (code != NGX_HTTP_CACHE_ROCKSDB_OK) {
             return code;
         }
+
         auto &cursors = cursor->store->cursors;
         auto  found = std::find(cursors.begin(), cursors.end(), cursor);
+
         if (found == cursors.end()) {
             return ngx_http_cache_rocksdb_error(
-    error, NGX_HTTP_CACHE_ROCKSDB_INVALID,
-    "unregistered cache index cursor");
+                error, NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                "unregistered cache index cursor");
         }
+
         cursors.erase(found);
         delete cursor;
         *pointer = nullptr;
+
         return NGX_HTTP_CACHE_ROCKSDB_OK;
     });
 }
 
 
 extern "C" int
-ngx_http_cache_rocksdb_stats(ngx_http_cache_rocksdb_t       *store,
+ngx_http_cache_rocksdb_stats(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_stats_t *stats,
     ngx_http_cache_rocksdb_error_t *error)
 {
     return ngx_http_cache_rocksdb_boundary(error, [&]() -> int {
-        int code = ngx_http_cache_rocksdb_check(store, error);
+        int  code = ngx_http_cache_rocksdb_check(store, error);
+
         if (code != NGX_HTTP_CACHE_ROCKSDB_OK) {
             return code;
         }
+
         if (!stats) {
             return ngx_http_cache_rocksdb_error(error,
-    NGX_HTTP_CACHE_ROCKSDB_INVALID,
-    "null cache index stats");
+                                                NGX_HTTP_CACHE_ROCKSDB_INVALID,
+                                                "null cache index stats");
         }
+
         std::memset(stats, 0, sizeof(*stats));
         stats->cache_capacity = store->cache->GetCapacity();
         stats->cache_usage = store->cache->GetUsage();
         stats->cache_pinned = store->cache->GetPinnedUsage();
         stats->write_buffer_usage = store->buffers->memory_usage();
         stats->cursor_handles = store->cursors.size();
+
         for (auto *cursor : store->cursors) {
             if (!cursor->expired) {
                 ++stats->active_cursors;
             }
         }
+
         for (auto *cf : store->cf) {
-            uint64_t value = 0;
+            uint64_t  value = 0;
+
             store->db->GetIntProperty(cf, "rocksdb.estimate-table-readers-mem",
                                       &value);
             stats->table_reader_memory += value;
@@ -1321,8 +1504,10 @@ ngx_http_cache_rocksdb_stats(ngx_http_cache_rocksdb_t       *store,
                                       &value);
             stats->memtable_memory += value;
         }
+
         stats->writes = store->writes;
         stats->conflicts = store->conflicts;
+
         return NGX_HTTP_CACHE_ROCKSDB_OK;
     });
 }

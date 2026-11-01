@@ -1,4 +1,8 @@
-/* Copyright (C) Hanada */
+
+/*
+ * Copyright (C) Hanada
+ */
+
 
 #include <ngx_config.h>
 #include <ngx_core.h>
@@ -23,19 +27,24 @@ ngx_http_cache_purge_native_lookup(ngx_http_file_cache_t *cache,
     ngx_memcpy(&hash, key, sizeof(hash));
     node = cache->sh->rbtree.root;
     sentinel = cache->sh->rbtree.sentinel;
+
     while (node != sentinel) {
         if (hash != node->key) {
             node = hash < node->key ? node->left : node->right;
             continue;
         }
+
         file = (ngx_http_file_cache_node_t *) node;
         compare = ngx_memcmp(key + sizeof(hash), file->key,
-                            NGX_HTTP_CACHE_KEY_LEN - sizeof(hash));
+                             NGX_HTTP_CACHE_KEY_LEN - sizeof(hash));
+
         if (compare == 0) {
             return file;
         }
+
         node = compare < 0 ? node->left : node->right;
     }
+
     return NULL;
 }
 
@@ -43,7 +52,7 @@ ngx_http_cache_purge_native_lookup(ngx_http_file_cache_t *cache,
 /* Read fill identity without retaining a node pointer or statting a file. */
 ngx_int_t
 ngx_http_cache_purge_native_identity(ngx_http_file_cache_t *cache,
-    const u_char  *key, ngx_file_uniq_t *uniq)
+    const u_char *key, ngx_file_uniq_t *uniq)
 {
     ngx_int_t                    rc;
     ngx_http_file_cache_node_t  *file;
@@ -52,11 +61,14 @@ ngx_http_cache_purge_native_identity(ngx_http_file_cache_t *cache,
     rc = NGX_DECLINED;
     ngx_shmtx_lock(&cache->shpool->mutex);
     file = ngx_http_cache_purge_native_lookup(cache, key);
+
     if (file != NULL && file->exists && file->uniq != 0) {
         *uniq = file->uniq;
         rc = NGX_OK;
     }
+
     ngx_shmtx_unlock(&cache->shpool->mutex);
+
     return rc;
 }
 
@@ -64,18 +76,22 @@ ngx_http_cache_purge_native_identity(ngx_http_file_cache_t *cache,
 /* Node state is touched only by a worker, under the native cache-zone lock. */
 ngx_int_t
 ngx_http_cache_purge_native_node(ngx_http_file_cache_t *cache,
-    const u_char  *key, ngx_file_uniq_t expected, ngx_uint_t action)
+    const u_char *key, ngx_file_uniq_t expected, ngx_uint_t action)
 {
     ngx_int_t                    rc;
     ngx_http_file_cache_node_t  *file;
 
     ngx_shmtx_lock(&cache->shpool->mutex);
     file = ngx_http_cache_purge_native_lookup(cache, key);
+
     if (file == NULL || (expected != 0 && expected != file->uniq)) {
         ngx_shmtx_unlock(&cache->shpool->mutex);
+
         return NGX_DECLINED;
     }
+
     rc = NGX_OK;
+
     switch (action) {
     case NGX_HTTP_CACHE_PURGE_NODE_READ:
         rc = file->purged;
@@ -114,7 +130,9 @@ ngx_http_cache_purge_native_node(ngx_http_file_cache_t *cache,
         rc = NGX_ERROR;
         break;
     }
+
     ngx_shmtx_unlock(&cache->shpool->mutex);
+
     return rc;
 }
 
@@ -122,24 +140,26 @@ ngx_http_cache_purge_native_node(ngx_http_file_cache_t *cache,
 /* These operations run in the background executor, never on a cache HIT. */
 ngx_int_t
 ngx_http_cache_purge_native_file(const char *name, ngx_uint_t invalidate,
-    ngx_file_uniq_t  expected, ngx_http_cache_purge_native_file_t *result)
+    ngx_file_uniq_t expected, ngx_http_cache_purge_native_file_t *result)
 {
-    size_t                         size;
-    time_t                         expired;
-    u_char                        *p;
-    ssize_t                        n;
-    ngx_fd_t                       fd;
-    ngx_err_t                      err;
-    ngx_int_t                      rc;
-    ngx_file_info_t                info;
-    ngx_http_file_cache_header_t   header;
+    size_t                        size;
+    time_t                        expired;
+    u_char                       *p;
+    ssize_t                       n;
+    ngx_fd_t                      fd;
+    ngx_err_t                     err;
+    ngx_int_t                     rc;
+    ngx_file_info_t               info;
+    ngx_http_file_cache_header_t  header;
 
     ngx_memzero(result, sizeof(*result));
 
-    fd = open(name, (invalidate ? O_RDWR : O_RDONLY) | O_CLOEXEC
-                    | O_NOFOLLOW | O_NONBLOCK);
+    fd = open(name, (invalidate ? O_RDWR : O_RDONLY) | O_CLOEXEC | O_NOFOLLOW
+                    | O_NONBLOCK);
+
     if (fd == NGX_INVALID_FILE) {
         result->error = ngx_errno;
+
         return result->error == NGX_ENOENT ? NGX_DECLINED : NGX_ERROR;
     }
 
@@ -180,6 +200,7 @@ ngx_http_cache_purge_native_file(const char *name, ngx_uint_t invalidate,
 
     while (size != sizeof(header)) {
         n = pread(fd, p + size, sizeof(header) - size, (off_t) size);
+
         if (n > 0) {
             size += n;
             continue;
@@ -210,6 +231,7 @@ ngx_http_cache_purge_native_file(const char *name, ngx_uint_t invalidate,
         n = pwrite(fd, p + size, sizeof(expired) - size,
                    (off_t) offsetof(ngx_http_file_cache_header_t, valid_sec)
                    + size);
+
         if (n > 0) {
             size += n;
             continue;

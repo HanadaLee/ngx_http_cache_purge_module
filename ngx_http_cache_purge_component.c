@@ -1,4 +1,8 @@
-/* Copyright (C) Hanada */
+
+/*
+ * Copyright (C) Hanada
+ */
+
 
 #include "ngx_http_cache_purge_internal.h"
 #include <stdlib.h>
@@ -23,31 +27,30 @@ struct ngx_http_cache_purge_jobs_s {
 };
 
 
-static int ngx_http_cache_purge_job_error(ngx_http_cache_rocksdb_error_t *error,
-    int  code, const char *message);
+static int ngx_http_cache_purge_job_error(
+    ngx_http_cache_rocksdb_error_t *error, int code, const char *message);
 static unsigned char *ngx_http_cache_purge_job_number(unsigned char *p,
     uint64_t value, size_t size);
 static uint64_t ngx_http_cache_purge_job_decode(const unsigned char *p,
     size_t size);
 static int ngx_http_cache_purge_job_valid(
     const ngx_http_cache_purge_job_t *job);
-static size_t ngx_http_cache_purge_job_encode(ngx_http_cache_purge_jobs_t *jobs,
-    const ngx_http_cache_purge_job_t *job);
+static size_t ngx_http_cache_purge_job_encode(
+    ngx_http_cache_purge_jobs_t *jobs, const ngx_http_cache_purge_job_t *job);
 static int ngx_http_cache_purge_job_save(ngx_http_cache_purge_jobs_t *jobs,
-    const ngx_http_cache_purge_job_t  *job, int durable,
+    const ngx_http_cache_purge_job_t *job, int durable,
     ngx_http_cache_rocksdb_error_t *error);
 static int ngx_http_cache_purge_job_equal(ngx_http_cache_rocksdb_bytes_t a,
     ngx_http_cache_rocksdb_bytes_t b);
 
 
-static ngx_http_cache_rocksdb_bytes_t  ngx_http_cache_purge_job_empty = {
-    NULL, 0
-};
+static ngx_http_cache_rocksdb_bytes_t  ngx_http_cache_purge_job_empty = { NULL,
+                                                                          0 };
 
 
 static int
-ngx_http_cache_purge_job_error(ngx_http_cache_rocksdb_error_t *error,
-    int  code, const char *message)
+ngx_http_cache_purge_job_error(ngx_http_cache_rocksdb_error_t *error, int code,
+    const char *message)
 {
     if (error != NULL) {
         error->code = code;
@@ -75,6 +78,7 @@ ngx_http_cache_purge_job_decode(const unsigned char *p, size_t size)
     uint64_t  value;
 
     value = 0;
+
     while (size--) {
         value = (value << 8) | *p++;
     }
@@ -92,6 +96,7 @@ ngx_http_cache_purge_job_valid(const ngx_http_cache_purge_job_t *job)
     ngx_http_cache_rocksdb_bytes_t        tags[NGX_HTTP_CACHE_PURGE_TAG_SELECT];
 
     s = &job->select;
+
     if (job->issued == 0 || job->action > NGX_HTTP_CACHE_PURGE_INVALIDATE
         || job->done > 1 || s->type > NGX_HTTP_CACHE_PURGE_SELECT_TAG
         || s->host_scope > 1 || s->value.len == 0
@@ -110,11 +115,14 @@ ngx_http_cache_purge_job_valid(const ngx_http_cache_purge_job_t *job)
     text[1] = s->namespace_value;
     text[2] = s->misc;
     text[3] = job->bookmark;
+
     for (i = 0; i < 4; i++) {
         maximum = i == 3 ? NGX_HTTP_CACHE_PURGE_JOB_TOKEN : 32768;
+
         if (i == 0 && s->type == NGX_HTTP_CACHE_PURGE_SELECT_TAG) {
             maximum = NGX_HTTP_CACHE_PURGE_TAG_LIST_MAX;
         }
+
         if (text[i].len > maximum
             || (text[i].len != 0 && text[i].data == NULL))
         {
@@ -130,9 +138,9 @@ static size_t
 ngx_http_cache_purge_job_encode(ngx_http_cache_purge_jobs_t *jobs,
     const ngx_http_cache_purge_job_t *job)
 {
-    size_t                           i;
-    unsigned char                   *p;
-    ngx_http_cache_rocksdb_bytes_t   text[4];
+    size_t                          i;
+    unsigned char                  *p;
+    ngx_http_cache_rocksdb_bytes_t  text[4];
 
     p = jobs->output;
     memcpy(p, "PJ1", 4);
@@ -151,6 +159,7 @@ ngx_http_cache_purge_job_encode(ngx_http_cache_purge_jobs_t *jobs,
     text[1] = job->select.namespace_value;
     text[2] = job->select.misc;
     text[3] = job->bookmark;
+
     for (i = 0; i < 4; i++) {
         p = ngx_http_cache_purge_job_number(p, text[i].len, 4);
     }
@@ -168,7 +177,7 @@ ngx_http_cache_purge_job_encode(ngx_http_cache_purge_jobs_t *jobs,
 
 static int
 ngx_http_cache_purge_job_save(ngx_http_cache_purge_jobs_t *jobs,
-    const ngx_http_cache_purge_job_t  *job, int durable,
+    const ngx_http_cache_purge_job_t *job, int durable,
     ngx_http_cache_rocksdb_error_t *error)
 {
     size_t                             length;
@@ -187,23 +196,23 @@ ngx_http_cache_purge_job_save(ngx_http_cache_purge_jobs_t *jobs,
     rows[0].value.len = length;
     rows[1].key.data = keys[1];
     rows[1].key.len = sizeof(keys[1]);
-    rows[1].type = job->done ? NGX_HTTP_CACHE_ROCKSDB_DELETE
-                             : NGX_HTTP_CACHE_ROCKSDB_PUT;
+    rows[1].type =
+        job->done ? NGX_HTTP_CACHE_ROCKSDB_DELETE : NGX_HTTP_CACHE_ROCKSDB_PUT;
 
     if (durable) {
         return ngx_http_cache_rocksdb_write(jobs->store, rows, 2, NULL, 0,
                                             error);
     }
 
-    return ngx_http_cache_rocksdb_write_deferred(jobs->store, rows, 1,
-                                                 NULL, 0, error);
+    return ngx_http_cache_rocksdb_write_deferred(jobs->store, rows, 1, NULL, 0,
+                                                 error);
 }
 
 
 int
 ngx_http_cache_purge_jobs_open(ngx_http_cache_rocksdb_t *store,
-    ngx_http_cache_purge_catalog_t  *catalog,
-    ngx_http_cache_purge_jobs_t    **out, ngx_http_cache_rocksdb_error_t *error)
+    ngx_http_cache_purge_catalog_t *catalog, ngx_http_cache_purge_jobs_t **out,
+    ngx_http_cache_rocksdb_error_t *error)
 {
     ngx_http_cache_purge_jobs_t  *jobs;
 
@@ -212,14 +221,16 @@ ngx_http_cache_purge_jobs_open(ngx_http_cache_rocksdb_t *store,
     }
 
     *out = NULL;
+
     if (store == NULL || catalog == NULL) {
         return NGX_HTTP_CACHE_ROCKSDB_INVALID;
     }
 
     jobs = calloc(1, sizeof(*jobs));
+
     if (jobs == NULL) {
-        return ngx_http_cache_purge_job_error(error,
-                  NGX_HTTP_CACHE_ROCKSDB_LIMIT, "cannot allocate purge jobs");
+        return ngx_http_cache_purge_job_error(
+            error, NGX_HTTP_CACHE_ROCKSDB_LIMIT, "cannot allocate purge jobs");
     }
 
     jobs->store = store;
@@ -239,15 +250,15 @@ ngx_http_cache_purge_jobs_close(ngx_http_cache_purge_jobs_t *jobs)
 
 int
 ngx_http_cache_purge_job_get(ngx_http_cache_purge_jobs_t *jobs,
-    const unsigned char  id[16], ngx_http_cache_purge_job_t *job,
+    const unsigned char id[16], ngx_http_cache_purge_job_t *job,
     ngx_http_cache_rocksdb_error_t *error)
 {
-    int                               rc;
-    size_t                            i, length, offset;
-    const unsigned char              *p;
-    ngx_http_cache_rocksdb_buffer_t   value;
-    unsigned char                     raw[17];
-    ngx_http_cache_rocksdb_bytes_t    key, text[4];
+    int                              rc;
+    size_t                           i, length, offset;
+    const unsigned char             *p;
+    ngx_http_cache_rocksdb_buffer_t  value;
+    unsigned char                    raw[17];
+    ngx_http_cache_rocksdb_bytes_t   key, text[4];
 
     raw[0] = 'J';
     memcpy(raw + 1, id, 16);
@@ -255,8 +266,9 @@ ngx_http_cache_purge_job_get(ngx_http_cache_purge_jobs_t *jobs,
     key.len = sizeof(raw);
     value.data = jobs->input;
     value.capacity = sizeof(jobs->input);
-    rc = ngx_http_cache_rocksdb_get(jobs->store,
-                       NGX_HTTP_CACHE_ROCKSDB_DEFAULT, key, &value, error);
+    rc = ngx_http_cache_rocksdb_get(
+        jobs->store, NGX_HTTP_CACHE_ROCKSDB_DEFAULT, key, &value, error);
+
     if (rc != 0) {
         return rc;
     }
@@ -281,8 +293,10 @@ ngx_http_cache_purge_job_get(ngx_http_cache_purge_jobs_t *jobs,
     job->skipped = ngx_http_cache_purge_job_decode(p + 40, 8);
     job->error = (uint32_t) ngx_http_cache_purge_job_decode(p + 48, 4);
     offset = NGX_HTTP_CACHE_PURGE_JOB_HEADER;
+
     for (i = 0; i < 4; i++) {
         length = (size_t) ngx_http_cache_purge_job_decode(p + 52 + i * 4, 4);
+
         if (length > value.length - offset) {
             goto corrupt;
         }
@@ -296,14 +310,15 @@ ngx_http_cache_purge_job_get(ngx_http_cache_purge_jobs_t *jobs,
     job->select.namespace_value = text[1];
     job->select.misc = text[2];
     job->bookmark = text[3];
+
     if (offset == value.length && ngx_http_cache_purge_job_valid(job)) {
         return 0;
     }
 
 corrupt:
 
-    return ngx_http_cache_purge_job_error(error,
-                         NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid purge job");
+    return ngx_http_cache_purge_job_error(
+        error, NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid purge job");
 }
 
 
@@ -311,13 +326,14 @@ static int
 ngx_http_cache_purge_job_equal(ngx_http_cache_rocksdb_bytes_t a,
     ngx_http_cache_rocksdb_bytes_t b)
 {
-    return a.len == b.len && (a.len == 0 || memcmp(a.data, b.data, a.len) == 0);
+    return a.len == b.len
+           && (a.len == 0 || memcmp(a.data, b.data, a.len) == 0);
 }
 
 
 int
 ngx_http_cache_purge_job_submit(ngx_http_cache_purge_jobs_t *jobs,
-    const ngx_http_cache_purge_job_t  *input, int *duplicate,
+    const ngx_http_cache_purge_job_t *input, int *duplicate,
     ngx_http_cache_rocksdb_error_t *error)
 {
     int                         rc;
@@ -328,12 +344,14 @@ ngx_http_cache_purge_job_submit(ngx_http_cache_purge_jobs_t *jobs,
     job.done = 0;
     job.visited = job.affected = job.skipped = job.error = 0;
     job.bookmark = ngx_http_cache_purge_job_empty;
+
     if (!ngx_http_cache_purge_job_valid(&job)) {
-        return ngx_http_cache_purge_job_error(error,
-                     NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid purge selector");
+        return ngx_http_cache_purge_job_error(
+            error, NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid purge selector");
     }
 
     rc = ngx_http_cache_purge_job_get(jobs, job.id, &old, error);
+
     if (rc == NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND) {
         return ngx_http_cache_purge_job_save(jobs, &job, 1, error);
     }
@@ -347,11 +365,12 @@ ngx_http_cache_purge_job_submit(ngx_http_cache_purge_jobs_t *jobs,
         || job.select.host_scope != old.select.host_scope
         || !ngx_http_cache_purge_job_equal(job.select.value, old.select.value)
         || !ngx_http_cache_purge_job_equal(job.select.namespace_value,
-                                            old.select.namespace_value)
+                                           old.select.namespace_value)
         || !ngx_http_cache_purge_job_equal(job.select.misc, old.select.misc))
     {
         return ngx_http_cache_purge_job_error(error,
-              NGX_HTTP_CACHE_ROCKSDB_CONFLICT, "purge operation id is reused");
+                                              NGX_HTTP_CACHE_ROCKSDB_CONFLICT,
+                                              "purge operation id is reused");
     }
 
     *duplicate = 1;
@@ -362,7 +381,7 @@ ngx_http_cache_purge_job_submit(ngx_http_cache_purge_jobs_t *jobs,
 
 int
 ngx_http_cache_purge_job_next(ngx_http_cache_purge_jobs_t *jobs,
-    const unsigned char  *after, ngx_http_cache_purge_job_t *job,
+    const unsigned char *after, ngx_http_cache_purge_job_t *job,
     ngx_http_cache_rocksdb_error_t *error)
 {
     int                               rc;
@@ -374,6 +393,7 @@ ngx_http_cache_purge_job_next(ngx_http_cache_purge_jobs_t *jobs,
     prefix.data = (const unsigned char *) "Q";
     prefix.len = 1;
     resume = ngx_http_cache_purge_job_empty;
+
     if (after != NULL) {
         last[0] = 'Q';
         memcpy(last + 1, after, 16);
@@ -383,7 +403,9 @@ ngx_http_cache_purge_job_next(ngx_http_cache_purge_jobs_t *jobs,
 
     cursor = NULL;
     rc = ngx_http_cache_rocksdb_cursor_open(jobs->store,
-                NGX_HTTP_CACHE_ROCKSDB_DEFAULT, prefix, resume, &cursor, error);
+                                            NGX_HTTP_CACHE_ROCKSDB_DEFAULT,
+                                            prefix, resume, &cursor, error);
+
     if (rc != 0) {
         return rc;
     }
@@ -393,6 +415,7 @@ ngx_http_cache_purge_job_next(ngx_http_cache_purge_jobs_t *jobs,
     memset(&value, 0, sizeof(value));
     rc = ngx_http_cache_rocksdb_cursor_next(cursor, &key, &value, error);
     ngx_http_cache_rocksdb_cursor_close(&cursor, NULL);
+
     if (rc != 0) {
         return rc;
     }
@@ -402,6 +425,7 @@ ngx_http_cache_purge_job_next(ngx_http_cache_purge_jobs_t *jobs,
     }
 
     rc = ngx_http_cache_purge_job_get(jobs, raw + 1, job, error);
+
     if (rc == 0 && job->done) {
         return NGX_HTTP_CACHE_ROCKSDB_CORRUPT;
     }
@@ -412,22 +436,23 @@ ngx_http_cache_purge_job_next(ngx_http_cache_purge_jobs_t *jobs,
 
 int
 ngx_http_cache_purge_job_step(ngx_http_cache_purge_jobs_t *jobs,
-    const unsigned char            id[16], uint64_t now, size_t limit,
-    ngx_http_cache_purge_apply_pt  apply, void *data,
-    ngx_http_cache_purge_job_t    *job, ngx_http_cache_rocksdb_error_t *error)
+    const unsigned char id[16], uint64_t now, size_t limit,
+    ngx_http_cache_purge_apply_pt apply, void *data,
+    ngx_http_cache_purge_job_t *job, ngx_http_cache_rocksdb_error_t *error)
 {
-    int                              rc, result, applied;
-    size_t                           i;
-    ngx_http_cache_purge_scan_t     *scan;
-    ngx_http_cache_purge_entry_t     entry;
-    ngx_http_cache_rocksdb_bytes_t   bookmark;
-    ngx_http_cache_rocksdb_error_t   saved;
+    int                             rc, result, applied;
+    size_t                          i;
+    ngx_http_cache_purge_scan_t    *scan;
+    ngx_http_cache_purge_entry_t    entry;
+    ngx_http_cache_rocksdb_bytes_t  bookmark;
+    ngx_http_cache_rocksdb_error_t  saved;
 
     if (limit == 0 || limit > 64 || apply == NULL) {
         return NGX_HTTP_CACHE_ROCKSDB_INVALID;
     }
 
     rc = ngx_http_cache_purge_job_get(jobs, id, job, error);
+
     if (rc != 0 || job->done) {
         return rc;
     }
@@ -439,16 +464,18 @@ ngx_http_cache_purge_job_step(ngx_http_cache_purge_jobs_t *jobs,
     job->bookmark.data = jobs->token;
     job->error = 0;
     scan = NULL;
-    result = ngx_http_cache_purge_scan_open(jobs->catalog, &job->select,
-                       job->bookmark,
-                       job->select.type == NGX_HTTP_CACHE_PURGE_SELECT_TAG,
-                       now, &scan, error);
+    result = ngx_http_cache_purge_scan_open(
+        jobs->catalog, &job->select, job->bookmark,
+        job->select.type == NGX_HTTP_CACHE_PURGE_SELECT_TAG, now, &scan,
+        error);
+
     if (result != 0) {
         return result;
     }
 
     for (i = 0; i < limit; i++) {
         result = ngx_http_cache_purge_scan_next(scan, &entry, error);
+
         if (result == NGX_HTTP_CACHE_ROCKSDB_DONE) {
             job->done = 1;
             job->bookmark.len = 0;
@@ -478,16 +505,20 @@ ngx_http_cache_purge_job_step(ngx_http_cache_purge_jobs_t *jobs,
 
         } else if (entry.retain_until != 0) {
             if (job->retain_until > entry.retain_until) {
-                result = ngx_http_cache_purge_catalog_retain(jobs->catalog,
-                    entry.id, entry.uniq, job->retain_until, error);
+                result = ngx_http_cache_purge_catalog_retain(
+                    jobs->catalog, entry.id, entry.uniq, job->retain_until,
+                    error);
+
                 if (result != 0) {
                     break;
                 }
             }
+
             job->skipped++;
 
         } else {
             applied = apply(data, &entry, job->action, error);
+
             if (applied != 0 && applied != NGX_HTTP_CACHE_ROCKSDB_NOT_FOUND
                 && applied != NGX_HTTP_CACHE_ROCKSDB_CONFLICT)
             {
@@ -500,11 +531,11 @@ ngx_http_cache_purge_job_step(ngx_http_cache_purge_jobs_t *jobs,
                     && job->retain_until > now)
                 {
                     result = ngx_http_cache_purge_catalog_retain(
-                        jobs->catalog, entry.id, entry.uniq,
-                        job->retain_until, error);
+                        jobs->catalog, entry.id, entry.uniq, job->retain_until,
+                        error);
                 } else {
                     result = ngx_http_cache_purge_catalog_remove(
-                                  jobs->catalog, entry.id, entry.uniq, error);
+                        jobs->catalog, entry.id, entry.uniq, error);
                 }
 
                 if (result != 0) {
@@ -527,14 +558,17 @@ ngx_http_cache_purge_job_step(ngx_http_cache_purge_jobs_t *jobs,
 
     ngx_http_cache_purge_scan_close(scan);
     memset(&saved, 0, sizeof(saved));
+
     if (result != 0) {
         job->error = (uint32_t) result;
+
         if (error != NULL) {
             saved = *error;
         }
     }
 
     rc = ngx_http_cache_purge_job_save(jobs, job, job->done, error);
+
     if (rc != 0) {
         return rc;
     }

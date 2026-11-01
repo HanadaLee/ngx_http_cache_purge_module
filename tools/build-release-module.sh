@@ -49,7 +49,7 @@ error_log stderr;
 events {}
 http {
     access_log off;
-    cache_purge_store $work/runtime/index cache=16m buffer=4m;
+    cache_purge_index_store $work/runtime/index cache=16m buffer=4m;
     cache_purge_state_zone release_control 4m;
     proxy_cache_path $work/runtime/cache keys_zone=release:1m;
     server {

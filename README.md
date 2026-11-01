@@ -1,103 +1,16 @@
-# ngx_http_cache_purge
+# ngx_http_cache_purge_module
 
-HTTP cache indexing and purge support for nginx and OpenResty. The repository
-contains `ngx_http_cache_purge_module` and `ngx_http_cache_rocksdb_module`.
-Production code is C; only the RocksDB bridge uses C++.
+Delete or invalidate HTTP cache entries across nginx cache zones. A persistent RocksDB index locates matching files, while shared rules take effect before background file processing completes.
 
-The simplified implementation builds as an nginx addon. Public PURGE requests
-persist a background task and publish a shared rule before returning 202.
-The native nginx cache manager owns RocksDB and processes files in bounded
-batches. Runtime checks cover public operations, native cache-manager ownership,
-stock nginx fallback and proxy propagation. Performance depends on the workload;
-the limitations below remain relevant. This working tree is not a release.
+The repository includes `ngx_http_cache_purge_module` and `ngx_http_cache_rocksdb_module`. It supports proxy, FastCGI, uwsgi, and scgi caches. Proxy caches can also propagate purge requirements to a CDN parent.
 
-## Behavior
-
-- Find cached objects across cache zones using an external persistent index.
-- Select objects by host, URL, URL prefix, URL/misc/namespace key, or scoped TAG.
-- Delete matching cache files in the background.
-- Invalidate by setting the native cache header's `valid_sec` to zero. Use the
-  existing in-memory `purged` flag to require successful origin validation when
-  `NGX_RESTY_EXT` is enabled. A 304 can reuse the entity; a 200 replaces it.
-- Permit restart to lose `purged`. The expired file then follows ordinary nginx
-  stale policy. Do not reconstruct strict invalidation from persistent proofs.
-- Keep active purge rules in bounded shared memory while background processing
-  is pending. Preserve proxy propagation for its configured window.
-- Maintain URL and TAG relationships in RocksDB without loading the entire
-  index into memory. RocksDB runs inside the native cache manager, with bounded
-  background work; no separate database service or container is required.
-
-No module metadata belongs in nginx cache files, extended attributes, hidden
-response headers or sidecar files. Ordinary HITs must not read module file
-proofs, query the index on every request or wait for background file maintenance.
-The removed transaction and recovery mechanisms are not optional compatibility
-modes.
-
-Indexing starts with managed cache fills. Existing unindexed files require an
-explicit index migration or a fresh cache-key namespace when first enabling
-this mode. The module does not infer historical identities from native keys or
-rebuild the index on ordinary HITs. Normal restarts reuse the persistent index.
-
-For a first MISS with no indexed file, a purge can complete before that
-in-flight response is stored. The old response can then become a HIT; strict
-prevention of this boundary is not implemented.
-
-## Configuration contract
-
-The key module and purge module are independent. Purge identity comes from
-explicit expressions, without parsing a particular native cache-key format:
-
-```nginx
-cache_purge_key_url       $cache_key_url;
-cache_purge_key_misc      $cache_key_misc;
-cache_purge_key_namespace $cache_key_namespace;
-```
-
-The variables above are optional outputs of the separate cache-key module;
-other configured expressions may be used. Both namespace defaults are empty.
-An empty namespace is an exact scope and never falls back to Host.
-
-`proxy_cache_purge`, `fastcgi_cache_purge`, `uwsgi_cache_purge` and
-`scgi_cache_purge` activate their respective location behavior. PURGE requests
-can use the original business location or a dedicated purge location. URL and
-misc construction remains configuration-driven. Module authentication is not
-provided; use nginx access controls as required.
-
-Control headers have separate configurable directive names and defaults under
-`X-Cache-Purge-`. Conditional configuration uses the expr module's `when`
-blocks, not an extra directive argument. Regular-expression selectors and
-physical MD5 filename selectors are outside the current scope.
-
-PURGE is the submission method. The management location supports JSON capability
-and task-status responses; it does not accept JSON POST submissions.
-A cached response can have up to 128 TAG items, each at most 1,024 bytes.
-`cache_purge_tag` accepts one or more complex values; their comma-separated
-results form one list. For example:
-
-```nginx
-cache_purge_tag $upstream_http_cache_tag extratag1 extratag2;
-```
-
-Empty items are ignored and surrounding spaces/tabs are trimmed. The item limit
-is checked before deduplication. A child directive replaces its inherited list;
-expr `when` selects a complete list using the usual candidate order.
-
-A TAG purge accepts up to 32 comma-separated items and matches any of them.
-Selectors are sorted and deduplicated before admission, so reordering the same
-list does not change a retry's identity. Overlapping TAGs affect each file once
-within the task. Both `tag` and `host-tag` support this behavior.
-
-### Minimal configuration
-
-Configure the persistent index outside all native cache directories. The store
-and shared zone are an `http`-level pair; enabling them does not automatically
-enable a business location. This example uses independent expressions and does
-not require the cache-key module:
+## Synopsis
 
 ```nginx
 http {
-    cache_purge_store /var/cache/nginx/index;
+    cache_purge_index_store /var/cache/nginx/index;
     cache_purge_state_zone purge 1m;
+
     proxy_cache_path /var/cache/nginx/content keys_zone=content:1m;
 
     server {
@@ -107,9 +20,12 @@ http {
         location / {
             proxy_cache content;
             proxy_cache_key "$scheme://$host$request_uri";
+            proxy_cache_revalidate on;
+
             cache_purge_key_url "$scheme://$host$request_uri";
             cache_purge_tag $upstream_http_cache_tag;
             proxy_cache_purge on;
+
             proxy_pass http://127.0.0.1:8081;
         }
 
@@ -120,57 +36,378 @@ http {
 }
 ```
 
-Send `PURGE /asset` to the business location. `X-Cache-Purge-Type` defaults to
-`url`; other values are `key`, `prefix`, `host`, `tag` and `host-tag`.
-`X-Cache-Purge-Action` defaults to `delete` and also accepts `invalidate`.
-A prefix is a literal URL byte prefix, without an appended wildcard.
-`url`, `prefix` and `host` cover all matching misc and namespace variants.
-`key` uses the configured URL, misc and namespace exactly. `tag` uses the
-configured namespace; `host-tag` uses the host extracted from the configured
-URL. Both TAG selectors read their list from `X-Cache-Purge-Tags`.
+Delete all indexed variants of `/asset`:
 
-For reliable retries, supply `X-Cache-Purge-Operation-Id` and
-`X-Cache-Purge-Issued-At` together, keeping both unchanged across attempts.
-The timestamp is Unix epoch milliseconds, compared at native second precision;
-same-second cache entries count as refreshed. Omit both headers to generate a
-new operation. A successful 202 confirms durable admission and shared-rule
-publication. Query `/__cache_purge/operations/ID` for background completion,
-or `/__cache_purge/capabilities` for readiness. A connection timeout does not
-cancel an accepted task. Reusing an ID for different work returns 409.
+```sh
+curl -i -X PURGE http://127.0.0.1:8080/asset -H 'Host: example.test'
+```
 
-The header names above are defaults. Separate `cache_purge_type_header`,
-`cache_purge_action_header`, `cache_purge_tags_header`,
-`cache_purge_operation_id_header` and `cache_purge_issued_at_header` directives
-override them. A dedicated PURGE location can read URL, misc and namespace from
-its own expressions without a `proxy_pass` or selected cache zone.
+A `202 Accepted` response confirms that the task is durable and its shared rule is published. File processing continues in the background. Use the returned `operation_id` with `/__cache_purge/operations/ID` to check completion.
+
+## Installation
+
+Requires Linux, nginx with HTTP cache support, CMake, a C++17 compiler, and the RocksDB development package. Build the backend libraries first:
+
+```sh
+module=/path/to/ngx_cache_purge
+cmake -S "$module" -B "$module/build"
+cmake --build "$module/build"
+export CACHE_PURGE_ROCKSDB_LIB_DIR="$module/build"
+```
+
+Build nginx statically with `--add-module=/path/to/ngx_cache_purge`, or dynamically with `--add-dynamic-module=/path/to/ngx_cache_purge`. A dynamic build produces two modules; load them in this order:
+
+```nginx
+load_module modules/ngx_http_cache_rocksdb_module.so;
+load_module modules/ngx_http_cache_purge_module.so;
+```
+
+Both modules and the backend libraries must come from the same source revision. The initial RocksDB bridge ABI and private storage formats are version 1. This implementation has not yet been released; development snapshots do not define an upgrade compatibility contract.
+
+The addon links with `-lrocksdb -lstdc++ -lm -pthread` by default. Set `CACHE_PURGE_ROCKSDB_LIBS` when a different link configuration is needed, such as static RocksDB with its compression dependencies.
+
+Build `ngx_expr_module` statically in the same nginx configuration to enable `when` blocks. The separate `ngx_http_cache_key_module` is optional: purge identities are configured through expressions, without linking to that module or parsing its key format.
+
+`NGX_RESTY_EXT` enables strict Invalidate handling. Automatic proxy request-header integration additionally requires `NGX_HTTP_PROXY_FILTER`. Ordinary nginx uses its native stale policy and the propagation variables described below.
+
+## Conditional configuration
+
+Location-level switches, identity expressions, TAG expressions, and control-header names support the expr module's `when` blocks in `http`, `server`, and `location`. `when` is a configuration block, not an extra directive parameter.
+
+For example, select the misc value from a management header for PURGE requests:
+
+```nginx
+http {
+    expr purge_request str_eq $request_method PURGE;
+
+    server {
+        location / {
+            when purge_request {
+                cache_purge_key_misc $http_x_cache_purge_misc;
+            }
+
+            cache_purge_key_misc $cookie_variant;
+        }
+    }
+}
+```
+
+The native cache key must represent the same variant as the configured purge identity. These directives describe index fields; they do not change `proxy_cache_key` or the corresponding key of another protocol.
+
+Values are inherited unless overridden. A child `cache_purge_tag` replaces the inherited list; `when` selects a complete list using the expr module's candidate order. `cache_purge_index_store`, `cache_purge_state_zone`, `cache_purge_propagation_timeout`, and `cache_purge_api` do not support `when`. None of these directives supports nginx rewrite `if` blocks.
+
+## Directives
+
+### cache_purge_index_store
+
+| Syntax: | **cache_purge_index_store** `path` [`cache=size`] [`buffer=size`] [`io_rate=size`]; |
+| :--- | :--- |
+| Default: | — |
+| Context: | `http` |
+
+Configures the persistent index. Use together with `cache_purge_state_zone`. Only one store is allowed, and its directory must be outside every native cache directory; neither path may contain the other.
+
+| Parameter | Default | Meaning |
+| :--- | :--- | :--- |
+| `cache` | `16m` | RocksDB cache budget, including write-buffer accounting; at least `4m`. |
+| `buffer` | `4m` | Write-buffer budget; at least `1m` and at most half of `cache`. |
+| `io_rate` | `16m` | Combined RocksDB flush and compaction I/O limit in bytes per second. `0` disables the limit; other values must be at least `1k`. |
+
+These budgets do not cap total process memory or the operating system's page cache. Ordinary index reads and WAL writes are not limited by `io_rate`. Changing the store path requires a full nginx restart.
+
+### cache_purge_state_zone
+
+| Syntax: | **cache_purge_state_zone** `name size`; |
+| :--- | :--- |
+| Default: | — |
+| Context: | `http` |
+
+Allocates shared memory for active rules, queued work, and completion state. The minimum size is `1m`. Configure one zone together with `cache_purge_index_store`.
+
+At most 256 selector slots are available across tasks. Each TAG in a batch consumes one slot; other selectors consume one slot per task. The byte budget can limit admission before that count is reached. Changing the zone name or size requires a full restart.
+
+### proxy_cache_purge
+
+| Syntax: | **proxy_cache_purge** `on` \| `off`; |
+| :--- | :--- |
+| Default: | `proxy_cache_purge off;` |
+| Context: | `http`, `server`, `location`, `when` |
+
+Enables indexing and purge handling for proxy cache requests. Requires `cache_purge_index_store`, `cache_purge_state_zone`, and an explicit `cache_purge_key_url` expression.
+
+Also accepts PURGE requests in the location. A dedicated purge location can enable this switch without `proxy_pass` or a selected cache zone; selection uses the shared index across zones.
+
+### fastcgi_cache_purge
+
+| Syntax: | **fastcgi_cache_purge** `on` \| `off`; |
+| :--- | :--- |
+| Default: | `fastcgi_cache_purge off;` |
+| Context: | `http`, `server`, `location`, `when` |
+
+Enables the same indexing and purge behavior for FastCGI caches, with the same configuration requirements as `proxy_cache_purge`. Parent propagation is not supported for FastCGI.
+
+### uwsgi_cache_purge
+
+| Syntax: | **uwsgi_cache_purge** `on` \| `off`; |
+| :--- | :--- |
+| Default: | `uwsgi_cache_purge off;` |
+| Context: | `http`, `server`, `location`, `when` |
+
+Enables the same indexing and purge behavior for uwsgi caches, with the same configuration requirements as `proxy_cache_purge`. Parent propagation is not supported for uwsgi.
+
+### scgi_cache_purge
+
+| Syntax: | **scgi_cache_purge** `on` \| `off`; |
+| :--- | :--- |
+| Default: | `scgi_cache_purge off;` |
+| Context: | `http`, `server`, `location`, `when` |
+
+Enables the same indexing and purge behavior for scgi caches, with the same configuration requirements as `proxy_cache_purge`. Parent propagation is not supported for scgi.
+
+### cache_purge_key_url
+
+| Syntax: | **cache_purge_key_url** `value`; |
+| :--- | :--- |
+| Default: | — |
+| Context: | `http`, `server`, `location`, `when` |
+
+Defines the URL identity used for indexing and PURGE selection. It must evaluate to an absolute HTTP or HTTPS URL, at most 32,768 bytes. An explicit expression is required wherever purge handling can be enabled; it does not inherit the native cache-key expression automatically.
+
+Use consistent URL normalization for cache fills and purge requests. URL and prefix comparisons use the configured bytes; host selection uses the lowercase host extracted from the URL. The identity must exclude slice/range suffixes so that all slices share the same selection scope.
+
+### cache_purge_key_misc
+
+| Syntax: | **cache_purge_key_misc** `value`; |
+| :--- | :--- |
+| Default: | `cache_purge_key_misc "";` |
+| Context: | `http`, `server`, `location`, `when` |
+
+Defines the additional variant identity, at most 32,768 bytes. A `key` purge matches URL, misc, and namespace exactly, then covers their indexed slice and Vary files. The module does not accept a serialized native key or an MD5 cache filename.
+
+### cache_purge_key_namespace
+
+| Syntax: | **cache_purge_key_namespace** `value`; |
+| :--- | :--- |
+| Default: | `cache_purge_key_namespace "";` |
+| Context: | `http`, `server`, `location`, `when` |
+
+Defines the namespace stored with an indexed object and used by `key` and `tag` purges. Indexed namespace values may contain at most 32,768 bytes. An empty namespace is an exact scope; it does not fall back to the request host.
+
+For a header-supplied namespace, configure an expression such as `$http_x_cache_purge_namespace`. There is no separate built-in namespace control header.
+
+### cache_purge_tag
+
+| Syntax: | **cache_purge_tag** `value ...`; |
+| :--- | :--- |
+| Default: | `cache_purge_tag "";` |
+| Context: | `http`, `server`, `location`, `when` |
+
+Defines TAGs associated with cached responses. Arguments can contain variables and are joined into one comma-separated list:
+
+```nginx
+cache_purge_tag $upstream_http_cache_tag extratag1 extratag2;
+```
+
+Each response may have up to 128 nonempty items, each at most 1,024 bytes. Empty items are ignored and surrounding spaces and tabs are trimmed. The count limit applies before deduplication. TAG names are compared exactly and must not contain commas, NUL, CR, or LF.
+
+### cache_purge_type_header
+
+| Syntax: | **cache_purge_type_header** `name`; |
+| :--- | :--- |
+| Default: | `cache_purge_type_header X-Cache-Purge-Type;` |
+| Context: | `http`, `server`, `location`, `when` |
+
+Names the PURGE selector header. Accepted values are `url`, `key`, `prefix`, `host`, `tag`, and `host-tag`; the default selector is `url`.
+
+All header-name directives below accept a literal name of 1–255 ASCII letters, digits, hyphens, or underscores. Names cannot contain variables. Duplicate instances of a consumed control header are rejected.
+
+### cache_purge_action_header
+
+| Syntax: | **cache_purge_action_header** `name`; |
+| :--- | :--- |
+| Default: | `cache_purge_action_header X-Cache-Purge-Action;` |
+| Context: | `http`, `server`, `location`, `when` |
+
+Names the PURGE action header. Accepted values are `delete` and `invalidate`; the default action is `delete`.
+
+### cache_purge_tags_header
+
+| Syntax: | **cache_purge_tags_header** `name`; |
+| :--- | :--- |
+| Default: | `cache_purge_tags_header X-Cache-Purge-Tags;` |
+| Context: | `http`, `server`, `location`, `when` |
+
+Names the comma-separated TAG selector header for `tag` and `host-tag` purges. A request accepts 1–32 nonempty items, each at most 1,024 bytes. Trimming and empty-item handling follow `cache_purge_tag`; the 32-item limit applies before deduplication. Nginx's request-header buffer limits also apply.
+
+TAGs are sorted and deduplicated before admission. Matching uses OR semantics, and overlapping TAGs affect each file once within the task.
+
+### cache_purge_operation_id_header
+
+| Syntax: | **cache_purge_operation_id_header** `name`; |
+| :--- | :--- |
+| Default: | `cache_purge_operation_id_header X-Cache-Purge-Operation-Id;` |
+| Context: | `http`, `server`, `location`, `when` |
+
+Names the operation identifier header for idempotent retries. Supply it together with the issued-at header, keeping both and the selector/action unchanged when retrying. IDs contain 1–128 ASCII letters, digits, hyphens, underscores, or periods. Reusing an ID for different work returns `409 Conflict`.
+
+### cache_purge_issued_at_header
+
+| Syntax: | **cache_purge_issued_at_header** `name`; |
+| :--- | :--- |
+| Default: | `cache_purge_issued_at_header X-Cache-Purge-Issued-At;` |
+| Context: | `http`, `server`, `location`, `when` |
+
+Names the purge timestamp header. The value is decimal Unix epoch milliseconds, at least `1000`, and is compared at native cache second precision. Omit both this header and the operation identifier to generate a new operation automatically. Supplying only one is rejected.
+
+### proxy_cache_purge_propagation
+
+| Syntax: | **proxy_cache_purge_propagation** `on` \| `off`; |
+| :--- | :--- |
+| Default: | `proxy_cache_purge_propagation off;` |
+| Context: | `http`, `server`, `location`, `when` |
+
+Enables outgoing purge headers for managed proxy requests. Enable it when the target is a CDN parent and leave it off when the target is the origin. Use `when` to select this behavior if routing depends on a condition. It does not control whether incoming propagation headers are honored.
+
+### cache_purge_ignore_propagation
+
+| Syntax: | **cache_purge_ignore_propagation** `on` \| `off`; |
+| :--- | :--- |
+| Default: | `cache_purge_ignore_propagation off;` |
+| Context: | `http`, `server`, `location`, `when` |
+
+When enabled, ignores incoming purge propagation headers. This can be selected conditionally with `when`. It does not disable locally submitted purge tasks or their rules.
+
+### cache_purge_propagation_timeout
+
+| Syntax: | **cache_purge_propagation_timeout** `time`; |
+| :--- | :--- |
+| Default: | `cache_purge_propagation_timeout 120s;` |
+| Context: | `http` |
+
+Sets how long a locally accepted purge contributes outgoing parent headers. The window is intended to allow invalidation to reach other cache tiers; it is not a deadline for background file processing. The parent compares cache timestamps without applying another propagation-age window.
+
+### cache_purge_propagation_time_header
+
+| Syntax: | **cache_purge_propagation_time_header** `name`; |
+| :--- | :--- |
+| Default: | `cache_purge_propagation_time_header X-Cache-Purge-Time;` |
+| Context: | `http`, `server`, `location`, `when` |
+
+Names the incoming and outgoing parent purge timestamp header, in Unix epoch milliseconds. It is separate from the issued-at header used to submit a management operation.
+
+### cache_purge_propagation_action_header
+
+| Syntax: | **cache_purge_propagation_action_header** `name`; |
+| :--- | :--- |
+| Default: | `cache_purge_propagation_action_header X-Cache-Purge-Action;` |
+| Context: | `http`, `server`, `location`, `when` |
+
+Names the incoming and outgoing parent purge action header: `delete` or `invalidate`. This is configured independently of `cache_purge_action_header`, although both default to the same name.
+
+### cache_purge_api
+
+| Syntax: | **cache_purge_api**; |
+| :--- | :--- |
+| Default: | — |
+| Context: | `location` |
+
+Installs a management handler in a prefix location. It accepts GET and HEAD requests for paths relative to that location:
+
+| Path | Response |
+| :--- | :--- |
+| `capabilities` | Readiness, propagation timeout, and index-cleanup counters. |
+| `operations/ID` | Admission and background-processing status for an operation. |
+
+Task responses include `operation_id`, `effective`, `durable`, `effective_at`, `propagation_until`, and a `cleanup` object with `state`, `scan_done`, `visited`, `affected`, and `error`. Processing is complete when `cleanup.state` is `done`. Unknown IDs return `404`; unavailable admission or status processing returns `503`.
+
+This handler does not accept JSON POST submissions. Use PURGE in an enabled location to submit work. The module performs no authentication; configure access control with nginx.
+
+## Purge requests
+
+PURGE requests have no body and can be sent to the original business location or a dedicated purge location. All selectors search the configured index across cache zones.
+
+| Type | Matching scope |
+| :--- | :--- |
+| `url` | Exact configured URL, across all misc and namespace variants. |
+| `key` | Exact configured URL, misc, and namespace, covering all indexed slice/Vary files. |
+| `prefix` | Literal prefix of the configured URL, across all misc and namespace variants. |
+| `host` | Host extracted from the configured URL, across paths, misc values, and namespaces. |
+| `tag` | Any listed TAG within the configured namespace. |
+| `host-tag` | Any listed TAG within the host extracted from the configured URL. |
+
+For prefix purges, supply the prefix itself without a trailing wildcard. Regex selectors and physical cache-filename selectors are not supported.
+
+The `delete` action removes matching files. The `invalidate` action expires them for upstream validation. With `NGX_RESTY_EXT`, only successful validation permits reuse: a 304 reuses the entity, a 200 replaces it, and an upstream failure cannot serve the invalidated entity. Enable the protocol's native cache-revalidation directive to allow conditional revalidation. Without the extension, ordinary nginx stale policy applies.
+
+A dedicated endpoint can obtain identity fields from configured headers:
+
+```nginx
+location = /purge {
+    proxy_cache_purge on;
+    cache_purge_key_url $http_x_cache_purge_url;
+    cache_purge_key_misc $http_x_cache_purge_misc;
+    cache_purge_key_namespace $http_x_cache_purge_namespace;
+}
+```
+
+Use this location in a server with the store and shared zone configured. These URL, misc, and namespace header names are chosen by the expressions; they are not built-in control headers.
+
+```sh
+curl -i -X PURGE http://127.0.0.1:8080/purge \
+    -H 'X-Cache-Purge-Type: key' \
+    -H 'X-Cache-Purge-Action: invalidate' \
+    -H 'X-Cache-Purge-Url: http://example.test/asset' \
+    -H 'X-Cache-Purge-Misc: language=en' \
+    -H 'X-Cache-Purge-Namespace: assets'
+```
+
+Acceptance waits for task persistence and shared-rule publication, not file enumeration. Disconnecting or timing out does not cancel an accepted task. Use the operation ID and issued-at headers to retry the same operation reliably.
 
 ## Proxy propagation
 
-Propagation is one-way from an edge to its CDN parent. The default outgoing
-window is 120 seconds. The parent compares the request's purge timestamp and
-mode with the native cache date, then serves, revalidates or replaces its cache.
-There is no response receipt or module signature.
+Propagation is one-way: L1 sends a timestamp and action to L2 on an upstream request. L2 compares them with its native cache date and either serves the cache or applies Delete/Invalidate before obtaining a response. Responses carry no receipt or other propagation metadata. FastCGI, uwsgi, and scgi do not use this protocol.
 
-Use `proxy_cache_purge_propagation on|off` to distinguish parent traffic from origin
-traffic. Extension builds use the existing proxy request-header framework;
-other builds expose variables for `proxy_set_header`. FastCGI, uwsgi and scgi do
-not propagate purge headers. TAG names are not sent to the parent.
+With both `NGX_RESTY_EXT` and `NGX_HTTP_PROXY_FILTER`, the module sets outgoing headers through the proxy request-header framework. Otherwise, configure `proxy_set_header` in the managed parent-facing location:
 
-The action is named consistently in both protocols: `delete` or `invalidate`.
-Propagation uses `cache_purge_propagation_action_header`, defaulting to
-`X-Cache-Purge-Action`, and `$cache_purge_propagation_action` for manual
-`proxy_set_header` configuration. The time header and variable keep their names.
-The old `cache_purge_propagation` switch and propagation `mode` names are removed.
+```nginx
+proxy_cache_purge_propagation on;
+proxy_set_header X-Cache-Purge-Time $cache_purge_propagation_time;
+proxy_set_header X-Cache-Purge-Action $cache_purge_propagation_action;
+```
 
-Known TAG associations survive local deletion for the propagation window.
-When a proxy MISS needs these associations, a background lookup reads the
-deduplicated key-to-TAG relation before request bytes are sent upstream. Cache
-HITs do not perform this lookup. An unknown TAG association adds no propagation
-requirement; first-MISS compensation for unknown TAGs is outside the scope.
+Use the configured propagation header names on both tiers and in these `proxy_set_header` directives. Incoming time and action headers must be present together. `cache_purge_ignore_propagation on` bypasses their interpretation.
 
-## Focused native tests
+TAG names are not sent upstream. Known TAG associations remain available for the propagation window after a local file is removed. A proxy MISS may query these retained associations in the background before sending upstream bytes; a cache HIT does not query RocksDB. A URL with no known TAG association has no TAG propagation requirement.
 
-The storage libraries and their current tests build independently:
+### Variables
+
+| Variable | Value |
+| :--- | :--- |
+| `$cache_purge_propagation_time` | Applicable purge timestamp in Unix epoch milliseconds. |
+| `$cache_purge_propagation_action` | Applicable action: `delete` or `invalidate`. |
+
+Both variables are empty when propagation is disabled or no applicable requirement exists. Internal `$cache_purge_*_guard` variables are installed by the module and do not need manual configuration.
+
+## Implementation
+
+The native nginx cache manager owns the RocksDB index and processes tasks in bounded batches. HTTP workers use shared memory and an internal queue; they do not open RocksDB or load the entire index into memory. Ordinary cache HITs do not perform index I/O or wait for background file maintenance.
+
+The index stores URL and TAG relationships with shared values and compact file references. Invalidate updates the native expiry field and the existing in-memory `purged` flag; no module-specific metadata is added to cache files, extended attributes, sidecars, or response headers. Only the RocksDB bridge uses C++; the purge implementation is C.
+
+Normal restarts reuse the persistent index and pending tasks. Missing-file records are collected in the background, retaining known TAG relationships for propagation. The management API exposes cumulative `index_cleanup.checked`, `index_cleanup.retained`, and `index_cleanup.errors` counters; these counters survive reloads and reset on a full restart.
+
+### Limits
+
+- Indexing starts with managed cache fills. Existing unindexed files require an explicit migration or a fresh cache-key namespace when enabling the module.
+- A full restart loses the in-memory `purged` flag. Expired files then follow ordinary nginx stale policy.
+- Cache dates have second precision. An entry dated in the same second as a purge is treated as refreshed.
+- A parent request started before a purge may finish afterward and receive a newer native cache date. This in-flight boundary is accepted.
+- A first MISS can be stored after a purge has already completed without finding an indexed file. Preventing that response from becoming a later HIT is not implemented.
+- Unknown TAG associations have no first-MISS propagation compensation. Large active rule sets and sustained high-TAG fills can affect throughput and tail latency.
+
+## Tests
+
+Build and run the standalone storage, catalog, and task tests:
 
 ```sh
 cmake -S . -B build -DCACHE_PURGE_STORE_TESTS=ON
@@ -178,202 +415,22 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The index uses one shared dictionary for repeated values and compact file
-postings. URL-prefix scans follow ordered URL rows; TAG scans use scoped
-postings. Deleting the last reference removes its dictionary rows. A short
-retention deadline can preserve known TAG associations after file removal;
-expired associations are collected in bounded batches. No file publication or
-validation proofs are stored by this index.
-
-RocksDB's SST file-table cache uses four shards to keep the default small
-file-handle budget useful. The URL and TAG column families, memory budgets,
-and maximum open-file setting are unchanged.
-
-The native cache manager also sweeps file records for configured cache roots.
-It checks at most eight records per batch, at least 250 ms apart, and yields
-between records to queued work or a 5 ms time budget. Individual database or
-filesystem calls cannot be interrupted by that budget. Only `ENOENT` retires
-a record; other filesystem errors preserve it. Missing files keep their TAG
-associations for the configured propagation window before normal collection.
-The sweep never deletes cache files or adds work to the HIT path.
-Later TAG purges extend known retained associations to their own window end,
-without reopening missing files. These rows count as skipped physical work.
-
-The capabilities response exposes cumulative `index_cleanup.checked`,
-`index_cleanup.retained`, and `index_cleanup.errors` counters. These describe
-file checks, successful transitions into retention, and check/retention errors;
-they are operational counters, not a durable ledger. Reload retains them;
-a full restart resets them. Sweep bookmarks are process-local and may rescan
-after a restart. Cleanup yields under load, so completion time is not fixed.
-The shared state format is version 1 and tasks use PJ1. This implementation
-has not been released or deployed; development snapshots do not define an
-upgrade or downgrade compatibility contract. Rebuild both addons together;
-the RocksDB bridge ABI and nginx core ABI are unchanged.
-
-RocksDB's target SST size and base-level capacity follow the write-buffer
-budget: 2 MiB and 8 MiB by default. They are compaction targets, not a limit on
-the total index size.
-
-The store's `io_rate=SIZE` parameter limits combined RocksDB flush and
-compaction reads/writes in bytes per second. It defaults to `16m`; `0` disables
-the limit, and nonzero values must be at least `1k`. For example:
-
-```nginx
-cache_purge_store /var/cache/nginx/index cache=16m buffer=4m io_rate=16m;
-```
-
-The limit uses RocksDB's rate limiter with a 1 ms refill interval. Ordinary
-index reads and WAL writes keep their existing behavior. Native cache-file
-cleanup still uses the executor's separate batch limit. The bridge options
-structure now uses ABI 2; rebuild both addons together. nginx's core ABI and
-the persisted index schema are unchanged.
-
-Background tasks use a durable admission record and an ordered pending queue.
-The nginx executor processes at most 8 files per batch, with at least 50 ms
-between successful batches. Each batch closes its snapshot and stores a
-continuation bookmark. Ordinary progress uses deferred WAL; admission and
-completion are synchronous. File errors preserve the unfinished entry for a
-later background retry. The executor must publish its shared rule before replying
-202, and apply native-node updates before withdrawing that rule. The owner
-and public PURGE handler implement this ordering.
-
-The store registers a normal nginx path-manager callback. nginx starts,
-reloads and respawns the cache manager; the module does not add a process
-supervisor or change nginx core. HTTP workers neither open RocksDB nor create
-database threads. The cache manager handles its queue through the existing pipe
-and timer, alongside native cache maintenance. RocksDB's internal threads stay
-inside that helper process. With `master_process off`, the existing in-process
-thread remains a debugging fallback and has a different performance profile.
-New queue messages wake the helper through the pipe. Once it drains the queue,
-it uses its idle timer instead of scheduling an extra immediate retry.
-
-The shared state reserves rule space before admission and exposes a successful
-completion only after publication. Its empty-rule path does not take the shared
-mutex. Completed rules retained only for propagation skip HIT filtering.
-Responses at least as new as the shared timestamp bound also skip URL/TAG
-evaluation and rule lookup, unless a newer incoming propagation timestamp
-requires filtering. Cached responses use the native cache date; origin
-responses use the request start time. This gate reads one shared atomic word
-without a lock. Writers keep a conservative timestamp bound until the last
-local rule finishes, with one extra shared counter and no per-object state.
-The shared index allows at most 256 selector slots across all tasks. Each TAG
-in a batch uses one slot; other task types use one slot each. Thus a 32-TAG
-task reserves 32 slots atomically while retaining one durable task and one
-completion state. Shared-memory bytes can constrain admission before that count.
-URL searches follow prefix ancestors; host searches compare full values.
-TAG lookup uses a separate bounded pointer array with precomputed hashes, then
-full values and scope, so collisions cannot broaden a purge. Groups of at most
-four TAG entries use direct comparisons. Background scans use one TAG cursor
-at a time and skip files belonging to an earlier selected TAG; they do not
-allocate an unbounded set of processed file IDs.
-When local rules contain only URL and prefix selectors, HIT filtering still
-evaluates only the URL. The array is rebuilt on publication and once after each
-collection batch under the shared mutex. Outgoing requests use the same index
-including retained propagation rules. Large active rule sets and sustained
-high-TAG fills can reduce throughput or increase tail latency. Queues contain
-copied messages, with count and byte limits, rather than request pointers or
-an in-memory copy of the cache index.
-
-The following focused checks exercise the native primitives and public addon.
-They are not full feature or performance acceptance tests.
+The HTTP runner builds an isolated nginx snapshot from a Git checkout and exercises PURGE admission, task status, cross-zone selection, native file operations, reloads, and cache-manager recovery:
 
 ```sh
-python3 t/native_files_runtime.py \
-    --nginx /path/to/configured/nginx --backend /path/to/build --state \
-    --output /tmp/native-files.json --sanitize
-
 python3 t/native_cache_runtime.py \
-    --nginx /path/to/nginx-ext-git-checkout \
-    --extension 1 --backend /path/to/build --public-module --no-thread-pool \
+    --nginx /path/to/nginx-git-checkout \
+    --extension 0 --backend /path/to/ngx_cache_purge/build \
+    --public-module --no-thread-pool \
     --output /tmp/native-cache.json
 ```
 
-The file checks verify that Invalidate changes only the native expiry field,
-Delete removes the selected file, already replaced files are preserved, invalid
-headers and nonregular files are rejected, and no module attributes or sidecars
-are created. The HTTP checks exercise failed-origin stale handling, 304 reuse,
-restart degradation and Delete with `open_file_cache`. `--extension 0` checks
-the existing native stale fallback without extension behavior. With
-`--public-module --backend`, the runner builds the actual addon and exercises
-PURGE and task status in a two-worker nginx instance. It covers cross-zone
-deletion, background retry, reload handoff, native helper respawn and request
-enforcement while a 512-object prefix task is still pending. Omitting
-`--public-module` selects a
-native-operation test adapter. `--sanitize` enables ASan/UBSan and requires
-matching backend archives; leak detection is disabled for nginx's process-exit
-allocation model.
+Use `--extension 1` with nginx-ext to test strict Invalidate handling. `--dynamic`, `--slice`, and `--protocols` add separate-module loading, sliced caches, and FastCGI/uwsgi/scgi coverage. `--expr`, `--proxy-filter`, and `--key` take paths to optional modules. Sanitizer runs require `--sanitize` and backend libraries built with `CACHE_PURGE_STORE_SANITIZE=ON`.
 
-Add `--slice` to exercise all native slices with subrequest logging disabled.
-Add `--key /path/to/ngx_http_cache_key_module` to test the two modules together
-through configuration variables. The same selector checks also run without the
-key module, including misc/namespace isolation, scoped TAGs and native Vary.
-`--dynamic` builds and loads the RocksDB and purge modules as separate DSOs.
-`--protocols` adds real FastCGI, uwsgi and scgi origin checks. `--ssl` builds
-TLS support for the parent propagation tests.
+`t/native_propagation_runtime.py` checks two cache tiers, propagation headers, retained TAG relationships, and the outgoing timeout using an already built nginx binary. `t/native_cache_benchmark.py` compares foreground latency, throughput, and process memory with and without indexing and background purges. Run either with `--help` for its options; benchmark results depend on workload and resource limits.
 
-`t/native_propagation_runtime.py --binary /path/to/nginx --output /tmp/tiers.json`
-runs two nginx cache instances and checks the one-way protocol, known TAG MISS,
-request-body preservation and outgoing timeout. Use `--framework --expr` with
-a binary built with those modules; otherwise it uses `proxy_set_header`.
-Add `--tls --streaming` to verify a TLS parent with certificate/hostname checks
-and unbuffered Content-Length and chunked request bodies. This requires a binary
-built with `--ssl` and the `openssl` command.
+## Author and license
 
-A focused foreground benchmark uses an already built public-module binary:
+Maintained by Hanada. Based on ngx_cache_purge by FRiCKLE, Piotr Sikora, and Denys Denysov.
 
-```sh
-python3 t/native_cache_benchmark.py --binary /path/to/nginx \
-    --output /tmp/cache-benchmark.json
-```
-
-It requires Linux and `wrk`. It compares the same binary with purge disabled,
-enabled without rules, deleting unrelated objects in the background, and
-retaining a completed rule. It records latency, throughput and process PSS;
-`--fills` and `--fill-rate` add continuous fills and check their index coverage.
-`--fill-only-control` adds a run that indexes new fills while disabling purge
-only for the measured hot URL. Every compared run then uses the same exact
-location for that URL. This separates request handling from background indexing;
-the fill coverage and deletion assertions remain enabled in the control run.
-`--request-delay` adds a delay in milliseconds between requests on each wrk
-connection to compare latency below saturation; it is not an open-loop load.
-`--seed-store` copies an offline, closed index before each enabled run; copied
-files are synchronized before measurement and charged to `--cgroup` when set.
-`--url-origin` selects the scheme and host of the configured purge URL identity.
-`--io-rate` overrides the store limit for comparisons with the same binary.
-`--cgroup` uses an existing Linux memory cgroup; `--profile` samples worker main
-threads with perf, while `--profile all` includes the cache manager and database
-threads. Profiling is for diagnosis, not latency acceptance. These focused
-measurements do not establish a production performance guarantee.
-
-The optional `--backend` file check runs persistent tasks through the actual
-native file functions. Use a matching sanitizer build when passing `--sanitize`.
-Task checks cover durable admission after abrupt owner exit, bounded progress,
-failure retries, idempotent operation IDs, large and binary selector values,
-and snapshot release between batches.
-
-The native runtime and benchmark runners accept `--cache-io` to exercise
-`sendfile on` with a 10,000-entry open-file cache, a 10-second validity interval,
-and `min_uses=2`. This is a separate I/O configuration comparison; keep its
-measurements separate from the default benchmark. The runtime runner retains
-its existing smaller open-file cache when this option is absent.
-When a reused runtime build selects a different backend library directory,
-the runner reconfigures its link inputs and records the archive hashes.
-
-The benchmark selects distinct cores from the topology exposed by Linux.
-It excludes nginx's SMT siblings from the load generator and controller,
-pins wrk to one separate core, and records actual thread affinities.
-`--server-cores` counts distinct cores; a separate load-generator core is
-required. Virtual-machine topology does not guarantee host CPU isolation.
-
-`--state` also tests shared queues/rules with nginx's actual slab allocator and
-process mutex. It checks publication ordering, disconnected callers, capacity
-rejection and cross-process visibility. It can run without linking RocksDB;
-with `--backend`, it also checks the durable-admission/publication sequence.
-
-Additional safeguards for unusual races or failure conditions are considered
-separately. They must not silently add work to every cache HIT or turn cache
-maintenance into a general transaction/recovery framework.
-
-## License
-
-See [LICENSE](LICENSE).
+Licensed under the [BSD 2-Clause License](LICENSE).

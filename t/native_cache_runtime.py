@@ -290,7 +290,7 @@ refused = None
 if args.public_module:
     refused = socket.socket()
     refused.bind(('127.0.0.1', 0))
-    owner_config = f'''cache_purge_store {run}/store;
+    owner_config = f'''cache_purge_index_store {run}/store;
     cache_purge_state_zone purge 1m;
     map $http_x_test_identity $native_purge_url {{
         default http://cache.test$uri;
@@ -466,14 +466,14 @@ checks, responses = [], []
 expected_manager_exits = []
 
 if args.public_module:
-    store_directive = f'cache_purge_store {run}/store;'
+    store_directive = f'cache_purge_index_store {run}/store;'
     assert config.count(store_directive) == 1
     for value, valid in (('0', True), ('1k', True), ('16m', True),
                          ('64m', True), ('1', False), ('1023', False),
                          ('-1', False), ('bad', False),
                          ('16m io_rate=32m', False)):
         candidate = config.replace(store_directive,
-            f'cache_purge_store {run}/store io_rate={value};')
+            f'cache_purge_index_store {run}/store io_rate={value};')
         candidate = candidate.replace(str(run / 'error.log'), str(run / 'config-check.log'))
         (run / 'config-check.conf').write_text(candidate)
         result = subprocess.run([str(binary), '-t', '-p', str(run),
