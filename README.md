@@ -18,6 +18,13 @@ http {
         server_name example.test;
 
         location / {
+            cache_key_namespace "";
+            cache_key_scheme $scheme;
+            cache_key_host $host;
+            cache_key_uri $request_uri;
+            cache_key_misc "";
+            cache_key_range "";
+
             proxy_cache content;
             proxy_cache_key $cache_key_full;
             proxy_cache_revalidate on;
@@ -38,7 +45,7 @@ http {
 }
 ```
 
-This example uses the bundled key module's defaults: `$scheme`, `$host`, and `$request_uri`, with empty namespace, misc, and range components. Configure `cache_key_*` directives when those inputs need to change.
+This example explicitly defines all six key components using their default values. Adjust the `cache_key_*` directives when those inputs need to change.
 
 Delete all indexed variants of `/asset`:
 
