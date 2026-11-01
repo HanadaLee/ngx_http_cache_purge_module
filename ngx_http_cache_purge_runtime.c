@@ -5,7 +5,7 @@
 #include <sched.h>
 
 
-#define NGX_HTTP_CACHE_PURGE_STATE_VERSION  6
+#define NGX_HTTP_CACHE_PURGE_STATE_VERSION  7
 #define NGX_HTTP_CACHE_PURGE_STATE_LIMIT    256
 #define NGX_HTTP_CACHE_PURGE_FILE_BATCH     8
 
@@ -15,7 +15,10 @@ typedef struct ngx_http_cache_purge_rule_s  ngx_http_cache_purge_rule_t;
 
 struct ngx_http_cache_purge_rule_s {
     ngx_queue_t                    queue;
-    ngx_http_cache_purge_rule_t   *parent;
+    union {
+        ngx_http_cache_purge_rule_t  *parent;
+        ngx_uint_t                    hash;
+    } lookup;
     u_char                         id[16];
     ngx_http_cache_purge_select_t  select;
     uint64_t                       issued, retain_until;
@@ -235,6 +238,10 @@ ngx_http_cache_purge_state_reserve(ngx_http_cache_purge_state_t *state,
     rule->retain_until = job->retain_until;
     rule->action = job->action;
     rule->select = job->select;
+    if (job->select.type == NGX_HTTP_CACHE_PURGE_SELECT_TAG) {
+        rule->lookup.hash = ngx_hash_key((u_char *) job->select.value.data,
+                                         job->select.value.len);
+    }
     p = (u_char *) (rule + 1);
     rule->select.value.data = p;
     p = ngx_cpymem(p, job->select.value.data, job->select.value.len);
@@ -265,6 +272,19 @@ ngx_http_cache_purge_state_group(ngx_uint_t type)
 }
 
 
+static ngx_inline ngx_int_t
+ngx_http_cache_purge_state_order(const ngx_http_cache_purge_rule_t *rule,
+    ngx_http_cache_rocksdb_bytes_t value, ngx_uint_t hash)
+{
+    if (rule->lookup.hash != hash) {
+        return rule->lookup.hash < hash ? -1 : 1;
+    }
+    return ngx_memn2cmp((u_char *) rule->select.value.data,
+                       (u_char *) value.data, rule->select.value.len,
+                       value.len);
+}
+
+
 static int
 ngx_http_cache_purge_state_compare(const void *a, const void *b)
 {
@@ -277,6 +297,10 @@ ngx_http_cache_purge_state_compare(const void *a, const void *b)
     y = ngx_http_cache_purge_state_group(right->select.type);
     if (x != y) {
         return x < y ? -1 : 1;
+    }
+    if (x == 2) {
+        return ngx_http_cache_purge_state_order(left, right->select.value,
+                                                right->lookup.hash);
     }
     return ngx_memn2cmp((u_char *) left->select.value.data,
                        (u_char *) right->select.value.data,
@@ -311,9 +335,9 @@ ngx_http_cache_purge_state_index(ngx_http_cache_purge_state_t *state)
     state->shared->ends[2] = n;
     ngx_qsort(index, n, sizeof(*index), ngx_http_cache_purge_state_compare);
 
-    /* URL ancestors include prefixes and duplicates; other groups are exact. */
+    /* TAG rules keep hashes; other groups retain parent links. */
     parent = NULL;
-    for (i = 0; i < n; i++) {
+    for (i = 0; i < state->shared->ends[1]; i++) {
         rule = index[i];
         while (parent != NULL
                && (ngx_http_cache_purge_state_group(parent->select.type)
@@ -323,9 +347,9 @@ ngx_http_cache_purge_state_index(ngx_http_cache_purge_state_t *state)
                                  rule->select.value.data,
                                  parent->select.value.len) != 0))
         {
-            parent = parent->parent;
+            parent = parent->lookup.parent;
         }
-        rule->parent = parent;
+        rule->lookup.parent = parent;
         parent = rule;
     }
 }
@@ -818,9 +842,50 @@ ngx_http_cache_purge_state_lookup(ngx_http_cache_purge_state_t *state,
         }
     }
     rule = low == start ? NULL : index[low - 1];
-    for ( /* void */; rule != NULL; rule = rule->parent) {
+    for ( /* void */; rule != NULL; rule = rule->lookup.parent) {
         if (group != 0
             && !ngx_http_cache_purge_state_equal(rule->select.value, value))
+        {
+            break;
+        }
+        ngx_http_cache_purge_state_apply(rule, entry, now, match, local_only);
+    }
+}
+
+
+/* The caller holds the lock and has more than four TAG rules. */
+static void
+ngx_http_cache_purge_state_tag_lookup(ngx_http_cache_purge_state_t *state,
+    ngx_http_cache_rocksdb_bytes_t value,
+    const ngx_http_cache_purge_entry_t *entry, uint64_t now,
+    ngx_http_cache_purge_match_t *match, ngx_uint_t local_only)
+{
+    ngx_http_cache_purge_rule_t  *rule, **index;
+    ngx_uint_t                    start, low, high, middle, hash;
+
+    index = state->shared->index;
+    start = state->shared->ends[1];
+    low = start;
+    high = state->shared->ends[2];
+    hash = ngx_hash_key((u_char *) value.data, value.len);
+    if (hash < index[low]->lookup.hash
+        || hash > index[high - 1]->lookup.hash)
+    {
+        return;
+    }
+    while (low < high) {
+        middle = (low + high) / 2;
+        rule = index[middle];
+        if (ngx_http_cache_purge_state_order(rule, value, hash) <= 0) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    while (low > start) {
+        rule = index[--low];
+        if (rule->lookup.hash != hash
+            || !ngx_http_cache_purge_state_equal(rule->select.value, value))
         {
             break;
         }
@@ -880,7 +945,7 @@ ngx_http_cache_purge_state_select(ngx_http_cache_purge_state_t *state,
             }
         } else {
             for (i = 0; i < entry->tag_count; i++) {
-                ngx_http_cache_purge_state_lookup(state, 2, entry->tags[i],
+                ngx_http_cache_purge_state_tag_lookup(state, entry->tags[i],
                                                   entry, now, match,
                                                   local_only);
             }

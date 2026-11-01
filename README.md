@@ -123,7 +123,7 @@ file checks, successful transitions into retention, and check/retention errors;
 they are operational counters, not a durable ledger. Reload retains them;
 a full restart resets them. Sweep bookmarks are process-local and may rescan
 after a restart. Cleanup yields under load, so completion time is not fixed.
-The shared state layout is now version 6; upgrading from earlier layouts
+The shared state format is now version 7; upgrading from earlier formats
 requires a full restart. The database schema and nginx core ABI are unchanged.
 
 RocksDB's target SST size and base-level capacity follow the write-buffer
@@ -167,8 +167,11 @@ The shared state reserves rule space before admission and exposes a successful
 completion only after publication. Its empty-rule path does not take the shared
 mutex. Completed rules retained only for propagation skip HIT filtering.
 The existing sorted array of at most 256 published rules groups URL/key/prefix,
-host and TAG selectors. URL searches follow prefix ancestors; host and TAG
-searches find exact candidates before checking their scope. TAG groups of at
+host and TAG selectors. URL searches follow prefix ancestors; host searches
+compare full values. Larger TAG groups compare precomputed hashes, then full
+values and scope, so hash collisions cannot broaden a purge. TAG rules reuse
+the ancestor pointer's storage for their hash, so the rule structure does not
+grow. TAG groups of at
 most four rules use direct comparisons to avoid small-table lookup overhead.
 When local rules contain only URL and prefix selectors, HIT filtering still
 evaluates only the URL. The array is rebuilt on publication and once after each

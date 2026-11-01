@@ -303,6 +303,8 @@ ngx_http_cache_purge_test_tags(ngx_http_cache_purge_state_t *state)
                                    "unmatched");
     ngx_expect(ngx_http_cache_purge_state_install(state, &other) == NGX_OK);
     job = ngx_http_cache_purge_job(0, NGX_HTTP_CACHE_PURGE_SELECT_TAG, "Aa");
+    ngx_expect(ngx_hash_key((u_char *) "Aa", 2)
+               == ngx_hash_key((u_char *) "BB", 2));
     ngx_expect(ngx_http_cache_purge_state_install(state, &job) == NGX_OK);
     for (i = 0; i < 64; i++) {
         entry.tags[i] = ngx_http_cache_purge_text("BB");
@@ -335,6 +337,10 @@ ngx_http_cache_purge_test_tags(ngx_http_cache_purge_state_t *state)
         extra = ngx_http_cache_purge_job(i, NGX_HTTP_CACHE_PURGE_SELECT_TAG,
                                         "boundary-unmatched");
         ngx_expect(ngx_http_cache_purge_state_install(state, &extra) == NGX_OK);
+        entry.tags[63] = ngx_http_cache_purge_text("BB");
+        ngx_expect(ngx_http_cache_purge_state_match(state, &entry, 201, &match)
+                   == NGX_DECLINED);
+        entry.tags[63] = ngx_http_cache_purge_text("Aa");
         ngx_expect(ngx_http_cache_purge_state_match(state, &entry, 201, &match)
                    == NGX_OK && !match.delete_before
                    && match.propagate_delete == 200);
