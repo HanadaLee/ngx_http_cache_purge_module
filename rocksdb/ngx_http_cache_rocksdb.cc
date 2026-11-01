@@ -372,6 +372,8 @@ ngx_http_cache_rocksdb_initialize(ngx_http_cache_rocksdb_t *store,
             rocksdb::RateLimiter::Mode::kAllIo));
     }
     options.max_open_files = static_cast<int>(store->options.max_open_files);
+    /* Avoid fragmenting the small file-handle budget across 64 shards. */
+    options.table_cache_numshardbits = 2;
     options.max_background_jobs =
         static_cast<int>(store->options.background_jobs);
 #if (defined(__linux__))

@@ -128,6 +128,8 @@ if args.sanitize:
     os.environ['ASAN_OPTIONS'] = 'detect_leaks=0:abort_on_error=1'
     os.environ['UBSAN_OPTIONS'] = 'halt_on_error=1:print_stacktrace=1'
 print('BUILD', root, flush=True)
+backend_hashes = {name: hashlib.sha256((args.backend / name).read_bytes()).hexdigest()
+                  for name in ('libngx_http_cache_purge_index.a', 'libngx_http_cache_rocksdb.a')} if args.backend else {}
 with (root / 'build.log').open('a' if args.reuse_build else 'w') as log:
     if args.reuse_build:
         assert '-DNGX_RESTY_EXT=' + str(args.extension) in (build / 'objs/Makefile').read_text()
@@ -143,7 +145,10 @@ with (root / 'build.log').open('a' if args.reuse_build else 'w') as log:
                 (build / 'objs/ngx_modules.c').read_text()) == bool(args.key)
         assert ('--add-dynamic-module=' + str(addon) in
                 (build / 'objs/ngx_auto_config.h').read_text()) == args.dynamic
-    else:
+    reconfigure = not args.reuse_build or (args.backend and any(
+        str(args.backend / name) not in (build / 'objs/Makefile').read_text()
+        for name in backend_hashes))
+    if reconfigure:
         subprocess.run(command, cwd=build, stdout=log, stderr=subprocess.STDOUT, check=True)
     subprocess.run(['make', '-j2'], cwd=build, stdout=log, stderr=subprocess.STDOUT, check=True)
 
@@ -922,7 +927,11 @@ errors = (run / 'error.log').read_text()
 for pid in expected_manager_exits:
     errors = re.sub(r'^.*\[alert\].*cache manager process ' + pid + r' exited on signal 9\n', '', errors, flags=re.M)
 assert '[alert]' not in errors and '[crit]' not in errors and '[emerg]' not in errors, errors
+for name, expected in backend_hashes.items():
+    assert hashlib.sha256((args.backend / name).read_bytes()).hexdigest() == expected, name
 report = {'status': 'passed', 'root': str(root), 'run': str(run),
+          'backend': str(args.backend) if args.backend else None,
+          'backend_sha256': backend_hashes,
           'executor': 'cache-manager' if args.public_module else 'worker-thread' if args.backend else None,
           'public_module': args.public_module,
           'expr': str(args.expr) if args.expr else None,

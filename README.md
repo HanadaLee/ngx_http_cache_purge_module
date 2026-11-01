@@ -107,6 +107,10 @@ retention deadline can preserve known TAG associations after file removal;
 expired associations are collected in bounded batches. No file publication or
 validation proofs are stored by this index.
 
+RocksDB's SST file-table cache uses four shards to keep the default small
+file-handle budget useful. The URL and TAG column families, memory budgets,
+and maximum open-file setting are unchanged.
+
 The native cache manager also sweeps file records for configured cache roots.
 It checks at most eight records per batch, at least 250 ms apart, and yields
 between records to queued work or a 5 ms time budget. Individual database or
@@ -269,6 +273,8 @@ The native runtime and benchmark runners accept `--cache-io` to exercise
 and `min_uses=2`. This is a separate I/O configuration comparison; keep its
 measurements separate from the default benchmark. The runtime runner retains
 its existing smaller open-file cache when this option is absent.
+When a reused runtime build selects a different backend library directory,
+the runner reconfigures its link inputs and records the archive hashes.
 
 The benchmark selects distinct cores from the topology exposed by Linux.
 It excludes nginx's SMT siblings from the load generator and controller,
