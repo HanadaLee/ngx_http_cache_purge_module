@@ -96,12 +96,15 @@ if args.framework:
 
 
 def request(tier, path, method='GET', headers=None, body=None, chunked=False):
+    identifier = str(len(responses) + 1)
     connection = http.client.HTTPConnection('127.0.0.1', ports[tier], timeout=10)
     connection.request(method, path, body=body,
-                       headers={'Host': 'cache.test', **(headers or {})},
+                       headers={'Host': 'cache.test', **(headers or {}),
+                                'X-Test-Request': identifier},
                        encode_chunked=chunked)
     response = connection.getresponse()
-    result = {'tier': tier, 'path': path, 'status': response.status,
+    result = {'tier': tier, 'path': path, 'request_id': identifier,
+              'status': response.status,
               'cache': response.getheader('X-Test-Cache'),
               'headers': dict(response.getheaders()), 'body': response.read().decode()}
     connection.close()
@@ -142,10 +145,13 @@ def submit(path, action, kind='url'):
 
 
 def parent_log(path):
+    identifier = next(response['request_id'] for response in reversed(responses)
+                      if response['tier'] == 'l1' and response['path'] == path)
     deadline = time.monotonic() + 1
     while True:
         entries = [json.loads(line) for line in (root / 'l2/access.log').read_text().splitlines()]
-        entries = [entry for entry in entries if entry['uri'] == path]
+        entries = [entry for entry in entries if entry['uri'] == path
+                   and entry['request_id'] == identifier]
         if entries:
             return entries[-1]
         assert time.monotonic() < deadline
@@ -193,7 +199,7 @@ pid {run}/nginx.pid;
 error_log {run}/error.log notice;
 events {{ worker_connections 128; }}
 http {{
-    log_format trace escape=json '{{"uri":"$uri","time":"$http_{time_header.lower().replace('-', '_')}","action":"$http_{action_header.lower().replace('-', '_')}","tag":"$http_x_cache_purge_tags","cache":"$upstream_cache_status"}}';
+    log_format trace escape=json '{{"uri":"$uri","request_id":"$http_x_test_request","time":"$http_{time_header.lower().replace('-', '_')}","action":"$http_{action_header.lower().replace('-', '_')}","tag":"$http_x_cache_purge_tags","cache":"$upstream_cache_status"}}';
     access_log {run}/access.log trace;
     cache_purge_index_store {run}/store;
     cache_purge_state_zone zone=purge:1m{' state=' + str(run / 'purge.zone') if args.state else ''};

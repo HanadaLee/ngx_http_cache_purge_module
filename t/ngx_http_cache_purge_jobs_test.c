@@ -91,7 +91,8 @@ ngx_http_cache_purge_apply(void *data,
 
     if (number == test->failure) {
         error->code = NGX_HTTP_CACHE_ROCKSDB_IO;
-        strcpy(error->message, "injected file error");
+        memcpy(error->message, "injected file error",
+               sizeof("injected file error"));
 
         return error->code;
     }

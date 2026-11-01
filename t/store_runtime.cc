@@ -417,11 +417,16 @@ ngx_http_cache_purge_test_reader(ngx_http_cache_rocksdb_t *store)
                                       "fork reader ownership check");
 
     if (child == 0) {
-        _exit(ngx_http_cache_rocksdb_reader_attach(
-                  reader, &ngx_http_cache_purge_test_error)
-              == NGX_HTTP_CACHE_ROCKSDB_OWNER ?
-                  0 :
-                  1);
+        if (ngx_http_cache_rocksdb_reader_attach(
+                reader, &ngx_http_cache_purge_test_error)
+            != NGX_HTTP_CACHE_ROCKSDB_OWNER)
+        {
+            _exit(1);
+        }
+
+        /* Drop inherited database resources without closing them after fork. */
+        execl("/bin/true", "true", static_cast<char *>(nullptr));
+        _exit(1);
     }
 
     int  status = 0;
@@ -1378,7 +1383,7 @@ main(int argc, char **argv)
                                           && stats.conflicts == 2,
                                           "budget and conflict accounting");
         ngx_http_cache_purge_test_close(store);
-        options.cursor_lifetime_ms = 10;
+        options.cursor_lifetime_ms = 1000;
         store = ngx_http_cache_purge_test_open(path, options);
         ngx_http_cache_purge_test_require(
             ngx_http_cache_purge_test_get(store,
@@ -1399,7 +1404,7 @@ main(int argc, char **argv)
                 ngx_http_cache_purge_test_bytes(""), &second,
                 &ngx_http_cache_purge_test_error),
             NGX_HTTP_CACHE_ROCKSDB_OK, "fork expiring view");
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
         ngx_http_cache_purge_test_expect(
             ngx_http_cache_rocksdb_stats(store, &stats,
                                          &ngx_http_cache_purge_test_error),

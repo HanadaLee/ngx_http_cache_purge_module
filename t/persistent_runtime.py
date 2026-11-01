@@ -8,7 +8,8 @@ import subprocess
 import sys
 import tempfile
 import time
-import xml.etree.ElementTree as ET
+# Only reads the CTest report generated in this run's new output directory.
+import xml.etree.ElementTree as ET  # nosemgrep: python.lang.security.use-defused-xml.use-defused-xml
 
 
 def main():

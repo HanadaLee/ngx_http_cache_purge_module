@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -36,6 +37,8 @@ ssize_t ngx_http_cache_purge_test_pwrite(int fd, const void *data, size_t size,
     off_t offset) __asm__("pwrite");
 ssize_t ngx_http_cache_purge_test_pread(int fd, void *data, size_t size,
     off_t offset) __asm__("pread");
+ssize_t ngx_http_cache_purge_test_pread_checked(int fd, void *data, size_t size,
+    off_t offset, size_t capacity) __asm__("__pread_chk");
 
 
 void
@@ -148,6 +151,19 @@ ngx_http_cache_purge_test_pread(int fd, void *data, size_t size, off_t offset)
     }
 
     return n;
+}
+
+
+/* Fortified builds must pass through the same fault-injection probe. */
+ssize_t
+ngx_http_cache_purge_test_pread_checked(int fd, void *data, size_t size,
+    off_t offset, size_t capacity)
+{
+    if (size > capacity) {
+        abort();
+    }
+
+    return ngx_http_cache_purge_test_pread(fd, data, size, offset);
 }
 
 

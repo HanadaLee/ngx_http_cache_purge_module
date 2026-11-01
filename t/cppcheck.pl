@@ -46,6 +46,7 @@ close $db or die $!;
 open my $advisory, '>', 'objs/purge-cppcheck-advisory.txt' or die $!;
 print {$advisory} "variableScope\nconstParameter\nconstParameterPointer\nconstVariablePointer\n",
                   "constVariable\nfuncArgNamesDifferent\nunusedStructMember\n",
+                  "checkLevelNormal\ncheckersReport\n",
                   "redundantContinue\nunusedFunction:$nginx/src/*.h\n",
                   "unusedFunction:src/*.h\n",
                   "unusedFunction:$nginx/src/core/ngx_slab.c\n",
