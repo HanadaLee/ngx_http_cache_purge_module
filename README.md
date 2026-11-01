@@ -85,13 +85,13 @@ load_module modules/ngx_http_cache_rocksdb_module.so;
 load_module modules/ngx_http_cache_purge_module.so;
 ```
 
-Load RocksDB before purge. The examples use the bundled key module; it has no link dependency on either module and can be omitted when configuration does not reference it. Build the modules and backend libraries from the same source revision.
+Load RocksDB before purge. The examples use the bundled key module. It is optional when your configuration supplies the identity values through other variables. Build the modules and backend libraries from the same source revision.
 
 For the key module alone, use `--add-module=/path/to/ngx_cache_purge/key` or `--add-dynamic-module=/path/to/ngx_cache_purge/key`. This build needs neither RocksDB nor HTTP cache support. Do not add `key/` separately when adding the repository root.
 
 The addon links with `-lrocksdb -lstdc++ -lm -pthread` by default. Set `CACHE_PURGE_ROCKSDB_LIBS` when a different link configuration is needed, such as static RocksDB with its compression dependencies.
 
-Build `ngx_expr_module` statically before this addon in the nginx configure arguments to enable `when` blocks. Purge identities are configured through expressions, without linking to the key module or parsing its key format.
+Build `ngx_expr_module` statically before this addon in the nginx configure arguments to enable `when` blocks. Use the purge identity directives to select values from the bundled key module or your own variables.
 
 `NGX_RESTY_EXT` enables strict Invalidate handling. Automatic proxy request-header integration additionally requires `NGX_HTTP_PROXY_FILTER`. Ordinary nginx uses its native stale policy and the propagation variables described below.
 
@@ -146,7 +146,7 @@ An empty namespace is valid and never falls back to the host. Nonempty namespace
 | `$cache_key_base` | Encoded namespace, scheme, host, URI, and misc |
 | `$cache_key_full` | The base fields followed by the encoded range, including an empty range |
 
-Base and full keys separate fields with the byte `0x1f`. A backslash inside a field becomes two backslashes; a field's own `0x1f` becomes the four printable bytes `\x1F`. These keys are binary. Use the individual component variables when constructing display strings or response headers.
+Base and full keys use an encoding that keeps their components distinct. Use the individual component variables when constructing readable strings or response headers.
 
 ```nginx
 cache_key_namespace "";
@@ -164,9 +164,9 @@ cache_purge_key_namespace $cache_key_namespace;
 
 Omit the range directive when the slice module is unavailable. The purge expressions explicitly associate the two modules; purge can use other business variables instead.
 
-Outputs evaluate the current input values when nginx reads them. One assembled output evaluates each needed component once; values are not frozen across request phases. Use stable inputs for a cached representation, especially when the same values are read later for indexing or display. The module does not capture native cache state, install bypass predicates, or expose a snapshot C API.
+Use stable component values throughout each request so that cache lookup, indexing, and displayed values identify the same response.
 
-Direct references from component expressions to this module's outputs are rejected during configuration. Indirect cycles and invalid dynamic namespaces log an error and fail variable evaluation. As with ordinary nginx variables, a caller may treat that failure as an empty value; it does not guarantee an HTTP error or prevent caching. Validate dynamic inputs in configuration rather than relying on this module as a request guard.
+Avoid circular variable references and validate dynamic namespace values. Invalid values are logged and can produce an empty cache-key value; they do not automatically reject the request.
 
 ## Purge directives
 
@@ -329,7 +329,7 @@ Names the PURGE action header. Accepted values are `delete` and `invalidate`; th
 
 Names the comma-separated TAG selector header for `tag` and `host-tag` purges. A request accepts 1–32 nonempty items, each at most 1,024 bytes. Trimming and empty-item handling follow `cache_purge_tag`; the 32-item limit applies before deduplication. Nginx's request-header buffer limits also apply.
 
-TAGs are sorted and deduplicated before admission. Matching uses OR semantics, and overlapping TAGs affect each file once within the task.
+A file matches when it has any listed TAG. Repeated or overlapping TAGs affect each file once within the task.
 
 ### cache_purge_operation_id_header
 
@@ -401,7 +401,7 @@ Names the incoming and outgoing parent purge action header: `delete` or `invalid
 | Default: | — |
 | Context: | `location` |
 
-Installs a management handler in a prefix location. It accepts GET and HEAD requests for paths relative to that location:
+Provides status endpoints in a prefix location. It accepts GET and HEAD requests for paths relative to that location:
 
 | Path | Response |
 | :--- | :--- |
@@ -457,7 +457,7 @@ Acceptance waits for task persistence and shared-rule publication, not file enum
 
 Propagation is one-way: L1 sends a timestamp and action to L2 on an upstream request. L2 compares them with its native cache date and either serves the cache or applies Delete/Invalidate before obtaining a response. Responses carry no receipt or other propagation metadata. This protocol applies only to proxy caches.
 
-With both `NGX_RESTY_EXT` and `NGX_HTTP_PROXY_FILTER`, the module sets outgoing headers through the proxy request-header framework. Otherwise, configure `proxy_set_header` in the managed parent-facing location:
+Builds with both `NGX_RESTY_EXT` and `NGX_HTTP_PROXY_FILTER` set outgoing headers automatically. Other builds require `proxy_set_header` in the managed parent-facing location:
 
 ```nginx
 proxy_cache_purge_propagation on;
@@ -467,7 +467,7 @@ proxy_set_header X-Cache-Purge-Action $cache_purge_propagation_action;
 
 Use the configured propagation header names on both tiers and in these `proxy_set_header` directives. Incoming time and action headers must be present together. `cache_purge_ignore_propagation on` bypasses their interpretation.
 
-TAG names are not sent upstream. Known TAG associations remain available for the propagation window after a local file is removed. A proxy MISS may query these retained associations in the background before sending upstream bytes; a cache HIT does not query RocksDB. A URL with no known TAG association has no TAG propagation requirement.
+TAG propagation uses the edge node's known URL-to-TAG associations, which remain available for the propagation window after a local file is removed. The parent receives the applicable timestamp and action. URLs with no known TAG association follow normal upstream handling.
 
 ### Variables
 
@@ -476,7 +476,7 @@ TAG names are not sent upstream. Known TAG associations remain available for the
 | `$cache_purge_propagation_time` | Applicable purge timestamp in Unix epoch milliseconds. |
 | `$cache_purge_propagation_action` | Applicable action: `delete` or `invalidate`. |
 
-Both variables are empty when propagation is disabled or no applicable requirement exists. Internal `$cache_purge_*_guard` variables are installed by the module and do not need manual configuration.
+Both variables are empty when propagation is disabled or no applicable requirement exists.
 
 ## Runtime behavior
 
@@ -492,9 +492,9 @@ Missing-file records are collected in the background, retaining known TAG relati
 
 - Indexing starts with managed cache fills. Existing unindexed files require an explicit migration or a fresh cache-key namespace when enabling the module.
 - Cache dates have second precision. An entry dated in the same second as a purge is treated as refreshed.
-- A parent request started before a purge may finish afterward and receive a newer native cache date. This in-flight boundary is accepted.
-- A first MISS can be stored after a purge has already completed without finding an indexed file. Preventing that response from becoming a later HIT is not implemented.
-- Unknown TAG associations have no first-MISS propagation compensation. Large active rule sets and sustained high-TAG fills can affect throughput and tail latency.
+- A parent request started before a purge may finish afterward with a cache timestamp newer than the purge. Subsequent timestamp checks can treat that response as refreshed.
+- A first cache fill still in progress when a purge completes can become a later HIT if the purge found no indexed entry for it.
+- TAG propagation covers known associations. URLs first encountered after a TAG purge follow normal upstream handling. Large active rule sets and responses with many TAGs can increase resource use and latency.
 
 ## Tests
 
