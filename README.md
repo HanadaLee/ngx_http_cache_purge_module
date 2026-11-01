@@ -64,7 +64,7 @@ Version 5 replaces the previous purge implementation and configuration interface
 - Configure `cache_purge_index_store`, `cache_purge_state_zone`, and the URL/misc/namespace expressions shown above. Enable each cache protocol with its `*_cache_purge on;` switch.
 - Submit `PURGE` requests for Delete or Invalidate. Successful submissions return `202 Accepted`; poll the operation endpoint when completion of background cleanup is required.
 - Restrict management locations through nginx access controls. The module does not perform authentication.
-- Start with fresh index and state paths, rebuild all three modules together, and perform a full nginx restart. Index and shared-state files from earlier implementations or development snapshots are not upgrade inputs.
+- Start with fresh index and state paths, rebuild all three modules together, and perform a full nginx restart. Do not reuse index or shared-state files from the previous implementation.
 
 ## Installation
 
@@ -85,7 +85,7 @@ load_module modules/ngx_http_cache_rocksdb_module.so;
 load_module modules/ngx_http_cache_purge_module.so;
 ```
 
-Load RocksDB before purge. The examples use the bundled key module; it has no link dependency on either module and can be omitted when configuration does not reference it. Build the modules and backend libraries from the same source revision. The initial RocksDB bridge ABI and private storage formats are version 1. Version 5.0.0 is the first release of this implementation. Development snapshots do not define an upgrade compatibility contract.
+Load RocksDB before purge. The examples use the bundled key module; it has no link dependency on either module and can be omitted when configuration does not reference it. Build the modules and backend libraries from the same source revision.
 
 For the key module alone, use `--add-module=/path/to/ngx_cache_purge/key` or `--add-dynamic-module=/path/to/ngx_cache_purge/key`. This build needs neither RocksDB nor HTTP cache support. Do not add `key/` separately when adding the repository root.
 
