@@ -7,14 +7,18 @@
 
 
 /* The caller holds the native cache-zone mutex. */
+static ngx_http_file_cache_node_t *ngx_http_cache_purge_native_lookup(
+    ngx_http_file_cache_t *cache, const u_char *key);
+
+
 static ngx_http_file_cache_node_t *
 ngx_http_cache_purge_native_lookup(ngx_http_file_cache_t *cache,
     const u_char *key)
 {
+    ngx_int_t                    compare;
+    ngx_rbtree_key_t             hash;
     ngx_rbtree_node_t           *node, *sentinel;
     ngx_http_file_cache_node_t  *file;
-    ngx_rbtree_key_t             hash;
-    ngx_int_t                    compare;
 
     ngx_memcpy(&hash, key, sizeof(hash));
     node = cache->sh->rbtree.root;
@@ -41,8 +45,8 @@ ngx_int_t
 ngx_http_cache_purge_native_identity(ngx_http_file_cache_t *cache,
     const u_char  *key, ngx_file_uniq_t *uniq)
 {
-    ngx_http_file_cache_node_t  *file;
     ngx_int_t                    rc;
+    ngx_http_file_cache_node_t  *file;
 
     *uniq = 0;
     rc = NGX_DECLINED;
@@ -62,8 +66,8 @@ ngx_int_t
 ngx_http_cache_purge_native_node(ngx_http_file_cache_t *cache,
     const u_char  *key, ngx_file_uniq_t expected, ngx_uint_t action)
 {
-    ngx_http_file_cache_node_t  *file;
     ngx_int_t                    rc;
+    ngx_http_file_cache_node_t  *file;
 
     ngx_shmtx_lock(&cache->shpool->mutex);
     file = ngx_http_cache_purge_native_lookup(cache, key);
@@ -120,15 +124,15 @@ ngx_int_t
 ngx_http_cache_purge_native_file(const char *name, ngx_uint_t invalidate,
     ngx_file_uniq_t  expected, ngx_http_cache_purge_native_file_t *result)
 {
-    ngx_fd_t                      fd;
-    ngx_file_info_t               info;
-    ngx_http_file_cache_header_t  header;
-    ngx_err_t                     err;
-    ssize_t                       n;
-    size_t                        size;
-    time_t                        expired;
-    u_char                       *p;
-    ngx_int_t                     rc;
+    size_t                         size;
+    time_t                         expired;
+    u_char                        *p;
+    ssize_t                        n;
+    ngx_fd_t                       fd;
+    ngx_err_t                      err;
+    ngx_int_t                      rc;
+    ngx_file_info_t                info;
+    ngx_http_file_cache_header_t   header;
 
     ngx_memzero(result, sizeof(*result));
 

@@ -26,6 +26,19 @@ typedef struct {
 } ngx_http_cache_purge_probe_wait_t;
 
 
+static ngx_int_t ngx_http_cache_purge_probe_guard(ngx_http_request_t *r,
+    ngx_http_variable_value_t  *value, uintptr_t data);
+static ngx_int_t ngx_http_cache_purge_probe_log(ngx_http_request_t *r);
+static ngx_int_t ngx_http_cache_purge_probe_handler(ngx_http_request_t *r);
+static char *ngx_http_cache_purge_probe_conf(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static void *ngx_http_cache_purge_probe_main(ngx_conf_t *cf);
+static char *ngx_http_cache_purge_probe_store(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static void ngx_http_cache_purge_probe_cleanup(void *data);
+static void ngx_http_cache_purge_probe_poll(ngx_event_t *event);
+
+
 static void *ngx_http_cache_purge_probe_main(ngx_conf_t *cf);
 static char *ngx_http_cache_purge_probe_store(ngx_conf_t *cf,
     ngx_command_t  *cmd, void *conf);
@@ -70,12 +83,16 @@ static ngx_command_t  ngx_http_cache_purge_probe_commands[] = {
 static ngx_http_module_t  ngx_http_cache_purge_probe_context = {
     ngx_http_cache_purge_probe_variables,
     ngx_http_cache_purge_probe_post,
-#if (NGX_HTTP_CACHE_PURGE_OWNER_TEST)
+    #if (NGX_HTTP_CACHE_PURGE_OWNER_TEST)
     ngx_http_cache_purge_probe_main,
-#else
+    #else
     NULL,
-#endif
-    NULL, NULL, NULL, NULL, NULL
+    #endif
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
 };
 
 ngx_module_t  ngx_http_cache_purge_native_probe_module = {
@@ -84,18 +101,20 @@ ngx_module_t  ngx_http_cache_purge_native_probe_module = {
     ngx_http_cache_purge_probe_commands,
     NGX_HTTP_MODULE,
     NULL,
-#if (NGX_HTTP_CACHE_PURGE_OWNER_TEST)
+    #if (NGX_HTTP_CACHE_PURGE_OWNER_TEST)
     ngx_http_cache_purge_probe_init,
     ngx_http_cache_purge_probe_process,
-#else
-    NULL, NULL,
-#endif
-    NULL, NULL,
-#if (NGX_HTTP_CACHE_PURGE_OWNER_TEST)
-    ngx_http_cache_purge_probe_exit,
-#else
+    #else
     NULL,
-#endif
+    NULL,
+    #endif
+    NULL,
+    NULL,
+    #if (NGX_HTTP_CACHE_PURGE_OWNER_TEST)
+    ngx_http_cache_purge_probe_exit,
+    #else
+    NULL,
+    #endif
     NULL,
     NGX_MODULE_V1_PADDING
 };
@@ -105,8 +124,8 @@ static ngx_int_t
 ngx_http_cache_purge_probe_guard(ngx_http_request_t *r,
     ngx_http_variable_value_t  *value, uintptr_t data)
 {
-    ngx_http_cache_t  *cache;
     ngx_int_t          purged;
+    ngx_http_cache_t  *cache;
 
     cache = r->cache;
     if (cache != NULL && cache->file_cache != NULL) {
@@ -127,9 +146,9 @@ ngx_http_cache_purge_probe_guard(ngx_http_request_t *r,
 static ngx_int_t
 ngx_http_cache_purge_probe_log(ngx_http_request_t *r)
 {
+    ngx_file_uniq_t       expected;
     ngx_http_cache_t     *cache;
     ngx_http_upstream_t  *upstream;
-    ngx_file_uniq_t       expected;
 #if (NGX_HTTP_CACHE_PURGE_OWNER_TEST)
     ngx_http_cache_purge_probe_main_t  *main;
     ngx_http_cache_purge_entry_t        entry;
@@ -199,14 +218,14 @@ ngx_http_cache_purge_probe_log(ngx_http_request_t *r)
 static ngx_int_t
 ngx_http_cache_purge_probe_handler(ngx_http_request_t *r)
 {
-    ngx_http_cache_purge_native_file_t  result;
-    ngx_http_file_cache_t              *cache;
-    ngx_str_t                           target, action;
-    ngx_md5_t                           md5;
-    ngx_int_t                           rc;
-    ngx_uint_t                          invalidate;
-    size_t                              length;
-    u_char                             *name, *p, key[NGX_HTTP_CACHE_KEY_LEN];
+    size_t                               length;
+    ngx_int_t                            rc;
+    ngx_md5_t                            md5;
+    ngx_str_t                            target, action;
+    ngx_uint_t                           invalidate;
+    ngx_http_file_cache_t               *cache;
+    ngx_http_cache_purge_native_file_t   result;
+    u_char                              *name, *p, key[NGX_HTTP_CACHE_KEY_LEN];
 #if (NGX_HTTP_CACHE_PURGE_OWNER_TEST)
     ngx_http_cache_purge_probe_main_t  *main;
 
@@ -285,16 +304,16 @@ ngx_http_cache_purge_probe_variables(ngx_conf_t *cf)
 static ngx_int_t
 ngx_http_cache_purge_probe_post(ngx_conf_t *cf)
 {
-    ngx_http_core_main_conf_t  *core;
     ngx_http_handler_pt        *handler;
+    ngx_http_core_main_conf_t  *core;
 #if (NGX_HTTP_CACHE_PURGE_OWNER_TEST)
-    ngx_http_cache_purge_probe_main_t  *main;
-    ngx_module_t                       *module;
-    ngx_command_t                      *command;
-    ngx_array_t                        *configured;
-    ngx_http_file_cache_t             **caches, **slot;
-    void                               *conf;
-    ngx_uint_t                          i, j;
+    ngx_http_cache_purge_probe_main_t   *main;
+    ngx_module_t                        *module;
+    ngx_command_t                       *command;
+    ngx_array_t                         *configured;
+    ngx_http_file_cache_t              **caches, **slot;
+    void                                *conf;
+    ngx_uint_t                           i, j;
 
     main = ngx_http_conf_get_module_main_conf(cf,
                                      ngx_http_cache_purge_native_probe_module);
@@ -367,9 +386,9 @@ ngx_http_cache_purge_probe_main(ngx_conf_t *cf)
 static char *
 ngx_http_cache_purge_probe_store(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
-    ngx_http_cache_purge_probe_main_t  *main;
-    ngx_shm_zone_t                     *zone;
     ngx_str_t                          *value;
+    ngx_shm_zone_t                     *zone;
+    ngx_http_cache_purge_probe_main_t  *main;
     ngx_str_t                         name = ngx_string("native_purge_state");
 
     main = conf;
@@ -404,8 +423,8 @@ ngx_http_cache_purge_probe_init(ngx_cycle_t *cycle)
 static ngx_int_t
 ngx_http_cache_purge_probe_process(ngx_cycle_t *cycle)
 {
-    ngx_http_cache_purge_probe_main_t  *main;
     ngx_http_cache_rocksdb_options_t    options;
+    ngx_http_cache_purge_probe_main_t  *main;
 
     main = ngx_http_cycle_get_module_main_conf(cycle,
                                      ngx_http_cache_purge_native_probe_module);
@@ -458,13 +477,13 @@ ngx_http_cache_purge_probe_cleanup(void *data)
 static void
 ngx_http_cache_purge_probe_poll(ngx_event_t *event)
 {
-    ngx_http_cache_purge_probe_wait_t  *ctx;
-    ngx_http_cache_purge_job_t          job;
-    ngx_http_request_t                 *r;
-    ngx_buf_t                          *buffer;
-    ngx_chain_t                         out;
-    ngx_int_t                           rc;
     int                                 result;
+    ngx_buf_t                          *buffer;
+    ngx_int_t                           rc;
+    ngx_chain_t                         out;
+    ngx_http_request_t                 *r;
+    ngx_http_cache_purge_job_t          job;
+    ngx_http_cache_purge_probe_wait_t  *ctx;
 
     ctx = event->data;
     r = ctx->request;
@@ -507,12 +526,12 @@ static ngx_int_t
 ngx_http_cache_purge_probe_async(ngx_http_request_t *r,
     ngx_http_cache_purge_probe_main_t *main)
 {
+    ngx_int_t                           number, rc;
     ngx_str_t                           action, target, id;
+    ngx_uint_t                          type;
+    ngx_pool_cleanup_t                 *cleanup;
     ngx_http_cache_purge_job_t          job;
     ngx_http_cache_purge_probe_wait_t  *ctx;
-    ngx_pool_cleanup_t                 *cleanup;
-    ngx_int_t                           number, rc;
-    ngx_uint_t                          type;
 
     if (!ngx_http_cache_purge_state_ready(&main->state)) {
         return NGX_HTTP_SERVICE_UNAVAILABLE;

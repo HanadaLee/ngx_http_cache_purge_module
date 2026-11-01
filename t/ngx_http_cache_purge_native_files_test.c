@@ -9,11 +9,11 @@
 int
 ngx_http_cache_purge_test_main(int argc, char **argv)
 {
-    ngx_http_file_cache_header_t          header;
-    ngx_http_cache_purge_native_file_t    result;
-    struct stat                           info;
-    ngx_int_t                             rc;
-    int                                   fd;
+    int                                 fd;
+    ngx_int_t                           rc;
+    struct stat                         info;
+    ngx_http_file_cache_header_t        header;
+    ngx_http_cache_purge_native_file_t  result;
     static const char                    key[] = "\nKEY: native-test\n";
     static const char                    response[] =
         "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n"

@@ -5,6 +5,13 @@
 
 #include "rocksdb/ngx_http_cache_rocksdb.h"
 
+#define NGX_HTTP_CACHE_PURGE_TAG_MAX       128
+#define NGX_HTTP_CACHE_PURGE_TAG_SELECT    32
+#define NGX_HTTP_CACHE_PURGE_TAG_LENGTH    1024
+#define NGX_HTTP_CACHE_PURGE_TAG_LIST_MAX                                     \
+    (NGX_HTTP_CACHE_PURGE_TAG_SELECT * (NGX_HTTP_CACHE_PURGE_TAG_LENGTH + 1)  \
+        - 1)
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -22,19 +29,32 @@ enum {
 };
 
 typedef struct {
-    unsigned char                   id[24], hash[16];
-    uint64_t                        uniq, created, retain_until;
-    ngx_http_cache_rocksdb_bytes_t  url, host, namespace_value, misc;
-    ngx_http_cache_rocksdb_bytes_t  root, zone, path;
-    ngx_http_cache_rocksdb_bytes_t  tags[64];
+    unsigned char                   id[24];
+    unsigned char                   hash[16];
+    uint64_t                        uniq;
+    uint64_t                        created;
+    uint64_t                        retain_until;
+    ngx_http_cache_rocksdb_bytes_t  url;
+    ngx_http_cache_rocksdb_bytes_t  host;
+    ngx_http_cache_rocksdb_bytes_t  namespace_value;
+    ngx_http_cache_rocksdb_bytes_t  misc;
+    ngx_http_cache_rocksdb_bytes_t  root;
+    ngx_http_cache_rocksdb_bytes_t  zone;
+    ngx_http_cache_rocksdb_bytes_t  path;
+    ngx_http_cache_rocksdb_bytes_t  tags[NGX_HTTP_CACHE_PURGE_TAG_MAX];
     size_t                          tag_count;
 } ngx_http_cache_purge_entry_t;
 
 typedef struct {
     unsigned                        type;
     unsigned                        host_scope;
-    ngx_http_cache_rocksdb_bytes_t  value, namespace_value, misc;
+    ngx_http_cache_rocksdb_bytes_t  value;
+    ngx_http_cache_rocksdb_bytes_t  namespace_value;
+    ngx_http_cache_rocksdb_bytes_t  misc;
 } ngx_http_cache_purge_select_t;
+
+int ngx_http_cache_purge_select_tags(ngx_http_cache_rocksdb_bytes_t value,
+    ngx_http_cache_rocksdb_bytes_t *tags, size_t *count);
 
 int ngx_http_cache_purge_catalog_open(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_purge_catalog_t  **catalog,
@@ -96,9 +116,13 @@ enum {
 
 typedef struct {
     unsigned char                   id[16];
-    unsigned                        action, done;
-    uint64_t                        issued, retain_until;
-    uint64_t                        visited, affected, skipped;
+    unsigned                        action;
+    unsigned                        done;
+    uint64_t                        issued;
+    uint64_t                        retain_until;
+    uint64_t                        visited;
+    uint64_t                        affected;
+    uint64_t                        skipped;
     uint32_t                        error;
     ngx_http_cache_purge_select_t   select;
     ngx_http_cache_rocksdb_bytes_t  bookmark;

@@ -7,6 +7,25 @@
 #include <sys/stat.h>
 
 
+static ngx_http_cache_rocksdb_bytes_t ngx_http_cache_purge_text(
+    const char *text);
+static void ngx_http_cache_purge_test_entry(ngx_http_cache_purge_entry_t *entry,
+    unsigned number);
+static size_t ngx_http_cache_purge_test_scan(
+    ngx_http_cache_purge_catalog_t *catalog, unsigned type, const char *value,
+    const char *scope, const char *misc, int host_scope, int retained,
+    uint64_t now, unsigned char ids[32][24]);
+static size_t ngx_http_cache_purge_test_rows(ngx_http_cache_rocksdb_t *store,
+    ngx_http_cache_rocksdb_cf_e cf, const char *prefix, size_t key_length);
+static int ngx_http_cache_purge_test_tag(void *data,
+    ngx_http_cache_rocksdb_bytes_t tag);
+static int ngx_http_cache_purge_test_visit(void *data,
+    const ngx_http_cache_purge_entry_t *entry,
+    ngx_http_cache_rocksdb_error_t *error);
+static void ngx_http_cache_purge_test_walk(
+    ngx_http_cache_purge_catalog_t *catalog);
+
+
 static unsigned  ngx_http_cache_purge_checks;
 
 #define ngx_expect(test)                                                       \
@@ -80,13 +99,13 @@ ngx_http_cache_purge_test_scan(ngx_http_cache_purge_catalog_t *catalog,
     unsigned type, const char *value, const char *scope, const char *misc,
     int host_scope, int retained, uint64_t now, unsigned char ids[32][24])
 {
-    ngx_http_cache_purge_select_t    select;
+    int                              rc;
+    size_t                           count;
     ngx_http_cache_purge_scan_t     *scan;
     ngx_http_cache_purge_entry_t     entry;
+    ngx_http_cache_purge_select_t    select;
     ngx_http_cache_rocksdb_bytes_t   after;
     ngx_http_cache_rocksdb_error_t   error;
-    size_t                           count;
-    int                              rc;
 
     memset(&select, 0, sizeof(select));
     select.type = type;
@@ -137,12 +156,12 @@ static size_t
 ngx_http_cache_purge_test_rows(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_rocksdb_cf_e cf, const char *prefix, size_t key_length)
 {
+    int                               rc;
+    size_t                            count;
+    ngx_http_cache_rocksdb_error_t    error;
+    ngx_http_cache_rocksdb_buffer_t   key, value;
     ngx_http_cache_rocksdb_cursor_t  *cursor;
-    ngx_http_cache_rocksdb_buffer_t  key, value;
-    ngx_http_cache_rocksdb_error_t   error;
-    unsigned char                   keys[65536], values[65536];
-    size_t                          count;
-    int                             rc;
+    unsigned char                     keys[65536], values[65536];
 
     cursor = NULL;
     ngx_expect(ngx_http_cache_rocksdb_cursor_open(store, cf,
@@ -186,7 +205,8 @@ typedef struct {
     ngx_http_cache_purge_catalog_t  *catalog;
     const char                      *root;
     size_t                           count;
-    int                              pause, remove;
+    int                              pause;
+    int                              remove;
     unsigned char                    ids[8][24];
 } ngx_http_cache_purge_walk_test_t;
 
@@ -219,12 +239,12 @@ ngx_http_cache_purge_test_visit(void *data,
 static void
 ngx_http_cache_purge_test_walk(ngx_http_cache_purge_catalog_t *catalog)
 {
-    ngx_http_cache_purge_walk_test_t  test;
-    ngx_http_cache_purge_entry_t      entry;
-    ngx_http_cache_rocksdb_error_t    error;
-    ngx_http_cache_rocksdb_bytes_t    root;
-    unsigned char                     after[24], empty[24];
     size_t                            i, count;
+    ngx_http_cache_purge_entry_t      entry;
+    ngx_http_cache_rocksdb_bytes_t    root;
+    ngx_http_cache_rocksdb_error_t    error;
+    ngx_http_cache_purge_walk_test_t  test;
+    unsigned char                     after[24], empty[24];
 
     memset(&test, 0, sizeof(test));
     memset(after, 0, sizeof(after));
@@ -285,22 +305,22 @@ ngx_http_cache_purge_test_walk(ngx_http_cache_purge_catalog_t *catalog)
 int
 ngx_http_cache_purge_test_main(void)
 {
-    ngx_http_cache_rocksdb_options_t  options;
-    ngx_http_cache_rocksdb_error_t    error;
-    ngx_http_cache_rocksdb_t         *store;
-    ngx_http_cache_purge_catalog_t   *catalog;
-    ngx_http_cache_purge_entry_t      entry, current;
-    ngx_http_cache_purge_select_t     select;
-    ngx_http_cache_purge_scan_t      *scan;
-    ngx_http_cache_rocksdb_bytes_t    bookmark;
-    ngx_http_cache_rocksdb_mutation_t legacy;
-    unsigned char                    ids[32][24], token[32822], saved[24];
+    ngx_http_cache_rocksdb_t           *store;
+    ngx_http_cache_purge_scan_t        *scan;
+    ngx_http_cache_purge_entry_t        entry, current;
+    ngx_http_cache_purge_select_t       select;
+    ngx_http_cache_purge_catalog_t     *catalog;
+    ngx_http_cache_rocksdb_bytes_t      bookmark;
+    ngx_http_cache_rocksdb_error_t      error;
+    ngx_http_cache_rocksdb_options_t    options;
+    ngx_http_cache_rocksdb_mutation_t   legacy;
+    unsigned char                       ids[32][24], token[32822], saved[24];
     char                             path[] = "/tmp/cache-catalog-XXXXXX";
-    char                             old_path[128];
-    char                             tag_values[64][16], long_url[4097];
+    char  old_path[128];
+    char  tag_values[128][16], long_url[4097];
     unsigned char                    misc[] = { 'a', 0, 'b' };
-    size_t                           i, count, removed;
-    int                              rc;
+    size_t  i, count, removed;
+    int     rc;
 
     ngx_expect(mkdtemp(path) != NULL);
     ngx_http_cache_rocksdb_options(&options);
@@ -319,8 +339,8 @@ ngx_http_cache_purge_test_main(void)
     entry.url = ngx_http_cache_purge_text(long_url);
     entry.misc.data = misc;
     entry.misc.len = sizeof(misc);
-    entry.tag_count = 64;
-    for (i = 0; i < 64; i++) {
+    entry.tag_count = 128;
+    for (i = 0; i < 128; i++) {
         snprintf(tag_values[i], sizeof(tag_values[i]), "tag-%02u",
                  (unsigned) i);
         entry.tags[i] = ngx_http_cache_purge_text(tag_values[i]);
@@ -330,7 +350,21 @@ ngx_http_cache_purge_test_main(void)
     count = 0;
     ngx_expect(ngx_http_cache_purge_catalog_tags(catalog, &entry,
                     ngx_http_cache_purge_test_tag, &count, &error) == 0);
-    ngx_expect(count == 64);
+    ngx_expect(count == 128);
+    ngx_expect(ngx_http_cache_purge_test_scan(catalog,
+        NGX_HTTP_CACHE_PURGE_SELECT_TAG, "tag-00,absent,tag-127", "", "",
+        0, 0, 0, ids) == 1);
+
+    /* Replace a full TAG set without exceeding the bounded mutation arena. */
+    for (i = 0; i < 128; i++) {
+        snprintf(tag_values[i], sizeof(tag_values[i]), "new-%03u",
+                 (unsigned) i);
+        entry.tags[i] = ngx_http_cache_purge_text(tag_values[i]);
+    }
+    ngx_expect(ngx_http_cache_purge_catalog_put(catalog, &entry, &error) == 0);
+    ngx_expect(ngx_http_cache_purge_test_scan(catalog,
+        NGX_HTTP_CACHE_PURGE_SELECT_TAG, "tag-00,new-000,new-127", "", "",
+        0, 0, 0, ids) == 1);
     memset(&select, 0, sizeof(select));
     select.type = NGX_HTTP_CACHE_PURGE_SELECT_KEY;
     select.value = entry.url;
@@ -342,10 +376,10 @@ ngx_http_cache_purge_test_main(void)
                && current.misc.data == NULL);
     memcpy(saved, current.id, 24);
     ngx_http_cache_purge_scan_close(scan);
-    entry.tag_count = 65;
+    entry.tag_count = 129;
     ngx_expect(ngx_http_cache_purge_catalog_put(catalog, &entry, &error)
                == NGX_HTTP_CACHE_ROCKSDB_INVALID);
-    entry.tag_count = 64;
+    entry.tag_count = 128;
     entry.misc.len = 32769;
     ngx_expect(ngx_http_cache_purge_catalog_put(catalog, &entry, &error)
                == NGX_HTTP_CACHE_ROCKSDB_INVALID);
@@ -355,7 +389,7 @@ ngx_http_cache_purge_test_main(void)
                == NGX_HTTP_CACHE_ROCKSDB_INVALID);
     ngx_expect(ngx_http_cache_purge_catalog_get(catalog, saved, &current,
                                                &error) == 0);
-    ngx_expect(current.tag_count == 64 && current.url.len == 4096);
+    ngx_expect(current.tag_count == 128 && current.url.len == 4096);
     ngx_expect(current.misc.len == sizeof(misc)
                && memcmp(current.misc.data, misc, sizeof(misc)) == 0);
     ngx_expect(ngx_http_cache_purge_catalog_remove(catalog, saved, 0, &error)

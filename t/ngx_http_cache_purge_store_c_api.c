@@ -13,6 +13,9 @@
 #include <unistd.h>
 
 
+static int ngx_http_cache_purge_test_sync(int fd, long operation);
+
+
 static unsigned  ngx_http_cache_purge_test_syncs;
 static unsigned  ngx_http_cache_purge_test_sync_error;
 static __thread unsigned ngx_http_cache_purge_test_direct_mode;
@@ -54,9 +57,9 @@ ngx_http_cache_purge_test_direct_supported(void)
 int
 ngx_http_cache_purge_test_open(const char *path, int flags, ...)
 {
-    va_list  args;
-    mode_t   mode;
     int      fd, probe;
+    mode_t   mode;
+    va_list  args;
 
     mode = 0;
     if ((flags & O_CREAT) || (flags & O_TMPFILE) == O_TMPFILE) {
@@ -138,8 +141,8 @@ ngx_http_cache_purge_test_sync_fail(unsigned fail)
 static int
 ngx_http_cache_purge_test_sync(int fd, long operation)
 {
-    char     name[64], target[4096];
     ssize_t  length;
+    char     name[64], target[4096];
 
     snprintf(name, sizeof(name), "/proc/self/fd/%d", fd);
     length = readlink(name, target, sizeof(target));
@@ -177,7 +180,7 @@ int
 ngx_http_cache_purge_store_c_probe(ngx_http_cache_rocksdb_t *store)
 {
     static const unsigned char      key[] = "C:abi";
-    unsigned char                   value[16];
+    unsigned char  value[16];
     ngx_http_cache_rocksdb_bytes_t  input = { key, sizeof(key) - 1 };
     ngx_http_cache_rocksdb_buffer_t output = { value, sizeof(value), 0 };
     ngx_http_cache_rocksdb_error_t  error;

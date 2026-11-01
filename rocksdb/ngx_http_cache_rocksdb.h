@@ -74,19 +74,19 @@ typedef enum {
 } ngx_http_cache_rocksdb_mutation_type_e;
 
 typedef struct {
-    ngx_http_cache_rocksdb_cf_e            cf;
-    ngx_http_cache_rocksdb_mutation_type_e type;
-    ngx_http_cache_rocksdb_bytes_t  key;
-    ngx_http_cache_rocksdb_bytes_t  value;
+    ngx_http_cache_rocksdb_cf_e             cf;
+    ngx_http_cache_rocksdb_mutation_type_e  type;
+    ngx_http_cache_rocksdb_bytes_t          key;
+    ngx_http_cache_rocksdb_bytes_t          value;
 } ngx_http_cache_rocksdb_mutation_t;
 
 typedef struct {
-    ngx_http_cache_rocksdb_cf_e    cf;
+    ngx_http_cache_rocksdb_cf_e     cf;
     ngx_http_cache_rocksdb_bytes_t  key;
     ngx_http_cache_rocksdb_bytes_t  value;
 
     /* 0: must be absent; 1: exact expected value */
-    int                             exists;
+    int  exists;
 
 } ngx_http_cache_rocksdb_condition_t;
 
@@ -106,7 +106,7 @@ typedef struct {
 void ngx_http_cache_rocksdb_options(ngx_http_cache_rocksdb_options_t *options);
 uint32_t ngx_http_cache_rocksdb_abi_2(void);
 
-/* Blocking APIs: call only on the owning worker's executor thread.
+/* Blocking APIs: call only on the owning process and executor thread.
  * A handle belongs to its opening process/thread and must never cross fork,
  * IPC or SHM. The directory must already exist and be writable (nginx creates
  * it through ngx_add_path). Open synchronizes the recovered WAL prefix before

@@ -5,30 +5,41 @@
 #include <sched.h>
 
 
-#define NGX_HTTP_CACHE_PURGE_STATE_VERSION  8
+#define NGX_HTTP_CACHE_PURGE_STATE_VERSION  1
 #define NGX_HTTP_CACHE_PURGE_STATE_LIMIT    256
 #define NGX_HTTP_CACHE_PURGE_FILE_BATCH     8
 
 
 typedef struct ngx_http_cache_purge_rule_s  ngx_http_cache_purge_rule_t;
 
+typedef struct {
+    ngx_http_cache_purge_rule_t     *rule;
+    ngx_http_cache_rocksdb_bytes_t   value;
+    ngx_uint_t                       hash;
+} ngx_http_cache_purge_tag_rule_t;
+
 
 struct ngx_http_cache_purge_rule_s {
-    ngx_queue_t                    queue;
-    union {
-        ngx_http_cache_purge_rule_t  *parent;
-        ngx_uint_t                    hash;
-    } lookup;
-    u_char                         id[16];
-    ngx_http_cache_purge_select_t  select;
-    uint64_t                       issued, retain_until;
-    ngx_uint_t                     action, references, published, local;
+    ngx_queue_t                       queue;
+    ngx_http_cache_purge_rule_t      *parent;
+    u_char                            id[16];
+    ngx_http_cache_purge_select_t     select;
+    uint64_t                          issued;
+    uint64_t                          retain_until;
+    ngx_uint_t                        action;
+    ngx_uint_t                        references;
+    ngx_uint_t                        published;
+    ngx_uint_t                        local;
+    ngx_uint_t                        tag_count;
+    ngx_http_cache_purge_tag_rule_t  *tags;
 };
 
 
 struct ngx_http_cache_purge_message_s {
-    ngx_queue_t                  all, pending;
-    ngx_pid_t                    owner, executor;
+    ngx_queue_t                  all;
+    ngx_queue_t                  pending;
+    ngx_pid_t                    owner;
+    ngx_pid_t                    executor;
     ngx_uint_t                   state;
     size_t                       bytes;
     int                          result;
@@ -37,29 +48,109 @@ struct ngx_http_cache_purge_message_s {
 
 
 struct ngx_http_cache_purge_shared_s {
-    ngx_uint_t                   version;
-    ngx_atomic_t                 published;
-    ngx_atomic_t                 before;
-    ngx_atomic_t                 complex;
-    ngx_atomic_t                 ready;
-    ngx_pid_t                    owner;
-    ngx_queue_t                  rules, messages, pending;
-    ngx_uint_t                   rule_count, message_count, local_count;
-    ngx_uint_t                   ends[3];
-    ngx_http_cache_purge_rule_t *index[NGX_HTTP_CACHE_PURGE_STATE_LIMIT];
-    size_t                       message_bytes, capacity;
-    uint64_t                     collected;
-    uint64_t                     cleanup[3];
+    ngx_uint_t                        version;
+    ngx_atomic_t                      published;
+    ngx_atomic_t                      before;
+    ngx_atomic_t                      complex;
+    ngx_atomic_t                      ready;
+    ngx_pid_t                         owner;
+    ngx_queue_t                       rules;
+    ngx_queue_t                       messages;
+    ngx_queue_t                       pending;
+    ngx_uint_t                        rule_count;
+    ngx_uint_t                        message_count;
+    ngx_uint_t                        local_count;
+    ngx_uint_t                        slots;
+    ngx_uint_t                        tag_count;
+    ngx_uint_t                        ends[3];
+    ngx_http_cache_purge_rule_t      *index[NGX_HTTP_CACHE_PURGE_STATE_LIMIT];
+    ngx_http_cache_purge_tag_rule_t  *tags[NGX_HTTP_CACHE_PURGE_STATE_LIMIT];
+    size_t                            message_bytes;
+    size_t                            capacity;
+    uint64_t                          collected;
+    uint64_t                          cleanup[3];
 };
+
+
+static ngx_uint_t ngx_http_cache_purge_state_fields(
+    ngx_http_cache_purge_work_t *work, ngx_http_cache_rocksdb_bytes_t **fields);
+static ngx_int_t ngx_http_cache_purge_state_size(
+    ngx_http_cache_purge_work_t *work);
+static void ngx_http_cache_purge_state_copy(ngx_http_cache_purge_work_t *dst,
+    ngx_http_cache_purge_work_t *src);
+static ngx_uint_t ngx_http_cache_purge_state_equal(
+    ngx_http_cache_rocksdb_bytes_t a, ngx_http_cache_rocksdb_bytes_t b);
+static ngx_http_cache_purge_rule_t *ngx_http_cache_purge_state_find(
+    ngx_http_cache_purge_state_t *state, const u_char id[16]);
+static ngx_int_t ngx_http_cache_purge_state_reserve(
+    ngx_http_cache_purge_state_t *state, const ngx_http_cache_purge_job_t *job,
+    ngx_http_cache_purge_rule_t **out);
+static ngx_inline ngx_uint_t ngx_http_cache_purge_state_group(ngx_uint_t type);
+static ngx_inline ngx_int_t ngx_http_cache_purge_state_order(
+    const ngx_http_cache_purge_tag_rule_t *tag,
+    ngx_http_cache_rocksdb_bytes_t value, ngx_uint_t hash);
+static int ngx_http_cache_purge_state_tag_compare(const void *a, const void *b);
+static int ngx_http_cache_purge_state_compare(const void *a, const void *b);
+static void ngx_http_cache_purge_state_index(
+    ngx_http_cache_purge_state_t *state);
+static void ngx_http_cache_purge_state_local(
+    ngx_http_cache_purge_state_t *state, ngx_http_cache_purge_rule_t *rule,
+    ngx_uint_t local);
+static void ngx_http_cache_purge_state_publish(
+    ngx_http_cache_purge_state_t *state, ngx_http_cache_purge_rule_t *rule,
+    const ngx_http_cache_purge_job_t *job);
+static void ngx_http_cache_purge_state_remove(
+    ngx_http_cache_purge_state_t *state, ngx_http_cache_purge_rule_t *rule);
+static void ngx_http_cache_purge_state_free(ngx_http_cache_purge_state_t *state,
+    ngx_http_cache_purge_message_t *message);
+static void ngx_http_cache_purge_state_result(ngx_http_cache_purge_job_t *dst,
+    const ngx_http_cache_purge_job_t *src);
+static ngx_uint_t ngx_http_cache_purge_state_matches(
+    const ngx_http_cache_purge_select_t *s,
+    const ngx_http_cache_purge_entry_t *entry);
+static void ngx_http_cache_purge_state_apply(ngx_http_cache_purge_rule_t *rule,
+    const ngx_http_cache_purge_entry_t *entry, uint64_t now,
+    ngx_http_cache_purge_match_t *match, ngx_uint_t local_only);
+static void ngx_http_cache_purge_state_lookup(
+    ngx_http_cache_purge_state_t *state, ngx_uint_t group,
+    ngx_http_cache_rocksdb_bytes_t value,
+    const ngx_http_cache_purge_entry_t *entry, uint64_t now,
+    ngx_http_cache_purge_match_t *match, ngx_uint_t local_only);
+static void ngx_http_cache_purge_state_tag_lookup(
+    ngx_http_cache_purge_state_t *state, ngx_http_cache_rocksdb_bytes_t value,
+    const ngx_http_cache_purge_entry_t *entry, uint64_t now,
+    ngx_http_cache_purge_match_t *match, ngx_uint_t local_only);
+static ngx_int_t ngx_http_cache_purge_state_select(
+    ngx_http_cache_purge_state_t *state,
+    const ngx_http_cache_purge_entry_t *entry, uint64_t now,
+    ngx_http_cache_purge_match_t *match, ngx_uint_t url_only,
+    ngx_uint_t local_only);
+static ngx_uint_t ngx_http_cache_purge_owner_idle(
+    ngx_http_cache_purge_owner_t *o, ngx_uint_t count, ngx_msec_t deadline);
+static int ngx_http_cache_purge_owner_check(void *data,
+    const ngx_http_cache_purge_entry_t *entry,
+    ngx_http_cache_rocksdb_error_t *error);
+static int ngx_http_cache_purge_owner_file(void *data,
+    const ngx_http_cache_purge_entry_t  *entry, unsigned action,
+    ngx_http_cache_rocksdb_error_t *error);
+static int ngx_http_cache_purge_owner_result(ngx_http_cache_purge_owner_t *o,
+    ngx_http_cache_purge_job_t *job);
+static void ngx_http_cache_purge_owner_close(ngx_http_cache_purge_owner_t *o);
+static int ngx_http_cache_purge_owner_tag(void *data,
+    ngx_http_cache_rocksdb_bytes_t tag);
+static int ngx_http_cache_purge_owner_records(ngx_http_cache_purge_owner_t *o);
+static int ngx_http_cache_purge_owner_execute(ngx_http_cache_purge_owner_t *o);
+static void *ngx_http_cache_purge_owner_thread(void *data);
+static void ngx_http_cache_purge_owner_deliver(ngx_http_cache_purge_owner_t *o);
 
 
 static ngx_uint_t
 ngx_http_cache_purge_state_fields(ngx_http_cache_purge_work_t *work,
     ngx_http_cache_rocksdb_bytes_t **fields)
 {
-    ngx_http_cache_purge_entry_t  *entry;
-    ngx_http_cache_purge_job_t    *job;
     ngx_uint_t                     i;
+    ngx_http_cache_purge_job_t    *job;
+    ngx_http_cache_purge_entry_t  *entry;
 
     if (work->type == NGX_HTTP_CACHE_PURGE_STATUS) {
         return 0;
@@ -92,14 +183,14 @@ ngx_http_cache_purge_state_fields(ngx_http_cache_purge_work_t *work,
 static ngx_int_t
 ngx_http_cache_purge_state_size(ngx_http_cache_purge_work_t *work)
 {
-    ngx_http_cache_rocksdb_bytes_t  *fields[71];
-    ngx_http_cache_purge_job_t      *job;
-    ngx_uint_t                       i, count;
     size_t                           maximum;
+    ngx_uint_t                       i, count;
+    ngx_http_cache_purge_job_t      *job;
+    ngx_http_cache_rocksdb_bytes_t  *fields[7 + NGX_HTTP_CACHE_PURGE_TAG_MAX];
 
     if ((work->type == NGX_HTTP_CACHE_PURGE_RECORD
          || work->type == NGX_HTTP_CACHE_PURGE_LOOKUP)
-        && work->data.entry.tag_count > 64)
+        && work->data.entry.tag_count > NGX_HTTP_CACHE_PURGE_TAG_MAX)
     {
         return NGX_ERROR;
     }
@@ -122,6 +213,11 @@ ngx_http_cache_purge_state_size(ngx_http_cache_purge_work_t *work)
     for (i = 0; i < count; i++) {
         maximum = work->type == NGX_HTTP_CACHE_PURGE_RECORD && i >= 7
                   ? 1024 : 32768;
+        if (work->type == NGX_HTTP_CACHE_PURGE_SUBMIT && i == 0
+            && work->data.job.select.type == NGX_HTTP_CACHE_PURGE_SELECT_TAG)
+        {
+            maximum = NGX_HTTP_CACHE_PURGE_TAG_LIST_MAX;
+        }
         if (fields[i]->len > maximum
             || (fields[i]->len != 0 && fields[i]->data == NULL)
             || fields[i]->len > NGX_HTTP_CACHE_PURGE_MESSAGE_MAX - work->size)
@@ -140,9 +236,9 @@ static void
 ngx_http_cache_purge_state_copy(ngx_http_cache_purge_work_t *dst,
     ngx_http_cache_purge_work_t *src)
 {
-    ngx_http_cache_rocksdb_bytes_t  *fields[71];
-    ngx_uint_t                       i, count;
     u_char                          *p;
+    ngx_uint_t                       i, count;
+    ngx_http_cache_rocksdb_bytes_t  *fields[7 + NGX_HTTP_CACHE_PURGE_TAG_MAX];
 
     *dst = *src;
     p = (u_char *) (dst + 1);
@@ -199,10 +295,12 @@ static ngx_int_t
 ngx_http_cache_purge_state_reserve(ngx_http_cache_purge_state_t *state,
     const ngx_http_cache_purge_job_t  *job, ngx_http_cache_purge_rule_t **out)
 {
-    ngx_http_cache_purge_rule_t    *rule;
-    ngx_http_cache_purge_select_t  *s;
-    u_char                         *p;
-    size_t                          size;
+    size_t                           size, start, i;
+    u_char                          *p;
+    ngx_uint_t                       count;
+    ngx_http_cache_purge_rule_t     *rule;
+    ngx_http_cache_purge_select_t   *s;
+    ngx_http_cache_rocksdb_bytes_t   tags[NGX_HTTP_CACHE_PURGE_TAG_SELECT];
 
     rule = ngx_http_cache_purge_state_find(state, job->id);
     if (rule != NULL) {
@@ -222,11 +320,32 @@ ngx_http_cache_purge_state_reserve(ngx_http_cache_purge_state_t *state,
         return NGX_OK;
     }
 
-    if (state->shared->rule_count == NGX_HTTP_CACHE_PURGE_STATE_LIMIT) {
+    count = 0;
+    if (job->select.type == NGX_HTTP_CACHE_PURGE_SELECT_TAG) {
+        for (start = 0, i = 0; i <= job->select.value.len; i++) {
+            if (i != job->select.value.len
+                && job->select.value.data[i] != ',')
+            {
+                continue;
+            }
+            if (i == start || i - start > NGX_HTTP_CACHE_PURGE_TAG_LENGTH
+                || count == NGX_HTTP_CACHE_PURGE_TAG_SELECT)
+            {
+                return NGX_ERROR;
+            }
+            tags[count].data = job->select.value.data + start;
+            tags[count++].len = i - start;
+            start = i + 1;
+        }
+    }
+    if (ngx_max(count, 1) > NGX_HTTP_CACHE_PURGE_STATE_LIMIT
+                             - state->shared->slots)
+    {
         return NGX_BUSY;
     }
 
-    size = sizeof(*rule) + job->select.value.len
+    size = sizeof(*rule) + count * sizeof(ngx_http_cache_purge_tag_rule_t)
+           + job->select.value.len
            + job->select.namespace_value.len + job->select.misc.len;
     rule = ngx_slab_calloc_locked(state->pool, size);
     if (rule == NULL) {
@@ -238,12 +357,16 @@ ngx_http_cache_purge_state_reserve(ngx_http_cache_purge_state_t *state,
     rule->retain_until = job->retain_until;
     rule->action = job->action;
     rule->select = job->select;
-    if (job->select.type == NGX_HTTP_CACHE_PURGE_SELECT_TAG) {
-        rule->lookup.hash = ngx_hash_key((u_char *) job->select.value.data,
-                                         job->select.value.len);
-    }
-    p = (u_char *) (rule + 1);
+    rule->tag_count = count;
+    rule->tags = (ngx_http_cache_purge_tag_rule_t *) (rule + 1);
+    p = (u_char *) (rule->tags + count);
     rule->select.value.data = p;
+    for (i = 0; i < count; i++) {
+        rule->tags[i].rule = rule;
+        rule->tags[i].value.data = p + (tags[i].data - job->select.value.data);
+        rule->tags[i].value.len = tags[i].len;
+        rule->tags[i].hash = ngx_hash_key((u_char *) tags[i].data, tags[i].len);
+    }
     p = ngx_cpymem(p, job->select.value.data, job->select.value.len);
     rule->select.namespace_value.data = p;
     if (job->select.namespace_value.len != 0) {
@@ -258,6 +381,7 @@ ngx_http_cache_purge_state_reserve(ngx_http_cache_purge_state_t *state,
 
     ngx_queue_insert_tail(&state->shared->rules, &rule->queue);
     state->shared->rule_count++;
+    state->shared->slots += ngx_max(count, 1);
     *out = rule;
 
     return NGX_OK;
@@ -273,23 +397,34 @@ ngx_http_cache_purge_state_group(ngx_uint_t type)
 
 
 static ngx_inline ngx_int_t
-ngx_http_cache_purge_state_order(const ngx_http_cache_purge_rule_t *rule,
+ngx_http_cache_purge_state_order(const ngx_http_cache_purge_tag_rule_t *tag,
     ngx_http_cache_rocksdb_bytes_t value, ngx_uint_t hash)
 {
-    if (rule->lookup.hash != hash) {
-        return rule->lookup.hash < hash ? -1 : 1;
+    if (tag->hash != hash) {
+        return tag->hash < hash ? -1 : 1;
     }
-    return ngx_memn2cmp((u_char *) rule->select.value.data,
-                       (u_char *) value.data, rule->select.value.len,
+    return ngx_memn2cmp((u_char *) tag->value.data,
+                       (u_char *) value.data, tag->value.len,
                        value.len);
+}
+
+
+static int
+ngx_http_cache_purge_state_tag_compare(const void *a, const void *b)
+{
+    ngx_http_cache_purge_tag_rule_t  *left, *right;
+
+    left = *(ngx_http_cache_purge_tag_rule_t * const *) a;
+    right = *(ngx_http_cache_purge_tag_rule_t * const *) b;
+    return ngx_http_cache_purge_state_order(left, right->value, right->hash);
 }
 
 
 static int
 ngx_http_cache_purge_state_compare(const void *a, const void *b)
 {
-    ngx_http_cache_purge_rule_t  *left, *right;
     ngx_uint_t                    x, y;
+    ngx_http_cache_purge_rule_t  *left, *right;
 
     left = *(ngx_http_cache_purge_rule_t * const *) a;
     right = *(ngx_http_cache_purge_rule_t * const *) b;
@@ -297,10 +432,6 @@ ngx_http_cache_purge_state_compare(const void *a, const void *b)
     y = ngx_http_cache_purge_state_group(right->select.type);
     if (x != y) {
         return x < y ? -1 : 1;
-    }
-    if (x == 2) {
-        return ngx_http_cache_purge_state_order(left, right->select.value,
-                                                right->lookup.hash);
     }
     return ngx_memn2cmp((u_char *) left->select.value.data,
                        (u_char *) right->select.value.data,
@@ -311,13 +442,14 @@ ngx_http_cache_purge_state_compare(const void *a, const void *b)
 static void
 ngx_http_cache_purge_state_index(ngx_http_cache_purge_state_t *state)
 {
-    ngx_http_cache_purge_rule_t  *rule, *parent, **index;
+    ngx_uint_t                    i, n, j;
     ngx_queue_t                  *q;
-    ngx_uint_t                    i, n;
+    ngx_http_cache_purge_rule_t  *rule, *parent, **index;
 
     index = state->shared->index;
     ngx_memzero(state->shared->ends, sizeof(state->shared->ends));
     n = 0;
+    state->shared->tag_count = 0;
     for (q = ngx_queue_head(&state->shared->rules);
          q != ngx_queue_sentinel(&state->shared->rules);
          q = ngx_queue_next(q))
@@ -328,14 +460,20 @@ ngx_http_cache_purge_state_index(ngx_http_cache_purge_state_t *state)
         }
 
         index[n++] = rule;
+        for (j = 0; j < rule->tag_count; j++) {
+            state->shared->tags[state->shared->tag_count++] = &rule->tags[j];
+        }
         state->shared->ends[ngx_http_cache_purge_state_group(
                                                    rule->select.type)]++;
     }
     state->shared->ends[1] += state->shared->ends[0];
     state->shared->ends[2] = n;
     ngx_qsort(index, n, sizeof(*index), ngx_http_cache_purge_state_compare);
+    ngx_qsort(state->shared->tags, state->shared->tag_count,
+              sizeof(state->shared->tags[0]),
+              ngx_http_cache_purge_state_tag_compare);
 
-    /* TAG rules keep hashes; other groups retain parent links. */
+    /* URL and host rules retain their prefix parent links. */
     parent = NULL;
     for (i = 0; i < state->shared->ends[1]; i++) {
         rule = index[i];
@@ -347,9 +485,9 @@ ngx_http_cache_purge_state_index(ngx_http_cache_purge_state_t *state)
                                  rule->select.value.data,
                                  parent->select.value.len) != 0))
         {
-            parent = parent->lookup.parent;
+            parent = parent->parent;
         }
-        rule->lookup.parent = parent;
+        rule->parent = parent;
         parent = rule;
     }
 }
@@ -409,6 +547,7 @@ ngx_http_cache_purge_state_remove(ngx_http_cache_purge_state_t *state,
 {
     ngx_queue_remove(&rule->queue);
     state->shared->rule_count--;
+    state->shared->slots -= ngx_max(rule->tag_count, 1);
     if (rule->published) {
         (void) ngx_atomic_fetch_add(&state->shared->published, -1);
         ngx_http_cache_purge_state_local(state, rule, 0);
@@ -464,12 +603,12 @@ ngx_int_t
 ngx_http_cache_purge_state_enqueue(ngx_http_cache_purge_state_t *state,
     ngx_uint_t  type, const void *input, ngx_http_cache_purge_message_t **out)
 {
-    ngx_http_cache_purge_work_t      work;
-    ngx_http_cache_purge_message_t  *message;
-    ngx_http_cache_purge_rule_t     *rule;
-    ngx_http_cache_purge_shared_t   *shared;
     size_t                           size;
     ngx_int_t                        rc;
+    ngx_http_cache_purge_rule_t     *rule;
+    ngx_http_cache_purge_work_t      work;
+    ngx_http_cache_purge_shared_t   *shared;
+    ngx_http_cache_purge_message_t  *message;
 
     *out = NULL;
     if (type > NGX_HTTP_CACHE_PURGE_LOOKUP || input == NULL) {
@@ -552,8 +691,8 @@ ngx_int_t
 ngx_http_cache_purge_state_take(ngx_http_cache_purge_state_t *state,
     ngx_http_cache_purge_work_t  *work, ngx_http_cache_purge_message_t **out)
 {
-    ngx_http_cache_purge_message_t  *message;
     ngx_queue_t                     *q;
+    ngx_http_cache_purge_message_t  *message;
 
     *out = NULL;
     ngx_shmtx_lock(&state->pool->mutex);
@@ -706,9 +845,9 @@ ngx_int_t
 ngx_http_cache_purge_state_install(ngx_http_cache_purge_state_t *state,
     const ngx_http_cache_purge_job_t *job)
 {
-    ngx_http_cache_purge_work_t   work;
-    ngx_http_cache_purge_rule_t  *rule;
     ngx_int_t                     rc;
+    ngx_http_cache_purge_rule_t  *rule;
+    ngx_http_cache_purge_work_t   work;
 
     ngx_memzero(&work, sizeof(work));
     work.type = NGX_HTTP_CACHE_PURGE_SUBMIT;
@@ -813,8 +952,8 @@ ngx_http_cache_purge_state_lookup(ngx_http_cache_purge_state_t *state,
     const ngx_http_cache_purge_entry_t *entry, uint64_t now,
     ngx_http_cache_purge_match_t *match, ngx_uint_t local_only)
 {
-    ngx_http_cache_purge_rule_t  *rule, **index;
     ngx_uint_t                    start, low, high, middle;
+    ngx_http_cache_purge_rule_t  *rule, **index;
 
     index = state->shared->index;
     start = group == 0 ? 0 : state->shared->ends[group - 1];
@@ -846,7 +985,7 @@ ngx_http_cache_purge_state_lookup(ngx_http_cache_purge_state_t *state,
         }
     }
     rule = low == start ? NULL : index[low - 1];
-    for ( /* void */; rule != NULL; rule = rule->lookup.parent) {
+    for ( /* void */; rule != NULL; rule = rule->parent) {
         if (group != 0
             && !ngx_http_cache_purge_state_equal(rule->select.value, value))
         {
@@ -864,36 +1003,37 @@ ngx_http_cache_purge_state_tag_lookup(ngx_http_cache_purge_state_t *state,
     const ngx_http_cache_purge_entry_t *entry, uint64_t now,
     ngx_http_cache_purge_match_t *match, ngx_uint_t local_only)
 {
-    ngx_http_cache_purge_rule_t  *rule, **index;
-    ngx_uint_t                    start, low, high, middle, hash;
+    ngx_uint_t                        start, low, high, middle, hash;
+    ngx_http_cache_purge_tag_rule_t  *tag, **index;
 
-    index = state->shared->index;
-    start = state->shared->ends[1];
+    index = state->shared->tags;
+    start = 0;
     low = start;
-    high = state->shared->ends[2];
+    high = state->shared->tag_count;
     hash = ngx_hash_key((u_char *) value.data, value.len);
-    if (hash < index[low]->lookup.hash
-        || hash > index[high - 1]->lookup.hash)
+    if (hash < index[low]->hash
+        || hash > index[high - 1]->hash)
     {
         return;
     }
     while (low < high) {
         middle = (low + high) / 2;
-        rule = index[middle];
-        if (ngx_http_cache_purge_state_order(rule, value, hash) <= 0) {
+        tag = index[middle];
+        if (ngx_http_cache_purge_state_order(tag, value, hash) <= 0) {
             low = middle + 1;
         } else {
             high = middle;
         }
     }
     while (low > start) {
-        rule = index[--low];
-        if (rule->lookup.hash != hash
-            || !ngx_http_cache_purge_state_equal(rule->select.value, value))
+        tag = index[--low];
+        if (tag->hash != hash
+            || !ngx_http_cache_purge_state_equal(tag->value, value))
         {
             break;
         }
-        ngx_http_cache_purge_state_apply(rule, entry, now, match, local_only);
+        ngx_http_cache_purge_state_apply(tag->rule, entry, now, match,
+                                          local_only);
     }
 }
 
@@ -904,15 +1044,16 @@ ngx_http_cache_purge_state_select(ngx_http_cache_purge_state_t *state,
     ngx_http_cache_purge_match_t *match, ngx_uint_t url_only,
     ngx_uint_t local_only)
 {
-    ngx_http_cache_purge_rule_t  *rule;
-    ngx_uint_t                    i, j;
+    ngx_uint_t                        i, j;
+    ngx_http_cache_purge_rule_t      *rule;
+    ngx_http_cache_purge_tag_rule_t  *tag;
 
     ngx_memzero(match, sizeof(*match));
     if (state->shared->published == 0) {
         return NGX_DECLINED;
     }
 
-    if (entry->tag_count > 64) {
+    if (entry->tag_count > NGX_HTTP_CACHE_PURGE_TAG_MAX) {
         return NGX_ERROR;
     }
 
@@ -926,10 +1067,11 @@ ngx_http_cache_purge_state_select(ngx_http_cache_purge_state_t *state,
     if (!url_only) {
         ngx_http_cache_purge_state_lookup(state, 1, entry->host, entry, now,
                                            match, local_only);
-        if (state->shared->ends[2] - state->shared->ends[1] <= 4) {
+        if (state->shared->tag_count <= 4) {
             /* A small TAG group is cheaper to compare directly. */
-            for (i = state->shared->ends[1]; i < state->shared->ends[2]; i++) {
-                rule = state->shared->index[i];
+            for (i = 0; i < state->shared->tag_count; i++) {
+                tag = state->shared->tags[i];
+                rule = tag->rule;
                 if ((!rule->local
                      && (local_only || rule->retain_until <= now))
                     || !ngx_http_cache_purge_state_matches(&rule->select,
@@ -938,7 +1080,7 @@ ngx_http_cache_purge_state_select(ngx_http_cache_purge_state_t *state,
                     continue;
                 }
                 for (j = 0; j < entry->tag_count; j++) {
-                    if (ngx_http_cache_purge_state_equal(rule->select.value,
+                    if (ngx_http_cache_purge_state_equal(tag->value,
                                                          entry->tags[j]))
                     {
                         ngx_http_cache_purge_state_apply(rule, entry, now,
@@ -996,8 +1138,8 @@ ngx_uint_t
 ngx_http_cache_purge_state_tagged(ngx_http_cache_purge_state_t *state,
     const ngx_http_cache_purge_entry_t *entry, uint64_t now)
 {
-    ngx_http_cache_purge_rule_t  *rule;
     ngx_uint_t                    i, found;
+    ngx_http_cache_purge_rule_t  *rule;
 
     if (state->shared->published == 0) {
         return 0;
@@ -1025,11 +1167,11 @@ void
 ngx_http_cache_purge_state_collect(ngx_http_cache_purge_state_t *state,
     uint64_t now)
 {
+    ngx_uint_t                       i, count, dead;
     ngx_queue_t                     *q, *next;
     ngx_http_cache_purge_rule_t     *rule;
     ngx_http_cache_purge_message_t  *message;
     ngx_pid_t                        pids[2 * NGX_HTTP_CACHE_PURGE_STATE_LIMIT];
-    ngx_uint_t                       i, count, dead;
 
     ngx_shmtx_lock(&state->pool->mutex);
     if (state->shared->collected == now) {
@@ -1138,13 +1280,15 @@ ngx_http_cache_purge_state_cleanup_stats(ngx_http_cache_purge_state_t *state,
  * Production work runs in the native cache manager; single mode uses a thread.
  */
 typedef struct {
-    ngx_http_cache_rocksdb_bytes_t  root, zone;
-    u_char                         after[24];
+    ngx_http_cache_rocksdb_bytes_t  root;
+    ngx_http_cache_rocksdb_bytes_t  zone;
+    u_char                          after[24];
 } ngx_http_cache_purge_target_t;
 
 
 typedef struct {
-    ngx_uint_t       target, action;
+    ngx_uint_t       target;
+    ngx_uint_t       action;
     ngx_file_uniq_t  uniq;
     u_char           hash[16];
 } ngx_http_cache_purge_delta_t;
@@ -1161,37 +1305,52 @@ enum {
 
 
 struct ngx_http_cache_purge_owner_s {
-    ngx_http_cache_purge_state_t    *state;
-    ngx_http_file_cache_t          **caches;
-    ngx_http_cache_purge_target_t   *targets;
-    ngx_uint_t                       target_count;
-    ngx_log_t                       *log;
-    ngx_connection_t                *connection;
-    ngx_event_t                      timer;
-    ngx_http_cache_purge_message_t  *ticket;
-    ngx_msec_t                       next_at, maintain_at;
-    ngx_msec_t                       sweep_at, sweep_deadline, propagation;
-    ngx_uint_t                       sweep_target, sweep_count;
-    ngx_uint_t                       opened, restoring, restored, pending;
-    ngx_uint_t                       selected, after_set, quota, threaded;
-    int                              last_error;
+    ngx_http_cache_purge_state_t     *state;
+    ngx_http_file_cache_t           **caches;
+    ngx_http_cache_purge_target_t    *targets;
+    ngx_uint_t                        target_count;
+    ngx_log_t                        *log;
+    ngx_connection_t                 *connection;
+    ngx_event_t                       timer;
+    ngx_http_cache_purge_message_t   *ticket;
+    ngx_msec_t                        next_at;
+    ngx_msec_t                        maintain_at;
+    ngx_msec_t                        sweep_at;
+    ngx_msec_t                        sweep_deadline;
+    ngx_msec_t                        propagation;
+    ngx_uint_t                        sweep_target;
+    ngx_uint_t                        sweep_count;
+    ngx_uint_t                        opened;
+    ngx_uint_t                        restoring;
+    ngx_uint_t                        restored;
+    ngx_uint_t                        pending;
+    ngx_uint_t                        selected;
+    ngx_uint_t                        after_set;
+    ngx_uint_t                        quota;
+    ngx_uint_t                        threaded;
+    int                               last_error;
 
-    pthread_t                         thread;
-    pthread_mutex_t                   mutex;
-    pthread_cond_t                    condition;
-    int                               phase, stopping, operation, result;
-    int                               notify_fd, have_job;
-    uint64_t                          now;
-    u_char                            after[16], current[16];
-    char                             *path;
-    ngx_http_cache_rocksdb_options_t  options;
-    ngx_http_cache_rocksdb_t         *store;
-    ngx_http_cache_purge_catalog_t   *catalog;
-    ngx_http_cache_purge_jobs_t      *jobs;
-    ngx_http_cache_purge_work_t      *work;
-    ngx_http_cache_rocksdb_error_t    error;
-    ngx_http_cache_purge_delta_t      changes[NGX_HTTP_CACHE_PURGE_FILE_BATCH];
-    ngx_uint_t                        change_count;
+    pthread_t                          thread;
+    pthread_mutex_t                    mutex;
+    pthread_cond_t                     condition;
+    int                                phase;
+    int                                stopping;
+    int                                operation;
+    int                                result;
+    int                                notify_fd;
+    int                                have_job;
+    uint64_t                           now;
+    u_char                             after[16];
+    u_char                             current[16];
+    char                              *path;
+    ngx_http_cache_rocksdb_options_t   options;
+    ngx_http_cache_rocksdb_t          *store;
+    ngx_http_cache_purge_catalog_t    *catalog;
+    ngx_http_cache_purge_jobs_t       *jobs;
+    ngx_http_cache_purge_work_t       *work;
+    ngx_http_cache_rocksdb_error_t     error;
+    ngx_http_cache_purge_delta_t       changes[NGX_HTTP_CACHE_PURGE_FILE_BATCH];
+    ngx_uint_t                         change_count;
 };
 
 
@@ -1237,8 +1396,8 @@ ngx_http_cache_purge_channel_init(ngx_cycle_t *cycle,
 void
 ngx_http_cache_purge_channel_close(void *data)
 {
-    ngx_http_cache_purge_state_t  *state;
     ngx_uint_t                     i;
+    ngx_http_cache_purge_state_t  *state;
 
     state = data;
     for (i = 0; i < 2; i++) {
@@ -1305,11 +1464,11 @@ ngx_http_cache_purge_owner_check(void *data,
     ngx_http_cache_rocksdb_error_t *error)
 {
     ngx_http_cache_purge_owner_t  *o = data;
-    ngx_file_info_t                info;
-    ngx_uint_t                     retained, failed;
-    char                           name[NGX_MAX_PATH];
-    size_t                         length;
-    int                            rc;
+    ngx_file_info_t  info;
+    ngx_uint_t       retained, failed;
+    char             name[NGX_MAX_PATH];
+    size_t           length;
+    int              rc;
 
     if (!ngx_http_cache_purge_owner_idle(o, o->sweep_count,
                                           o->sweep_deadline))
@@ -1357,13 +1516,13 @@ ngx_http_cache_purge_owner_file(void *data,
     const ngx_http_cache_purge_entry_t  *entry, unsigned action,
     ngx_http_cache_rocksdb_error_t *error)
 {
-    ngx_http_cache_purge_owner_t       *o;
-    ngx_http_cache_purge_native_file_t  file;
-    ngx_http_cache_purge_delta_t       *delta;
-    ngx_uint_t                          i;
-    ngx_int_t                           rc;
-    char                                name[NGX_MAX_PATH];
-    size_t                              length;
+    size_t                               length;
+    ngx_int_t                            rc;
+    ngx_uint_t                           i;
+    ngx_http_cache_purge_delta_t        *delta;
+    ngx_http_cache_purge_owner_t        *o;
+    ngx_http_cache_purge_native_file_t   file;
+    char                                 name[NGX_MAX_PATH];
 
     o = data;
     for (i = 0; i < o->target_count; i++) {
@@ -1450,7 +1609,7 @@ static int
 ngx_http_cache_purge_owner_tag(void *data, ngx_http_cache_rocksdb_bytes_t tag)
 {
     ngx_http_cache_purge_owner_t  *o = data;
-    ngx_http_cache_purge_match_t   match, *result;
+    ngx_http_cache_purge_match_t  match, *result;
 
     o->work->data.entry.tag_count = 1;
     o->work->data.entry.tags[0] = tag;
@@ -1471,10 +1630,10 @@ ngx_http_cache_purge_owner_tag(void *data, ngx_http_cache_rocksdb_bytes_t tag)
 static int
 ngx_http_cache_purge_owner_records(ngx_http_cache_purge_owner_t *o)
 {
-    ngx_http_cache_purge_message_t  *message;
-    ngx_queue_t                     *pending;
-    ngx_uint_t                       i, ready;
     int                              rc;
+    ngx_uint_t                       i, ready;
+    ngx_queue_t                     *pending;
+    ngx_http_cache_purge_message_t  *message;
 
     for (i = 0; /* void */; i++) {
         rc = ngx_http_cache_purge_catalog_put(o->catalog,
@@ -1508,12 +1667,12 @@ ngx_http_cache_purge_owner_records(ngx_http_cache_purge_owner_t *o)
 static int
 ngx_http_cache_purge_owner_execute(ngx_http_cache_purge_owner_t *o)
 {
-    ngx_http_cache_purge_job_t     job;
-    ngx_http_cache_purge_target_t *target;
-    ngx_msec_t                     deadline;
-    ngx_uint_t                     i;
-    size_t                         removed;
-    int                            rc, duplicate, copied;
+    int                             rc, duplicate, copied;
+    size_t                          removed;
+    ngx_msec_t                      deadline;
+    ngx_uint_t                      i;
+    ngx_http_cache_purge_job_t      job;
+    ngx_http_cache_purge_target_t  *target;
 
     memset(&o->error, 0, sizeof(o->error));
     memset(&job, 0, sizeof(job));
@@ -1613,9 +1772,9 @@ ngx_http_cache_purge_owner_execute(ngx_http_cache_purge_owner_t *o)
 static void *
 ngx_http_cache_purge_owner_thread(void *data)
 {
-    ngx_http_cache_purge_owner_t  *o;
     sigset_t                       set;
     struct sched_param             priority;
+    ngx_http_cache_purge_owner_t  *o;
 
     o = data;
     sigfillset(&set);
@@ -1654,10 +1813,10 @@ ngx_http_cache_purge_owner_thread(void *data)
 static void
 ngx_http_cache_purge_owner_deliver(ngx_http_cache_purge_owner_t *o)
 {
+    ngx_int_t                      rc;
+    ngx_uint_t                     i, nodes_ok;
     ngx_http_cache_purge_job_t    *job;
     ngx_http_cache_purge_delta_t  *delta;
-    ngx_uint_t                     i, nodes_ok;
-    ngx_int_t                      rc;
 
     nodes_ok = 1;
     for (i = 0; i < o->change_count; i++) {
@@ -1771,10 +1930,10 @@ ngx_http_cache_purge_owner_deliver(ngx_http_cache_purge_owner_t *o)
 static void
 ngx_http_cache_purge_owner_drive(ngx_http_cache_purge_owner_t *o)
 {
-    ngx_uint_t  complete, queued;
+    int         operation;
     ngx_int_t   rc;
     ngx_msec_t  delay;
-    int         operation;
+    ngx_uint_t  complete, queued;
 
     if (o->timer.timer_set) {
         ngx_del_timer(&o->timer);
@@ -1872,10 +2031,10 @@ ngx_http_cache_purge_owner_drive(ngx_http_cache_purge_owner_t *o)
 static void
 ngx_http_cache_purge_owner_notify(ngx_event_t *event)
 {
+    ssize_t                        n;
     ngx_connection_t              *c;
     ngx_http_cache_purge_owner_t  *o;
     u_char                         buffer[256];
-    ssize_t                        n;
 
     c = event->data;
     o = c->data;
@@ -1902,13 +2061,13 @@ ngx_http_cache_purge_owner_start(ngx_cycle_t *cycle,
     ngx_msec_t propagation, ngx_uint_t threaded,
     ngx_http_cache_purge_owner_t **out)
 {
-    ngx_http_cache_purge_owner_t    *o;
-    ngx_str_t                        names[2];
-    ngx_uint_t                       i, j;
-    ngx_http_cache_rocksdb_bytes_t  *field;
-    u_char                          *p;
-    pthread_attr_t                   attr;
     int                              rc;
+    u_char                          *p;
+    ngx_uint_t                       i, j;
+    pthread_attr_t                   attr;
+    ngx_http_cache_purge_owner_t    *o;
+    ngx_http_cache_rocksdb_bytes_t  *field;
+    ngx_str_t                        names[2];
 
     *out = NULL;
     o = ngx_pcalloc(cycle->pool, sizeof(*o));

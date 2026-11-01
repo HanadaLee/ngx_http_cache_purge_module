@@ -35,7 +35,7 @@ os.environ['UBSAN_OPTIONS'] = 'halt_on_error=1:print_stacktrace=1'
 state = {'version': 1, 'calls': []}
 processes, checks, responses = [], [], []
 time_header = 'X-Test-Purge-Time' if args.custom_headers else 'X-Cache-Purge-Time'
-mode_header = 'X-Test-Purge-Mode' if args.custom_headers else 'X-Cache-Purge-Mode'
+action_header = 'X-Test-Purge-Action' if args.custom_headers else 'X-Cache-Purge-Action'
 
 
 class Origin(http.server.BaseHTTPRequestHandler):
@@ -87,7 +87,7 @@ if args.tls:
         '-subj', '/CN=cache.test', '-addext', 'subjectAltName=DNS:cache.test',
         '-days', '1'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 header_config = f'''proxy_set_header {time_header} $cache_purge_propagation_time;
-            proxy_set_header {mode_header} $cache_purge_propagation_mode;'''
+            proxy_set_header {action_header} $cache_purge_propagation_action;'''
 if args.framework:
     header_config = ''
 
@@ -103,7 +103,7 @@ def request(tier, path, method='GET', headers=None, body=None, chunked=False):
               'headers': dict(response.getheaders()), 'body': response.read().decode()}
     connection.close()
     assert not any(name.lower().startswith('x-cache-purge-') for name in result['headers']), result
-    assert time_header not in result['headers'] and mode_header not in result['headers'], result
+    assert time_header not in result['headers'] and action_header not in result['headers'], result
     responses.append(result)
     return result
 
@@ -124,7 +124,7 @@ def submit(path, action, kind='url'):
     result = request('l1', '/control', 'PURGE', {
         'X-Target': 'http://cache.test' + path,
         'X-Cache-Purge-Action': action, 'X-Cache-Purge-Type': kind,
-        'X-Cache-Purge-Tags': 'known'})
+        'X-Cache-Purge-Tags': 'aaa-absent, known'})
     assert result['status'] == 202, result
     operation = json.loads(result['body'])
     deadline = time.monotonic() + 5
@@ -168,12 +168,12 @@ try:
             proxy_ssl_name cache.test;'''
         propagation = 'on' if tier == 'l1' else 'off'
         conditions = ''
-        flags = f'cache_purge_propagation {propagation};'
+        flags = f'proxy_cache_purge_propagation {propagation};'
         if args.expr:
             conditions = '''expr allow_propagation str_eq $http_x_origin "";
     expr ignore_propagation str_eq $http_x_ignore 1;'''
-            flags = ('''when allow_propagation { cache_purge_propagation on; }
-            cache_purge_propagation off;''' if tier == 'l1' else flags)
+            flags = ('''when allow_propagation { proxy_cache_purge_propagation on; }
+            proxy_cache_purge_propagation off;''' if tier == 'l1' else flags)
             flags += '''
             when ignore_propagation { cache_purge_ignore_propagation on; }
             cache_purge_ignore_propagation off;'''
@@ -190,12 +190,12 @@ pid {run}/nginx.pid;
 error_log {run}/error.log notice;
 events {{ worker_connections 128; }}
 http {{
-    log_format trace escape=json '{{"uri":"$uri","time":"$http_{time_header.lower().replace('-', '_')}","mode":"$http_{mode_header.lower().replace('-', '_')}","tag":"$http_x_cache_purge_tags","cache":"$upstream_cache_status"}}';
+    log_format trace escape=json '{{"uri":"$uri","time":"$http_{time_header.lower().replace('-', '_')}","action":"$http_{action_header.lower().replace('-', '_')}","tag":"$http_x_cache_purge_tags","cache":"$upstream_cache_status"}}';
     access_log {run}/access.log trace;
     cache_purge_store {run}/store;
     cache_purge_state_zone purge 1m;
     cache_purge_propagation_time_header {time_header};
-    cache_purge_propagation_mode_header {mode_header};
+    cache_purge_propagation_action_header {action_header};
     {'cache_purge_propagation_timeout 3s;' if tier == 'l1' else ''}
     cache_purge_key_url http://cache.test$uri;
     cache_purge_tag $upstream_http_cache_tag;
@@ -257,11 +257,11 @@ http {{
     assert result['body'] == 'body-v1' and result['cache'] == 'REVALIDATED', result
     assert len(state['calls']) == previous + 1 and state['calls'][-1]['If-None-Match'] == '"v1"'
     seen = parent_log(path)
-    assert seen['time'] == str(operation['effective_at']) and seen['mode'] == 'invalidate', seen
+    assert seen['time'] == str(operation['effective_at']) and seen['action'] == 'invalidate', seen
     assert seen['tag'] == '', seen
     previous = len(state['calls'])
     assert request('l2', path, headers={time_header: seen['time'],
-                                     mode_header: 'invalidate'})['cache'] == 'HIT'
+                                     action_header: 'invalidate'})['cache'] == 'HIT'
     assert len(state['calls']) == previous
     checks.append('L1 Invalidate makes L2 revalidate; 304 is reused and the same timestamp then permits HIT')
 
@@ -273,14 +273,14 @@ http {{
     result = request('l1', path)
     assert result['body'] == 'body-v2' and result['cache'] == 'MISS', result
     seen = parent_log(path)
-    assert seen['time'] == str(operation['effective_at']) and seen['mode'] == 'delete', seen
+    assert seen['time'] == str(operation['effective_at']) and seen['action'] == 'delete', seen
     assert 'If-None-Match' not in state['calls'][-1], state['calls'][-1]
     checks.append('L1 Delete makes an unpurged L2 replace its old cache without conditional reuse')
 
     time.sleep(3.1)
     assert request('l1', path, headers={'X-Bypass': '1'})['status'] == 200
     seen = parent_log(path)
-    assert seen['time'] == '' and seen['mode'] == '', seen
+    assert seen['time'] == '' and seen['action'] == '', seen
     checks.append('outgoing timeout stops propagation; parent has no sender-window requirement')
 
     path = '/tag-miss'
@@ -293,15 +293,15 @@ http {{
     assert result['body'] == 'body-v3' and result['cache'] == 'MISS', result
     assert state['calls'][-1]['body_sha256'] == hashlib.sha256(payload).hexdigest()
     seen = parent_log(path)
-    assert seen['time'] == str(operation['effective_at']) and seen['mode'] == 'delete', seen
+    assert seen['time'] == str(operation['effective_at']) and seen['action'] == 'delete', seen
     assert seen['tag'] == '', seen
-    checks.append('known TAG association survives local deletion and supplies propagation on the next MISS without sending TAG names')
+    checks.append('a batched TAG selector uses a known association after deletion to propagate on MISS without sending TAG names')
 
     result = request('l1', '/unknown-body', body=payload)
     assert result['body'] == 'body-v3', result
     assert state['calls'][-1]['body_sha256'] == hashlib.sha256(payload).hexdigest()
     seen = parent_log('/unknown-body')
-    assert seen['time'] == '' and seen['mode'] == '', seen
+    assert seen['time'] == '' and seen['action'] == '', seen
     checks.append('known and unknown TAG MISS preserve a Content-Length request body while lookup is pending')
 
     if args.streaming:
@@ -328,13 +328,13 @@ http {{
         time.sleep(1.05)
         previous = len(state['calls'])
         result = request('l2', path, headers={'X-Ignore': '1',
-            time_header: str(int(time.time() * 1000)), mode_header: 'delete'})
+            time_header: str(int(time.time() * 1000)), action_header: 'delete'})
         assert result['cache'] == 'HIT' and len(state['calls']) == previous, result
         hit('l1', path)
         submit(path, 'delete')
         request('l1', path, headers={'X-Origin': '1'})
         seen = parent_log(path)
-        assert seen['time'] == '' and seen['mode'] == '', seen
+        assert seen['time'] == '' and seen['action'] == '', seen
         checks.append('expr when independently disables incoming trust and outgoing propagation')
     before = json.loads(request('l1', '/management/capabilities')['body'])['index_cleanup']
     path = '/cleanup/entry'
@@ -356,7 +356,7 @@ http {{
     result = request('l1', path)
     assert result['cache'] == 'MISS' and result['body'] == f'body-v{state["version"]}', result
     seen = parent_log(path)
-    assert seen['time'] == str(operation['effective_at']) and seen['mode'] == 'delete', seen
+    assert seen['time'] == str(operation['effective_at']) and seen['action'] == 'delete', seen
     assert seen['tag'] == '', seen
     checks.append('native inactive eviction is swept in the cache manager while its known TAG association still propagates the next purge')
 
@@ -386,7 +386,7 @@ http {{
         assert not cached[0].exists()
         checks.append('filesystem permission errors preserve the cache file and its index entry for a later explicit purge')
 
-    assert all(time_header not in call and mode_header not in call for call in state['calls']), state['calls']
+    assert all(time_header not in call and action_header not in call for call in state['calls']), state['calls']
     checks.append('parent with propagation off sends no control headers to origin; business responses contain no purge receipt')
     if args.tls:
         checks.append('all parent requests use TLS with certificate and hostname verification enabled')
@@ -409,6 +409,6 @@ args.output.write_text(json.dumps({'status': 'passed', 'root': str(root),
                if args.modules else {},
     'framework': args.framework, 'expr': args.expr, 'tls': args.tls, 'streaming': args.streaming,
     'permission_check': os.geteuid() != 0,
-    'time_header': time_header, 'mode_header': mode_header, 'checks': checks,
+    'time_header': time_header, 'action_header': action_header, 'checks': checks,
     'responses': responses, 'origin_calls': state['calls']}, indent=2) + '\n')
 print(json.dumps({'root': str(root), 'checks': checks}))

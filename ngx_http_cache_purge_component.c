@@ -6,7 +6,7 @@
 #include <stdio.h>
 
 
-#define NGX_HTTP_CACHE_PURGE_JOB_TEXT    32768
+#define NGX_HTTP_CACHE_PURGE_JOB_TEXT    NGX_HTTP_CACHE_PURGE_TAG_LIST_MAX
 #define NGX_HTTP_CACHE_PURGE_JOB_TOKEN   32822
 #define NGX_HTTP_CACHE_PURGE_JOB_HEADER  68
 #define NGX_HTTP_CACHE_PURGE_JOB_SIZE                                         \
@@ -21,6 +21,23 @@ struct ngx_http_cache_purge_jobs_s {
     unsigned char                    output[NGX_HTTP_CACHE_PURGE_JOB_SIZE];
     unsigned char                    token[NGX_HTTP_CACHE_PURGE_JOB_TOKEN];
 };
+
+
+static int ngx_http_cache_purge_job_error(ngx_http_cache_rocksdb_error_t *error,
+    int  code, const char *message);
+static unsigned char *ngx_http_cache_purge_job_number(unsigned char *p,
+    uint64_t value, size_t size);
+static uint64_t ngx_http_cache_purge_job_decode(const unsigned char *p,
+    size_t size);
+static int ngx_http_cache_purge_job_valid(
+    const ngx_http_cache_purge_job_t *job);
+static size_t ngx_http_cache_purge_job_encode(ngx_http_cache_purge_jobs_t *jobs,
+    const ngx_http_cache_purge_job_t *job);
+static int ngx_http_cache_purge_job_save(ngx_http_cache_purge_jobs_t *jobs,
+    const ngx_http_cache_purge_job_t  *job, int durable,
+    ngx_http_cache_rocksdb_error_t *error);
+static int ngx_http_cache_purge_job_equal(ngx_http_cache_rocksdb_bytes_t a,
+    ngx_http_cache_rocksdb_bytes_t b);
 
 
 static ngx_http_cache_rocksdb_bytes_t  ngx_http_cache_purge_job_empty = {
@@ -69,16 +86,22 @@ ngx_http_cache_purge_job_decode(const unsigned char *p, size_t size)
 static int
 ngx_http_cache_purge_job_valid(const ngx_http_cache_purge_job_t *job)
 {
+    size_t                                i, maximum, count;
     const ngx_http_cache_purge_select_t  *s;
     ngx_http_cache_rocksdb_bytes_t        text[4];
-    size_t                                i, maximum;
+    ngx_http_cache_rocksdb_bytes_t        tags[NGX_HTTP_CACHE_PURGE_TAG_SELECT];
 
     s = &job->select;
     if (job->issued == 0 || job->action > NGX_HTTP_CACHE_PURGE_INVALIDATE
         || job->done > 1 || s->type > NGX_HTTP_CACHE_PURGE_SELECT_TAG
         || s->host_scope > 1 || s->value.len == 0
-        || (s->host_scope && s->type != NGX_HTTP_CACHE_PURGE_SELECT_TAG)
-        || (s->type == NGX_HTTP_CACHE_PURGE_SELECT_TAG && s->value.len > 1024))
+        || (s->host_scope && s->type != NGX_HTTP_CACHE_PURGE_SELECT_TAG))
+    {
+        return 0;
+    }
+
+    if (s->type == NGX_HTTP_CACHE_PURGE_SELECT_TAG
+        && ngx_http_cache_purge_select_tags(s->value, tags, &count) != 0)
     {
         return 0;
     }
@@ -88,8 +111,10 @@ ngx_http_cache_purge_job_valid(const ngx_http_cache_purge_job_t *job)
     text[2] = s->misc;
     text[3] = job->bookmark;
     for (i = 0; i < 4; i++) {
-        maximum = i == 3 ? NGX_HTTP_CACHE_PURGE_JOB_TOKEN
-                         : NGX_HTTP_CACHE_PURGE_JOB_TEXT;
+        maximum = i == 3 ? NGX_HTTP_CACHE_PURGE_JOB_TOKEN : 32768;
+        if (i == 0 && s->type == NGX_HTTP_CACHE_PURGE_SELECT_TAG) {
+            maximum = NGX_HTTP_CACHE_PURGE_TAG_LIST_MAX;
+        }
         if (text[i].len > maximum
             || (text[i].len != 0 && text[i].data == NULL))
         {
@@ -105,9 +130,9 @@ static size_t
 ngx_http_cache_purge_job_encode(ngx_http_cache_purge_jobs_t *jobs,
     const ngx_http_cache_purge_job_t *job)
 {
-    unsigned char                  *p;
-    ngx_http_cache_rocksdb_bytes_t  text[4];
-    size_t                          i;
+    size_t                           i;
+    unsigned char                   *p;
+    ngx_http_cache_rocksdb_bytes_t   text[4];
 
     p = jobs->output;
     memcpy(p, "PJ1", 4);
@@ -146,9 +171,9 @@ ngx_http_cache_purge_job_save(ngx_http_cache_purge_jobs_t *jobs,
     const ngx_http_cache_purge_job_t  *job, int durable,
     ngx_http_cache_rocksdb_error_t *error)
 {
-    ngx_http_cache_rocksdb_mutation_t  rows[2];
-    unsigned char                      keys[2][17];
     size_t                             length;
+    unsigned char                      keys[2][17];
+    ngx_http_cache_rocksdb_mutation_t  rows[2];
 
     length = ngx_http_cache_purge_job_encode(jobs, job);
     memset(rows, 0, sizeof(rows));
@@ -217,12 +242,12 @@ ngx_http_cache_purge_job_get(ngx_http_cache_purge_jobs_t *jobs,
     const unsigned char  id[16], ngx_http_cache_purge_job_t *job,
     ngx_http_cache_rocksdb_error_t *error)
 {
-    unsigned char                    raw[17];
-    const unsigned char             *p;
-    ngx_http_cache_rocksdb_bytes_t   key, text[4];
-    ngx_http_cache_rocksdb_buffer_t  value;
-    size_t                           i, length, offset;
-    int                              rc;
+    int                               rc;
+    size_t                            i, length, offset;
+    const unsigned char              *p;
+    ngx_http_cache_rocksdb_buffer_t   value;
+    unsigned char                     raw[17];
+    ngx_http_cache_rocksdb_bytes_t    key, text[4];
 
     raw[0] = 'J';
     memcpy(raw + 1, id, 16);
@@ -295,8 +320,8 @@ ngx_http_cache_purge_job_submit(ngx_http_cache_purge_jobs_t *jobs,
     const ngx_http_cache_purge_job_t  *input, int *duplicate,
     ngx_http_cache_rocksdb_error_t *error)
 {
-    ngx_http_cache_purge_job_t  job, old;
     int                         rc;
+    ngx_http_cache_purge_job_t  job, old;
 
     *duplicate = 0;
     job = *input;
@@ -340,11 +365,11 @@ ngx_http_cache_purge_job_next(ngx_http_cache_purge_jobs_t *jobs,
     const unsigned char  *after, ngx_http_cache_purge_job_t *job,
     ngx_http_cache_rocksdb_error_t *error)
 {
-    ngx_http_cache_rocksdb_cursor_t  *cursor;
+    int                               rc;
     ngx_http_cache_rocksdb_bytes_t    prefix, resume;
     ngx_http_cache_rocksdb_buffer_t   key, value;
+    ngx_http_cache_rocksdb_cursor_t  *cursor;
     unsigned char                     raw[17], last[17];
-    int                               rc;
 
     prefix.data = (const unsigned char *) "Q";
     prefix.len = 1;
@@ -391,12 +416,12 @@ ngx_http_cache_purge_job_step(ngx_http_cache_purge_jobs_t *jobs,
     ngx_http_cache_purge_apply_pt  apply, void *data,
     ngx_http_cache_purge_job_t    *job, ngx_http_cache_rocksdb_error_t *error)
 {
-    ngx_http_cache_purge_scan_t    *scan;
-    ngx_http_cache_purge_entry_t    entry;
-    ngx_http_cache_rocksdb_bytes_t  bookmark;
-    ngx_http_cache_rocksdb_error_t  saved;
-    size_t                          i;
-    int                             rc, result, applied;
+    int                              rc, result, applied;
+    size_t                           i;
+    ngx_http_cache_purge_scan_t     *scan;
+    ngx_http_cache_purge_entry_t     entry;
+    ngx_http_cache_rocksdb_bytes_t   bookmark;
+    ngx_http_cache_rocksdb_error_t   saved;
 
     if (limit == 0 || limit > 64 || apply == NULL) {
         return NGX_HTTP_CACHE_ROCKSDB_INVALID;

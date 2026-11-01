@@ -7,7 +7,7 @@
 
 
 #define NGX_HTTP_CACHE_PURGE_ARENA  (1024 * 1024)
-#define NGX_HTTP_CACHE_PURGE_ROWS   1024
+#define NGX_HTTP_CACHE_PURGE_ROWS   2048
 #define NGX_HTTP_CACHE_PURGE_TEXT   32768
 
 
@@ -18,7 +18,8 @@ struct ngx_http_cache_purge_catalog_s {
     ngx_http_cache_rocksdb_mutation_t   rows[NGX_HTTP_CACHE_PURGE_ROWS];
     unsigned char                      *arena;
     unsigned char                       scratch[65536];
-    size_t                             used, count;
+    size_t                              used;
+    size_t                              count;
     uint64_t                            next;
     int                                 status;
     ngx_http_cache_rocksdb_error_t     *error;
@@ -26,28 +27,134 @@ struct ngx_http_cache_purge_catalog_s {
 
 
 typedef struct {
-    uint64_t                       fields[6], tags[64];
-    uint64_t                       uniq, created, retain_until;
-    size_t                          tag_count;
-    ngx_http_cache_purge_bytes_t    path;
+    uint64_t                       fields[6],
+                                   tags[NGX_HTTP_CACHE_PURGE_TAG_MAX];
+    uint64_t                      uniq;
+    uint64_t                      created;
+    uint64_t                      retain_until;
+    size_t                        tag_count;
+    ngx_http_cache_purge_bytes_t  path;
 } ngx_http_cache_purge_row_t;
 
 
 struct ngx_http_cache_purge_scan_s {
-    ngx_http_cache_purge_catalog_t  *catalog;
-    ngx_http_cache_rocksdb_cursor_t *outer, *inner;
-    ngx_http_cache_rocksdb_cf_e      cf;
-    unsigned char                   outer_key[NGX_HTTP_CACHE_PURGE_TEXT + 2];
-    unsigned char                   inner_key[49];
-    unsigned char                   token[NGX_HTTP_CACHE_PURGE_TEXT + 54];
-    size_t                          outer_length, inner_length;
-    uint64_t                        now;
-    int                             retained, nested;
+    ngx_http_cache_purge_catalog_t   *catalog;
+    ngx_http_cache_rocksdb_cursor_t  *outer;
+    ngx_http_cache_rocksdb_cursor_t  *inner;
+    ngx_http_cache_rocksdb_cf_e       cf;
+    unsigned char                     outer_key[NGX_HTTP_CACHE_PURGE_TEXT + 2];
+    unsigned char                     inner_key[49];
+    unsigned char                     token[NGX_HTTP_CACHE_PURGE_TEXT + 54];
+    size_t                            outer_length;
+    size_t                            inner_length;
+    uint64_t                          now;
+    uint64_t                          tags[NGX_HTTP_CACHE_PURGE_TAG_SELECT];
+    uint64_t                          tag_scope;
+    size_t                            tag_count;
+    size_t                            tag_index;
+    unsigned char                     tag_kind;
+    int                               retained;
+    int                               nested;
 };
+
+
+static int ngx_http_cache_purge_catalog_error(ngx_http_cache_purge_catalog_t *c,
+    int code, const char *message);
+static void ngx_http_cache_purge_catalog_begin(
+    ngx_http_cache_purge_catalog_t *c, ngx_http_cache_rocksdb_error_t *error);
+static unsigned char *ngx_http_cache_purge_catalog_alloc(
+    ngx_http_cache_purge_catalog_t *c, size_t length);
+static uint64_t ngx_http_cache_purge_catalog_number(const unsigned char *p,
+    size_t length);
+static unsigned char *ngx_http_cache_purge_catalog_encode(unsigned char *p,
+    uint64_t value, size_t length);
+static ngx_http_cache_purge_bytes_t ngx_http_cache_purge_catalog_copy(
+    ngx_http_cache_purge_catalog_t *c, const void *data, size_t length);
+static ngx_http_cache_purge_bytes_t ngx_http_cache_purge_catalog_id(
+    ngx_http_cache_purge_catalog_t *c, unsigned char kind, uint64_t id);
+static int ngx_http_cache_purge_catalog_equal(ngx_http_cache_purge_bytes_t a,
+    ngx_http_cache_purge_bytes_t b);
+static ngx_http_cache_purge_bytes_t ngx_http_cache_purge_catalog_read(
+    ngx_http_cache_purge_catalog_t *c, ngx_http_cache_rocksdb_cursor_t *view,
+    ngx_http_cache_rocksdb_cf_e cf, ngx_http_cache_purge_bytes_t key);
+static void ngx_http_cache_purge_catalog_set(ngx_http_cache_purge_catalog_t *c,
+    ngx_http_cache_rocksdb_cf_e cf, ngx_http_cache_purge_bytes_t key,
+    ngx_http_cache_purge_bytes_t value, int remove);
+static int ngx_http_cache_purge_catalog_commit(
+    ngx_http_cache_purge_catalog_t *c, int sync);
+static ngx_http_cache_purge_bytes_t ngx_http_cache_purge_catalog_word(
+    ngx_http_cache_purge_catalog_t *c, unsigned char kind,
+    ngx_http_cache_purge_bytes_t value);
+static uint64_t ngx_http_cache_purge_catalog_reference(
+    ngx_http_cache_purge_catalog_t *c, unsigned char kind,
+    ngx_http_cache_purge_bytes_t value, int add);
+static void ngx_http_cache_purge_catalog_release(
+    ngx_http_cache_purge_catalog_t *c, uint64_t id);
+static int ngx_http_cache_purge_catalog_decode(
+    ngx_http_cache_purge_catalog_t *c, ngx_http_cache_purge_bytes_t value,
+    ngx_http_cache_purge_row_t *row);
+static ngx_http_cache_purge_bytes_t ngx_http_cache_purge_catalog_record(
+    ngx_http_cache_purge_catalog_t *c, const ngx_http_cache_purge_row_t *row);
+static ngx_http_cache_purge_bytes_t ngx_http_cache_purge_catalog_file_key(
+    ngx_http_cache_purge_catalog_t *c, const unsigned char id[24]);
+static void ngx_http_cache_purge_catalog_tag_reference(
+    ngx_http_cache_purge_catalog_t *c, const ngx_http_cache_purge_row_t *row,
+    uint64_t tag, int drop);
+static void ngx_http_cache_purge_catalog_post(ngx_http_cache_purge_catalog_t *c,
+    const ngx_http_cache_purge_row_t *row, const unsigned char id[24],
+                                     int drop);
+static void ngx_http_cache_purge_catalog_gc_row(
+    ngx_http_cache_purge_catalog_t *c, uint64_t until,
+    const unsigned char id[24], int remove);
+static void ngx_http_cache_purge_catalog_drop(ngx_http_cache_purge_catalog_t *c,
+    const ngx_http_cache_purge_row_t *row, const unsigned char id[24]);
+static int ngx_http_cache_purge_catalog_entry(ngx_http_cache_purge_catalog_t *c,
+    ngx_http_cache_rocksdb_cursor_t *view, const unsigned char id[24],
+    ngx_http_cache_purge_entry_t *entry, int file_only,
+    ngx_http_cache_purge_scan_t *scan);
+static int ngx_http_cache_purge_scan_inner(ngx_http_cache_purge_scan_t *scan,
+    uint64_t url, ngx_http_cache_purge_bytes_t after,
+    ngx_http_cache_rocksdb_error_t *error);
+static int ngx_http_cache_purge_scan_tag(ngx_http_cache_purge_scan_t *scan,
+    ngx_http_cache_purge_bytes_t after, ngx_http_cache_rocksdb_error_t *error);
 
 
 static const unsigned char  ngx_http_cache_purge_kinds[] = "UHNMRZ";
 static ngx_http_cache_purge_bytes_t  ngx_http_cache_purge_empty = { NULL, 0 };
+
+
+int
+ngx_http_cache_purge_select_tags(ngx_http_cache_purge_bytes_t value,
+    ngx_http_cache_purge_bytes_t *tags, size_t *count)
+{
+    size_t  i, start;
+
+    *count = 0;
+    if (value.len == 0 || value.data == NULL
+        || value.len > NGX_HTTP_CACHE_PURGE_TAG_LIST_MAX)
+    {
+        return NGX_HTTP_CACHE_ROCKSDB_INVALID;
+    }
+    for (start = 0, i = 0; i <= value.len; i++) {
+        if (i != value.len && value.data[i] != ',') {
+            if (value.data[i] == 0 || value.data[i] == '\r'
+                || value.data[i] == '\n')
+            {
+                return NGX_HTTP_CACHE_ROCKSDB_INVALID;
+            }
+            continue;
+        }
+        if (i == start || i - start > NGX_HTTP_CACHE_PURGE_TAG_LENGTH
+            || *count == NGX_HTTP_CACHE_PURGE_TAG_SELECT)
+        {
+            return NGX_HTTP_CACHE_ROCKSDB_INVALID;
+        }
+        tags[*count].data = value.data + start;
+        tags[(*count)++].len = i - start;
+        start = i + 1;
+    }
+    return 0;
+}
 
 
 static int
@@ -134,8 +241,8 @@ static ngx_http_cache_purge_bytes_t
 ngx_http_cache_purge_catalog_copy(ngx_http_cache_purge_catalog_t *c,
     const void *data, size_t length)
 {
-    ngx_http_cache_purge_bytes_t  value;
-    unsigned char                *p;
+    unsigned char                 *p;
+    ngx_http_cache_purge_bytes_t   value;
 
     p = ngx_http_cache_purge_catalog_alloc(c, length);
     if (p == NULL) {
@@ -179,9 +286,9 @@ ngx_http_cache_purge_catalog_read(ngx_http_cache_purge_catalog_t *c,
     ngx_http_cache_rocksdb_cursor_t *view, ngx_http_cache_rocksdb_cf_e cf,
     ngx_http_cache_purge_bytes_t key)
 {
-    ngx_http_cache_rocksdb_buffer_t  buffer;
-    size_t                           i;
     int                              rc;
+    size_t                           i;
+    ngx_http_cache_rocksdb_buffer_t  buffer;
 
     if (c->status != 0) {
         return ngx_http_cache_purge_empty;
@@ -226,8 +333,8 @@ ngx_http_cache_purge_catalog_set(ngx_http_cache_purge_catalog_t *c,
     ngx_http_cache_rocksdb_cf_e cf, ngx_http_cache_purge_bytes_t key,
     ngx_http_cache_purge_bytes_t value, int remove)
 {
-    ngx_http_cache_rocksdb_mutation_t  *row;
     size_t                              i;
+    ngx_http_cache_rocksdb_mutation_t  *row;
 
     if (c->status != 0) {
         return;
@@ -281,8 +388,8 @@ static ngx_http_cache_purge_bytes_t
 ngx_http_cache_purge_catalog_word(ngx_http_cache_purge_catalog_t *c,
     unsigned char kind, ngx_http_cache_purge_bytes_t value)
 {
-    ngx_http_cache_purge_bytes_t  key;
-    unsigned char                *p;
+    unsigned char                 *p;
+    ngx_http_cache_purge_bytes_t   key;
 
     p = ngx_http_cache_purge_catalog_alloc(c, value.len + 2);
     if (p == NULL) {
@@ -306,11 +413,11 @@ static uint64_t
 ngx_http_cache_purge_catalog_reference(ngx_http_cache_purge_catalog_t *c,
     unsigned char kind, ngx_http_cache_purge_bytes_t value, int add)
 {
-    ngx_http_cache_purge_bytes_t  key, old, encoded, reverse, number;
-    ngx_http_cache_rocksdb_cf_e   cf;
-    uint64_t                     id, count;
-    unsigned char                raw[16];
-    unsigned char               *p;
+    uint64_t                       id, count;
+    unsigned char                 *p;
+    ngx_http_cache_rocksdb_cf_e    cf;
+    ngx_http_cache_purge_bytes_t   key, old, encoded, reverse, number;
+    unsigned char                  raw[16];
 
     cf = kind == 'U' ? NGX_HTTP_CACHE_ROCKSDB_URL
                      : NGX_HTTP_CACHE_ROCKSDB_DEFAULT;
@@ -385,10 +492,10 @@ static void
 ngx_http_cache_purge_catalog_release(ngx_http_cache_purge_catalog_t *c,
     uint64_t id)
 {
-    ngx_http_cache_purge_bytes_t  reverse, word, key, value, encoded;
+    uint64_t                      count;
     ngx_http_cache_rocksdb_cf_e   cf;
-    uint64_t                     count;
-    unsigned char                raw[16], kind;
+    ngx_http_cache_purge_bytes_t  reverse, word, key, value, encoded;
+    unsigned char                 raw[16], kind;
 
     reverse = ngx_http_cache_purge_catalog_id(c, 'D', id);
     word = ngx_http_cache_purge_catalog_read(c, NULL,
@@ -439,11 +546,13 @@ static int
 ngx_http_cache_purge_catalog_decode(ngx_http_cache_purge_catalog_t *c,
     ngx_http_cache_purge_bytes_t value, ngx_http_cache_purge_row_t *row)
 {
-    const unsigned char  *p;
     size_t                i, length;
+    const unsigned char  *p;
 
     memset(row, 0, sizeof(*row));
-    if (value.len < 78 || value.data[0] != 1 || value.data[73] > 64) {
+    if (value.len < 78 || value.data[0] != 1
+        || value.data[73] > NGX_HTTP_CACHE_PURGE_TAG_MAX)
+    {
         return ngx_http_cache_purge_catalog_error(c,
                   NGX_HTTP_CACHE_ROCKSDB_CORRUPT, "invalid file index row");
     }
@@ -491,9 +600,9 @@ static ngx_http_cache_purge_bytes_t
 ngx_http_cache_purge_catalog_record(ngx_http_cache_purge_catalog_t *c,
     const ngx_http_cache_purge_row_t *row)
 {
-    ngx_http_cache_purge_bytes_t  value;
-    unsigned char                *p;
-    size_t                        i;
+    size_t                         i;
+    unsigned char                 *p;
+    ngx_http_cache_purge_bytes_t   value;
 
     value.len = 78 + row->tag_count * 8 + row->path.len;
     p = ngx_http_cache_purge_catalog_alloc(c, value.len);
@@ -539,9 +648,9 @@ static void
 ngx_http_cache_purge_catalog_tag_reference(ngx_http_cache_purge_catalog_t *c,
     const ngx_http_cache_purge_row_t *row, uint64_t tag, int drop)
 {
-    unsigned char                raw[33], number[8], *p;
+    uint64_t                      count;
     ngx_http_cache_purge_bytes_t  key, value;
-    uint64_t                     count;
+    unsigned char                 raw[33], number[8], *p;
 
     raw[0] = 'K';
     p = ngx_http_cache_purge_catalog_encode(raw + 1, row->fields[0], 8);
@@ -575,9 +684,9 @@ static void
 ngx_http_cache_purge_catalog_post(ngx_http_cache_purge_catalog_t *c,
     const ngx_http_cache_purge_row_t *row, const unsigned char id[24], int drop)
 {
-    unsigned char                raw[49], *p;
-    ngx_http_cache_purge_bytes_t  key;
     size_t                        i;
+    ngx_http_cache_purge_bytes_t  key;
+    unsigned char                 raw[49], *p;
 
     raw[0] = 'A';
     p = ngx_http_cache_purge_catalog_encode(raw + 1, row->fields[0], 8);
@@ -621,14 +730,14 @@ ngx_http_cache_purge_catalog_tags(ngx_http_cache_purge_catalog_t *c,
     ngx_http_cache_purge_tag_pt handler, void *data,
     ngx_http_cache_rocksdb_error_t *error)
 {
-    ngx_http_cache_rocksdb_cursor_t  *cursor;
     ngx_http_cache_rocksdb_buffer_t   key, value;
+    ngx_http_cache_rocksdb_cursor_t  *cursor;
+    unsigned char                     raw[33], count[8];
     ngx_http_cache_purge_bytes_t      fields[3], prefix, tag;
-    unsigned char                    raw[33], count[8];
     const unsigned char              kinds[] = "UNM";
-    uint64_t                         id;
-    size_t                           i;
-    int                              rc;
+    uint64_t  id;
+    size_t    i;
+    int       rc;
 
     ngx_http_cache_purge_catalog_begin(c, error);
     fields[0] = identity->url;
@@ -698,8 +807,8 @@ static void
 ngx_http_cache_purge_catalog_gc_row(ngx_http_cache_purge_catalog_t *c,
     uint64_t until, const unsigned char id[24], int remove)
 {
-    unsigned char                 raw[33];
     ngx_http_cache_purge_bytes_t  key;
+    unsigned char                 raw[33];
 
     if (until == 0) {
         return;
@@ -737,9 +846,9 @@ ngx_http_cache_purge_catalog_open(ngx_http_cache_rocksdb_t *store,
     ngx_http_cache_purge_catalog_t **catalog,
     ngx_http_cache_rocksdb_error_t *error)
 {
-    ngx_http_cache_purge_catalog_t  *c;
+    int                              rc;
     ngx_http_cache_purge_bytes_t     key, value;
-    int                             rc;
+    ngx_http_cache_purge_catalog_t  *c;
 
     *catalog = NULL;
     c = calloc(1, sizeof(*c));
@@ -806,13 +915,15 @@ ngx_http_cache_purge_catalog_put(ngx_http_cache_purge_catalog_t *c,
     const ngx_http_cache_purge_entry_t *entry,
     ngx_http_cache_rocksdb_error_t *error)
 {
-    ngx_http_cache_purge_bytes_t  fields[6], key, value;
+    size_t                        i, j;
     ngx_http_cache_purge_row_t    row, old;
-    unsigned char                id[24];
-    size_t                       i, j;
+    unsigned char                 id[24];
+    ngx_http_cache_purge_bytes_t  fields[6], key, value;
 
     ngx_http_cache_purge_catalog_begin(c, error);
-    if (entry->tag_count > 64 || entry->retain_until != 0) {
+    if (entry->tag_count > NGX_HTTP_CACHE_PURGE_TAG_MAX
+        || entry->retain_until != 0)
+    {
         return ngx_http_cache_purge_catalog_error(c,
                     NGX_HTTP_CACHE_ROCKSDB_INVALID, "invalid cache entry");
     }
@@ -925,11 +1036,12 @@ ngx_http_cache_purge_catalog_put(ngx_http_cache_purge_catalog_t *c,
 static int
 ngx_http_cache_purge_catalog_entry(ngx_http_cache_purge_catalog_t *c,
     ngx_http_cache_rocksdb_cursor_t *view, const unsigned char id[24],
-    ngx_http_cache_purge_entry_t *entry, int file_only)
+    ngx_http_cache_purge_entry_t *entry, int file_only,
+    ngx_http_cache_purge_scan_t *scan)
 {
-    ngx_http_cache_purge_bytes_t  key, value, *fields[6];
+    size_t                        i, j;
     ngx_http_cache_purge_row_t    row;
-    size_t                        i;
+    ngx_http_cache_purge_bytes_t  key, value, *fields[6];
 
     memset(entry, 0, sizeof(*entry));
     key = ngx_http_cache_purge_catalog_file_key(c, id);
@@ -945,6 +1057,19 @@ ngx_http_cache_purge_catalog_entry(ngx_http_cache_purge_catalog_t *c,
 
     if (ngx_http_cache_purge_catalog_decode(c, value, &row) != 0) {
         return c->status;
+    }
+
+    /*
+     * The first selected TAG owns a file; no growing seen-file set is needed.
+     */
+    if (scan != NULL) {
+        for (i = 0; i < scan->tag_index; i++) {
+            for (j = 0; j < row.tag_count; j++) {
+                if (scan->tags[i] == row.tags[j]) {
+                    return NGX_HTTP_CACHE_ROCKSDB_DONE;
+                }
+            }
+        }
     }
 
     if (ngx_http_cache_purge_catalog_number(id, 8) != row.fields[4]) {
@@ -1000,7 +1125,7 @@ ngx_http_cache_purge_catalog_get(ngx_http_cache_purge_catalog_t *c,
 {
     ngx_http_cache_purge_catalog_begin(c, error);
 
-    return ngx_http_cache_purge_catalog_entry(c, NULL, id, entry, 0);
+    return ngx_http_cache_purge_catalog_entry(c, NULL, id, entry, 0, NULL);
 }
 
 
@@ -1010,14 +1135,14 @@ ngx_http_cache_purge_catalog_walk(ngx_http_cache_purge_catalog_t *c,
     ngx_http_cache_purge_check_pt check, void *data,
     ngx_http_cache_rocksdb_error_t *error)
 {
+    int                               rc;
+    size_t                            i;
+    uint64_t                          id;
+    ngx_http_cache_purge_bytes_t      prefix, resume;
+    ngx_http_cache_purge_entry_t      entry;
+    ngx_http_cache_rocksdb_buffer_t   key, value;
     ngx_http_cache_rocksdb_cursor_t  *cursor;
-    ngx_http_cache_rocksdb_buffer_t  key, value;
-    ngx_http_cache_purge_entry_t     entry;
-    ngx_http_cache_purge_bytes_t     prefix, resume;
-    unsigned char                    raw[25];
-    uint64_t                         id;
-    size_t                           i;
-    int                              rc;
+    unsigned char                     raw[25];
 
     ngx_http_cache_purge_catalog_begin(c, error);
     if (root.data == NULL || root.len == 0
@@ -1063,7 +1188,8 @@ ngx_http_cache_purge_catalog_walk(ngx_http_cache_purge_catalog_t *c,
             break;
         }
         ngx_http_cache_purge_catalog_begin(c, error);
-        rc = ngx_http_cache_purge_catalog_entry(c, cursor, raw + 1, &entry, 1);
+        rc = ngx_http_cache_purge_catalog_entry(c, cursor, raw + 1, &entry, 1,
+                                                NULL);
         if (rc == 0) {
             rc = check(data, &entry, error);
         }
@@ -1082,8 +1208,8 @@ ngx_http_cache_purge_catalog_remove(ngx_http_cache_purge_catalog_t *c,
     const unsigned char id[24], uint64_t expected,
     ngx_http_cache_rocksdb_error_t *error)
 {
-    ngx_http_cache_purge_bytes_t  key, value;
     ngx_http_cache_purge_row_t    row;
+    ngx_http_cache_purge_bytes_t  key, value;
 
     ngx_http_cache_purge_catalog_begin(c, error);
     key = ngx_http_cache_purge_catalog_file_key(c, id);
@@ -1118,8 +1244,8 @@ ngx_http_cache_purge_catalog_retain(ngx_http_cache_purge_catalog_t *c,
     const unsigned char id[24], uint64_t expected, uint64_t until,
     ngx_http_cache_rocksdb_error_t *error)
 {
-    ngx_http_cache_purge_bytes_t  key, value;
     ngx_http_cache_purge_row_t    row;
+    ngx_http_cache_purge_bytes_t  key, value;
 
     ngx_http_cache_purge_catalog_begin(c, error);
     if (until == 0) {
@@ -1161,13 +1287,13 @@ ngx_http_cache_purge_catalog_collect(ngx_http_cache_purge_catalog_t *c,
     uint64_t now, size_t limit, size_t *removed,
     ngx_http_cache_rocksdb_error_t *error)
 {
+    int                               rc;
+    size_t                            i;
+    ngx_http_cache_purge_row_t        row;
+    ngx_http_cache_purge_bytes_t      prefix, stored, selected;
+    ngx_http_cache_rocksdb_buffer_t   key, value;
     ngx_http_cache_rocksdb_cursor_t  *cursor;
-    ngx_http_cache_rocksdb_buffer_t  key, value;
-    ngx_http_cache_purge_bytes_t     prefix, stored, selected;
-    ngx_http_cache_purge_row_t       row;
-    unsigned char                    raw[33];
-    size_t                           i;
-    int                              rc;
+    unsigned char                     raw[33];
 
     *removed = 0;
     cursor = NULL;
@@ -1261,23 +1387,59 @@ ngx_http_cache_purge_scan_inner(ngx_http_cache_purge_scan_t *scan,
 }
 
 
+static int
+ngx_http_cache_purge_scan_tag(ngx_http_cache_purge_scan_t *scan,
+    ngx_http_cache_purge_bytes_t after, ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_bytes_t  prefix;
+    unsigned char                 raw[17];
+
+    while (scan->tag_index < scan->tag_count
+           && scan->tags[scan->tag_index] == 0)
+    {
+        scan->tag_index++;
+        after = ngx_http_cache_purge_empty;
+    }
+    if (scan->tag_index == scan->tag_count || scan->tag_scope == 0) {
+        scan->tag_index = scan->tag_count;
+        return 0;
+    }
+    if (scan->tag_count > 1) {
+        scan->outer_key[0] = (unsigned char) scan->tag_index;
+        scan->outer_length = 1;
+    }
+    raw[0] = scan->tag_kind;
+    ngx_http_cache_purge_catalog_encode(raw + 1, scan->tag_scope, 8);
+    ngx_http_cache_purge_catalog_encode(raw + 9,
+                                         scan->tags[scan->tag_index], 8);
+    prefix.data = raw;
+    prefix.len = sizeof(raw);
+    return ngx_http_cache_rocksdb_cursor_open(scan->catalog->store,
+                    NGX_HTTP_CACHE_ROCKSDB_TAG, prefix, after,
+                    &scan->inner, error);
+}
+
+
 int
 ngx_http_cache_purge_scan_open(ngx_http_cache_purge_catalog_t *c,
     const ngx_http_cache_purge_select_t *selector,
     ngx_http_cache_purge_bytes_t after, int retained, uint64_t now,
     ngx_http_cache_purge_scan_t **out, ngx_http_cache_rocksdb_error_t *error)
 {
-    ngx_http_cache_purge_scan_t  *scan;
-    ngx_http_cache_purge_bytes_t  prefix, value, outer, inner;
-    unsigned char                raw[25];
-    uint64_t                     first, second, third;
-    size_t                       length;
-    int                          rc;
+    int                            rc;
+    size_t                         length, i, maximum;
+    uint64_t                       first, second, third;
+    ngx_http_cache_purge_scan_t   *scan;
+    ngx_http_cache_purge_bytes_t   prefix, value, outer, inner;
+    unsigned char                  raw[25];
+    ngx_http_cache_purge_bytes_t   tags[NGX_HTTP_CACHE_PURGE_TAG_SELECT];
 
     *out = NULL;
     ngx_http_cache_purge_catalog_begin(c, error);
+    maximum = selector->type == NGX_HTTP_CACHE_PURGE_SELECT_TAG
+              ? NGX_HTTP_CACHE_PURGE_TAG_LIST_MAX : NGX_HTTP_CACHE_PURGE_TEXT;
     if (selector->type > NGX_HTTP_CACHE_PURGE_SELECT_TAG
-        || selector->value.len > NGX_HTTP_CACHE_PURGE_TEXT
+        || selector->value.len > maximum
         || (selector->value.len != 0 && selector->value.data == NULL)
         || selector->namespace_value.len > NGX_HTTP_CACHE_PURGE_TEXT
         || (selector->namespace_value.len != 0
@@ -1347,6 +1509,31 @@ ngx_http_cache_purge_scan_open(ngx_http_cache_purge_catalog_t *c,
         goto ready;
     }
 
+    if (selector->type == NGX_HTTP_CACHE_PURGE_SELECT_TAG) {
+        scan->cf = NGX_HTTP_CACHE_ROCKSDB_TAG;
+        scan->tag_kind = selector->host_scope ? 'H' : 'N';
+        rc = ngx_http_cache_purge_select_tags(selector->value, tags,
+                                               &scan->tag_count);
+        if (rc != 0 || outer.len > 1
+            || (outer.len && outer.data[0] >= scan->tag_count))
+        {
+            rc = NGX_HTTP_CACHE_ROCKSDB_INVALID;
+            goto failed;
+        }
+        scan->tag_index = outer.len ? outer.data[0] : 0;
+        scan->tag_scope = ngx_http_cache_purge_catalog_reference(c,
+                                scan->tag_kind, selector->namespace_value, 0);
+        for (i = 0; i < scan->tag_count; i++) {
+            scan->tags[i] = ngx_http_cache_purge_catalog_reference(c, 'T',
+                                                                   tags[i], 0);
+        }
+        rc = c->status;
+        if (rc == 0) {
+            rc = ngx_http_cache_purge_scan_tag(scan, inner, error);
+        }
+        goto ready;
+    }
+
     if (outer.len != 0) {
         rc = NGX_HTTP_CACHE_ROCKSDB_INVALID;
         goto failed;
@@ -1358,18 +1545,6 @@ ngx_http_cache_purge_scan_open(ngx_http_cache_purge_catalog_t *c,
         raw[0] = 'H';
         first = ngx_http_cache_purge_catalog_reference(c, 'H', selector->value,
                                                        0);
-
-    } else if (selector->type == NGX_HTTP_CACHE_PURGE_SELECT_TAG) {
-        scan->cf = NGX_HTTP_CACHE_ROCKSDB_TAG;
-        raw[0] = selector->host_scope ? 'H' : 'N';
-        first = ngx_http_cache_purge_catalog_reference(c, raw[0],
-                                            selector->namespace_value, 0);
-        second = ngx_http_cache_purge_catalog_reference(c, 'T',
-                                                         selector->value, 0);
-        length = 17;
-        if (second == 0) {
-            goto ready;
-        }
 
     } else {
         raw[0] = 'A';
@@ -1428,18 +1603,25 @@ int
 ngx_http_cache_purge_scan_next(ngx_http_cache_purge_scan_t *scan,
     ngx_http_cache_purge_entry_t *entry, ngx_http_cache_rocksdb_error_t *error)
 {
-    ngx_http_cache_purge_catalog_t  *c;
-    ngx_http_cache_rocksdb_buffer_t  key, value;
-    unsigned char                   number[16];
-    uint64_t                        url;
-    size_t                          visited;
-    int                             rc;
+    int                               rc;
+    size_t                            visited;
+    uint64_t                          url;
+    ngx_http_cache_purge_catalog_t   *c;
+    ngx_http_cache_rocksdb_buffer_t   key, value;
+    unsigned char                     number[16];
 
     c = scan->catalog;
     ngx_http_cache_purge_catalog_begin(c, error);
     memset(entry, 0, sizeof(*entry));
 
     for (visited = 0; visited < 64; visited++) {
+        if (scan->inner == NULL && scan->tag_count != 0) {
+            rc = ngx_http_cache_purge_scan_tag(scan,
+                                         ngx_http_cache_purge_empty, error);
+            if (rc != 0) {
+                return rc;
+            }
+        }
         if (scan->inner == NULL) {
             if (scan->outer == NULL) {
                 return NGX_HTTP_CACHE_ROCKSDB_DONE;
@@ -1474,6 +1656,17 @@ ngx_http_cache_purge_scan_next(ngx_http_cache_purge_scan_t *scan,
         memset(&value, 0, sizeof(value));
         rc = ngx_http_cache_rocksdb_cursor_next(scan->inner, &key, &value,
                                                  error);
+        if (rc == NGX_HTTP_CACHE_ROCKSDB_DONE && scan->tag_count != 0) {
+            ngx_http_cache_rocksdb_cursor_close(&scan->inner, NULL);
+            scan->inner_length = 0;
+            scan->tag_index++;
+            if (scan->tag_index == scan->tag_count) {
+                return NGX_HTTP_CACHE_ROCKSDB_DONE;
+            }
+            scan->outer_key[0] = (unsigned char) scan->tag_index;
+            scan->outer_length = 1;
+            continue;
+        }
         if (rc == NGX_HTTP_CACHE_ROCKSDB_DONE && scan->nested) {
             ngx_http_cache_rocksdb_cursor_close(&scan->inner, NULL);
             continue;
@@ -1490,7 +1683,10 @@ ngx_http_cache_purge_scan_next(ngx_http_cache_purge_scan_t *scan,
         scan->inner_length = key.length;
         ngx_http_cache_purge_catalog_begin(c, error);
         rc = ngx_http_cache_purge_catalog_entry(c, scan->inner,
-                           scan->inner_key + key.length - 24, entry, 1);
+                           scan->inner_key + key.length - 24, entry, 1, scan);
+        if (rc == NGX_HTTP_CACHE_ROCKSDB_DONE) {
+            continue;
+        }
         if (rc != 0) {
             return rc;
         }
@@ -1511,8 +1707,8 @@ ngx_http_cache_purge_scan_next(ngx_http_cache_purge_scan_t *scan,
 ngx_http_cache_purge_bytes_t
 ngx_http_cache_purge_scan_bookmark(ngx_http_cache_purge_scan_t *scan)
 {
-    ngx_http_cache_purge_bytes_t  value;
-    unsigned char                *p;
+    unsigned char                 *p;
+    ngx_http_cache_purge_bytes_t   value;
 
     p = ngx_http_cache_purge_catalog_encode(scan->token, scan->outer_length, 2);
     *p++ = (unsigned char) scan->inner_length;

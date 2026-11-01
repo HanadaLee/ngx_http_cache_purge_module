@@ -43,8 +43,10 @@ typedef struct {
 } ngx_http_cache_purge_state_t;
 
 typedef struct {
-    uint64_t  delete_before, invalidate_before;
-    uint64_t  propagate_delete, propagate_invalidate;
+    uint64_t  delete_before;
+    uint64_t  invalidate_before;
+    uint64_t  propagate_delete;
+    uint64_t  propagate_invalidate;
 } ngx_http_cache_purge_match_t;
 
 enum {
@@ -56,7 +58,7 @@ enum {
 
 #define NGX_HTTP_CACHE_PURGE_MESSAGE_MAX  (256 * 1024)
 
-/* Thread input owns its strings in the trailing allocation. It contains no
+/* Queued work owns its strings in the trailing allocation. It contains no
  * request, cache-node, shared-memory or database pointers. */
 typedef struct {
     ngx_uint_t                    type;
@@ -74,7 +76,7 @@ ngx_int_t ngx_http_cache_purge_state_enqueue(
     ngx_http_cache_purge_state_t  *state, ngx_uint_t type, const void *input,
     ngx_http_cache_purge_message_t **message);
 
-/* Only the elected worker-0 owner consumes work. The caller supplies an
+/* Only the database owner consumes work. The caller supplies an
  * aligned MESSAGE_MAX-byte private buffer; task completion runs on its event
  * loop. Record-only batches may complete on the database thread.
  * Detached submissions remain accepted and continue in the background.
@@ -151,7 +153,7 @@ enum {
     NGX_HTTP_CACHE_PURGE_ID_HEADER,
     NGX_HTTP_CACHE_PURGE_ISSUED_HEADER,
     NGX_HTTP_CACHE_PURGE_TIME_HEADER,
-    NGX_HTTP_CACHE_PURGE_MODE_HEADER,
+    NGX_HTTP_CACHE_PURGE_PROPAGATION_ACTION_HEADER,
     NGX_HTTP_CACHE_PURGE_VALUES
 };
 
@@ -160,18 +162,19 @@ typedef void (*ngx_http_cache_purge_finalize_pt)(ngx_http_request_t *r,
 typedef ngx_int_t (*ngx_http_cache_purge_create_pt)(ngx_http_request_t *r);
 
 typedef struct {
-    ngx_http_cache_purge_state_t      state;
-    ngx_http_cache_purge_owner_t     *owner;
-    ngx_path_t                       *path;
-    ngx_shm_zone_t                   *zone;
-    ngx_msec_t                        propagation;
-    ngx_http_cache_rocksdb_options_t  options;
-    ngx_array_t                       caches, locations;
-    ngx_http_complex_value_t          defaults[NGX_HTTP_CACHE_PURGE_VALUES];
-    ngx_http_complex_value_t          guard[4];
-    ngx_buf_tag_t                     protocol[4];
-    ngx_http_cache_purge_finalize_pt  finalize[4];
-    ngx_http_cache_purge_create_pt    create[4];
+    ngx_http_cache_purge_state_t       state;
+    ngx_http_cache_purge_owner_t      *owner;
+    ngx_path_t                        *path;
+    ngx_shm_zone_t                    *zone;
+    ngx_msec_t                         propagation;
+    ngx_http_cache_rocksdb_options_t   options;
+    ngx_array_t                        caches;
+    ngx_array_t                        locations;
+    ngx_http_complex_value_t           defaults[NGX_HTTP_CACHE_PURGE_VALUES];
+    ngx_http_complex_value_t           guard[4];
+    ngx_buf_tag_t                      protocol[4];
+    ngx_http_cache_purge_finalize_pt   finalize[4];
+    ngx_http_cache_purge_create_pt     create[4];
 } ngx_http_cache_purge_main_conf_t;
 
 typedef struct {

@@ -13,6 +13,23 @@
 #include <signal.h>
 
 
+static ngx_http_cache_rocksdb_bytes_t ngx_http_cache_purge_text(
+    const char *text);
+static int ngx_http_cache_purge_apply(void *data,
+    const ngx_http_cache_purge_entry_t  *entry, unsigned action,
+    ngx_http_cache_rocksdb_error_t *error);
+static void ngx_http_cache_purge_entry(ngx_http_cache_purge_entry_t *entry,
+    unsigned  number, const char *root);
+static ngx_http_cache_purge_job_t ngx_http_cache_purge_job(unsigned id,
+    unsigned type, const char *value, unsigned action);
+static void ngx_http_cache_purge_open(const char *path,
+    ngx_http_cache_rocksdb_t **store, ngx_http_cache_purge_catalog_t **catalog,
+    ngx_http_cache_purge_jobs_t **jobs);
+static void ngx_http_cache_purge_close(ngx_http_cache_rocksdb_t **store,
+    ngx_http_cache_purge_catalog_t  *catalog,
+                                    ngx_http_cache_purge_jobs_t *jobs);
+
+
 static unsigned  ngx_http_cache_purge_checks;
 
 #define ngx_expect(test)                                                     \
@@ -26,7 +43,11 @@ static unsigned  ngx_http_cache_purge_checks;
 
 
 typedef struct {
-    unsigned  calls, first, failure, missing, replaced;
+    unsigned  calls;
+    unsigned  first;
+    unsigned  failure;
+    unsigned  missing;
+    unsigned  replaced;
 } ngx_http_cache_purge_test_t;
 
 
@@ -47,8 +68,8 @@ ngx_http_cache_purge_apply(void *data,
     const ngx_http_cache_purge_entry_t  *entry, unsigned action,
     ngx_http_cache_rocksdb_error_t *error)
 {
-    ngx_http_cache_purge_test_t  *test;
     unsigned                      number;
+    ngx_http_cache_purge_test_t  *test;
 #if (NGX_HTTP_CACHE_PURGE_NATIVE_TEST)
     char                                name[512];
     ngx_http_cache_purge_native_file_t  result;
@@ -163,8 +184,8 @@ ngx_http_cache_purge_open(const char *path, ngx_http_cache_rocksdb_t **store,
     ngx_http_cache_purge_catalog_t  **catalog,
     ngx_http_cache_purge_jobs_t **jobs)
 {
-    ngx_http_cache_rocksdb_options_t  options;
     ngx_http_cache_rocksdb_error_t    error;
+    ngx_http_cache_rocksdb_options_t  options;
 
     ngx_http_cache_rocksdb_options(&options);
     ngx_expect(ngx_http_cache_rocksdb_open(path, &options, store, &error) == 0);
@@ -189,25 +210,27 @@ ngx_http_cache_purge_close(ngx_http_cache_rocksdb_t **store,
 int
 ngx_http_cache_purge_test_main(void)
 {
-    ngx_http_cache_rocksdb_t        *store;
-    ngx_http_cache_purge_catalog_t  *catalog;
-    ngx_http_cache_purge_jobs_t     *jobs;
-    ngx_http_cache_rocksdb_error_t   error;
-    ngx_http_cache_rocksdb_stats_t   stats;
-    ngx_http_cache_purge_entry_t     entry;
-    ngx_http_cache_purge_job_t       input, output, saved;
-    ngx_http_cache_purge_test_t      test;
-    ngx_http_cache_purge_scan_t     *scan;
-    ngx_http_cache_rocksdb_bytes_t   empty;
-    unsigned char                    id[24];
-    char                             root[] = "/tmp/cache-jobs-XXXXXX";
-    char                             crash[] = "/tmp/cache-jobs-crash-XXXXXX";
-    char                             text[32769], binary[] = { 'a', 0, 'b' };
-    size_t                           removed;
-    uint64_t                         written, synced;
-    int                              duplicate, rc, status;
-    unsigned                         i;
-    pid_t                            child;
+    int                                 duplicate, rc, status;
+    pid_t                               child;
+    size_t                              removed;
+    uint64_t                            written, synced;
+    unsigned                            i;
+    ngx_http_cache_rocksdb_t           *store;
+    ngx_http_cache_purge_job_t          input, output, saved;
+    ngx_http_cache_purge_jobs_t        *jobs;
+    ngx_http_cache_purge_scan_t        *scan;
+    ngx_http_cache_purge_test_t         test;
+    ngx_http_cache_purge_entry_t        entry;
+    ngx_http_cache_purge_catalog_t     *catalog;
+    ngx_http_cache_rocksdb_bytes_t      empty;
+    ngx_http_cache_rocksdb_error_t      error;
+    ngx_http_cache_rocksdb_stats_t      stats;
+    char                                root[] = "/tmp/cache-jobs-XXXXXX";
+    char                                crash[] =
+        "/tmp/cache-jobs-crash-XXXXXX";
+    char                                text[32769];
+    char                                binary[] = { 'a', 0, 'b' };
+    unsigned char                       id[24];
 #if (NGX_HTTP_CACHE_PURGE_NATIVE_TEST)
     ngx_http_file_cache_header_t  header;
     char                          name[512];

@@ -8,6 +8,23 @@ ngx_pid_t             ngx_pid;
 ngx_int_t             ngx_ncpu = 2;
 volatile ngx_cycle_t *ngx_cycle;
 
+static ngx_http_cache_rocksdb_bytes_t ngx_http_cache_purge_text(
+    const char *text);
+static ngx_http_cache_purge_job_t ngx_http_cache_purge_job(unsigned number,
+    unsigned type, const char *value);
+static void ngx_http_cache_purge_reference(
+    const ngx_http_cache_purge_job_t *jobs, size_t count,
+    const ngx_http_cache_purge_entry_t *entry, uint64_t now,
+    ngx_uint_t local_only, ngx_http_cache_purge_match_t *match);
+static void ngx_http_cache_purge_test_urls(ngx_http_cache_purge_state_t *state);
+static void ngx_http_cache_purge_test_mixed(
+    ngx_http_cache_purge_state_t *state);
+static void ngx_http_cache_purge_test_tags(ngx_http_cache_purge_state_t *state);
+static void ngx_http_cache_purge_test_dates(
+    ngx_http_cache_purge_state_t *state);
+static void ngx_http_cache_purge_empty(ngx_http_cache_purge_state_t *state);
+
+
 static unsigned       ngx_http_cache_purge_checks;
 
 
@@ -72,11 +89,11 @@ ngx_http_cache_purge_reference(const ngx_http_cache_purge_job_t *jobs,
     size_t count, const ngx_http_cache_purge_entry_t *entry, uint64_t now,
     ngx_uint_t local_only, ngx_http_cache_purge_match_t *match)
 {
-    const ngx_http_cache_purge_job_t     *job;
-    const ngx_http_cache_purge_select_t  *s;
-    ngx_http_cache_rocksdb_bytes_t        value, scope;
     size_t                                i, j;
     uint64_t                             *local, *propagate;
+    ngx_http_cache_rocksdb_bytes_t        value, scope;
+    const ngx_http_cache_purge_job_t     *job;
+    const ngx_http_cache_purge_select_t  *s;
 
     memset(match, 0, sizeof(*match));
     for (i = 0; i < count; i++) {
@@ -143,12 +160,12 @@ ngx_http_cache_purge_reference(const ngx_http_cache_purge_job_t *jobs,
 static void
 ngx_http_cache_purge_test_urls(ngx_http_cache_purge_state_t *state)
 {
-    ngx_http_cache_purge_job_t    jobs[128];
-    ngx_http_cache_purge_entry_t  entry;
-    ngx_http_cache_purge_match_t  fast, full, expected;
     ngx_int_t                     a, b;
     ngx_uint_t                    i, j, k, pass;
+    ngx_http_cache_purge_entry_t  entry;
+    ngx_http_cache_purge_match_t  fast, full, expected;
     u_char                        values[128][8], query[8];
+    ngx_http_cache_purge_job_t    jobs[128];
 
     memset(&entry, 0, sizeof(entry));
     for (i = 0; i < 128; i++) {
@@ -214,12 +231,12 @@ ngx_http_cache_purge_test_urls(ngx_http_cache_purge_state_t *state)
 static void
 ngx_http_cache_purge_test_mixed(ngx_http_cache_purge_state_t *state)
 {
-    ngx_http_cache_purge_job_t    jobs[120];
+    uint64_t                      now;
+    ngx_uint_t                    i, j, k, pass, local;
     ngx_http_cache_purge_entry_t  entry;
     ngx_http_cache_purge_match_t  actual, expected;
-    ngx_uint_t                    i, j, k, pass, local;
     u_char                        values[120][8], query[8];
-    uint64_t                      now;
+    ngx_http_cache_purge_job_t    jobs[120];
 
     memset(&entry, 0, sizeof(entry));
     for (i = 0; i < 120; i++) {
@@ -293,10 +310,12 @@ ngx_http_cache_purge_test_mixed(ngx_http_cache_purge_state_t *state)
 static void
 ngx_http_cache_purge_test_tags(ngx_http_cache_purge_state_t *state)
 {
+    size_t                        used, bytes;
+    ngx_uint_t                    i, rules, messages;
     ngx_http_cache_purge_job_t    job, other, extra;
     ngx_http_cache_purge_entry_t  entry;
     ngx_http_cache_purge_match_t  match;
-    ngx_uint_t                    i;
+    char                          batch[512];
 
     memset(&entry, 0, sizeof(entry));
     other = ngx_http_cache_purge_job(1, NGX_HTTP_CACHE_PURGE_SELECT_TAG,
@@ -306,10 +325,10 @@ ngx_http_cache_purge_test_tags(ngx_http_cache_purge_state_t *state)
     ngx_expect(ngx_hash_key((u_char *) "Aa", 2)
                == ngx_hash_key((u_char *) "BB", 2));
     ngx_expect(ngx_http_cache_purge_state_install(state, &job) == NGX_OK);
-    for (i = 0; i < 64; i++) {
+    for (i = 0; i < 128; i++) {
         entry.tags[i] = ngx_http_cache_purge_text("BB");
     }
-    for (i = 0; i <= 64; i++) {
+    for (i = 0; i <= 128; i++) {
         entry.tag_count = i;
         ngx_expect(ngx_http_cache_purge_state_match(state, &entry, 201, &match)
                    == NGX_DECLINED);
@@ -321,7 +340,7 @@ ngx_http_cache_purge_test_tags(ngx_http_cache_purge_state_t *state)
             entry.tags[i - 1] = ngx_http_cache_purge_text("BB");
         }
     }
-    entry.tags[63] = ngx_http_cache_purge_text("Aa");
+    entry.tags[127] = ngx_http_cache_purge_text("Aa");
     entry.namespace_value = ngx_http_cache_purge_text("other");
     ngx_expect(ngx_http_cache_purge_state_match(state, &entry, 201, &match)
                == NGX_DECLINED);
@@ -337,10 +356,10 @@ ngx_http_cache_purge_test_tags(ngx_http_cache_purge_state_t *state)
         extra = ngx_http_cache_purge_job(i, NGX_HTTP_CACHE_PURGE_SELECT_TAG,
                                         "boundary-unmatched");
         ngx_expect(ngx_http_cache_purge_state_install(state, &extra) == NGX_OK);
-        entry.tags[63] = ngx_http_cache_purge_text("BB");
+        entry.tags[127] = ngx_http_cache_purge_text("BB");
         ngx_expect(ngx_http_cache_purge_state_match(state, &entry, 201, &match)
                    == NGX_DECLINED);
-        entry.tags[63] = ngx_http_cache_purge_text("Aa");
+        entry.tags[127] = ngx_http_cache_purge_text("Aa");
         ngx_expect(ngx_http_cache_purge_state_match(state, &entry, 201, &match)
                    == NGX_OK && !match.delete_before
                    && match.propagate_delete == 200);
@@ -351,6 +370,33 @@ ngx_http_cache_purge_test_tags(ngx_http_cache_purge_state_t *state)
     }
     ngx_http_cache_purge_state_finish(state, other.id);
     ngx_http_cache_purge_state_collect(state, 321);
+
+    used = 0;
+    for (i = 0; i < 32; i++) {
+        used += snprintf(batch + used, sizeof(batch) - used,
+                         "%sbatch-%02u", i ? "," : "", (unsigned) i);
+    }
+    job = ngx_http_cache_purge_job(40, NGX_HTTP_CACHE_PURGE_SELECT_TAG, batch);
+    for (i = 0; i < 8; i++) {
+        job.id[15] = (u_char) (40 + i);
+        ngx_expect(ngx_http_cache_purge_state_install(state, &job) == NGX_OK);
+    }
+    job.id[15] = 48;
+    ngx_expect(ngx_http_cache_purge_state_install(state, &job) == NGX_BUSY);
+    entry.tag_count = 1;
+    entry.tags[0] = ngx_http_cache_purge_text("batch-31");
+    ngx_expect(ngx_http_cache_purge_state_match(state, &entry, 201, &match)
+               == NGX_OK && match.delete_before == 200);
+    entry.namespace_value = ngx_http_cache_purge_text("other");
+    ngx_expect(ngx_http_cache_purge_state_match(state, &entry, 201, &match)
+               == NGX_DECLINED);
+    for (i = 0; i < 8; i++) {
+        job.id[15] = (u_char) (40 + i);
+        ngx_http_cache_purge_state_finish(state, job.id);
+    }
+    ngx_http_cache_purge_state_collect(state, 322);
+    ngx_http_cache_purge_state_stats(state, &rules, &messages, &bytes);
+    ngx_expect(rules == 0);
 }
 
 
@@ -414,8 +460,8 @@ ngx_http_cache_purge_test_dates(ngx_http_cache_purge_state_t *state)
 static void
 ngx_http_cache_purge_empty(ngx_http_cache_purge_state_t *state)
 {
-    ngx_uint_t  rules, messages;
     size_t      bytes;
+    ngx_uint_t  rules, messages;
 
     ngx_http_cache_purge_state_stats(state, &rules, &messages, &bytes);
     ngx_expect(rules == 0 && messages == 0 && bytes == 0);
@@ -426,31 +472,31 @@ ngx_http_cache_purge_empty(ngx_http_cache_purge_state_t *state)
 int
 ngx_http_cache_purge_test_main(void)
 {
-    ngx_shm_zone_t                   zone;
-    ngx_http_cache_purge_state_t     state, reloaded;
-    ngx_http_cache_purge_job_t       job, result;
-    ngx_http_cache_purge_entry_t     entry;
-    ngx_http_cache_purge_match_t     match;
-    ngx_http_cache_purge_message_t  *message, *taken, *pending[256];
-    ngx_http_cache_purge_work_t     *work;
-    ngx_slab_pool_t                 *pool;
-    ngx_cycle_t                      cycle;
+    size_t                           bytes;
     ngx_log_t                        log;
     ngx_uint_t                       i, baseline, rules, messages;
-    size_t                           bytes;
+    ngx_cycle_t                      cycle;
+    ngx_shm_zone_t                   zone;
+    ngx_slab_pool_t                 *pool;
+    ngx_http_cache_purge_job_t       job, result;
+    ngx_http_cache_purge_work_t     *work;
+    ngx_http_cache_purge_entry_t     entry;
+    ngx_http_cache_purge_match_t     match;
+    ngx_http_cache_purge_state_t     state, reloaded;
     int                              code, status, ready[2], done[2];
+    ngx_http_cache_purge_message_t  *message, *taken, *pending[256];
     char                             byte, url[] = "http://a.test/one";
     char                             misc[] = { 'a', 0, 'b' };
-    char                            *large;
-    pid_t                            child;
+    char   *large;
+    pid_t   child;
 #if (NGX_HTTP_CACHE_PURGE_BACKEND_TEST)
-    ngx_http_cache_rocksdb_t         *store;
-    ngx_http_cache_purge_catalog_t   *catalog;
-    ngx_http_cache_purge_jobs_t      *jobs;
-    ngx_http_cache_rocksdb_options_t  options;
-    ngx_http_cache_rocksdb_error_t    error;
+    ngx_http_cache_rocksdb_t          *store;
+    ngx_http_cache_purge_catalog_t    *catalog;
+    ngx_http_cache_purge_jobs_t       *jobs;
+    ngx_http_cache_rocksdb_options_t   options;
+    ngx_http_cache_rocksdb_error_t     error;
     char                              database[] = "/tmp/cache-state-XXXXXX";
-    int                               duplicate;
+    int  duplicate;
 #endif
 
     memset(&cycle, 0, sizeof(cycle));
@@ -463,7 +509,8 @@ ngx_http_cache_purge_test_main(void)
     for (i = ngx_pagesize; i >>= 1; ngx_pagesize_shift++) { /* void */ }
     ngx_slab_sizes_init();
     memset(&zone, 0, sizeof(zone));
-    zone.shm.size = 1024 * 1024;
+    /* Reach the message-count limit independently of the 128-TAG size. */
+    zone.shm.size = 2 * 1024 * 1024;
     zone.shm.addr = mmap(NULL, zone.shm.size, PROT_READ | PROT_WRITE,
                          MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     ngx_expect(zone.shm.addr != MAP_FAILED);
@@ -751,12 +798,14 @@ ngx_http_cache_purge_test_main(void)
     ngx_expect(ngx_http_cache_purge_state_enqueue(&state,
                NGX_HTTP_CACHE_PURGE_RECORD, &entry, &message) == NGX_OK
                && message == NULL);
-    ngx_expect(ngx_http_cache_purge_state_enqueue(&state,
-               NGX_HTTP_CACHE_PURGE_RECORD, &entry, &message) == NGX_OK);
+    for (i = 0; i < 3; i++) {
+        ngx_expect(ngx_http_cache_purge_state_enqueue(&state,
+                   NGX_HTTP_CACHE_PURGE_RECORD, &entry, &message) == NGX_OK);
+    }
     ngx_expect(ngx_http_cache_purge_state_enqueue(&state,
                NGX_HTTP_CACHE_PURGE_RECORD, &entry, &message) == NGX_BUSY);
     free(large);
-    for (i = 0; i < 2; i++) {
+    for (i = 0; i < 4; i++) {
         ngx_expect(ngx_http_cache_purge_state_take(&state, work, &taken)
                    == NGX_OK && work->data.entry.url.data[100] == 'x');
         ngx_http_cache_purge_state_complete(&state, taken, 0, NULL);

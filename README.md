@@ -70,8 +70,22 @@ physical MD5 filename selectors are outside the current scope.
 
 PURGE is the submission method. The management location supports JSON capability
 and task-status responses; it does not accept JSON POST submissions.
-A TAG purge currently accepts one TAG;
-cached objects can have multiple TAGs.
+A cached response can have up to 128 TAG items, each at most 1,024 bytes.
+`cache_purge_tag` accepts one or more complex values; their comma-separated
+results form one list. For example:
+
+```nginx
+cache_purge_tag $upstream_http_cache_tag extratag1 extratag2;
+```
+
+Empty items are ignored and surrounding spaces/tabs are trimmed. The item limit
+is checked before deduplication. A child directive replaces its inherited list;
+expr `when` selects a complete list using the usual candidate order.
+
+A TAG purge accepts up to 32 comma-separated items and matches any of them.
+Selectors are sorted and deduplicated before admission, so reordering the same
+list does not change a retry's identity. Overlapping TAGs affect each file once
+within the task. Both `tag` and `host-tag` support this behavior.
 
 ### Minimal configuration
 
@@ -113,7 +127,7 @@ A prefix is a literal URL byte prefix, without an appended wildcard.
 `url`, `prefix` and `host` cover all matching misc and namespace variants.
 `key` uses the configured URL, misc and namespace exactly. `tag` uses the
 configured namespace; `host-tag` uses the host extracted from the configured
-URL. Both TAG selectors read one value from `X-Cache-Purge-Tags`.
+URL. Both TAG selectors read their list from `X-Cache-Purge-Tags`.
 
 For reliable retries, supply `X-Cache-Purge-Operation-Id` and
 `X-Cache-Purge-Issued-At` together, keeping both unchanged across attempts.
@@ -137,10 +151,16 @@ window is 120 seconds. The parent compares the request's purge timestamp and
 mode with the native cache date, then serves, revalidates or replaces its cache.
 There is no response receipt or module signature.
 
-Use `cache_purge_propagation on|off` to distinguish parent traffic from origin
+Use `proxy_cache_purge_propagation on|off` to distinguish parent traffic from origin
 traffic. Extension builds use the existing proxy request-header framework;
 other builds expose variables for `proxy_set_header`. FastCGI, uwsgi and scgi do
 not propagate purge headers. TAG names are not sent to the parent.
+
+The action is named consistently in both protocols: `delete` or `invalidate`.
+Propagation uses `cache_purge_propagation_action_header`, defaulting to
+`X-Cache-Purge-Action`, and `$cache_purge_propagation_action` for manual
+`proxy_set_header` configuration. The time header and variable keep their names.
+The old `cache_purge_propagation` switch and propagation `mode` names are removed.
 
 Known TAG associations survive local deletion for the propagation window.
 When a proxy MISS needs these associations, a background lookup reads the
@@ -185,8 +205,10 @@ file checks, successful transitions into retention, and check/retention errors;
 they are operational counters, not a durable ledger. Reload retains them;
 a full restart resets them. Sweep bookmarks are process-local and may rescan
 after a restart. Cleanup yields under load, so completion time is not fixed.
-The shared state format is now version 8; upgrading from earlier formats
-requires a full restart. The database schema and nginx core ABI are unchanged.
+The shared state format is version 1 and tasks use PJ1. This implementation
+has not been released or deployed; development snapshots do not define an
+upgrade or downgrade compatibility contract. Rebuild both addons together;
+the RocksDB bridge ABI and nginx core ABI are unchanged.
 
 RocksDB's target SST size and base-level capacity follow the write-buffer
 budget: 2 MiB and 8 MiB by default. They are compaction targets, not a limit on
@@ -234,13 +256,16 @@ requires filtering. Cached responses use the native cache date; origin
 responses use the request start time. This gate reads one shared atomic word
 without a lock. Writers keep a conservative timestamp bound until the last
 local rule finishes, with one extra shared counter and no per-object state.
-The existing sorted array of at most 256 published rules groups URL/key/prefix,
-host and TAG selectors. URL searches follow prefix ancestors; host searches
-compare full values. Larger TAG groups compare precomputed hashes, then full
-values and scope, so hash collisions cannot broaden a purge. TAG rules reuse
-the ancestor pointer's storage for their hash, so the rule structure does not
-grow. TAG groups of at most four rules use direct comparisons to avoid
-small-table lookup overhead.
+The shared index allows at most 256 selector slots across all tasks. Each TAG
+in a batch uses one slot; other task types use one slot each. Thus a 32-TAG
+task reserves 32 slots atomically while retaining one durable task and one
+completion state. Shared-memory bytes can constrain admission before that count.
+URL searches follow prefix ancestors; host searches compare full values.
+TAG lookup uses a separate bounded pointer array with precomputed hashes, then
+full values and scope, so collisions cannot broaden a purge. Groups of at most
+four TAG entries use direct comparisons. Background scans use one TAG cursor
+at a time and skip files belonging to an earlier selected TAG; they do not
+allocate an unbounded set of processed file IDs.
 When local rules contain only URL and prefix selectors, HIT filtering still
 evaluates only the URL. The array is rebuilt on publication and once after each
 collection batch under the shared mutex. Outgoing requests use the same index

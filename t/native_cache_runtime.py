@@ -192,7 +192,7 @@ class Origin(http.server.BaseHTTPRequestHandler):
             self.send_header('ETag', etag)
             self.send_header('Cache-Control', 'max-age=3600')
             self.send_header('Cache-Tag', self.headers.get('Accept-Language', 'native')
-                             if self.path == '/variants/vary' else 'native')
+                             if self.path == '/variants/vary' else self.headers.get('X-Test-Tags', 'native'))
             body = b'' if status == 304 else ('body-v' + str(version)).encode()
             if self.path == '/variants/vary':
                 self.send_header('Vary', 'Accept-Language')
@@ -297,11 +297,11 @@ if args.public_module:
         invalid "";
     }}
     cache_purge_key_url $native_purge_url;
-    cache_purge_tag $upstream_http_cache_tag;'''
+    cache_purge_tag $upstream_http_cache_tag inherited;'''
     control_config = 'proxy_cache_purge on; cache_purge_key_url $http_x_target;'
     business_config = '''proxy_cache_purge on;
             proxy_set_header X-Cache-Purge-Time $cache_purge_propagation_time;
-            proxy_set_header X-Cache-Purge-Mode $cache_purge_propagation_mode;'''
+            proxy_set_header X-Cache-Purge-Action $cache_purge_propagation_action;'''
     api_config = 'location /management/ { cache_purge_api; }'
     api_config += f'''
         location = /memory-error {{
@@ -360,7 +360,21 @@ if args.public_module:
             cache_purge_key_url http://variants.test$uri;
             cache_purge_key_misc $http_x_test_misc;
             cache_purge_key_namespace $http_x_test_namespace;''')
+    tag_config = 'cache_purge_tag $upstream_http_cache_tag $http_x_extra_tag extra-a extra-b;'
+    if args.expr:
+        tag_config = 'when is_get { ' + tag_config + ' } cache_purge_tag fallback;'
     api_config += f'''
+        location /tag-input/ {{
+            proxy_cache_purge on;
+            cache_purge_key_url http://tags.test$uri;
+            cache_purge_key_namespace tag-input;
+            {tag_config}
+            proxy_cache test;
+            proxy_cache_key $uri;
+            proxy_cache_valid 200 1h;
+            proxy_pass http://127.0.0.1:{origin.server_port};
+            add_header X-Cache $upstream_cache_status always;
+        }}
         location /variants/ {{
             proxy_cache_purge on;
             {variant_identity}
@@ -883,6 +897,41 @@ try:
             assert finished(25)['affected'] == 2
             assert all(not p.exists() for p in varying)
             checks.append('one configured key purge removes both native Vary files')
+
+            scoped = {'X-Test-Namespace': 'tag-input'}
+            limit_tags = ','.join(f'limit-{i}' for i in range(125))
+            hit('/tag-input/limit', {'X-Test-Tags': limit_tags, 'X-Extra-Tag': 'source-extra'})
+            time.sleep(1.05)
+            assert accepted('delete', '', 40, 'tag', {
+                **scoped, 'X-Cache-Purge-Tags': 'limit-124,source-extra,extra-b'})['status'] == 202
+            assert finished(40)['affected'] == 1
+            assert request('/tag-input/limit')['cache'] == 'MISS'
+            checks.append('128 response TAGs combine upstream, variable and literal arguments and overlapping selectors affect a file once')
+
+            for path, tags in [('a', 'batch-0,batch-1'), ('b', 'batch-31'), ('c', 'unselected')]:
+                hit('/tag-input/' + path, {'X-Test-Tags': tags})
+            time.sleep(1.05)
+            issued = str(int(time.time() * 1000))
+            batch = [f'batch-{i}' for i in range(32)]
+            headers = {**scoped, 'X-Cache-Purge-Issued-At': issued,
+                       'X-Cache-Purge-Tags': ', '.join(batch)}
+            assert accepted('invalidate', '', 41, 'tag', headers)['status'] == 202
+            assert finished(41)['affected'] == 2
+            headers['X-Cache-Purge-Tags'] = ','.join(reversed(batch))
+            assert accepted('invalidate', '', 41, 'tag', headers)['status'] == 202
+            assert finished(41)['affected'] == 2
+            assert request('/tag-input/a')['cache'] == 'EXPIRED'
+            assert request('/tag-input/b')['cache'] == 'EXPIRED'
+            assert request('/tag-input/c')['cache'] == 'HIT'
+            checks.append('32-TAG Invalidate uses OR semantics, preserves unrelated files and replays reordered selectors idempotently')
+            for value in (','.join(batch + ['overflow']), ' , , ', 'x' * 1025):
+                assert accepted('delete', '', 42, 'tag', {
+                    **scoped, 'X-Cache-Purge-Tags': value})['status'] == 400
+            time.sleep(1.05)
+            assert accepted('delete', '', 42, 'tag', {
+                **scoped, 'X-Cache-Purge-Tags': ' extra-b, extra-b, , '})['status'] == 202
+            assert finished(42)['affected'] == 4
+            checks.append('TAG submission rejects 33 items and overlong or empty lists, while duplicates and empty comma fields are canonicalized')
             for number, protocol in enumerate(protocol_servers):
                 target = '/' + protocol + '/item'
                 hit(target)
@@ -902,7 +951,7 @@ try:
                 assert response['cache'] == 'MISS' and response['body'] == f'body-v{state["version"]}', response
                 calls = [params for name, params in state['protocol_calls'] if name == protocol]
                 assert not calls[-1].get('HTTP_IF_NONE_MATCH'), calls[-1]
-                assert all(not params.get('HTTP_X_CACHE_PURGE_TIME') and not params.get('HTTP_X_CACHE_PURGE_MODE') for params in calls)
+                assert all(not params.get('HTTP_X_CACHE_PURGE_TIME') and not params.get('HTTP_X_CACHE_PURGE_ACTION') for params in calls)
                 checks.append(protocol + ' independently supports HIT, Invalidate, stale policy, 304 and Delete without propagation headers')
 except BaseException as exc:
     (run / 'failure.json').write_text(json.dumps({
