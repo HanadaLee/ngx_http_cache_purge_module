@@ -270,6 +270,12 @@ and `min_uses=2`. This is a separate I/O configuration comparison; keep its
 measurements separate from the default benchmark. The runtime runner retains
 its existing smaller open-file cache when this option is absent.
 
+The benchmark selects distinct cores from the topology exposed by Linux.
+It excludes nginx's SMT siblings from the load generator and controller,
+pins wrk to one separate core, and records actual thread affinities.
+`--server-cores` counts distinct cores; a separate load-generator core is
+required. Virtual-machine topology does not guarantee host CPU isolation.
+
 `--state` also tests shared queues/rules with nginx's actual slab allocator and
 process mutex. It checks publication ordering, disconnected callers, capacity
 rejection and cross-process visibility. It can run without linking RocksDB;

@@ -24,7 +24,7 @@ parser.add_argument('--rounds', type=int, default=3)
 parser.add_argument('--bulk', type=int, default=8192)
 parser.add_argument('--connections', type=int, default=16)
 parser.add_argument('--workers', type=int, default=2)
-parser.add_argument('--server-cores', type=int, default=2)
+parser.add_argument('--server-cores', type=int, default=2, help='Number of distinct CPU cores reserved for nginx')
 parser.add_argument('--fills', type=int, default=0)
 parser.add_argument('--fill-rate', type=int, default=500)
 parser.add_argument('--request-delay', type=int, default=0, help='wrk delay in milliseconds between requests on each connection')
@@ -76,11 +76,32 @@ class Origin(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def cpu_siblings(cpu):
+    path = Path(f'/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list')
+    siblings = set()
+    for part in path.read_text().strip().split(','):
+        bounds = list(map(int, part.split('-')))
+        siblings.update(range(bounds[0], bounds[-1] + 1))
+    return siblings
+
+
 cpus = sorted(os.sched_getaffinity(0))
-assert args.workers > 0 and 0 < args.server_cores <= len(cpus)
-server_cpus = cpus[:args.server_cores]
-client_cpus = cpus[args.server_cores:] or cpus
-os.sched_setaffinity(0, client_cpus)
+cores, seen = [], set()
+topology = {cpu: sorted(cpu_siblings(cpu)) for cpu in cpus}
+for cpu in cpus:
+    if cpu not in seen:
+        group = sorted(set(topology[cpu]).intersection(cpus))
+        assert cpu in group
+        cores.append(group)
+        seen.update(group)
+assert args.workers > 0 and 0 < args.server_cores < len(cores), \
+    'A separate physical core is required for the load generator'
+server_cpus = [group[0] for group in cores[:args.server_cores]]
+server_siblings = [cpu for group in cores[:args.server_cores] for cpu in group]
+client_cpus = [cores[args.server_cores][0]]
+controller_cpus = [cpu for group in cores[args.server_cores + 1:] for cpu in group] or client_cpus
+assert not set(server_siblings).intersection(client_cpus + controller_cpus)
+os.sched_setaffinity(0, controller_cpus)
 origin = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Origin)
 threading.Thread(target=origin.serve_forever, daemon=True).start()
 (root / 'stats.lua').write_text('''done = function(summary, latency, requests)
@@ -98,6 +119,8 @@ report = {'root': str(root), 'binary': str(args.binary),
           'binary_sha256': hashlib.sha256(args.binary.read_bytes()).hexdigest(),
           'script_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
           'server_cpus': server_cpus, 'client_cpus': client_cpus,
+          'controller_cpus': controller_cpus,
+          'server_siblings': server_siblings, 'cpu_topology': topology,
           'origin_and_controller_pinned': True,
           'workers': args.workers,
           'connections': args.connections, 'seconds': args.seconds,
@@ -154,12 +177,15 @@ def resources(pid):
             pss += int(memory['Pss'])
             rss += int(memory['Rss'])
             for task in (directory / 'task').iterdir():
+                affinity = sorted(os.sched_getaffinity(int(task.name)))
+                assert set(affinity).issubset(server_cpus), (task, affinity)
                 policy = str(os.sched_getscheduler(int(task.name)))
                 policies[policy] = policies.get(policy, 0) + 1
                 stat = (task / 'stat').read_text().rsplit(')', 1)[1].split()
                 policy_ticks[policy] = policy_ticks.get(policy, 0) + int(stat[11]) + int(stat[12])
                 status = (task / 'status').read_text()
                 threads[task.name] = dict(name=(task / 'comm').read_text().strip(),
+                    affinity=affinity,
                     policy=int(policy), nice=int(stat[16]), user_ticks=int(stat[11]),
                     system_ticks=int(stat[12]), minor_faults=int(stat[7]),
                     **{key: int(value) for key, value in re.findall(
@@ -388,7 +414,7 @@ http {{
 
                     filler = threading.Thread(target=fill, daemon=True)
                     filler.start()
-                command = ['taskset', '-c', ','.join(map(str, client_cpus)), 'wrk', '-t1',
+                command = ['wrk', '-t1',
                            '-c' + str(args.connections), '-d' + str(args.seconds) + 's',
                            '--latency', '-s', str(root / 'stats.lua'),
                            '-H', 'Host: bench.test', f'http://127.0.0.1:{port}{args.hot_path}']
@@ -407,7 +433,10 @@ http {{
                         '-F', '999', '-p' if args.profile == 'all' else '-t',
                         ','.join(targets), '-o', str(run / (mode + '.perf'))],
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                load = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                load = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                        preexec_fn=lambda: os.sched_setaffinity(0, client_cpus))
+                load_affinity = sorted(os.sched_getaffinity(load.pid))
+                assert load_affinity == client_cpus, load_affinity
                 progress = []
                 if submitting:
                     operations, admission_ms = submit()
@@ -435,7 +464,7 @@ http {{
                 assert hot_calls == origin_before and request(args.hot_path)[1] == 'HIT'
                 sample.update(mode=mode, run=str(run), resources_before=before,
                               resources_after=resources(process.pid), progress=progress,
-                              fill=fill_stats, admission_ms=admission_ms)
+                              fill=fill_stats, admission_ms=admission_ms, load_affinity=load_affinity)
                 if enabled:
                     status, _, body = request('/management/capabilities')
                     assert status == 200
