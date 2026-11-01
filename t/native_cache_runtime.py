@@ -37,6 +37,8 @@ parser.add_argument('--slice', action='store_true')
 parser.add_argument('--dynamic', action='store_true')
 parser.add_argument('--protocols', action='store_true')
 parser.add_argument('--ssl', action='store_true')
+parser.add_argument('--state', action='store_true',
+                    help='Persist native cache zones and the purge state zone')
 parser.add_argument('--cache-io', action='store_true',
                     help='Exercise sendfile and cached native file descriptors')
 args = parser.parse_args()
@@ -52,6 +54,8 @@ if args.public_module:
     assert args.backend, '--public-module requires --backend'
 if args.slice or args.dynamic or args.protocols:
     assert args.public_module, 'extended HTTP checks require --public-module'
+if args.state:
+    assert args.public_module and args.extension, '--state requires the public module and nginx-ext'
 repo = Path(__file__).resolve().parent.parent
 root = args.reuse_build or Path(tempfile.mkdtemp(prefix='cache-native-runtime-'))
 build, addon, run = root / 'nginx', root / 'addon', root / 'run'
@@ -71,6 +75,8 @@ with tarfile.open(fileobj=io.BytesIO(archive)) as source:
     core_files = [entry for entry in source if entry.isfile() and entry.name.startswith('src/')]
     for entry in core_files:
         assert (build / entry.name).read_bytes() == source.extractfile(entry).read(), entry.name
+state_supported = args.extension and 'NGX_RESTY_SHM_PERSISTENCE' in (build / 'src/core/ngx_cycle.h').read_text()
+assert not args.state or state_supported, 'core has no shared memory persistence support'
 inputs = ('ngx_http_cache_purge_files.c', 'ngx_http_cache_purge.h',
           'ngx_http_cache_purge_internal.h', 'rocksdb/ngx_http_cache_rocksdb.h',
           't/ngx_http_cache_purge_native_probe.c')
@@ -290,8 +296,9 @@ refused = None
 if args.public_module:
     refused = socket.socket()
     refused.bind(('127.0.0.1', 0))
+    state_parameter = f' state={run}/purge.zone' if args.state else ''
     owner_config = f'''cache_purge_index_store {run}/store;
-    cache_purge_state_zone purge 1m;
+    cache_purge_state_zone zone=purge:1m{state_parameter};
     map $http_x_test_identity $native_purge_url {{
         default http://cache.test$uri;
         invalid "";
@@ -417,7 +424,9 @@ if args.public_module:
             {protocol}_pass 127.0.0.1:{server.server_address[1]};
             add_header X-Cache $upstream_cache_status always;
         }}'''
-second_cache = (f'proxy_cache_path {run}/cache2 levels=1:2 keys_zone=test2:1m;\n'
+cache_state = f' keys_state={run}/cache.zone' if args.state else ''
+cache2_state = f' keys_state={run}/cache2.zone' if args.state else ''
+second_cache = (f'proxy_cache_path {run}/cache2 levels=1:2 keys_zone=test2:1m{cache2_state};\n'
                 'map $http_x_zone $native_cache_zone { default test; second test2; }'
                 if args.backend else '')
 loads = ('\n'.join(f'load_module {build}/objs/{name}.so;'
@@ -434,7 +443,7 @@ events {{ worker_connections 128; }}
 http {{
     access_log off;
     {owner_config}
-    proxy_cache_path {run}/cache levels=1:2 keys_zone=test:1m;
+    proxy_cache_path {run}/cache levels=1:2 keys_zone=test:1m{cache_state};
     {second_cache}
     {cache_io}
     server {{
@@ -477,6 +486,28 @@ if args.public_module:
             '-c', str(run / 'config-check.conf')], capture_output=True, text=True)
         assert (result.returncode == 0) == valid, (value, result.stderr)
     checks.append('store I/O rate accepts disabled and sized limits, rejects invalid and duplicate values')
+
+    zone_directive = f'cache_purge_state_zone zone=purge:1m{state_parameter};'
+    assert config.count(zone_directive) == 1
+    for value, valid in (('zone=purge:1m', True), ('zone=purge:1024k', True),
+                         ('purge 1m', False), ('purge:1m', False),
+                         ('zone=', False), ('zone=:1m', False),
+                         ('zone=purge', False), ('zone=purge:', False),
+                         ('zone=purge:bad', False), ('zone=purge:512k', False),
+                         ('zone=purge:1m unknown=1', False),
+                         ('zone=purge:1m state=', False),
+                         ('zone=purge:1m state=one state=two', False),
+                         (f'zone=purge:1m state={run}/parse.zone', bool(state_supported)),
+                         (f'state={run}/parse.zone zone=purge:1m', bool(state_supported)),
+                         ('zone=purge:1m zone=other:1m', False),
+                         ('zone=purge:1m; cache_purge_state_zone zone=other:1m', False)):
+        candidate = config.replace(zone_directive, f'cache_purge_state_zone {value};')
+        candidate = candidate.replace(str(run / 'error.log'), str(run / 'config-check.log'))
+        (run / 'config-check.conf').write_text(candidate)
+        result = subprocess.run([str(binary), '-t', '-p', str(run),
+            '-c', str(run / 'config-check.conf')], capture_output=True, text=True)
+        assert (result.returncode == 0) == valid, (value, result.stderr)
+    checks.append('state zone uses zone=name:size and rejects malformed, undersized and duplicate definitions')
 
 def start():
     proc = subprocess.Popen([str(binary), '-p', str(run), '-c', str(run / 'nginx.conf')],
@@ -642,12 +673,24 @@ try:
     expired = cached.read_bytes()
     process.send_signal(signal.SIGQUIT)
     assert process.wait(10) == 0
+    if args.state:
+        assert all((run / name).stat().st_size > 0 for name in ('purge.zone', 'cache.zone', 'cache2.zone'))
     process = start()
     ready()
     response = request()
-    assert response['status'] == 200 and response['cache'] == 'STALE', response
-    assert response['body'] == 'body-v1' and cached.read_bytes() == expired
-    checks.append('restart loses purged and permits ordinary expired-cache stale without restoring metadata')
+    if args.state:
+        assert response['status'] == 500 and response['body'] == 'failure', response
+        assert cached.read_bytes() == expired
+        state['fail'] = False
+        response = request()
+        assert response['cache'] == 'REVALIDATED' and response['body'] == 'body-v1', response
+        assert cached.stat().st_ino == inode
+        hit()
+        checks.append('saved native zones preserve purged on the first request after restart and permit 304 reuse')
+    else:
+        assert response['status'] == 200 and response['cache'] == 'STALE', response
+        assert response['body'] == 'body-v1' and cached.read_bytes() == expired
+        checks.append('restart loses purged and permits ordinary expired-cache stale without restoring metadata')
 
     purge('delete', '/item', 3)
     assert not cached.exists()
@@ -985,6 +1028,7 @@ report = {'status': 'passed', 'root': str(root), 'run': str(run),
           'key_module': str(repo / 'key') if args.public_module else None,
           'slice': args.slice,
           'dynamic': args.dynamic,
+          'state': args.state,
           'protocols': list(protocol_servers),
           'nginx_thread_pool': not args.no_thread_pool,
           'sanitize': args.sanitize,

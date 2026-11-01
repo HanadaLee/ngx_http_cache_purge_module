@@ -105,6 +105,10 @@ static void ngx_http_cache_purge_state_publish(
     const ngx_http_cache_purge_job_t *job);
 static void ngx_http_cache_purge_state_remove(
     ngx_http_cache_purge_state_t *state, ngx_http_cache_purge_rule_t *rule);
+#if (NGX_RESTY_EXT && NGX_RESTY_SHM_PERSISTENCE)
+static void ngx_http_cache_purge_state_restore(
+    ngx_http_cache_purge_state_t *state);
+#endif
 static void ngx_http_cache_purge_state_free(
     ngx_http_cache_purge_state_t *state,
     ngx_http_cache_purge_message_t *message);
@@ -602,6 +606,80 @@ ngx_http_cache_purge_state_remove(ngx_http_cache_purge_state_t *state,
 }
 
 
+#if (NGX_RESTY_EXT && NGX_RESTY_SHM_PERSISTENCE)
+
+ngx_int_t
+ngx_http_cache_purge_state_signature(ngx_conf_t *cf, ngx_str_t *signature)
+{
+    size_t  size;
+
+    size = sizeof("cache-purge:") + sizeof(NGX_MODULE_SIGNATURE)
+           + 5 * (NGX_SIZE_T_LEN + 1);
+    signature->data = ngx_pnalloc(cf->pool, size);
+
+    if (signature->data == NULL) {
+        return NGX_ERROR;
+    }
+
+    signature->len =
+        ngx_sprintf(signature->data,
+                    "cache-purge:%ui:%s:%uz:%uz:%uz:%uz",
+                    (ngx_uint_t) NGX_HTTP_CACHE_PURGE_STATE_VERSION,
+                    NGX_MODULE_SIGNATURE,
+                    sizeof(ngx_http_cache_purge_shared_t),
+                    sizeof(ngx_http_cache_purge_rule_t),
+                    sizeof(ngx_http_cache_purge_tag_rule_t),
+                    sizeof(ngx_http_cache_purge_message_t))
+        - signature->data;
+
+    return NGX_OK;
+}
+
+
+/* A restored zone has no live owners, waiters, or notification channels. */
+static void
+ngx_http_cache_purge_state_restore(ngx_http_cache_purge_state_t *state)
+{
+    uint64_t                         now;
+    ngx_queue_t                     *q, *next;
+    ngx_http_cache_purge_rule_t     *rule;
+    ngx_http_cache_purge_message_t  *message;
+
+    now = (uint64_t) ngx_time();
+    ngx_shmtx_lock(&state->pool->mutex);
+
+    for (q = ngx_queue_head(&state->shared->messages);
+         q != ngx_queue_sentinel(&state->shared->messages); q = next)
+    {
+        next = ngx_queue_next(q);
+        message = ngx_queue_data(q, ngx_http_cache_purge_message_t, all);
+        ngx_http_cache_purge_state_free(state, message);
+    }
+
+    ngx_queue_init(&state->shared->pending);
+
+    for (q = ngx_queue_head(&state->shared->rules);
+         q != ngx_queue_sentinel(&state->shared->rules); q = next)
+    {
+        next = ngx_queue_next(q);
+        rule = ngx_queue_data(q, ngx_http_cache_purge_rule_t, queue);
+        rule->references = 0;
+
+        if (!rule->published || (!rule->local && rule->retain_until <= now)) {
+            ngx_http_cache_purge_state_remove(state, rule);
+        }
+    }
+
+    state->shared->ready = 0;
+    state->shared->owner = 0;
+    state->shared->collected = 0;
+    ngx_http_cache_purge_state_index(state);
+    ngx_shmtx_unlock(&state->pool->mutex);
+}
+
+#endif
+
+
 ngx_int_t
 ngx_http_cache_purge_state_init(ngx_shm_zone_t *zone, void *old)
 {
@@ -642,6 +720,12 @@ ngx_http_cache_purge_state_init(ngx_shm_zone_t *zone, void *old)
     }
 
     state->shared = shared;
+
+#if (NGX_RESTY_EXT && NGX_RESTY_SHM_PERSISTENCE)
+    if (old == NULL && zone->restore) {
+        ngx_http_cache_purge_state_restore(state);
+    }
+#endif
 
     return NGX_OK;
 }

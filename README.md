@@ -9,7 +9,7 @@ The repository includes `ngx_http_cache_purge_module`, `ngx_http_cache_rocksdb_m
 ```nginx
 http {
     cache_purge_index_store /var/cache/nginx/index;
-    cache_purge_state_zone purge 1m;
+    cache_purge_state_zone zone=purge:1m;
 
     proxy_cache_path /var/cache/nginx/content keys_zone=content:1m;
 
@@ -178,7 +178,7 @@ These budgets do not cap total process memory or the operating system's page cac
 
 ### cache_purge_state_zone
 
-| Syntax: | **cache_purge_state_zone** `name size`; |
+| Syntax: | **cache_purge_state_zone** `zone=name:size` [`state=file`]; |
 | :--- | :--- |
 | Default: | — |
 | Context: | `http` |
@@ -186,6 +186,24 @@ These budgets do not cap total process memory or the operating system's page cac
 Allocates shared memory for active rules, queued work, and completion state. The minimum size is `1m`. Configure one zone together with `cache_purge_index_store`.
 
 At most 256 selector slots are available across tasks. Each TAG in a batch consumes one slot; other selectors consume one slot per task. The byte budget can limit admission before that count is reached. Changing the zone name or size requires stopping nginx and starting it again.
+
+The optional `state` parameter saves the zone on an orderly nginx shutdown and restores it at startup. It requires nginx-ext with shared-memory persistence enabled; unsupported builds reject this parameter. Relative file paths use the nginx prefix. Use a writable path outside native cache directories, and retain it across container recreation. After successful startup, the restored file is removed; the next orderly shutdown writes a fresh snapshot.
+
+```nginx
+cache_purge_state_zone zone=purge:1m state=/var/lib/nginx/purge.zone;
+```
+
+Restored rules retain their original propagation deadlines; restarting does not extend the propagation window. Accepted tasks resume from the persistent index, and cleanup counters are retained. State files must belong to the same index and configuration and must not be shared between independent nginx instances.
+
+This saves purge rules. To retain the strict Invalidate behavior of existing cache entries, also enable nginx-ext persistence for each native cache zone:
+
+```nginx
+proxy_cache_path /var/cache/nginx/content
+                 keys_zone=content:10m
+                 keys_state=/var/lib/nginx/content.zone;
+```
+
+With the same compatible build, zone sizes, paths, and preserved files, this retains cache state across an orderly restart. A master process killed with `SIGKILL` cannot save a new snapshot. Incompatible snapshots can be discarded, and size or address conflicts can prevent startup; nginx-ext reports these conditions in the error log.
 
 ### proxy_cache_purge
 
@@ -455,9 +473,9 @@ Purge tasks are processed in the background. Ordinary cache HITs do not wait for
 
 A configuration reload (`nginx -s reload`) keeps the master process running and preserves state in unchanged cache and purge zones. A restart means stopping all nginx processes and then starting nginx again. This includes a graceful shutdown with `nginx -s quit`; forced termination, process crashes, and power loss are abnormal shutdowns.
 
-Reloads and restarts reuse the persistent index and resume recorded pending tasks. After a restart, completed Invalidate operations no longer enforce their stricter stale-response restriction; affected entries follow ordinary nginx stale policy. This applies even after a graceful shutdown.
+Reloads and restarts reuse the persistent index and resume recorded pending tasks. Without native cache-zone persistence, completed Invalidate operations no longer enforce their stricter stale-response restriction after a restart; affected entries follow ordinary nginx stale policy. This applies even after a graceful shutdown. Use native cache-zone persistence together with `cache_purge_state_zone state=...` when both cache state and purge rules must survive an orderly restart.
 
-Missing-file records are collected in the background, retaining known TAG relationships for propagation. The management API exposes cumulative `index_cleanup.checked`, `index_cleanup.retained`, and `index_cleanup.errors` counters; these counters survive reloads with the same purge zone and reset when nginx is stopped and started again.
+Missing-file records are collected in the background, retaining known TAG relationships for propagation. The management API exposes cumulative `index_cleanup.checked`, `index_cleanup.retained`, and `index_cleanup.errors` counters; these counters survive reloads with the same purge zone. Across a stop and start, they are retained when a saved purge zone is restored and otherwise reset.
 
 ### Limits
 
@@ -488,6 +506,8 @@ python3 t/native_cache_runtime.py \
 ```
 
 Use `--extension 1` with nginx-ext to test strict Invalidate handling. `--dynamic`, `--slice`, and `--protocols` add separate-module loading, sliced caches, and FastCGI/uwsgi/scgi coverage. `--expr` and `--proxy-filter` take paths to optional modules. The public suite uses the bundled key module for variant and slice identities. Sanitizer runs require `--sanitize` and backend libraries built with `CACHE_PURGE_STORE_SANITIZE=ON`.
+
+With a persistence-capable nginx-ext build, `--state` also verifies saved native cache zones, the first request after restart, and retained propagation rules. The combined runner `t/persistent_runtime.py` accepts the same option with `--extension 1`.
 
 `t/persistent_runtime.py` also runs the key variable suite against the combined build. To verify a standalone key build, run `python3 t/key_runtime.py --nginx /path/to/nginx --output /tmp/key.json`; add `--without-cache`, `--dynamic`, or `--expr-source /path/to/expr` as needed.
 

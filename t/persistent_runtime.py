@@ -18,6 +18,8 @@ def main():
     parser.add_argument('--expr', type=Path)
     parser.add_argument('--proxy-filter', type=Path)
     parser.add_argument('--extension', type=int, choices=(0, 1), default=0)
+    parser.add_argument('--state', action='store_true',
+                        help='Verify nginx-ext zone persistence and restart recovery')
     parser.add_argument('--build', type=Path)
     parser.add_argument('--reports', type=Path, required=True)
     parser.add_argument('--jobs', type=int, default=2)
@@ -29,6 +31,8 @@ def main():
     args = parser.parse_args()
     if args.jobs < 1 or args.jobs > 32:
         parser.error('--jobs must be between 1 and 32')
+    if args.state and (not args.extension or args.backend_only):
+        parser.error('--state requires HTTP checks with --extension 1')
     if not args.backend_only:
         if not args.nginx:
             parser.error('HTTP checks require an --nginx source tree')
@@ -41,6 +45,7 @@ def main():
     reports.mkdir(parents=True, exist_ok=True)
     build = args.build.resolve() if args.build else Path(tempfile.mkdtemp(prefix='cache-purge-build-'))
     result = {'build': str(build), 'backend_only': args.backend_only,
+              'state': args.state,
               'dynamic': args.dynamic, 'sanitize': args.sanitize, 'stages': [],
               'status': 'running'}
 
@@ -99,6 +104,8 @@ def main():
                     public_args += [option, path.resolve()]
             if args.dynamic:
                 public_args += ['--dynamic']
+            if args.state:
+                public_args += ['--state']
             public = suite('public', 'native_cache_runtime.py', public_args)
             nginx = Path(public['root']) / 'nginx'
             key_args = ['--binary', nginx / 'objs/nginx']
@@ -118,6 +125,8 @@ def main():
                 propagation += ['--framework']
             if args.expr:
                 propagation += ['--expr']
+            if args.state:
+                propagation += ['--state']
             suite('propagation', 'native_propagation_runtime.py', propagation)
             suite('propagation-streaming', 'native_propagation_runtime.py',
                   [*propagation, '--tls', '--streaming', '--custom-headers'])

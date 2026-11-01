@@ -13,6 +13,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--nginx', type=Path, required=True)
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--sanitize', action='store_true')
+parser.add_argument('--extension', action='store_true')
 parser.add_argument('--backend', type=Path,
                     help='CMake build directory for native background-job checks')
 parser.add_argument('--state', action='store_true',
@@ -26,6 +27,8 @@ command = ['cc', '-std=gnu89', '-Wall', '-Wextra', '-Werror', '-O2', '-g',
            '-fdata-sections', '-Wl,--gc-sections']
 if args.sanitize:
     command += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
+if args.extension:
+    command.append('-DNGX_RESTY_EXT=1')
 for name in ('objs', 'src/core', 'src/event', 'src/event/modules',
              'src/event/quic', 'src/os/unix', 'src/http', 'src/http/modules',
              'src/http/v2', 'src/http/v3'):
@@ -168,6 +171,7 @@ if args.state:
         checks.append('durable task acceptance precedes shared-rule publication and completion')
 
 report = {'status': 'passed', 'checks': checks, 'root': str(root),
+          'extension': args.extension,
           'sanitize': args.sanitize, 'nginx': str(args.nginx), 'layout': layout,
           'jobs': jobs_result.stdout.strip() if jobs_result else None,
           'state': state_result.stdout.strip() if state_result else None,

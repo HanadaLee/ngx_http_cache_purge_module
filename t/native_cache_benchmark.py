@@ -237,7 +237,7 @@ os.close(descriptor)
             available.bind(('127.0.0.1', 0))
             port = available.getsockname()[1]
         settings = f'''cache_purge_index_store {run}/store{store_options};
-            cache_purge_state_zone purge 1m;
+            cache_purge_state_zone zone=purge:1m;
             cache_purge_key_url {args.url_origin}$uri;
             cache_purge_tag $upstream_http_cache_tag;
             location /management/ {{ cache_purge_api; }}

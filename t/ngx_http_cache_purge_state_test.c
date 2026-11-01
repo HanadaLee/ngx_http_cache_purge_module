@@ -12,6 +12,13 @@ ngx_pid_t              ngx_pid;
 ngx_int_t              ngx_ncpu = 2;
 volatile ngx_cycle_t  *ngx_cycle;
 
+#if (NGX_RESTY_EXT && NGX_RESTY_SHM_PERSISTENCE)
+static ngx_time_t       ngx_http_cache_purge_time;
+volatile ngx_time_t    *ngx_cached_time = &ngx_http_cache_purge_time;
+
+static void ngx_http_cache_purge_test_restore(ngx_shm_zone_t *zone);
+#endif
+
 static ngx_http_cache_rocksdb_bytes_t ngx_http_cache_purge_text(
     const char *text);
 static ngx_http_cache_purge_job_t ngx_http_cache_purge_job(unsigned number,
@@ -531,6 +538,62 @@ ngx_http_cache_purge_empty(ngx_http_cache_purge_state_t *state)
 }
 
 
+#if (NGX_RESTY_EXT && NGX_RESTY_SHM_PERSISTENCE)
+
+static void
+ngx_http_cache_purge_test_restore(ngx_shm_zone_t *zone)
+{
+    size_t                           bytes;
+    ngx_uint_t                       rules, messages;
+    ngx_http_cache_purge_job_t       job;
+    ngx_http_cache_purge_state_t    *state;
+    ngx_http_cache_purge_entry_t     entry;
+    ngx_http_cache_purge_match_t     match;
+    ngx_http_cache_purge_message_t  *message;
+
+    state = zone->data;
+    ngx_http_cache_purge_time.sec = 250;
+    job = ngx_http_cache_purge_job(1, NGX_HTTP_CACHE_PURGE_SELECT_URL,
+                                   "http://a.test/one");
+    ngx_expect(ngx_http_cache_purge_state_install(state, &job) == NGX_OK);
+    job.id[15] = 2;
+    job.action = NGX_HTTP_CACHE_PURGE_INVALIDATE;
+    job.done = 1;
+    ngx_expect(ngx_http_cache_purge_state_install(state, &job) == NGX_OK);
+    job.id[15] = 3;
+    job.retain_until = 240;
+    ngx_expect(ngx_http_cache_purge_state_install(state, &job) == NGX_OK);
+    job.id[15] = 4;
+    job.done = 0;
+    ngx_expect(ngx_http_cache_purge_state_enqueue(
+                   state, NGX_HTTP_CACHE_PURGE_SUBMIT, &job, &message)
+               == NGX_OK);
+
+    zone->restore = 1;
+    zone->shm.exists = 1;
+    ngx_expect(ngx_http_cache_purge_state_init(zone, NULL) == NGX_OK);
+    ngx_http_cache_purge_state_stats(state, &rules, &messages, &bytes);
+    ngx_expect(rules == 2 && messages == 0 && bytes == 0);
+    ngx_expect(!ngx_http_cache_purge_state_ready(state));
+
+    ngx_memzero(&entry, sizeof(entry));
+    entry.url = ngx_http_cache_purge_text("http://a.test/one");
+    ngx_expect(ngx_http_cache_purge_state_match(state, &entry, 250, &match)
+               == NGX_OK);
+    ngx_expect(match.delete_before == 200 && match.invalidate_before == 0);
+    ngx_expect(match.propagate_delete == 200
+               && match.propagate_invalidate == 200);
+
+    job.id[15] = 1;
+    ngx_http_cache_purge_state_finish(state, job.id);
+    ngx_http_cache_purge_state_collect(state, 321);
+    ngx_http_cache_purge_empty(state);
+    zone->restore = 0;
+}
+
+#endif
+
+
 int
 ngx_http_cache_purge_test_main(void)
 {
@@ -1034,6 +1097,9 @@ ngx_http_cache_purge_test_main(void)
     ngx_http_cache_purge_empty(&state);
     ngx_http_cache_purge_test_dates(&state);
     ngx_http_cache_purge_empty(&state);
+#if (NGX_RESTY_EXT && NGX_RESTY_SHM_PERSISTENCE)
+    ngx_http_cache_purge_test_restore(&zone);
+#endif
     ngx_expect(pool->pfree == baseline);
     ngx_shmtx_destroy(&pool->mutex);
     ngx_expect(munmap(zone.shm.addr, zone.shm.size) == 0);

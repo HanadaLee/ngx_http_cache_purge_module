@@ -77,7 +77,7 @@ static ngx_command_t  ngx_http_cache_purge_commands[] = {
       NULL },
 
     { ngx_string("cache_purge_state_zone"),
-      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE2,
+      NGX_HTTP_MAIN_CONF|NGX_CONF_1MORE,
       ngx_http_cache_purge_state_zone,
       NGX_HTTP_MAIN_CONF_OFFSET,
       0,
@@ -649,22 +649,109 @@ static char *
 ngx_http_cache_purge_state_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *data)
 {
     ngx_http_cache_purge_main_conf_t  *main = data;
-    ssize_t                            size;
-    ngx_str_t                         *value;
+
+    u_char      *p;
+    ssize_t      size;
+    ngx_str_t   *value, name, file, s;
+    ngx_uint_t   i;
+#if (NGX_RESTY_EXT && NGX_RESTY_SHM_PERSISTENCE)
+    ngx_shm_zone_params_t  zp;
+#endif
 
     if (main->zone != NULL) {
         return "is duplicate";
     }
 
     value = cf->args->elts;
-    size = ngx_parse_size(&value[2]);
+    ngx_str_null(&name);
+    ngx_str_null(&file);
+    size = 0;
+
+    for (i = 1; i < cf->args->nelts; i++) {
+        if (ngx_strncmp(value[i].data, "zone=", 5) == 0) {
+            if (name.len != 0) {
+                return "has a duplicate zone parameter";
+            }
+
+            name.data = value[i].data + 5;
+            p = ngx_strlchr(name.data, value[i].data + value[i].len, ':');
+
+            if (p == NULL || p == name.data) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "invalid zone \"%V\", "
+                                   "expected zone=name:size",
+                                   &value[i]);
+                return NGX_CONF_ERROR;
+            }
+
+            name.len = p - name.data;
+            s.data = p + 1;
+            s.len = value[i].data + value[i].len - s.data;
+            size = ngx_parse_size(&s);
+
+            if (size == NGX_ERROR) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "invalid zone size \"%V\"", &value[i]);
+                return NGX_CONF_ERROR;
+            }
+
+            continue;
+        }
+
+        if (ngx_strncmp(value[i].data, "state=", 6) == 0) {
+            if (file.data != NULL) {
+                return "has a duplicate state parameter";
+            }
+
+            file.data = value[i].data + 6;
+            file.len = value[i].len - 6;
+
+            if (file.len == 0) {
+                return "requires a nonempty state file name";
+            }
+
+            if (ngx_conf_full_name(cf->cycle, &file, 0) != NGX_OK) {
+                return NGX_CONF_ERROR;
+            }
+
+            continue;
+        }
+
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid parameter \"%V\"", &value[i]);
+        return NGX_CONF_ERROR;
+    }
+
+    if (name.len == 0) {
+        return "requires zone=name:size";
+    }
 
     if (size < 1024 * 1024) {
         return "requires a shared zone of at least 1m";
     }
 
-    main->zone = ngx_shared_memory_add(cf, &value[1], (size_t) size,
-                                       &ngx_http_cache_purge_module);
+    if (file.data != NULL) {
+#if (NGX_RESTY_EXT && NGX_RESTY_SHM_PERSISTENCE)
+        ngx_memzero(&zp, sizeof(ngx_shm_zone_params_t));
+        zp.name = name;
+        zp.size = size;
+        zp.file = file;
+        zp.tag = &ngx_http_cache_purge_module;
+        zp.restorable = 1;
+
+        if (ngx_http_cache_purge_state_signature(cf, &zp.signature) != NGX_OK) {
+            return NGX_CONF_ERROR;
+        }
+
+        main->zone = ngx_shared_memory_add_ext(cf, &zp);
+#else
+        return "state requires nginx-ext shared memory persistence support";
+#endif
+
+    } else {
+        main->zone = ngx_shared_memory_add(cf, &name, (size_t) size,
+                                           &ngx_http_cache_purge_module);
+    }
 
     if (main->zone == NULL) {
         return NGX_CONF_ERROR;

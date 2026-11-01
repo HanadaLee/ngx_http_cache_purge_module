@@ -26,6 +26,7 @@ parser.add_argument('--expr', action='store_true')
 parser.add_argument('--custom-headers', action='store_true')
 parser.add_argument('--tls', action='store_true', help='Verify the L2 TLS certificate and hostname')
 parser.add_argument('--streaming', action='store_true', help='Disable request buffering in both proxy tiers')
+parser.add_argument('--state', action='store_true', help='Verify propagation rules survive an orderly restart')
 args = parser.parse_args()
 root = args.root.resolve() if args.root else Path(tempfile.mkdtemp(prefix='cache-propagation-'))
 if args.root:
@@ -34,6 +35,8 @@ os.environ['ASAN_OPTIONS'] = 'detect_leaks=0:abort_on_error=1'
 os.environ['UBSAN_OPTIONS'] = 'halt_on_error=1:print_stacktrace=1'
 state = {'version': 1, 'calls': []}
 processes, checks, responses = [], [], []
+masters = {}
+propagation_seconds = 10 if args.state else 3
 time_header = 'X-Test-Purge-Time' if args.custom_headers else 'X-Cache-Purge-Time'
 action_header = 'X-Test-Purge-Action' if args.custom_headers else 'X-Cache-Purge-Action'
 
@@ -193,10 +196,10 @@ http {{
     log_format trace escape=json '{{"uri":"$uri","time":"$http_{time_header.lower().replace('-', '_')}","action":"$http_{action_header.lower().replace('-', '_')}","tag":"$http_x_cache_purge_tags","cache":"$upstream_cache_status"}}';
     access_log {run}/access.log trace;
     cache_purge_index_store {run}/store;
-    cache_purge_state_zone purge 1m;
+    cache_purge_state_zone zone=purge:1m{' state=' + str(run / 'purge.zone') if args.state else ''};
     cache_purge_propagation_time_header {time_header};
     cache_purge_propagation_action_header {action_header};
-    {'cache_purge_propagation_timeout 3s;' if tier == 'l1' else ''}
+    {f'cache_purge_propagation_timeout {propagation_seconds}s;' if tier == 'l1' else ''}
     cache_purge_key_url http://cache.test$uri;
     cache_purge_tag $upstream_http_cache_tag;
     proxy_cache_path {run}/cache levels=1:2 keys_zone=cache:1m;
@@ -234,6 +237,7 @@ http {{
             process = subprocess.Popen([str(args.binary), '-p', str(run), '-c', str(run / 'nginx.conf')],
                                        stdout=log, stderr=subprocess.STDOUT)
         processes.append(process)
+        masters[tier] = process
         deadline = time.monotonic() + 10
         while True:
             assert process.poll() is None, (run / 'stdout.log').read_text()
@@ -241,7 +245,7 @@ http {{
                 result = request(tier, '/management/capabilities')
                 capability = json.loads(result['body'])
                 if capability['ready']:
-                    assert capability['propagation_timeout_ms'] == (3000 if tier == 'l1' else 120000)
+                    assert capability['propagation_timeout_ms'] == (propagation_seconds * 1000 if tier == 'l1' else 120000)
                     break
             except OSError:
                 pass
@@ -269,6 +273,29 @@ http {{
     hit('l2', path)
     hit('l1', path)
     operation = submit(path, 'delete')
+    if args.state:
+        run = root / 'l1'
+        cleanup = json.loads(request('l1', '/management/capabilities')['body'])['index_cleanup']
+        masters['l1'].send_signal(signal.SIGQUIT)
+        assert masters['l1'].wait(10) == 0
+        assert (run / 'purge.zone').stat().st_size > 0
+        with (run / 'stdout.log').open('a') as log:
+            process = subprocess.Popen([str(args.binary), '-p', str(run), '-c', str(run / 'nginx.conf')],
+                                       stdout=log, stderr=subprocess.STDOUT)
+        processes.append(process)
+        masters['l1'] = process
+        deadline = time.monotonic() + 10
+        while True:
+            assert process.poll() is None, (run / 'stdout.log').read_text()
+            try:
+                capability = json.loads(request('l1', '/management/capabilities')['body'])
+                if capability['ready']:
+                    assert all(capability['index_cleanup'][key] >= value for key, value in cleanup.items())
+                    break
+            except OSError:
+                pass
+            assert time.monotonic() < deadline
+            time.sleep(.02)
     state['version'] = 2
     result = request('l1', path)
     assert result['body'] == 'body-v2' and result['cache'] == 'MISS', result
@@ -276,8 +303,10 @@ http {{
     assert seen['time'] == str(operation['effective_at']) and seen['action'] == 'delete', seen
     assert 'If-None-Match' not in state['calls'][-1], state['calls'][-1]
     checks.append('L1 Delete makes an unpurged L2 replace its old cache without conditional reuse')
+    if args.state:
+        checks.append('completed propagation rules and cleanup counters survive a graceful L1 restart')
 
-    time.sleep(3.1)
+    time.sleep(propagation_seconds + .1)
     assert request('l1', path, headers={'X-Bypass': '1'})['status'] == 200
     seen = parent_log(path)
     assert seen['time'] == '' and seen['action'] == '', seen
@@ -408,6 +437,7 @@ args.output.write_text(json.dumps({'status': 'passed', 'root': str(root),
                 for name in ('ngx_http_cache_rocksdb_module.so', 'ngx_http_cache_purge_module.so')}
                if args.modules else {},
     'framework': args.framework, 'expr': args.expr, 'tls': args.tls, 'streaming': args.streaming,
+    'state': args.state,
     'permission_check': os.geteuid() != 0,
     'time_header': time_header, 'action_header': action_header, 'checks': checks,
     'responses': responses, 'origin_calls': state['calls']}, indent=2) + '\n')
