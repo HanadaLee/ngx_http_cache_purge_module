@@ -1,9 +1,9 @@
-name: Build, Test & Release
+name: Build & Test
 
 on:
   push:
     branches: [ main, 'releases/**', 'dev/**' ]
-    tags: ['4.*']
+    tags: ['5.*']
   pull_request:
     branches: [ main, 'releases/**', 'dev/**' ]
   schedule:
@@ -41,10 +41,8 @@ jobs:
           persist-credentials: false
       - name: Check APT mirror export
         run: python3 -m unittest discover -s .github/actions/apt-mirror -v
-      - name: Check immutable release publication safeguards
-        run: python3 -m unittest discover -s t -p test_release.py -v
-      - name: Check PVS-Studio runner failure handling
-        run: python3 -m unittest discover -s t -p test_pvs_studio.py -v
+      - name: Check CI selection and failure handling
+        run: python3 -m unittest discover -s t -p test_ci.py -v
       - name: Check persistent test failure handling
         run: python3 -m unittest discover -s t -p test_persistent_runtime.py -v
       - id: matrix
@@ -56,7 +54,7 @@ jobs:
   test-matrix:
     needs: prepare
     if: needs.prepare.outputs.run == 'true'
-    name: Persistent / ${{ matrix.name }} / nginx ${{ matrix.nginx }}
+    name: Persistent / ${{ matrix.name }} / ${{ matrix.core }} ${{ matrix.nginx }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     strategy:
@@ -76,13 +74,15 @@ jobs:
           context: .
           file: t/Dockerfile
           target: integration
-          build-args: NGINX_VERSION=${{ matrix.nginx }}
+          build-args: |
+            NGINX_VERSION=${{ matrix.nginx }}
+            NGINX_VARIANT=${{ matrix.core }}
           secrets: ${{ steps.apt.outputs.buildkit_secret }}
           secret-files: apt_ca=/etc/ssl/certs/ca-certificates.crt
           tags: cache-purge-test:local
           load: true
-          cache-from: type=gha,scope=persistent-${{ matrix.nginx }}
-          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,mode=min,ignore-error=true,scope=persistent-{0}', matrix.nginx) || '' }}
+          cache-from: type=gha,scope=persistent-${{ matrix.core }}-${{ matrix.nginx }}
+          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,mode=min,ignore-error=true,scope=persistent-{0}-{1}', matrix.core, matrix.nginx) || '' }}
           provenance: false
       - name: Backend, native cache, four protocols and one-way propagation
         env:
@@ -149,7 +149,7 @@ jobs:
           cmake -S . -B /tmp/cache-analysis -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
           cmake --build /tmp/cache-analysis --parallel 2
           export CACHE_PURGE_ROCKSDB_LIB_DIR=/tmp/cache-analysis
-          sh t/download.sh https://nginx.org/download/nginx-1.31.7.tar.gz /tmp/nginx-analysis.tar.gz
+          sh t/download.sh https://nginx.org/download/nginx-1.31.8.tar.gz /tmp/nginx-analysis.tar.gz
           mkdir /tmp/nginx-analysis
           tar -xzf /tmp/nginx-analysis.tar.gz --strip-components=1 -C /tmp/nginx-analysis
           NGINX_SOURCE=/tmp/nginx-analysis perl t/cppcheck.pl
@@ -223,77 +223,3 @@ jobs:
                       failed.append(name)
           raise SystemExit(1 if failed else 0)
           PYTHON
-
-  release-modules:
-    name: Rebuild check
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
-    needs: ci
-    if: startsWith(github.ref, 'refs/tags/4.') && github.event_name == 'push'
-    runs-on: ${{ matrix.platform.runner }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      max-parallel: 2
-      matrix:
-        nginx: ['1.31.7']
-        platform:
-          - {arch: x86_64, runner: ubuntu-24.04}
-          - {arch: aarch64, runner: ubuntu-24.04-arm}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/apt-mirror
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake pkg-config librocksdb-dev libpcre2-dev zlib1g-dev libssl-dev python3
-      - name: Build, load-test and package module
-        env:
-          NGINX_VERSION: ${{ matrix.nginx }}
-          MODULE_VERSION: ${{ github.ref_name }}
-        run: bash tools/build-release-module.sh
-      - name: Verify byte-for-byte rebuild
-        env:
-          NGINX_VERSION: ${{ matrix.nginx }}
-          MODULE_VERSION: ${{ github.ref_name }}
-        run: bash tools/verify-release-rebuild.sh
-      - name: Attest archive build provenance
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: |
-            dist/*.tar.gz
-            dist/*.zip
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: release-module-${{ matrix.nginx }}-${{ matrix.platform.arch }}
-          path: dist/*
-          if-no-files-found: error
-          retention-days: 3
-          compression-level: 0
-
-  create-release:
-    name: Publish release with verified assets
-    needs: [ci, release-modules]
-    if: startsWith(github.ref, 'refs/tags/4.') && github.event_name == 'push'
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: release-module-*
-          merge-multiple: true
-          path: dist
-      - name: Upload to draft, verify and publish
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: bash tools/publish-release.sh

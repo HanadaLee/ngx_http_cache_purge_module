@@ -12,13 +12,17 @@ import xml.etree.ElementTree as ET
 
 
 def main():
+    extended = os.getenv('NGINX_VARIANT') == 'nginx-ext'
+    sources = Path(os.getenv('NGINX_SOURCE', '/opt/cache-test-sources/nginx')).parent
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--nginx', type=Path, default=os.getenv('NGINX_SOURCE'))
     parser.add_argument('--nginx-ref', default='HEAD')
-    parser.add_argument('--expr', type=Path)
-    parser.add_argument('--proxy-filter', type=Path)
-    parser.add_argument('--extension', type=int, choices=(0, 1), default=0)
-    parser.add_argument('--state', action='store_true',
+    parser.add_argument('--expr', type=Path,
+                        default=sources / 'ngx_expr_module' if extended else None)
+    parser.add_argument('--proxy-filter', type=Path,
+                        default=sources / 'ngx_http_proxy_filter_module' if extended else None)
+    parser.add_argument('--extension', type=int, choices=(0, 1), default=int(extended))
+    parser.add_argument('--state', action='store_true', default=extended,
                         help='Verify nginx-ext zone persistence and restart recovery')
     parser.add_argument('--build', type=Path)
     parser.add_argument('--reports', type=Path, required=True)

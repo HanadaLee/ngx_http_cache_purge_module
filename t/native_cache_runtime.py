@@ -15,6 +15,7 @@ import socket
 import socketserver
 import struct
 import subprocess
+import sys
 import tempfile
 import tarfile
 import threading
@@ -136,27 +137,32 @@ if args.sanitize:
 print('BUILD', root, flush=True)
 backend_hashes = {name: hashlib.sha256((args.backend / name).read_bytes()).hexdigest()
                   for name in ('libngx_http_cache_purge_index.a', 'libngx_http_cache_rocksdb.a')} if args.backend else {}
-with (root / 'build.log').open('a' if args.reuse_build else 'w') as log:
-    if args.reuse_build:
-        assert '-DNGX_RESTY_EXT=' + str(args.extension) in (build / 'objs/Makefile').read_text()
-        assert ('-DNGX_HTTP_CACHE_PURGE_OWNER_TEST=1' in
-                (build / 'objs/Makefile').read_text()) == bool(args.backend and not args.public_module)
-        assert ('-fsanitize=address,undefined' in
-                (build / 'objs/Makefile').read_text()) == args.sanitize
-        assert ('ngx_http_slice_filter_module' in
-                (build / 'objs/ngx_modules.c').read_text()) == args.slice
-        assert ('ngx_http_ssl_module' in
-                (build / 'objs/ngx_modules.c').read_text()) == args.ssl
-        assert ('ngx_http_cache_key_module' in
-                (build / 'objs/ngx_modules.c').read_text()) == (args.public_module and not args.dynamic)
-        assert ('--add-dynamic-module=' + str(addon) in
-                (build / 'objs/ngx_auto_config.h').read_text()) == args.dynamic
-    reconfigure = not args.reuse_build or (args.backend and any(
-        str(args.backend / name) not in (build / 'objs/Makefile').read_text()
-        for name in backend_hashes))
-    if reconfigure:
-        subprocess.run(command, cwd=build, stdout=log, stderr=subprocess.STDOUT, check=True)
-    subprocess.run(['make', '-j2'], cwd=build, stdout=log, stderr=subprocess.STDOUT, check=True)
+try:
+    with (root / 'build.log').open('a' if args.reuse_build else 'w') as log:
+        if args.reuse_build:
+            assert '-DNGX_RESTY_EXT=' + str(args.extension) in (build / 'objs/Makefile').read_text()
+            assert ('-DNGX_HTTP_CACHE_PURGE_OWNER_TEST=1' in
+                    (build / 'objs/Makefile').read_text()) == bool(args.backend and not args.public_module)
+            assert ('-fsanitize=address,undefined' in
+                    (build / 'objs/Makefile').read_text()) == args.sanitize
+            assert ('ngx_http_slice_filter_module' in
+                    (build / 'objs/ngx_modules.c').read_text()) == args.slice
+            assert ('ngx_http_ssl_module' in
+                    (build / 'objs/ngx_modules.c').read_text()) == args.ssl
+            assert ('ngx_http_cache_key_module' in
+                    (build / 'objs/ngx_modules.c').read_text()) == (args.public_module and not args.dynamic)
+            assert ('--add-dynamic-module=' + str(addon) in
+                    (build / 'objs/ngx_auto_config.h').read_text()) == args.dynamic
+        reconfigure = not args.reuse_build or (args.backend and any(
+            str(args.backend / name) not in (build / 'objs/Makefile').read_text()
+            for name in backend_hashes))
+        if reconfigure:
+            subprocess.run(command, cwd=build, stdout=log, stderr=subprocess.STDOUT, check=True)
+        subprocess.run(['make', '-j2'], cwd=build, stdout=log, stderr=subprocess.STDOUT, check=True)
+except subprocess.CalledProcessError:
+    print((root / 'build.log').read_text()[-16000:], file=sys.stderr)
+    raise
+
 
 state = {'fail': False, 'version': 1, 'calls': [], 'ranges': [], 'protocol_calls': []}
 slow_started = threading.Event()

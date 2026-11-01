@@ -1,12 +1,13 @@
 # Disposable test containers only; no runtime database service is introduced.
 x-test-base: &test-base
-  image: ngx-cache-purge-test:${NGINX_VERSION:-1.31.7}-${UBUNTU_VERSION:-24.04}
+  image: ngx-cache-purge-test:${NGINX_VARIANT:-nginx}-${NGINX_VERSION:-1.31.8}-${UBUNTU_VERSION:-24.04}
   build:
     context: ..
     dockerfile: t/Dockerfile
     target: integration
     args:
-      NGINX_VERSION: ${NGINX_VERSION:-1.31.7}
+      NGINX_VERSION: ${NGINX_VERSION:-1.31.8}
+      NGINX_VARIANT: ${NGINX_VARIANT:-nginx}
       UBUNTU_VERSION: ${UBUNTU_VERSION:-24.04}
   user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
   volumes:
@@ -21,25 +22,7 @@ x-test-base: &test-base
 services:
   nginx-test:
     <<: *test-base
-    command: ["python3", "t/persistent_runtime.py", "--reports", "/reports/run"]
+    command: ["python3", "t/persistent_runtime.py", "--reports", "/reports/${NGINX_VARIANT:-nginx}"]
   test-sanitize:
     <<: *test-base
-    command: ["python3", "t/persistent_runtime.py", "--sanitize", "--reports", "/reports/asan"]
-  test-pvs:
-    image: ngx-cache-purge-pvs:${NGINX_VERSION:-1.31.7}-${UBUNTU_VERSION:-24.04}
-    build:
-      context: ..
-      dockerfile: t/Dockerfile
-      target: pvs-studio
-      args:
-        NGINX_VERSION: ${NGINX_VERSION:-1.31.7}
-        UBUNTU_VERSION: ${UBUNTU_VERSION:-24.04}
-    volumes:
-      - ..:/src:ro
-      - ./test-results:/reports
-    cap_add: [SYS_PTRACE]
-    environment:
-      LICENSE_NAME: ${LICENSE_NAME:-}
-      LICENSE_KEY: ${LICENSE_KEY:-}
-      PVS_JOBS: ${PVS_JOBS:-2}
-    command: ["bash", "t/pvs_studio.sh"]
+    command: ["python3", "t/persistent_runtime.py", "--sanitize", "--reports", "/reports/${NGINX_VARIANT:-nginx}-asan"]

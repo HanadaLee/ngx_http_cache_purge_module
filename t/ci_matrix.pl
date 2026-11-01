@@ -18,16 +18,19 @@ if (!$full && $base =~ /^[0-9a-f]{40}$/ && $base !~ /^0+$/) {
     }
 }
 
-my @integration = (
-    {name => 'mainline-static', nginx => '1.31.7', dynamic => 'false', sanitize => 'false', cc => 'gcc', cxx => 'g++'},
-    {name => 'mainline-dynamic', nginx => '1.31.7', dynamic => 'true', sanitize => 'false', cc => 'gcc', cxx => 'g++'},
-    {name => 'mainline-asan', nginx => '1.31.7', dynamic => 'false', sanitize => 'true', cc => 'gcc', cxx => 'g++'},
-    {name => 'stable-dynamic', nginx => '1.26.3', dynamic => 'true', sanitize => 'false', cc => 'gcc', cxx => 'g++'},
-);
-if ($full) {
+my @integration;
+for my $core ('nginx', 'nginx-ext') {
     push @integration,
-        {name => 'mainline-clang', nginx => '1.31.7', dynamic => 'true', sanitize => 'false', cc => 'clang', cxx => 'clang++'};
+        {name => "$core-static", core => $core, nginx => '1.31.8', dynamic => 'false', sanitize => 'false', cc => 'gcc', cxx => 'g++'},
+        {name => "$core-dynamic", core => $core, nginx => '1.31.8', dynamic => 'true', sanitize => 'false', cc => 'gcc', cxx => 'g++'},
+        {name => "$core-asan", core => $core, nginx => '1.31.8', dynamic => 'false', sanitize => 'true', cc => 'gcc', cxx => 'g++'};
+    if ($full) {
+        push @integration,
+            {name => "$core-clang", core => $core, nginx => '1.31.8', dynamic => 'true', sanitize => 'false', cc => 'clang', cxx => 'clang++'};
+    }
 }
+push @integration,
+    {name => 'stable-dynamic', core => 'nginx', nginx => '1.26.3', dynamic => 'true', sanitize => 'false', cc => 'gcc', cxx => 'g++'};
 open my $out, '>>', $ENV{GITHUB_OUTPUT} or die "GITHUB_OUTPUT: $!";
 print {$out} 'run=', ($run ? 'true' : 'false'), "\n",
              'full=', ($full ? 'true' : 'false'), "\n",

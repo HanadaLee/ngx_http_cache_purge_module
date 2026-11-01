@@ -55,6 +55,17 @@ curl -i -X PURGE http://127.0.0.1:8080/asset -H 'Host: example.test'
 
 A `202 Accepted` response confirms that the task is durable and its shared rule is published. File processing continues in the background. Use the returned `operation_id` with `/__cache_purge/operations/ID` to check completion.
 
+Releases are source tags. Build the modules against the nginx or OpenResty source and dependencies used by your server. GitHub Actions checks branch updates, pull requests, and `5.*` tags; it does not publish prebuilt modules.
+
+## Upgrading to 5.0.0
+
+Version 5 replaces the previous purge implementation and configuration interface. It does not preserve generation namespaces, REFRESH profiles, or the legacy zone/key arguments of the purge directives.
+
+- Configure `cache_purge_index_store`, `cache_purge_state_zone`, and the URL/misc/namespace expressions shown above. Enable each cache protocol with its `*_cache_purge on;` switch.
+- Submit `PURGE` requests for Delete or Invalidate. Successful submissions return `202 Accepted`; poll the operation endpoint when completion of background cleanup is required.
+- Restrict management locations through nginx access controls. The module does not perform authentication.
+- Start with fresh index and state paths, rebuild all three modules together, and perform a full nginx restart. Index and shared-state files from earlier implementations or development snapshots are not upgrade inputs.
+
 ## Installation
 
 Requires Linux, nginx with HTTP cache support, CMake, a C++17 compiler, and the RocksDB development package. Build the backend libraries first:
@@ -74,7 +85,7 @@ load_module modules/ngx_http_cache_rocksdb_module.so;
 load_module modules/ngx_http_cache_purge_module.so;
 ```
 
-Load RocksDB before purge. The examples use the bundled key module; it has no link dependency on either module and can be omitted when configuration does not reference it. Build the modules and backend libraries from the same source revision. The initial RocksDB bridge ABI and private storage formats are version 1. This implementation has not yet been released; development snapshots do not define an upgrade compatibility contract.
+Load RocksDB before purge. The examples use the bundled key module; it has no link dependency on either module and can be omitted when configuration does not reference it. Build the modules and backend libraries from the same source revision. The initial RocksDB bridge ABI and private storage formats are version 1. Version 5.0.0 is the first release of this implementation. Development snapshots do not define an upgrade compatibility contract.
 
 For the key module alone, use `--add-module=/path/to/ngx_cache_purge/key` or `--add-dynamic-module=/path/to/ngx_cache_purge/key`. This build needs neither RocksDB nor HTTP cache support. Do not add `key/` separately when adding the repository root.
 
@@ -486,6 +497,18 @@ Missing-file records are collected in the background, retaining known TAG relati
 - Unknown TAG associations have no first-MISS propagation compensation. Large active rule sets and sustained high-TAG fills can affect throughput and tail latency.
 
 ## Tests
+
+GitHub Actions tests both nginx and nginx-ext with static, dynamic, and sanitizer builds. nginx-ext runs also enable expr, proxy-header integration, and shared-zone persistence. Release tags run the extended Clang and Valgrind checks.
+
+Run either container profile locally:
+
+```sh
+mkdir -p t/test-results
+NGINX_VARIANT=nginx docker compose -f t/docker-compose.test.yml run --build --rm nginx-test
+NGINX_VARIANT=nginx-ext docker compose -f t/docker-compose.test.yml run --build --rm nginx-test
+```
+
+Use a fresh report directory for each run; the runner rejects existing results.
 
 Build and run the standalone storage, catalog, and task tests:
 
