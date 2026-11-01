@@ -174,7 +174,7 @@ Configures the persistent index. Use together with `cache_purge_state_zone`. Onl
 | `buffer` | `4m` | Write-buffer budget; at least `1m` and at most half of `cache`. |
 | `io_rate` | `16m` | Combined RocksDB flush and compaction I/O limit in bytes per second. `0` disables the limit; other values must be at least `1k`. |
 
-These budgets do not cap total process memory or the operating system's page cache. Ordinary index reads and WAL writes are not limited by `io_rate`. Changing the store path requires a full nginx restart.
+These budgets do not cap total process memory or the operating system's page cache. Ordinary index reads and WAL writes are not limited by `io_rate`. Changing the store path requires stopping nginx and starting it again.
 
 ### cache_purge_state_zone
 
@@ -185,7 +185,7 @@ These budgets do not cap total process memory or the operating system's page cac
 
 Allocates shared memory for active rules, queued work, and completion state. The minimum size is `1m`. Configure one zone together with `cache_purge_index_store`.
 
-At most 256 selector slots are available across tasks. Each TAG in a batch consumes one slot; other selectors consume one slot per task. The byte budget can limit admission before that count is reached. Changing the zone name or size requires a full restart.
+At most 256 selector slots are available across tasks. Each TAG in a batch consumes one slot; other selectors consume one slot per task. The byte budget can limit admission before that count is reached. Changing the zone name or size requires stopping nginx and starting it again.
 
 ### proxy_cache_purge
 
@@ -453,12 +453,15 @@ Both variables are empty when propagation is disabled or no applicable requireme
 
 Purge tasks are processed in the background. Ordinary cache HITs do not wait for background file maintenance.
 
-Normal restarts reuse the persistent index and pending tasks. Missing-file records are collected in the background, retaining known TAG relationships for propagation. The management API exposes cumulative `index_cleanup.checked`, `index_cleanup.retained`, and `index_cleanup.errors` counters; these counters survive reloads and reset on a full restart.
+A configuration reload (`nginx -s reload`) keeps the master process running and preserves state in unchanged cache and purge zones. A restart means stopping all nginx processes and then starting nginx again. This includes a graceful shutdown with `nginx -s quit`; forced termination, process crashes, and power loss are abnormal shutdowns.
+
+Reloads and restarts reuse the persistent index and resume recorded pending tasks. After a restart, completed Invalidate operations no longer enforce their stricter stale-response restriction; affected entries follow ordinary nginx stale policy. This applies even after a graceful shutdown.
+
+Missing-file records are collected in the background, retaining known TAG relationships for propagation. The management API exposes cumulative `index_cleanup.checked`, `index_cleanup.retained`, and `index_cleanup.errors` counters; these counters survive reloads with the same purge zone and reset when nginx is stopped and started again.
 
 ### Limits
 
 - Indexing starts with managed cache fills. Existing unindexed files require an explicit migration or a fresh cache-key namespace when enabling the module.
-- After a full restart, previously invalidated entries follow ordinary nginx stale policy.
 - Cache dates have second precision. An entry dated in the same second as a purge is treated as refreshed.
 - A parent request started before a purge may finish afterward and receive a newer native cache date. This in-flight boundary is accepted.
 - A first MISS can be stored after a purge has already completed without finding an indexed file. Preventing that response from becoming a later HIT is not implemented.
