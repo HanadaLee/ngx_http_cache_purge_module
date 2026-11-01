@@ -821,7 +821,10 @@ ngx_http_cache_purge_state_enqueue(ngx_http_cache_purge_state_t *state,
     }
 
     if (state->channel[1] != -1) {
-        (void) write(state->channel[1], "q", 1);
+        if (write(state->channel[1], "q", 1) == -1 && ngx_errno != NGX_EAGAIN) {
+            ngx_log_error(NGX_LOG_WARN, ngx_cycle->log, ngx_errno,
+                          "cache purge queue notification failed");
+        }
     }
 
     return NGX_OK;
@@ -2041,7 +2044,12 @@ ngx_http_cache_purge_owner_thread(void *data)
         pthread_mutex_lock(&o->mutex);
         o->phase = 3;
         pthread_mutex_unlock(&o->mutex);
-        (void) write(o->notify_fd, "d", 1);
+
+        if (write(o->notify_fd, "d", 1) == -1 && ngx_errno != NGX_EAGAIN) {
+            ngx_log_error(NGX_LOG_WARN, o->log, ngx_errno,
+                          "cache purge completion notification failed");
+        }
+
         pthread_mutex_lock(&o->mutex);
     }
 
