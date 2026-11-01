@@ -2384,6 +2384,10 @@ ngx_http_cache_purge_owner_stop(ngx_http_cache_purge_owner_t *o)
         return;
     }
 
+    if (o == ngx_http_cache_purge_manager_owner) {
+        ngx_http_cache_purge_manager_owner = NULL;
+    }
+
     if (o->timer.timer_set) {
         ngx_del_timer(&o->timer);
     }
