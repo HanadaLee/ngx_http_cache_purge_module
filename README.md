@@ -123,8 +123,8 @@ file checks, successful transitions into retention, and check/retention errors;
 they are operational counters, not a durable ledger. Reload retains them;
 a full restart resets them. Sweep bookmarks are process-local and may rescan
 after a restart. Cleanup yields under load, so completion time is not fixed.
-The shared state layout is now version 5; upgrading from layout 4 requires a
-full restart. The database schema and nginx core ABI are unchanged.
+The shared state layout is now version 6; upgrading from earlier layouts
+requires a full restart. The database schema and nginx core ABI are unchanged.
 
 RocksDB's target SST size and base-level capacity follow the write-buffer
 budget: 2 MiB and 8 MiB by default. They are compaction targets, not a limit on
@@ -166,11 +166,14 @@ it uses its idle timer instead of scheduling an extra immediate retry.
 The shared state reserves rule space before admission and exposes a successful
 completion only after publication. Its empty-rule path does not take the shared
 mutex. Completed rules retained only for propagation skip HIT filtering.
-When local rules contain only URL and prefix selectors, HIT filtering evaluates
-only the URL and searches a sorted array of at most 256 rules, following prefix
-ancestors for overlapping matches. The array is rebuilt on rule changes under
-the shared mutex. Other selectors use full identity matching; outgoing requests
-still include retained propagation rules. Full HTTP latency and contention
+The existing sorted array of at most 256 published rules groups URL/key/prefix,
+host and TAG selectors. URL searches follow prefix ancestors; host and TAG
+searches find exact candidates before checking their scope. TAG groups of at
+most four rules use direct comparisons to avoid small-table lookup overhead.
+When local rules contain only URL and prefix selectors, HIT filtering still
+evaluates only the URL. The array is rebuilt on publication and once after each
+collection batch under the shared mutex. Outgoing requests use the same index
+including retained propagation rules. Full HTTP latency and contention
 acceptance remain outstanding. Queues contain
 copied messages, with count and byte limits, rather than request pointers or
 an in-memory copy of the cache index.

@@ -68,11 +68,84 @@ ngx_http_cache_purge_job(unsigned number, unsigned type, const char *value)
 
 
 static void
+ngx_http_cache_purge_reference(const ngx_http_cache_purge_job_t *jobs,
+    size_t count, const ngx_http_cache_purge_entry_t *entry, uint64_t now,
+    ngx_uint_t local_only, ngx_http_cache_purge_match_t *match)
+{
+    const ngx_http_cache_purge_job_t     *job;
+    const ngx_http_cache_purge_select_t  *s;
+    ngx_http_cache_rocksdb_bytes_t        value, scope;
+    size_t                                i, j;
+    uint64_t                             *local, *propagate;
+
+    memset(match, 0, sizeof(*match));
+    for (i = 0; i < count; i++) {
+        job = &jobs[i];
+        s = &job->select;
+        if (job->done && (local_only || job->retain_until <= now)) {
+            continue;
+        }
+        value = s->type == NGX_HTTP_CACHE_PURGE_SELECT_HOST ? entry->host
+                                                            : entry->url;
+        if (s->type == NGX_HTTP_CACHE_PURGE_SELECT_TAG) {
+            scope = s->host_scope ? entry->host : entry->namespace_value;
+            if (scope.len != s->namespace_value.len
+                || (scope.len && memcmp(scope.data, s->namespace_value.data,
+                                        scope.len)))
+            {
+                continue;
+            }
+            for (j = 0; j < entry->tag_count; j++) {
+                value = entry->tags[j];
+                if (value.len == s->value.len
+                    && !memcmp(value.data, s->value.data, value.len))
+                {
+                    break;
+                }
+            }
+            if (j == entry->tag_count) {
+                continue;
+            }
+        }
+        if (s->value.len > value.len
+            || (s->type != NGX_HTTP_CACHE_PURGE_SELECT_PREFIX
+                && s->value.len != value.len)
+            || memcmp(s->value.data, value.data, s->value.len))
+        {
+            continue;
+        }
+        if (s->type == NGX_HTTP_CACHE_PURGE_SELECT_KEY
+            && (s->misc.len != entry->misc.len
+                || s->namespace_value.len != entry->namespace_value.len
+                || (s->misc.len && memcmp(s->misc.data, entry->misc.data,
+                                           s->misc.len))
+                || (s->namespace_value.len
+                    && memcmp(s->namespace_value.data,
+                              entry->namespace_value.data,
+                              s->namespace_value.len))))
+        {
+            continue;
+        }
+        local = job->action == NGX_HTTP_CACHE_PURGE_DELETE
+                ? &match->delete_before : &match->invalidate_before;
+        propagate = job->action == NGX_HTTP_CACHE_PURGE_DELETE
+                    ? &match->propagate_delete : &match->propagate_invalidate;
+        if (!job->done && job->issued > *local) {
+            *local = job->issued;
+        }
+        if (job->retain_until > now && job->issued > *propagate) {
+            *propagate = job->issued;
+        }
+    }
+}
+
+
+static void
 ngx_http_cache_purge_test_urls(ngx_http_cache_purge_state_t *state)
 {
     ngx_http_cache_purge_job_t    jobs[128];
     ngx_http_cache_purge_entry_t  entry;
-    ngx_http_cache_purge_match_t  fast, full;
+    ngx_http_cache_purge_match_t  fast, full, expected;
     ngx_int_t                     a, b;
     ngx_uint_t                    i, j, k, pass;
     u_char                        values[128][8], query[8];
@@ -101,6 +174,7 @@ ngx_http_cache_purge_test_urls(ngx_http_cache_purge_state_t *state)
     for (pass = 0; pass < 2; pass++) {
         if (pass) {
             for (i = 0; i < 128; i += 3) {
+                jobs[i].done = 1;
                 ngx_http_cache_purge_state_finish(state, jobs[i].id);
             }
         }
@@ -115,6 +189,9 @@ ngx_http_cache_purge_test_urls(ngx_http_cache_purge_state_t *state)
             b = ngx_http_cache_purge_state_match_local(state, &entry, 1000,
                                                         &full);
             ngx_expect(a == b && memcmp(&fast, &full, sizeof(fast)) == 0);
+            ngx_http_cache_purge_reference(jobs, 128, &entry, 1000, 1,
+                                             &expected);
+            ngx_expect(memcmp(&fast, &expected, sizeof(fast)) == 0);
         }
     }
 
@@ -125,6 +202,88 @@ ngx_http_cache_purge_test_urls(ngx_http_cache_purge_state_t *state)
         a = ngx_http_cache_purge_state_match_url(state, &entry, 1201, &fast);
         b = ngx_http_cache_purge_state_match_local(state, &entry, 1201, &full);
         ngx_expect(a == b && memcmp(&fast, &full, sizeof(fast)) == 0);
+        ngx_http_cache_purge_reference(jobs, 128, &entry, 1201, 1, &expected);
+        ngx_expect(memcmp(&fast, &expected, sizeof(fast)) == 0);
+        jobs[i].done = 1;
+        ngx_http_cache_purge_state_finish(state, jobs[i].id);
+    }
+    ngx_http_cache_purge_state_collect(state, 1202);
+}
+
+
+static void
+ngx_http_cache_purge_test_mixed(ngx_http_cache_purge_state_t *state)
+{
+    ngx_http_cache_purge_job_t    jobs[120];
+    ngx_http_cache_purge_entry_t  entry;
+    ngx_http_cache_purge_match_t  actual, expected;
+    ngx_uint_t                    i, j, k, pass, local;
+    u_char                        values[120][8], query[8];
+    uint64_t                      now;
+
+    memset(&entry, 0, sizeof(entry));
+    for (i = 0; i < 120; i++) {
+        jobs[i] = ngx_http_cache_purge_job(i,
+                         i % 6 < 5 ? i % 6 : NGX_HTTP_CACHE_PURGE_SELECT_TAG,
+                         "x");
+        jobs[i].issued = 600 + i;
+        jobs[i].retain_until = 1200 + i % 2;
+        jobs[i].action = (i / 6) % 2;
+        jobs[i].select.host_scope = i % 6 == 5;
+        jobs[i].select.value.data = values[i];
+        jobs[i].select.value.len = (i / 6) % 5 + 1;
+        for (j = 0; j < jobs[i].select.value.len; j++) {
+            values[i][j] = ((i / 30) >> j) & 1 ? 255 : 0;
+        }
+        jobs[i].select.namespace_value = ngx_http_cache_purge_text(
+                                                   i % 2 ? "" : "scope");
+        jobs[i].select.misc = ngx_http_cache_purge_text(i % 3 ? "" : "misc");
+        if (i % 6 == 5) {
+            jobs[i].select.namespace_value = jobs[i].select.value;
+        }
+    }
+    for (i = 0; i < 120; i++) {
+        ngx_expect(ngx_http_cache_purge_state_install(state,
+                     &jobs[(i * 37) % 120]) == NGX_OK);
+    }
+    for (pass = 0; pass < 3; pass++) {
+        now = pass == 0 ? 1000 : 1200 + pass - 1;
+        if (pass == 1) {
+            for (i = 0; i < 120; i += 5) {
+                jobs[i].done = 1;
+                ngx_http_cache_purge_state_finish(state, jobs[i].id);
+            }
+        }
+        ngx_http_cache_purge_state_collect(state, now);
+        for (i = 1; i < 128; i++) {
+            for (j = 0, k = i; k > 1; k >>= 1) {
+                query[j++] = k & 1 ? 255 : 0;
+            }
+            entry.url.data = query;
+            entry.url.len = j;
+            entry.host = entry.url;
+            entry.namespace_value = ngx_http_cache_purge_text(
+                                                     i % 2 ? "" : "scope");
+            entry.misc = ngx_http_cache_purge_text(i % 3 ? "" : "misc");
+            entry.tag_count = i % 4;
+            for (k = 0; k < entry.tag_count; k++) {
+                entry.tags[k] = entry.url;
+            }
+            for (local = 0; local < 2; local++) {
+                if (local) {
+                    (void) ngx_http_cache_purge_state_match_local(state,
+                                                   &entry, now, &actual);
+                } else {
+                    (void) ngx_http_cache_purge_state_match(state, &entry,
+                                                            now, &actual);
+                }
+                ngx_http_cache_purge_reference(jobs, 120, &entry, now, local,
+                                                 &expected);
+                ngx_expect(memcmp(&actual, &expected, sizeof(actual)) == 0);
+            }
+        }
+    }
+    for (i = 0; i < 120; i++) {
         ngx_http_cache_purge_state_finish(state, jobs[i].id);
     }
     ngx_http_cache_purge_state_collect(state, 1202);
@@ -134,7 +293,7 @@ ngx_http_cache_purge_test_urls(ngx_http_cache_purge_state_t *state)
 static void
 ngx_http_cache_purge_test_tags(ngx_http_cache_purge_state_t *state)
 {
-    ngx_http_cache_purge_job_t    job, other;
+    ngx_http_cache_purge_job_t    job, other, extra;
     ngx_http_cache_purge_entry_t  entry;
     ngx_http_cache_purge_match_t  match;
     ngx_uint_t                    i;
@@ -144,8 +303,6 @@ ngx_http_cache_purge_test_tags(ngx_http_cache_purge_state_t *state)
                                    "unmatched");
     ngx_expect(ngx_http_cache_purge_state_install(state, &other) == NGX_OK);
     job = ngx_http_cache_purge_job(0, NGX_HTTP_CACHE_PURGE_SELECT_TAG, "Aa");
-    ngx_expect(ngx_hash_key((u_char *) "Aa", 2)
-               == ngx_hash_key((u_char *) "BB", 2));
     ngx_expect(ngx_http_cache_purge_state_install(state, &job) == NGX_OK);
     for (i = 0; i < 64; i++) {
         entry.tags[i] = ngx_http_cache_purge_text("BB");
@@ -174,6 +331,18 @@ ngx_http_cache_purge_test_tags(ngx_http_cache_purge_state_t *state)
     ngx_expect(ngx_http_cache_purge_state_match(state, &entry, 201, &match)
                == NGX_OK && !match.delete_before
                && match.propagate_delete == 200);
+    for (i = 2; i < 5; i++) {
+        extra = ngx_http_cache_purge_job(i, NGX_HTTP_CACHE_PURGE_SELECT_TAG,
+                                        "boundary-unmatched");
+        ngx_expect(ngx_http_cache_purge_state_install(state, &extra) == NGX_OK);
+        ngx_expect(ngx_http_cache_purge_state_match(state, &entry, 201, &match)
+                   == NGX_OK && !match.delete_before
+                   && match.propagate_delete == 200);
+    }
+    for (i = 2; i < 5; i++) {
+        extra.id[15] = (u_char) i;
+        ngx_http_cache_purge_state_finish(state, extra.id);
+    }
     ngx_http_cache_purge_state_finish(state, other.id);
     ngx_http_cache_purge_state_collect(state, 321);
 }
@@ -602,6 +771,8 @@ ngx_http_cache_purge_test_main(void)
     ngx_http_cache_purge_state_collect(&state, 507);
     ngx_http_cache_purge_empty(&state);
     ngx_http_cache_purge_test_urls(&state);
+    ngx_http_cache_purge_empty(&state);
+    ngx_http_cache_purge_test_mixed(&state);
     ngx_http_cache_purge_empty(&state);
     ngx_http_cache_purge_test_tags(&state);
     ngx_http_cache_purge_empty(&state);
