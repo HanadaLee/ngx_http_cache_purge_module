@@ -112,6 +112,8 @@ void ngx_http_cache_purge_state_collect(ngx_http_cache_purge_state_t *state,
 
 void ngx_http_cache_purge_state_stats(ngx_http_cache_purge_state_t *state,
     ngx_uint_t  *rules, ngx_uint_t *messages, size_t *bytes);
+void ngx_http_cache_purge_state_cleanup_stats(
+    ngx_http_cache_purge_state_t *state, uint64_t stats[3]);
 
 typedef struct ngx_http_cache_purge_owner_s  ngx_http_cache_purge_owner_t;
 
@@ -125,7 +127,8 @@ ngx_int_t ngx_http_cache_purge_owner_start(ngx_cycle_t *cycle,
     ngx_http_cache_purge_state_t            *state, const ngx_str_t *path,
     const ngx_http_cache_rocksdb_options_t  *options,
     ngx_http_file_cache_t                  **caches, ngx_uint_t count,
-    ngx_uint_t threaded, ngx_http_cache_purge_owner_t **owner);
+    ngx_msec_t propagation, ngx_uint_t threaded,
+    ngx_http_cache_purge_owner_t **owner);
 void ngx_http_cache_purge_owner_stop(ngx_http_cache_purge_owner_t *owner);
 
 #if (NGX_EXPR)

@@ -415,7 +415,9 @@ ngx_http_cache_purge_job_step(ngx_http_cache_purge_jobs_t *jobs,
     job->error = 0;
     scan = NULL;
     result = ngx_http_cache_purge_scan_open(jobs->catalog, &job->select,
-                       job->bookmark, 0, now, &scan, error);
+                       job->bookmark,
+                       job->select.type == NGX_HTTP_CACHE_PURGE_SELECT_TAG,
+                       now, &scan, error);
     if (result != 0) {
         return result;
     }
@@ -447,6 +449,16 @@ ngx_http_cache_purge_job_step(ngx_http_cache_purge_jobs_t *jobs,
         }
 
         if (entry.created >= job->issued) {
+            job->skipped++;
+
+        } else if (entry.retain_until != 0) {
+            if (job->retain_until > entry.retain_until) {
+                result = ngx_http_cache_purge_catalog_retain(jobs->catalog,
+                    entry.id, entry.uniq, job->retain_until, error);
+                if (result != 0) {
+                    break;
+                }
+            }
             job->skipped++;
 
         } else {

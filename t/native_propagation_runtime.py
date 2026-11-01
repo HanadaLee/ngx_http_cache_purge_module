@@ -200,6 +200,8 @@ http {{
     cache_purge_key_url http://cache.test$uri;
     cache_purge_tag $upstream_http_cache_tag;
     proxy_cache_path {run}/cache levels=1:2 keys_zone=cache:1m;
+    {f'proxy_cache_path {run}/cleanup levels=1:2 keys_zone=cleanup:1m inactive=1s;' if tier == 'l1' else ''}
+    {'map $uri $test_cache_zone { default cache; ~^/cleanup/ cleanup; }' if tier == 'l1' else ''}
     {conditions}
     server {{
         listen 127.0.0.1:{ports[tier]};
@@ -213,7 +215,7 @@ http {{
             proxy_cache_purge on;
             {flags}
             {header_config}
-            proxy_cache cache;
+            proxy_cache {'$test_cache_zone' if tier == 'l1' else 'cache'};
             proxy_cache_key $uri;
             proxy_cache_bypass $http_x_bypass;
             proxy_cache_revalidate on;
@@ -334,6 +336,56 @@ http {{
         seen = parent_log(path)
         assert seen['time'] == '' and seen['mode'] == '', seen
         checks.append('expr when independently disables incoming trust and outgoing propagation')
+    before = json.loads(request('l1', '/management/capabilities')['body'])['index_cleanup']
+    path = '/cleanup/entry'
+    hit('l2', path)
+    hit('l1', path)
+    digest = hashlib.md5(path.encode()).hexdigest()
+    cached = list((root / 'l1/cleanup').rglob(digest))
+    assert len(cached) == 1
+    deadline = time.monotonic() + 15
+    while True:
+        cleanup = json.loads(request('l1', '/management/capabilities')['body'])['index_cleanup']
+        if not cached[0].exists() and cleanup['retained'] > before['retained']:
+            break
+        assert time.monotonic() < deadline, cleanup
+        time.sleep(.02)
+    assert cleanup['errors'] == before['errors'], cleanup
+    operation = submit(path, 'delete', 'tag')
+    state['version'] += 1
+    result = request('l1', path)
+    assert result['cache'] == 'MISS' and result['body'] == f'body-v{state["version"]}', result
+    seen = parent_log(path)
+    assert seen['time'] == str(operation['effective_at']) and seen['mode'] == 'delete', seen
+    assert seen['tag'] == '', seen
+    checks.append('native inactive eviction is swept in the cache manager while its known TAG association still propagates the next purge')
+
+    if os.geteuid() != 0:
+        path = '/permission'
+        hit('l1', path)
+        digest = hashlib.md5(path.encode()).hexdigest()
+        cached = list((root / 'l1/cache').rglob(digest))
+        assert len(cached) == 1
+        directory = cached[0].parent
+        permissions = directory.stat().st_mode
+        before = json.loads(request('l1', '/management/capabilities')['body'])['index_cleanup']
+        try:
+            directory.chmod(0)
+            deadline = time.monotonic() + 15
+            while True:
+                cleanup = json.loads(request('l1', '/management/capabilities')['body'])['index_cleanup']
+                if cleanup['errors'] > before['errors']:
+                    break
+                assert time.monotonic() < deadline, cleanup
+                time.sleep(.05)
+        finally:
+            directory.chmod(permissions)
+        assert cached[0].exists()
+        assert request('l1', path)['cache'] == 'HIT'
+        submit(path, 'delete')
+        assert not cached[0].exists()
+        checks.append('filesystem permission errors preserve the cache file and its index entry for a later explicit purge')
+
     assert all(time_header not in call and mode_header not in call for call in state['calls']), state['calls']
     checks.append('parent with propagation off sends no control headers to origin; business responses contain no purge receipt')
     if args.tls:
@@ -356,6 +408,7 @@ args.output.write_text(json.dumps({'status': 'passed', 'root': str(root),
                 for name in ('ngx_http_cache_rocksdb_module.so', 'ngx_http_cache_purge_module.so')}
                if args.modules else {},
     'framework': args.framework, 'expr': args.expr, 'tls': args.tls, 'streaming': args.streaming,
+    'permission_check': os.geteuid() != 0,
     'time_header': time_header, 'mode_header': mode_header, 'checks': checks,
     'responses': responses, 'origin_calls': state['calls']}, indent=2) + '\n')
 print(json.dumps({'root': str(root), 'checks': checks}))

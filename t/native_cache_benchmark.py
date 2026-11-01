@@ -325,10 +325,20 @@ http {{
                         assert time.monotonic() < deadline, cleanups
                         time.sleep(.1)
                 before = resources(process.pid)
+                cleanup_before = None
+                if enabled:
+                    status, _, body = request('/management/capabilities')
+                    assert status == 200
+                    cleanup_before = json.loads(body).get('index_cleanup')
                 origin_before = hot_calls
                 fill_stats = {'completed': 0}
                 if args.fills and not background:
                     mode += '-fill'
+                    if active:
+                        status, _, body = request('/management/capabilities')
+                        assert status == 200
+                        fill_stats['cleanup_before'] = json.loads(body).get(
+                            'index_cleanup', {}).get('retained', 0)
 
                     def fill():
                         client = http.client.HTTPConnection('127.0.0.1', port, timeout=3)
@@ -400,6 +410,11 @@ http {{
                 sample.update(mode=mode, run=str(run), resources_before=before,
                               resources_after=resources(process.pid), progress=progress,
                               fill=fill_stats, admission_ms=admission_ms)
+                if enabled:
+                    status, _, body = request('/management/capabilities')
+                    assert status == 200
+                    sample['index_cleanup_before'] = cleanup_before
+                    sample['index_cleanup_after'] = json.loads(body).get('index_cleanup')
                 sample['requests_per_second'] = sample['requests'] * 1e6 / sample['duration_us']
                 report['samples'].append(sample)
                 print(json.dumps({k: sample[k] for k in ('mode', 'requests_per_second', 'p50_us', 'p99_us')}), flush=True)
@@ -427,10 +442,16 @@ http {{
                             if cleanup['state'] == 'done':
                                 fill_stats['indexed_files'] = cleanup['affected']
                                 fill_stats['indexed_records'] = cleanup['visited']
-                                assert cleanup['visited'] == args.fills, fill_stats
+                                status, _, body = request('/management/capabilities')
+                                assert status == 200
+                                retired = json.loads(body).get('index_cleanup', {}).get('retained', 0)
+                                fill_stats['swept_records'] = retired - fill_stats['cleanup_before']
+                                assert fill_stats['swept_records'] >= 0, fill_stats
+                                assert cleanup['visited'] + fill_stats['swept_records'] == args.fills, fill_stats
                                 if args.evict:
                                     assert 0 < cleanup['affected'] < args.fills, fill_stats
                                 else:
+                                    assert fill_stats['swept_records'] == 0, fill_stats
                                     assert cleanup['affected'] == args.fills, fill_stats
                                 break
                             assert time.monotonic() < deadline, cleanup

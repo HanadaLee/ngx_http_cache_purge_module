@@ -566,7 +566,7 @@ ngx_http_cache_purge_worker(ngx_cycle_t *cycle)
     {
         return ngx_http_cache_purge_owner_start(cycle, &main->state,
                 &main->path->name, &main->options, main->caches.elts,
-                main->caches.nelts, 1, &main->owner);
+                main->caches.nelts, main->propagation, 1, &main->owner);
     }
     if (ngx_process != NGX_PROCESS_HELPER && main->state.channel[0] != -1) {
         (void) close(main->state.channel[0]);
@@ -584,7 +584,8 @@ ngx_http_cache_purge_manager(void *data)
     if (main->owner == NULL) {
         if (ngx_http_cache_purge_owner_start((ngx_cycle_t *) ngx_cycle,
                 &main->state, &main->path->name, &main->options,
-                main->caches.elts, main->caches.nelts, 0, &main->owner)
+                main->caches.elts, main->caches.nelts, main->propagation, 0,
+                &main->owner)
             != NGX_OK)
         {
             ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,

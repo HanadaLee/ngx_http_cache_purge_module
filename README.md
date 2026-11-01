@@ -107,6 +107,25 @@ retention deadline can preserve known TAG associations after file removal;
 expired associations are collected in bounded batches. No file publication or
 validation proofs are stored by this index.
 
+The native cache manager also sweeps file records for configured cache roots.
+It checks at most eight records per batch, at least 250 ms apart, and yields
+between records to queued work or a 5 ms time budget. Individual database or
+filesystem calls cannot be interrupted by that budget. Only `ENOENT` retires
+a record; other filesystem errors preserve it. Missing files keep their TAG
+associations for the configured propagation window before normal collection.
+The sweep never deletes cache files or adds work to the HIT path.
+Later TAG purges extend known retained associations to their own window end,
+without reopening missing files. These rows count as skipped physical work.
+
+The capabilities response exposes cumulative `index_cleanup.checked`,
+`index_cleanup.retained`, and `index_cleanup.errors` counters. These describe
+file checks, successful transitions into retention, and check/retention errors;
+they are operational counters, not a durable ledger. Reload retains them;
+a full restart resets them. Sweep bookmarks are process-local and may rescan
+after a restart. Cleanup yields under load, so completion time is not fixed.
+The shared state layout is now version 5; upgrading from layout 4 requires a
+full restart. The database schema and nginx core ABI are unchanged.
+
 RocksDB's target SST size and base-level capacity follow the write-buffer
 budget: 2 MiB and 8 MiB by default. They are compaction targets, not a limit on
 the total index size.

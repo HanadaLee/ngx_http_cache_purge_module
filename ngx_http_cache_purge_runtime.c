@@ -5,7 +5,7 @@
 #include <sched.h>
 
 
-#define NGX_HTTP_CACHE_PURGE_STATE_VERSION  4
+#define NGX_HTTP_CACHE_PURGE_STATE_VERSION  5
 #define NGX_HTTP_CACHE_PURGE_STATE_LIMIT    256
 #define NGX_HTTP_CACHE_PURGE_FILE_BATCH     8
 
@@ -52,6 +52,7 @@ struct ngx_http_cache_purge_shared_s {
     ngx_http_cache_purge_rule_t *urls[NGX_HTTP_CACHE_PURGE_STATE_LIMIT];
     size_t                       message_bytes, capacity;
     uint64_t                     collected;
+    uint64_t                     cleanup[3];
 };
 
 
@@ -1023,11 +1024,25 @@ ngx_http_cache_purge_state_stats(ngx_http_cache_purge_state_t *state,
 }
 
 
+void
+ngx_http_cache_purge_state_cleanup_stats(ngx_http_cache_purge_state_t *state,
+    uint64_t stats[3])
+{
+    ngx_memzero(stats, 3 * sizeof(*stats));
+    if (state->shared != NULL) {
+        ngx_shmtx_lock(&state->pool->mutex);
+        ngx_memcpy(stats, state->shared->cleanup, 3 * sizeof(*stats));
+        ngx_shmtx_unlock(&state->pool->mutex);
+    }
+}
+
+
 /*
  * Production work runs in the native cache manager; single mode uses a thread.
  */
 typedef struct {
     ngx_http_cache_rocksdb_bytes_t  root, zone;
+    u_char                         after[24];
 } ngx_http_cache_purge_target_t;
 
 
@@ -1043,7 +1058,8 @@ enum {
     NGX_HTTP_CACHE_PURGE_OWNER_MESSAGE,
     NGX_HTTP_CACHE_PURGE_OWNER_NEXT,
     NGX_HTTP_CACHE_PURGE_OWNER_STEP,
-    NGX_HTTP_CACHE_PURGE_OWNER_MAINTAIN
+    NGX_HTTP_CACHE_PURGE_OWNER_MAINTAIN,
+    NGX_HTTP_CACHE_PURGE_OWNER_SWEEP
 };
 
 
@@ -1057,6 +1073,8 @@ struct ngx_http_cache_purge_owner_s {
     ngx_event_t                      timer;
     ngx_http_cache_purge_message_t  *ticket;
     ngx_msec_t                       next_at, maintain_at;
+    ngx_msec_t                       sweep_at, sweep_deadline, propagation;
+    ngx_uint_t                       sweep_target, sweep_count;
     ngx_uint_t                       opened, restoring, restored, pending;
     ngx_uint_t                       selected, after_set, quota, threaded;
     int                              last_error;
@@ -1161,6 +1179,74 @@ ngx_uint_t
 ngx_http_cache_purge_state_complex(ngx_http_cache_purge_state_t *state)
 {
     return state->shared->complex;
+}
+
+
+static ngx_uint_t
+ngx_http_cache_purge_owner_idle(ngx_http_cache_purge_owner_t *o,
+    ngx_uint_t count, ngx_msec_t deadline)
+{
+    ngx_uint_t  queued;
+
+    ngx_time_update();
+    ngx_shmtx_lock(&o->state->pool->mutex);
+    queued = !ngx_queue_empty(&o->state->shared->pending);
+    ngx_shmtx_unlock(&o->state->pool->mutex);
+    return !queued && (count == 0
+                       || (ngx_msec_int_t) (ngx_current_msec - deadline) < 0);
+}
+
+
+static int
+ngx_http_cache_purge_owner_check(void *data,
+    const ngx_http_cache_purge_entry_t *entry,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_owner_t  *o = data;
+    ngx_file_info_t                info;
+    ngx_uint_t                     retained, failed;
+    char                           name[NGX_MAX_PATH];
+    size_t                         length;
+    int                            rc;
+
+    if (!ngx_http_cache_purge_owner_idle(o, o->sweep_count,
+                                          o->sweep_deadline))
+    {
+        return NGX_HTTP_CACHE_ROCKSDB_BUSY;
+    }
+    o->sweep_count++;
+    if (entry->retain_until != 0) {
+        return 0;
+    }
+    length = entry->root.len + entry->path.len + 2;
+    if (length > sizeof(name)) {
+        error->code = NGX_HTTP_CACHE_ROCKSDB_INVALID;
+        snprintf(error->message, sizeof(error->message),
+                 "invalid cache index cleanup path");
+        return NGX_HTTP_CACHE_ROCKSDB_INVALID;
+    }
+    memcpy(name, entry->root.data, entry->root.len);
+    name[entry->root.len] = '/';
+    memcpy(name + entry->root.len + 1, entry->path.data, entry->path.len);
+    name[length - 1] = 0;
+    rc = 0;
+    retained = failed = 0;
+    if (ngx_link_info(name, &info) == NGX_FILE_ERROR) {
+        if (ngx_errno == NGX_ENOENT) {
+            rc = ngx_http_cache_purge_catalog_retain(o->catalog, entry->id,
+                  entry->uniq, o->now + (o->propagation + 999) / 1000, error);
+            retained = rc == 0;
+            failed = rc != 0;
+        } else {
+            failed = 1;
+        }
+    }
+    ngx_shmtx_lock(&o->state->pool->mutex);
+    o->state->shared->cleanup[0]++;
+    o->state->shared->cleanup[1] += retained;
+    o->state->shared->cleanup[2] += failed;
+    ngx_shmtx_unlock(&o->state->pool->mutex);
+    return rc;
 }
 
 
@@ -1320,9 +1406,12 @@ ngx_http_cache_purge_owner_records(ngx_http_cache_purge_owner_t *o)
 static int
 ngx_http_cache_purge_owner_execute(ngx_http_cache_purge_owner_t *o)
 {
-    ngx_http_cache_purge_job_t  job;
-    size_t                      removed;
-    int                         rc, duplicate, copied;
+    ngx_http_cache_purge_job_t     job;
+    ngx_http_cache_purge_target_t *target;
+    ngx_msec_t                     deadline;
+    ngx_uint_t                     i;
+    size_t                         removed;
+    int                            rc, duplicate, copied;
 
     memset(&o->error, 0, sizeof(o->error));
     memset(&job, 0, sizeof(job));
@@ -1391,12 +1480,28 @@ ngx_http_cache_purge_owner_execute(ngx_http_cache_purge_owner_t *o)
         return rc;
 
     case NGX_HTTP_CACHE_PURGE_OWNER_MAINTAIN:
-        rc = ngx_http_cache_purge_catalog_collect(o->catalog, o->now, 32,
-                                                   &removed, &o->error);
+        deadline = ngx_current_msec + 5;
+        for (i = 0; i < 32
+                    && ngx_http_cache_purge_owner_idle(o, i, deadline); i++)
+        {
+            rc = ngx_http_cache_purge_catalog_collect(o->catalog, o->now, 1,
+                                                       &removed, &o->error);
+            if (rc != 0 || removed == 0) {
+                break;
+            }
+        }
         if (rc == 0) {
             rc = ngx_http_cache_rocksdb_sync(o->store, &o->error);
         }
         return rc;
+
+    case NGX_HTTP_CACHE_PURGE_OWNER_SWEEP:
+        target = &o->targets[o->sweep_target];
+        o->sweep_count = 0;
+        o->sweep_deadline = ngx_current_msec + 5;
+        return ngx_http_cache_purge_catalog_walk(o->catalog, target->root,
+                   target->after, NGX_HTTP_CACHE_PURGE_FILE_BATCH,
+                   ngx_http_cache_purge_owner_check, o, &o->error);
     }
 
     return NGX_HTTP_CACHE_ROCKSDB_INVALID;
@@ -1546,6 +1651,17 @@ ngx_http_cache_purge_owner_deliver(ngx_http_cache_purge_owner_t *o)
     case NGX_HTTP_CACHE_PURGE_OWNER_MAINTAIN:
         o->maintain_at = ngx_current_msec + 1000;
         break;
+
+    case NGX_HTTP_CACHE_PURGE_OWNER_SWEEP:
+        if (o->result == NGX_HTTP_CACHE_ROCKSDB_DONE) {
+            ngx_memzero(o->targets[o->sweep_target].after, 24);
+            o->sweep_target = (o->sweep_target + 1) % o->target_count;
+        }
+        o->sweep_at = ngx_current_msec
+                     + (o->result == 0
+                        || o->result == NGX_HTTP_CACHE_ROCKSDB_BUSY ? 250
+                                                                  : 1000);
+        break;
     }
 }
 
@@ -1601,6 +1717,10 @@ ngx_http_cache_purge_owner_drive(ngx_http_cache_purge_owner_t *o)
         operation = o->selected ? NGX_HTTP_CACHE_PURGE_OWNER_STEP
                                : NGX_HTTP_CACHE_PURGE_OWNER_NEXT;
         o->quota = 0;
+    } else if (!o->pending && o->target_count != 0
+               && (ngx_msec_int_t) (ngx_current_msec - o->sweep_at) >= 0)
+    {
+        operation = NGX_HTTP_CACHE_PURGE_OWNER_SWEEP;
     }
 
     if (operation != -1) {
@@ -1636,7 +1756,9 @@ ngx_http_cache_purge_owner_drive(ngx_http_cache_purge_owner_t *o)
         ngx_shmtx_unlock(&o->state->pool->mutex);
         if (queued
             || (o->pending
-                && (ngx_msec_int_t) (ngx_current_msec - o->next_at) >= 0))
+                && (ngx_msec_int_t) (ngx_current_msec - o->next_at) >= 0)
+            || (!o->pending && o->target_count != 0
+                && (ngx_msec_int_t) (ngx_current_msec - o->sweep_at) >= 0))
         {
             delay = 1;
         }
@@ -1675,7 +1797,8 @@ ngx_http_cache_purge_owner_start(ngx_cycle_t *cycle,
     ngx_http_cache_purge_state_t            *state, const ngx_str_t *path,
     const ngx_http_cache_rocksdb_options_t  *options,
     ngx_http_file_cache_t                  **caches, ngx_uint_t count,
-    ngx_uint_t threaded, ngx_http_cache_purge_owner_t **out)
+    ngx_msec_t propagation, ngx_uint_t threaded,
+    ngx_http_cache_purge_owner_t **out)
 {
     ngx_http_cache_purge_owner_t    *o;
     ngx_str_t                        names[2];
@@ -1694,9 +1817,11 @@ ngx_http_cache_purge_owner_start(ngx_cycle_t *cycle,
     o->threaded = threaded;
     o->log = cycle->log;
     o->options = *options;
+    o->propagation = propagation;
     o->notify_fd = state->channel[1];
     o->next_at = ngx_current_msec;
     o->maintain_at = ngx_current_msec + 1000;
+    o->sweep_at = ngx_current_msec + 1000;
     o->path = ngx_pnalloc(cycle->pool, path->len + 1);
     o->targets = ngx_pcalloc(cycle->pool, count * sizeof(*o->targets));
     o->caches = ngx_palloc(cycle->pool, count * sizeof(*o->caches));

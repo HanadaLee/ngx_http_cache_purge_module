@@ -182,6 +182,106 @@ ngx_http_cache_purge_test_tag(void *data, ngx_http_cache_rocksdb_bytes_t tag)
 }
 
 
+typedef struct {
+    ngx_http_cache_purge_catalog_t  *catalog;
+    const char                      *root;
+    size_t                           count;
+    int                              pause, remove;
+    unsigned char                    ids[8][24];
+} ngx_http_cache_purge_walk_test_t;
+
+
+static int
+ngx_http_cache_purge_test_visit(void *data,
+    const ngx_http_cache_purge_entry_t *entry,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_purge_walk_test_t  *test = data;
+
+    ngx_expect(entry->root.len == strlen(test->root)
+               && memcmp(entry->root.data, test->root, entry->root.len) == 0);
+    ngx_expect(entry->url.data == NULL && entry->tag_count == 0);
+    if (test->pause) {
+        test->pause = 0;
+        return NGX_HTTP_CACHE_ROCKSDB_BUSY;
+    }
+    ngx_expect(test->count < 8);
+    memcpy(test->ids[test->count++], entry->id, 24);
+    if (test->remove) {
+        return ngx_http_cache_purge_catalog_remove(test->catalog, entry->id,
+                                                    entry->uniq, error);
+    }
+    return ngx_http_cache_purge_catalog_retain(test->catalog, entry->id,
+                                               entry->uniq, 2000, error);
+}
+
+
+static void
+ngx_http_cache_purge_test_walk(ngx_http_cache_purge_catalog_t *catalog)
+{
+    ngx_http_cache_purge_walk_test_t  test;
+    ngx_http_cache_purge_entry_t      entry;
+    ngx_http_cache_rocksdb_error_t    error;
+    ngx_http_cache_rocksdb_bytes_t    root;
+    unsigned char                     after[24], empty[24];
+    size_t                            i, count;
+
+    memset(&test, 0, sizeof(test));
+    memset(after, 0, sizeof(after));
+    memset(empty, 0, sizeof(empty));
+    test.catalog = catalog;
+    test.root = "/walk/a";
+    root = ngx_http_cache_purge_text(test.root);
+    ngx_expect(ngx_http_cache_purge_catalog_walk(catalog, root, after, 2,
+                   ngx_http_cache_purge_test_visit, &test, &error)
+               == NGX_HTTP_CACHE_ROCKSDB_DONE && test.count == 0);
+    for (i = 1; i <= 6; i++) {
+        ngx_http_cache_purge_test_entry(&entry, (unsigned) i);
+        entry.root = ngx_http_cache_purge_text(i % 2 ? "/walk/a" : "/walk/b");
+        ngx_expect(ngx_http_cache_purge_catalog_put(catalog, &entry, &error)
+                   == 0);
+    }
+    test.pause = 1;
+    ngx_expect(ngx_http_cache_purge_catalog_walk(catalog, root, after, 2,
+                   ngx_http_cache_purge_test_visit, &test, &error)
+               == NGX_HTTP_CACHE_ROCKSDB_BUSY && test.count == 0);
+    ngx_expect(memcmp(after, empty, sizeof(after)) == 0);
+    ngx_expect(ngx_http_cache_purge_catalog_walk(catalog, root, after, 2,
+                   ngx_http_cache_purge_test_visit, &test, &error) == 0
+               && test.count == 2);
+    ngx_expect(ngx_http_cache_purge_catalog_walk(catalog, root, after, 2,
+                   ngx_http_cache_purge_test_visit, &test, &error)
+               == NGX_HTTP_CACHE_ROCKSDB_DONE && test.count == 3);
+    for (i = 0; i < 3; i++) {
+        ngx_expect(test.ids[i][23] == i * 2 + 1);
+        ngx_expect(ngx_http_cache_purge_catalog_get(catalog, test.ids[i],
+                                                    &entry, &error) == 0);
+        ngx_expect(entry.retain_until == 2000 && entry.tag_count == 2);
+    }
+    test.root = "/walk/b";
+    test.count = 0;
+    test.remove = 1;
+    root = ngx_http_cache_purge_text(test.root);
+    ngx_expect(ngx_http_cache_purge_catalog_walk(catalog, root, after, 8,
+                   ngx_http_cache_purge_test_visit, &test, &error)
+               == NGX_HTTP_CACHE_ROCKSDB_DONE && test.count == 3);
+    for (i = 0; i < 3; i++) {
+        ngx_expect(test.ids[i][23] == i * 2 + 2);
+    }
+    ngx_http_cache_purge_test_entry(&entry, 8);
+    entry.root = root;
+    ngx_expect(ngx_http_cache_purge_catalog_put(catalog, &entry, &error) == 0);
+    test.count = 0;
+    ngx_expect(ngx_http_cache_purge_catalog_walk(catalog, root, after, 8,
+                   ngx_http_cache_purge_test_visit, &test, &error)
+               == NGX_HTTP_CACHE_ROCKSDB_DONE && test.count == 1);
+    ngx_expect(test.ids[0][23] == 8);
+    ngx_expect(ngx_http_cache_purge_catalog_collect(catalog, 2000, 64,
+                                                     &count, &error) == 0
+               && count == 3);
+}
+
+
 int
 ngx_http_cache_purge_test_main(void)
 {
@@ -453,6 +553,11 @@ ngx_http_cache_purge_test_main(void)
                                                        &removed, &error) == 0);
         ngx_expect(removed == (i < 2 ? 32 : 6));
     }
+    ngx_expect(ngx_http_cache_purge_test_rows(store,
+                  NGX_HTTP_CACHE_ROCKSDB_URL, "", 0) == 0);
+    ngx_expect(ngx_http_cache_purge_test_rows(store,
+                  NGX_HTTP_CACHE_ROCKSDB_TAG, "", 0) == 0);
+    ngx_http_cache_purge_test_walk(catalog);
     ngx_expect(ngx_http_cache_purge_test_rows(store,
                   NGX_HTTP_CACHE_ROCKSDB_URL, "", 0) == 0);
     ngx_expect(ngx_http_cache_purge_test_rows(store,

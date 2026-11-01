@@ -325,13 +325,19 @@ ngx_http_cache_purge_test_main(void)
     input.retain_until = 400;
     test.missing = 9;
     test.replaced = 10;
+    ngx_expect(ngx_http_cache_purge_catalog_retain(catalog, id, entry.uniq,
+                                                  310, &error) == 0);
+    i = test.calls;
     ngx_expect(ngx_http_cache_purge_job_submit(jobs, &input, &duplicate, &error)
                == 0);
     ngx_expect(ngx_http_cache_purge_job_step(jobs, input.id, 301, 64,
                ngx_http_cache_purge_apply, &test, &output, &error) == 0);
     ngx_expect(output.done && output.affected == 0 && output.skipped == 2);
+    ngx_expect(test.calls == i + 1);
     ngx_expect(ngx_http_cache_purge_catalog_get(catalog, id, &entry, &error)
                == 0 && entry.retain_until == 400);
+    ngx_expect(ngx_http_cache_purge_catalog_collect(catalog, 310, 64,
+               &removed, &error) == 0 && removed == 0);
     ngx_expect(ngx_http_cache_purge_catalog_collect(catalog, 400, 64,
                &removed, &error) == 0 && removed == 1);
 

@@ -1005,6 +1005,79 @@ ngx_http_cache_purge_catalog_get(ngx_http_cache_purge_catalog_t *c,
 
 
 int
+ngx_http_cache_purge_catalog_walk(ngx_http_cache_purge_catalog_t *c,
+    ngx_http_cache_purge_bytes_t root, unsigned char after[24], size_t limit,
+    ngx_http_cache_purge_check_pt check, void *data,
+    ngx_http_cache_rocksdb_error_t *error)
+{
+    ngx_http_cache_rocksdb_cursor_t  *cursor;
+    ngx_http_cache_rocksdb_buffer_t  key, value;
+    ngx_http_cache_purge_entry_t     entry;
+    ngx_http_cache_purge_bytes_t     prefix, resume;
+    unsigned char                    raw[25];
+    uint64_t                         id;
+    size_t                           i;
+    int                              rc;
+
+    ngx_http_cache_purge_catalog_begin(c, error);
+    if (root.data == NULL || root.len == 0
+        || root.len > NGX_HTTP_CACHE_PURGE_TEXT || after == NULL
+        || limit == 0 || limit > 64 || check == NULL)
+    {
+        return NGX_HTTP_CACHE_ROCKSDB_INVALID;
+    }
+    id = ngx_http_cache_purge_catalog_reference(c, 'R', root, 0);
+    if (c->status != 0) {
+        return c->status;
+    }
+    if (id == 0) {
+        return NGX_HTTP_CACHE_ROCKSDB_DONE;
+    }
+    raw[0] = 'F';
+    ngx_http_cache_purge_catalog_encode(raw + 1, id, 8);
+    prefix.data = raw;
+    prefix.len = 9;
+    resume = ngx_http_cache_purge_empty;
+    if (memcmp(after, raw + 1, 8) == 0) {
+        memcpy(raw + 9, after + 8, 16);
+        resume.data = raw;
+        resume.len = sizeof(raw);
+    }
+    cursor = NULL;
+    rc = ngx_http_cache_rocksdb_cursor_open(c->store,
+        NGX_HTTP_CACHE_ROCKSDB_DEFAULT, prefix, resume, &cursor, error);
+    if (rc != 0) {
+        return rc;
+    }
+    key.data = raw;
+    key.capacity = sizeof(raw);
+    value.data = c->scratch;
+    value.capacity = sizeof(c->scratch);
+    for (i = 0; i < limit; i++) {
+        rc = ngx_http_cache_rocksdb_cursor_next(cursor, &key, &value, error);
+        if (rc != 0) {
+            break;
+        }
+        if (key.length != sizeof(raw)) {
+            rc = NGX_HTTP_CACHE_ROCKSDB_CORRUPT;
+            break;
+        }
+        ngx_http_cache_purge_catalog_begin(c, error);
+        rc = ngx_http_cache_purge_catalog_entry(c, cursor, raw + 1, &entry, 1);
+        if (rc == 0) {
+            rc = check(data, &entry, error);
+        }
+        if (rc != 0) {
+            break;
+        }
+        memcpy(after, entry.id, 24);
+    }
+    ngx_http_cache_rocksdb_cursor_close(&cursor, NULL);
+    return rc;
+}
+
+
+int
 ngx_http_cache_purge_catalog_remove(ngx_http_cache_purge_catalog_t *c,
     const unsigned char id[24], uint64_t expected,
     ngx_http_cache_rocksdb_error_t *error)

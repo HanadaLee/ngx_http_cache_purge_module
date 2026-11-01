@@ -49,6 +49,16 @@ int ngx_http_cache_purge_catalog_put(ngx_http_cache_purge_catalog_t *catalog,
 int ngx_http_cache_purge_catalog_get(ngx_http_cache_purge_catalog_t *catalog,
     const unsigned char  id[24], ngx_http_cache_purge_entry_t *entry,
     ngx_http_cache_rocksdb_error_t *error);
+typedef int (*ngx_http_cache_purge_check_pt)(void *data,
+    const ngx_http_cache_purge_entry_t *entry,
+    ngx_http_cache_rocksdb_error_t *error);
+/* Walk one configured root. Start with a zero bookmark; DONE ends the range.
+ * A failed callback leaves that row for retry. Each call closes its snapshot.
+ * */
+int ngx_http_cache_purge_catalog_walk(ngx_http_cache_purge_catalog_t *catalog,
+    ngx_http_cache_rocksdb_bytes_t root, unsigned char after[24], size_t limit,
+    ngx_http_cache_purge_check_pt check, void *data,
+    ngx_http_cache_rocksdb_error_t *error);
 int ngx_http_cache_purge_catalog_remove(ngx_http_cache_purge_catalog_t *catalog,
     const unsigned char  id[24], uint64_t expected,
     ngx_http_cache_rocksdb_error_t *error);

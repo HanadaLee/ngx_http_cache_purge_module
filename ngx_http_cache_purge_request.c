@@ -1322,6 +1322,7 @@ ngx_http_cache_purge_api(ngx_http_request_t *r)
     ngx_http_cache_purge_ctx_t        *ctx;
     ngx_str_t                          tail, body;
     u_char                            *p;
+    uint64_t                           stats[3];
 
     main = ngx_http_get_module_main_conf(r, ngx_http_cache_purge_module);
     conf = ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_module);
@@ -1337,6 +1338,7 @@ ngx_http_cache_purge_api(ngx_http_request_t *r)
         tail.len--;
     }
     if (ngx_http_cache_purge_equal(tail, "capabilities")) {
+        ngx_http_cache_purge_state_cleanup_stats(&main->state, stats);
         body.data = ngx_pnalloc(r->pool, 512);
         if (body.data == NULL) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -1344,9 +1346,11 @@ ngx_http_cache_purge_api(ngx_http_request_t *r)
         p = ngx_sprintf(body.data,
             "{\"version\":\"ngx-http-cache-purge/v3\",\"ready\":%s,"
             "\"authentication\":\"nginx-configuration\",\"json_submit\":false,"
-            "\"propagation_timeout_ms\":%M}",
+            "\"propagation_timeout_ms\":%M,\"index_cleanup\":{"
+            "\"checked\":%uL,\"retained\":%uL,\"errors\":%uL}}",
             main->path && ngx_http_cache_purge_state_ready(&main->state)
-            ? "true" : "false", main->propagation);
+            ? "true" : "false", main->propagation,
+            stats[0], stats[1], stats[2]);
         body.len = p - body.data;
         return ngx_http_cache_purge_respond(r, NGX_HTTP_OK, body);
     }
