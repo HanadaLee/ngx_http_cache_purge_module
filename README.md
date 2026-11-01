@@ -7,8 +7,9 @@ Production code is C; only the RocksDB bridge uses C++.
 The simplified implementation builds as an nginx addon. Public PURGE requests
 persist a background task and publish a shared rule before returning 202.
 The native nginx cache manager owns RocksDB and processes files in bounded
-batches. Full feature and performance acceptance is still pending; this working
-tree is not a release.
+batches. Runtime checks cover public operations, native cache-manager ownership,
+stock nginx fallback and proxy propagation. Performance depends on the workload;
+the limitations below remain relevant. This working tree is not a release.
 
 ## Behavior
 
@@ -71,6 +72,63 @@ PURGE is the submission method. The management location supports JSON capability
 and task-status responses; it does not accept JSON POST submissions.
 A TAG purge currently accepts one TAG;
 cached objects can have multiple TAGs.
+
+### Minimal configuration
+
+Configure the persistent index outside all native cache directories. The store
+and shared zone are an `http`-level pair; enabling them does not automatically
+enable a business location. This example uses independent expressions and does
+not require the cache-key module:
+
+```nginx
+http {
+    cache_purge_store /var/cache/nginx/index;
+    cache_purge_state_zone purge 1m;
+    proxy_cache_path /var/cache/nginx/content keys_zone=content:1m;
+
+    server {
+        listen 127.0.0.1:8080;
+        server_name example.test;
+
+        location / {
+            proxy_cache content;
+            proxy_cache_key "$scheme://$host$request_uri";
+            cache_purge_key_url "$scheme://$host$request_uri";
+            cache_purge_tag $upstream_http_cache_tag;
+            proxy_cache_purge on;
+            proxy_pass http://127.0.0.1:8081;
+        }
+
+        location /__cache_purge/ {
+            cache_purge_api;
+        }
+    }
+}
+```
+
+Send `PURGE /asset` to the business location. `X-Cache-Purge-Type` defaults to
+`url`; other values are `key`, `prefix`, `host`, `tag` and `host-tag`.
+`X-Cache-Purge-Action` defaults to `delete` and also accepts `invalidate`.
+A prefix is a literal URL byte prefix, without an appended wildcard.
+`url`, `prefix` and `host` cover all matching misc and namespace variants.
+`key` uses the configured URL, misc and namespace exactly. `tag` uses the
+configured namespace; `host-tag` uses the host extracted from the configured
+URL. Both TAG selectors read one value from `X-Cache-Purge-Tags`.
+
+For reliable retries, supply `X-Cache-Purge-Operation-Id` and
+`X-Cache-Purge-Issued-At` together, keeping both unchanged across attempts.
+The timestamp is Unix epoch milliseconds, compared at native second precision;
+same-second cache entries count as refreshed. Omit both headers to generate a
+new operation. A successful 202 confirms durable admission and shared-rule
+publication. Query `/__cache_purge/operations/ID` for background completion,
+or `/__cache_purge/capabilities` for readiness. A connection timeout does not
+cancel an accepted task. Reusing an ID for different work returns 409.
+
+The header names above are defaults. Separate `cache_purge_type_header`,
+`cache_purge_action_header`, `cache_purge_tags_header`,
+`cache_purge_operation_id_header` and `cache_purge_issued_at_header` directives
+override them. A dedicated PURGE location can read URL, misc and namespace from
+its own expressions without a `proxy_pass` or selected cache zone.
 
 ## Proxy propagation
 
@@ -186,8 +244,8 @@ small-table lookup overhead.
 When local rules contain only URL and prefix selectors, HIT filtering still
 evaluates only the URL. The array is rebuilt on publication and once after each
 collection batch under the shared mutex. Outgoing requests use the same index
-including retained propagation rules. Full HTTP latency and contention
-acceptance remain outstanding. Queues contain
+including retained propagation rules. Large active rule sets and sustained
+high-TAG fills can reduce throughput or increase tail latency. Queues contain
 copied messages, with count and byte limits, rather than request pointers or
 an in-memory copy of the cache index.
 
