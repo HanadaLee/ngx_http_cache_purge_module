@@ -163,13 +163,8 @@ ngx_http_cache_purge_reference(const ngx_http_cache_purge_job_t *jobs,
 
         if (s->type == NGX_HTTP_CACHE_PURGE_SELECT_KEY
             && (s->misc.len != entry->misc.len
-                || s->namespace_value.len != entry->namespace_value.len
                 || (s->misc.len
-                    && memcmp(s->misc.data, entry->misc.data, s->misc.len))
-                || (s->namespace_value.len
-                    && memcmp(s->namespace_value.data,
-                              entry->namespace_value.data,
-                              s->namespace_value.len))))
+                    && memcmp(s->misc.data, entry->misc.data, s->misc.len))))
         {
             continue;
         }
