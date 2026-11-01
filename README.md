@@ -231,6 +231,10 @@ It requires Linux and `wrk`. It compares the same binary with purge disabled,
 enabled without rules, deleting unrelated objects in the background, and
 retaining a completed rule. It records latency, throughput and process PSS;
 `--fills` and `--fill-rate` add continuous fills and check their index coverage.
+`--fill-only-control` adds a run that indexes new fills while disabling purge
+only for the measured hot URL. Every compared run then uses the same exact
+location for that URL. This separates request handling from background indexing;
+the fill coverage and deletion assertions remain enabled in the control run.
 `--request-delay` adds a delay in milliseconds between requests on each wrk
 connection to compare latency below saturation; it is not an open-loop load.
 `--seed-store` copies an offline, closed index before each enabled run; copied

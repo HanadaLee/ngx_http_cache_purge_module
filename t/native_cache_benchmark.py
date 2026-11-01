@@ -34,6 +34,7 @@ parser.add_argument('--url-origin', default='http://bench.test', help='Scheme an
 parser.add_argument('--io-rate', help='Override the store background I/O rate, for example 16m or 0')
 parser.add_argument('--profile', nargs='?', const='worker', choices=('worker', 'all'), help='Sample worker main threads or all nginx threads with perf; timing is diagnostic only')
 parser.add_argument('--owner-control', action='store_true', help='Also measure configured resources with the business location disabled')
+parser.add_argument('--fill-only-control', action='store_true', help='Also index fills while disabling purge only for the measured hot URL')
 parser.add_argument('--hold-cleanup', action='store_true', help='Keep the first target unreadable to measure a rule without bulk file processing')
 parser.add_argument('--rules', type=int, default=1, help='Number of simultaneous prefix tasks')
 parser.add_argument('--distinct-prefixes', action='store_true', help='Use a separate target prefix and blocked file for each task')
@@ -89,6 +90,7 @@ if args.request_delay:
         script.write(f'\ndelay = function() return {args.request_delay} end\n')
 report = {'root': str(root), 'binary': str(args.binary),
           'binary_sha256': hashlib.sha256(args.binary.read_bytes()).hexdigest(),
+          'script_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
           'server_cpus': server_cpus, 'client_cpus': client_cpus,
           'origin_and_controller_pinned': True,
           'workers': args.workers,
@@ -101,6 +103,7 @@ report = {'root': str(root), 'binary': str(args.binary),
           'url_origin': args.url_origin,
           'io_rate': args.io_rate,
           'owner_control': args.owner_control,
+          'fill_only_control': args.fill_only_control,
           'hold_cleanup': args.hold_cleanup,
           'admission_before_load': args.hold_cleanup,
           'distinct_prefixes': args.distinct_prefixes,
@@ -168,11 +171,16 @@ def resources(pid):
 
 
 try:
-    variants = [(False, False), (True, False), (True, True)] if args.owner_control else [(False, False), (True, True)]
-    variants = variants * args.rounds + [(True, True)]
-    for number, (enabled, active) in enumerate(variants):
+    variants = [(False, False, False)]
+    if args.owner_control:
+        variants.append((True, False, False))
+    if args.fill_only_control:
+        variants.append((True, True, True))
+    variants.append((True, True, False))
+    variants = variants * args.rounds + [(True, True, False)]
+    for number, (enabled, active, fill_only) in enumerate(variants):
         background = number == len(variants) - 1
-        mode = 'background-delete' if background else 'idle' if active else 'owner-only' if enabled else 'disabled'
+        mode = 'background-delete' if background else 'fill-only' if fill_only else 'idle' if active else 'owner-only' if enabled else 'disabled'
         run = root / str(number)
         (run / 'cache').mkdir(parents=True)
         (run / 'logs').mkdir()
@@ -231,6 +239,16 @@ http {{
             head, locations = settings.split('location /management/', 1)
             config = config.replace(settings, 'location /management/' + locations)
             config = config.replace('    access_log off;', '    access_log off;\n' + head)
+        if args.fill_only_control:
+            hot_location = f'''location = {args.hot_path} {{
+                proxy_pass http://127.0.0.1:{origin.server_port};
+                proxy_cache cache;
+                proxy_cache_key $uri;
+                {'proxy_cache_purge on;' if active and not fill_only else 'proxy_cache_purge off;'}
+                add_header X-Cache $upstream_cache_status always;
+            }}
+            '''
+            config = config.replace('location / {', hot_location + 'location / {')
         (run / 'nginx.conf').write_text(config)
         with (run / 'stdout.log').open('w') as output:
             process = subprocess.Popen([str(args.binary), '-p', str(run), '-c', str(run / 'nginx.conf')],
