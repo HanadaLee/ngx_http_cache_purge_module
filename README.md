@@ -264,6 +264,12 @@ Task checks cover durable admission after abrupt owner exit, bounded progress,
 failure retries, idempotent operation IDs, large and binary selector values,
 and snapshot release between batches.
 
+The native runtime and benchmark runners accept `--cache-io` to exercise
+`sendfile on` with a 10,000-entry open-file cache, a 10-second validity interval,
+and `min_uses=2`. This is a separate I/O configuration comparison; keep its
+measurements separate from the default benchmark. The runtime runner retains
+its existing smaller open-file cache when this option is absent.
+
 `--state` also tests shared queues/rules with nginx's actual slab allocator and
 process mutex. It checks publication ordering, disconnected callers, capacity
 rejection and cross-process visibility. It can run without linking RocksDB;

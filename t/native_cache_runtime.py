@@ -38,7 +38,17 @@ parser.add_argument('--slice', action='store_true')
 parser.add_argument('--dynamic', action='store_true')
 parser.add_argument('--protocols', action='store_true')
 parser.add_argument('--ssl', action='store_true')
+parser.add_argument('--cache-io', action='store_true',
+                    help='Exercise sendfile and cached native file descriptors')
 args = parser.parse_args()
+cache_io = '''sendfile on;
+    open_file_cache max=10000 inactive=20s;
+    open_file_cache_valid 10s;
+    open_file_cache_min_uses 2;
+    open_file_cache_errors on;''' if args.cache_io else '''
+    open_file_cache max=128 inactive=30s;
+    open_file_cache_valid 30s;
+    open_file_cache_min_uses 1;'''
 if args.public_module:
     assert args.backend, '--public-module requires --backend'
 if args.slice or args.key or args.dynamic or args.protocols:
@@ -410,9 +420,7 @@ http {{
     {owner_config}
     proxy_cache_path {run}/cache levels=1:2 keys_zone=test:1m;
     {second_cache}
-    open_file_cache max=128 inactive=30s;
-    open_file_cache_valid 30s;
-    open_file_cache_min_uses 1;
+    {cache_io}
     server {{
         listen 127.0.0.1:{port};
         location = /control {{ {control_config} }}
@@ -925,6 +933,7 @@ report = {'status': 'passed', 'root': str(root), 'run': str(run),
           'protocols': list(protocol_servers),
           'nginx_thread_pool': not args.no_thread_pool,
           'sanitize': args.sanitize,
+          'cache_io': args.cache_io,
           'extension': args.extension,
           'core_revision': revision, 'core_files_unchanged': len(core_files),
           'checks': checks, 'responses': responses,

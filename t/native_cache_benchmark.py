@@ -40,7 +40,13 @@ parser.add_argument('--rules', type=int, default=1, help='Number of simultaneous
 parser.add_argument('--distinct-prefixes', action='store_true', help='Use a separate target prefix and blocked file for each task')
 parser.add_argument('--hot-path', default='/hot')
 parser.add_argument('--cgroup', type=Path, help='Preconfigured cgroup v1 memory directory; only nginx joins it')
+parser.add_argument('--cache-io', action='store_true', help='Enable sendfile and cache native file descriptors')
 args = parser.parse_args()
+cache_io = '''sendfile on;
+    open_file_cache max=10000 inactive=20s;
+    open_file_cache_valid 10s;
+    open_file_cache_min_uses 2;
+    open_file_cache_errors on;''' if args.cache_io else ''
 assert args.seconds > 0 and args.rounds >= 0 and args.bulk > 0
 assert args.request_delay >= 0
 assert 0 < args.rules <= 256 and args.hot_path.startswith('/hot')
@@ -98,6 +104,7 @@ report = {'root': str(root), 'binary': str(args.binary),
           'request_delay_ms': args.request_delay,
           'fills': args.fills, 'fill_rate': args.fill_rate,
           'native_eviction': args.evict,
+          'cache_io': args.cache_io,
           'seed_store': str(args.seed_store) if args.seed_store else None,
           'seed_store_synced_in_cgroup': bool(args.seed_store and args.cgroup),
           'url_origin': args.url_origin,
@@ -220,6 +227,7 @@ error_log {run}/error.log notice;
 events {{ worker_connections 1024; }}
 http {{
     access_log off;
+    {cache_io}
     proxy_cache_path {run}/cache levels=1:2 keys_zone=cache:4m {'max_size=1m' if args.evict and not background else ''};
     server {{
         listen 127.0.0.1:{port};
