@@ -129,16 +129,73 @@ Values are inherited unless overridden. A child `cache_purge_tag` replaces the i
 
 The six directives accept one complex value in `http`, `server`, and `location`. With `ngx_expr_module`, all six also support `when` blocks. The first matching candidate wins; a child containing only conditional candidates falls back to its parent. Place conditional candidates before an unconditional value.
 
-| Directive syntax | Default | Read-only output |
-| :--- | :--- | :--- |
-| `cache_key_namespace value;` | `""` | `$cache_key_namespace` |
-| `cache_key_scheme value;` | `$scheme` | `$cache_key_scheme` |
-| `cache_key_host value;` | `$host` | `$cache_key_host` |
-| `cache_key_uri value;` | `$request_uri` | `$cache_key_uri` |
-| `cache_key_misc value;` | `""` | `$cache_key_misc` |
-| `cache_key_range value;` | `""` | `$cache_key_range` |
+### cache_key_namespace
 
-An empty namespace is valid and never falls back to the host. Nonempty namespaces accept up to 255 printable ASCII bytes, excluding spaces and commas. Other components preserve their input bytes. Argument filtering and URL normalization belong in the configured expressions; the module does not perform them automatically.
+| Syntax: | **cache_key_namespace** `value`; |
+| :--- | :--- |
+| Default: | `cache_key_namespace "";` |
+| Context: | `http`, `server`, `location`, `when` |
+
+Sets the namespace used to isolate cache keys. An empty namespace is valid and stays empty. Nonempty values accept up to 255 printable ASCII bytes, excluding spaces and commas.
+
+The selected value is available through the read-only variable `$cache_key_namespace`.
+
+### cache_key_scheme
+
+| Syntax: | **cache_key_scheme** `value`; |
+| :--- | :--- |
+| Default: | `cache_key_scheme $scheme;` |
+| Context: | `http`, `server`, `location`, `when` |
+
+Sets the scheme component of the cache key and URL.
+
+The selected value is available through the read-only variable `$cache_key_scheme`.
+
+### cache_key_host
+
+| Syntax: | **cache_key_host** `value`; |
+| :--- | :--- |
+| Default: | `cache_key_host $host;` |
+| Context: | `http`, `server`, `location`, `when` |
+
+Sets the host component of the cache key and URL.
+
+The selected value is available through the read-only variable `$cache_key_host`.
+
+### cache_key_uri
+
+| Syntax: | **cache_key_uri** `value`; |
+| :--- | :--- |
+| Default: | `cache_key_uri $request_uri;` |
+| Context: | `http`, `server`, `location`, `when` |
+
+Sets the URI component of the cache key and URL. Configure argument filtering and URL normalization in this expression when needed.
+
+The selected value is available through the read-only variable `$cache_key_uri`.
+
+### cache_key_misc
+
+| Syntax: | **cache_key_misc** `value`; |
+| :--- | :--- |
+| Default: | `cache_key_misc "";` |
+| Context: | `http`, `server`, `location`, `when` |
+
+Sets additional values that distinguish cached variants of the same URL, such as a language or content-selection variable.
+
+The selected value is available through the read-only variable `$cache_key_misc`.
+
+### cache_key_range
+
+| Syntax: | **cache_key_range** `value`; |
+| :--- | :--- |
+| Default: | `cache_key_range "";` |
+| Context: | `http`, `server`, `location`, `when` |
+
+Sets the range component of the full cache key. Use `$slice_range` with sliced caching so that each slice has a distinct full key while sharing the same base key.
+
+The selected value is available through the read-only variable `$cache_key_range`.
+
+### Variables
 
 | Derived variable | Value |
 | :--- | :--- |
