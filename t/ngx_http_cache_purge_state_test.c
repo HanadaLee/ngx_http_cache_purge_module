@@ -355,6 +355,63 @@ ngx_http_cache_purge_test_tags(ngx_http_cache_purge_state_t *state)
 
 
 static void
+ngx_http_cache_purge_test_dates(ngx_http_cache_purge_state_t *state)
+{
+    ngx_http_cache_purge_job_t  older, newer;
+
+    older = ngx_http_cache_purge_job(1, NGX_HTTP_CACHE_PURGE_SELECT_PREFIX,
+                                       "http://a.test/");
+    newer = ngx_http_cache_purge_job(2, NGX_HTTP_CACHE_PURGE_SELECT_TAG,
+                                       "news");
+    newer.issued = 250;
+    ngx_expect(ngx_http_cache_purge_state_filtering(state, 0) == 0);
+    ngx_expect(ngx_http_cache_purge_state_install(state, &older) == NGX_OK);
+    ngx_shmtx_lock(&state->pool->mutex);
+    ngx_expect(ngx_http_cache_purge_state_filtering(state, 199) == 1);
+    ngx_expect(ngx_http_cache_purge_state_filtering(state, 200) == 0);
+    ngx_expect(ngx_http_cache_purge_state_filtering(state, 201) == 0);
+    ngx_shmtx_unlock(&state->pool->mutex);
+    ngx_expect(ngx_http_cache_purge_state_install(state, &newer) == NGX_OK);
+    ngx_expect(ngx_http_cache_purge_state_filtering(state, 200) == 1);
+    ngx_expect(ngx_http_cache_purge_state_filtering(state, 250) == 0);
+    ngx_expect(ngx_http_cache_purge_state_complex(state) == 1);
+    ngx_http_cache_purge_state_finish(state, newer.id);
+    ngx_expect(ngx_http_cache_purge_state_filtering(state, 199) == 1);
+    ngx_expect(ngx_http_cache_purge_state_complex(state) == 0);
+    ngx_http_cache_purge_state_finish(state, older.id);
+    ngx_expect(ngx_http_cache_purge_state_filtering(state, 0) == 0);
+    ngx_expect(ngx_http_cache_purge_state_active(state) == 2);
+
+    /* Completed restoration and repeated publication must not leak counts. */
+    newer.done = 1;
+    ngx_expect(ngx_http_cache_purge_state_install(state, &newer) == NGX_OK);
+    ngx_expect(ngx_http_cache_purge_state_filtering(state, 0) == 0);
+    newer.done = 0;
+    ngx_expect(ngx_http_cache_purge_state_install(state, &newer) == NGX_OK);
+    ngx_expect(ngx_http_cache_purge_state_install(state, &newer) == NGX_OK);
+    ngx_expect(ngx_http_cache_purge_state_filtering(state, 249) == 1);
+    newer.done = 1;
+    ngx_expect(ngx_http_cache_purge_state_install(state, &newer) == NGX_OK);
+    ngx_expect(ngx_http_cache_purge_state_filtering(state, 0) == 0);
+    ngx_http_cache_purge_state_collect(state, 1321);
+
+    /* A timestamp at or beyond the atomic word limit must not wrap. */
+    newer.issued = (ngx_atomic_uint_t) -1;
+    newer.done = 0;
+    ngx_expect(ngx_http_cache_purge_state_install(state, &newer) == NGX_OK);
+    ngx_expect(ngx_http_cache_purge_state_filtering(state, UINT64_MAX) == 1);
+    ngx_http_cache_purge_state_finish(state, newer.id);
+    ngx_expect(ngx_http_cache_purge_state_filtering(state, 0) == 0);
+    ngx_http_cache_purge_state_collect(state, 1322);
+    newer.issued = UINT64_MAX;
+    ngx_expect(ngx_http_cache_purge_state_install(state, &newer) == NGX_OK);
+    ngx_expect(ngx_http_cache_purge_state_filtering(state, UINT64_MAX) == 1);
+    ngx_http_cache_purge_state_finish(state, newer.id);
+    ngx_http_cache_purge_state_collect(state, 1323);
+}
+
+
+static void
 ngx_http_cache_purge_empty(ngx_http_cache_purge_state_t *state)
 {
     ngx_uint_t  rules, messages;
@@ -362,6 +419,7 @@ ngx_http_cache_purge_empty(ngx_http_cache_purge_state_t *state)
 
     ngx_http_cache_purge_state_stats(state, &rules, &messages, &bytes);
     ngx_expect(rules == 0 && messages == 0 && bytes == 0);
+    ngx_expect(ngx_http_cache_purge_state_filtering(state, 0) == 0);
 }
 
 
@@ -429,6 +487,7 @@ ngx_http_cache_purge_test_main(void)
     ngx_shmtx_lock(&pool->mutex);
     ngx_expect(ngx_http_cache_purge_state_match(&state, &entry, 201, &match)
                == NGX_DECLINED);
+    ngx_expect(ngx_http_cache_purge_state_filtering(&state, 0) == 0);
     ngx_expect(ngx_http_cache_purge_state_match_url(&state, &entry, 201, &match)
                == NGX_DECLINED);
     ngx_shmtx_unlock(&pool->mutex);
@@ -449,6 +508,7 @@ ngx_http_cache_purge_test_main(void)
                && work->data.job.select.value.data >= (u_char *) (work + 1)
                && work->data.job.select.value.data
                   < (u_char *) work + work->size);
+    ngx_expect(ngx_http_cache_purge_state_filtering(&state, 0) == 0);
 #if (NGX_HTTP_CACHE_PURGE_BACKEND_TEST)
     ngx_expect(mkdtemp(database) != NULL);
     ngx_http_cache_rocksdb_options(&options);
@@ -481,10 +541,10 @@ ngx_http_cache_purge_test_main(void)
     ngx_expect(ngx_http_cache_purge_state_poll(&state, &message, &code, &result)
                == NGX_OK && code == 0 && message == NULL
                && result.select.value.data == NULL);
-    ngx_expect(ngx_http_cache_purge_state_filtering(&state) == 1);
+    ngx_expect(ngx_http_cache_purge_state_filtering(&state, 0) == 1);
     ngx_expect(ngx_http_cache_purge_state_complex(&state) == 0);
     ngx_http_cache_purge_state_finish(&state, job.id);
-    ngx_expect(ngx_http_cache_purge_state_filtering(&state) == 0);
+    ngx_expect(ngx_http_cache_purge_state_filtering(&state, 0) == 0);
     ngx_expect(ngx_http_cache_purge_state_active(&state) == 1);
     ngx_expect(ngx_http_cache_purge_state_match(&state, &entry, 319, &match)
                == NGX_OK && !match.delete_before && match.propagate_delete);
@@ -506,6 +566,7 @@ ngx_http_cache_purge_test_main(void)
     ngx_expect(ngx_http_cache_purge_state_take(&state, work, &taken) == NGX_OK);
     ngx_http_cache_purge_state_complete(&state, taken,
                                        NGX_HTTP_CACHE_ROCKSDB_IO, NULL);
+    ngx_expect(ngx_http_cache_purge_state_filtering(&state, 0) == 0);
     ngx_expect(ngx_http_cache_purge_state_poll(&state, &message, &code, &result)
                == NGX_OK && code == NGX_HTTP_CACHE_ROCKSDB_IO);
     ngx_http_cache_purge_empty(&state);
@@ -718,6 +779,8 @@ ngx_http_cache_purge_test_main(void)
         ngx_expect(read(done[0], &byte, 1) == 1);
         ngx_expect(ngx_http_cache_purge_state_match(&state, &entry, 201, &match)
                    == NGX_OK);
+        ngx_expect(ngx_http_cache_purge_state_filtering(&state, 199) == 1);
+        ngx_expect(ngx_http_cache_purge_state_filtering(&state, 200) == 0);
         ngx_expect(ngx_http_cache_purge_state_poll(&state, &message,
                    &code, &result) == NGX_OK && code == 0);
         _exit(0);
@@ -781,6 +844,8 @@ ngx_http_cache_purge_test_main(void)
     ngx_http_cache_purge_test_mixed(&state);
     ngx_http_cache_purge_empty(&state);
     ngx_http_cache_purge_test_tags(&state);
+    ngx_http_cache_purge_empty(&state);
+    ngx_http_cache_purge_test_dates(&state);
     ngx_http_cache_purge_empty(&state);
     ngx_expect(pool->pfree == baseline);
     ngx_shmtx_destroy(&pool->mutex);

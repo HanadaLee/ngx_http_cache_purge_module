@@ -138,6 +138,8 @@ with (root / 'build.log').open('a' if args.reuse_build else 'w') as log:
     subprocess.run(['make', '-j2'], cwd=build, stdout=log, stderr=subprocess.STDOUT, check=True)
 
 state = {'fail': False, 'version': 1, 'calls': [], 'ranges': [], 'protocol_calls': []}
+slow_started = threading.Event()
+slow_release = threading.Event()
 
 def slice_body():
     return (f'slice-v{state["version"]}-'.encode() * 384)[:3072]
@@ -145,6 +147,10 @@ def slice_body():
 class Origin(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         state['calls'].append(self.headers.get('If-None-Match'))
+        version = state['version']
+        if self.path == '/bulk/zz-slow' and not slow_release.is_set():
+            slow_started.set()
+            assert slow_release.wait(5), 'in-flight request was not released'
         if self.path.startswith('/slice/'):
             body = slice_body()
             match = re.fullmatch(r'bytes=(\d+)-(\d+)', self.headers.get('Range', ''))
@@ -165,14 +171,14 @@ class Origin(http.server.BaseHTTPRequestHandler):
             self.send_response(500)
             body = b'failure'
         else:
-            etag = '"v' + str(state['version']) + '"'
+            etag = '"v' + str(version) + '"'
             status = 304 if self.headers.get('If-None-Match') == etag else 200
             self.send_response(status)
             self.send_header('ETag', etag)
             self.send_header('Cache-Control', 'max-age=3600')
             self.send_header('Cache-Tag', self.headers.get('Accept-Language', 'native')
                              if self.path == '/variants/vary' else 'native')
-            body = b'' if status == 304 else ('body-v' + str(state['version'])).encode()
+            body = b'' if status == 304 else ('body-v' + str(version)).encode()
             if self.path == '/variants/vary':
                 self.send_header('Vary', 'Accept-Language')
                 body += self.headers.get('Accept-Language', 'default').encode()
@@ -271,7 +277,11 @@ if args.public_module:
     refused.bind(('127.0.0.1', 0))
     owner_config = f'''cache_purge_store {run}/store;
     cache_purge_state_zone purge 1m;
-    cache_purge_key_url http://cache.test$uri;
+    map $http_x_test_identity $native_purge_url {{
+        default http://cache.test$uri;
+        invalid "";
+    }}
+    cache_purge_key_url $native_purge_url;
     cache_purge_tag $upstream_http_cache_tag;'''
     control_config = 'proxy_cache_purge on; cache_purge_key_url $http_x_target;'
     business_config = '''proxy_cache_purge on;
@@ -722,21 +732,38 @@ try:
             response = request(targets[-1])
             assert response['cache'] == 'REVALIDATED' and response['body'] == 'body-v2', response
             assert last_file.stat().st_ino == last_inode
+            response = request(targets[-1], {'X-Test-Identity': 'invalid'})
+            assert response['status'] == 200 and response['cache'] == 'HIT', response
+            assert json.loads(progress(7)['body'])['cleanup']['state'] == 'pending'
             finished(7)
             assert request(targets[-1])['cache'] == 'HIT'
             checks.append('pending prefix Invalidate revalidates the last cached object before background processing reaches it')
 
+            inflight = []
+            slow = threading.Thread(target=lambda: inflight.append(request('/bulk/zz-slow')))
+            slow.start()
+            assert slow_started.wait(2)
             time.sleep(1.05)
             state['version'] = 3
             response = accepted('delete', '/bulk/', 8, 'prefix')
             assert response['status'] == 202, response
             pending = json.loads(progress(8)['body'])['cleanup']
             assert pending['state'] == 'pending' and pending['visited'] < 256, pending
+            slow_release.set()
+            slow.join(5)
+            assert not slow.is_alive() and inflight[0]['body'] == 'body-v2', inflight
+            response = request('/bulk/zz-slow')
+            assert response['cache'] == 'MISS' and response['body'] == 'body-v3', response
             response = request(targets[-1])
             assert response['cache'] == 'MISS' and response['body'] == 'body-v3', response
+            response = request(targets[-1], {'X-Test-Identity': 'invalid'})
+            assert response['status'] == 200 and response['cache'] == 'HIT', response
+            assert json.loads(progress(8)['body'])['cleanup']['state'] == 'pending'
             finished(8)
             assert request(targets[-1])['cache'] == 'HIT'
             checks.append('pending prefix Delete fetches a new entity and background work preserves the refreshed object')
+            checks.append('fresh HITs skip URL evaluation while older prefix tasks remain pending')
+            checks.append('a pre-purge in-flight response completes without becoming a cache HIT while its rule is pending')
             for _ in range(2):
                 response = request('/memory-error')
                 assert response['status'] == 502 and response['cache'] == 'MISS', response

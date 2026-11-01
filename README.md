@@ -123,7 +123,7 @@ file checks, successful transitions into retention, and check/retention errors;
 they are operational counters, not a durable ledger. Reload retains them;
 a full restart resets them. Sweep bookmarks are process-local and may rescan
 after a restart. Cleanup yields under load, so completion time is not fixed.
-The shared state format is now version 7; upgrading from earlier formats
+The shared state format is now version 8; upgrading from earlier formats
 requires a full restart. The database schema and nginx core ABI are unchanged.
 
 RocksDB's target SST size and base-level capacity follow the write-buffer
@@ -166,13 +166,19 @@ it uses its idle timer instead of scheduling an extra immediate retry.
 The shared state reserves rule space before admission and exposes a successful
 completion only after publication. Its empty-rule path does not take the shared
 mutex. Completed rules retained only for propagation skip HIT filtering.
+Responses at least as new as the shared timestamp bound also skip URL/TAG
+evaluation and rule lookup, unless a newer incoming propagation timestamp
+requires filtering. Cached responses use the native cache date; origin
+responses use the request start time. This gate reads one shared atomic word
+without a lock. Writers keep a conservative timestamp bound until the last
+local rule finishes, with one extra shared counter and no per-object state.
 The existing sorted array of at most 256 published rules groups URL/key/prefix,
 host and TAG selectors. URL searches follow prefix ancestors; host searches
 compare full values. Larger TAG groups compare precomputed hashes, then full
 values and scope, so hash collisions cannot broaden a purge. TAG rules reuse
 the ancestor pointer's storage for their hash, so the rule structure does not
-grow. TAG groups of at
-most four rules use direct comparisons to avoid small-table lookup overhead.
+grow. TAG groups of at most four rules use direct comparisons to avoid
+small-table lookup overhead.
 When local rules contain only URL and prefix selectors, HIT filtering still
 evaluates only the URL. The array is rebuilt on publication and once after each
 collection batch under the shared mutex. Outgoing requests use the same index

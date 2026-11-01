@@ -745,21 +745,22 @@ ngx_http_cache_purge_header(ngx_http_request_t *r)
     }
     main = ngx_http_get_module_main_conf(r, ngx_http_cache_purge_module);
     ctx = ngx_http_get_module_ctx(r, ngx_http_cache_purge_module);
-    if (!ngx_http_cache_purge_state_filtering(&main->state)
-        && (ctx == NULL || ctx->incoming == 0))
+    date = (uint64_t) (r->cached ? r->cache->date : r->start_sec);
+    if (!ngx_http_cache_purge_state_filtering(&main->state, date)
+        && (ctx == NULL || date >= ctx->incoming))
     {
         return ngx_http_cache_purge_next_header(r);
     }
     if (ngx_http_cache_purge_protocol(r) == NGX_DECLINED) {
         return ngx_http_cache_purge_next_header(r);
     }
-    if (ngx_http_cache_purge_match(r, &entry, &match, 1) != NGX_OK) {
-        return NGX_ERROR;
-    }
     u = r->upstream;
     if (u->cache_status == NGX_HTTP_CACHE_REVALIDATED) {
         /* Native 304 processing updates cache date after cache_send(). */
         return ngx_http_cache_purge_next_header(r);
+    }
+    if (ngx_http_cache_purge_match(r, &entry, &match, 1) != NGX_OK) {
+        return NGX_ERROR;
     }
     if (!r->cached) {
         if ((uint64_t) r->start_sec < match.delete_before
@@ -769,7 +770,6 @@ ngx_http_cache_purge_header(ngx_http_request_t *r)
         }
         return ngx_http_cache_purge_next_header(r);
     }
-    date = (uint64_t) r->cache->date;
     remove = date < match.delete_before;
     invalidate = date < match.invalidate_before;
     if (!remove && !invalidate) {

@@ -192,7 +192,7 @@ ngx_int_t ngx_http_cache_purge_value(ngx_http_request_t *r, ngx_uint_t n,
 ngx_uint_t ngx_http_cache_purge_state_active(
     ngx_http_cache_purge_state_t *state);
 ngx_uint_t ngx_http_cache_purge_state_filtering(
-    ngx_http_cache_purge_state_t *state);
+    ngx_http_cache_purge_state_t *state, uint64_t date);
 ngx_uint_t ngx_http_cache_purge_state_complex(
     ngx_http_cache_purge_state_t *state);
 ngx_uint_t ngx_http_cache_purge_state_tagged(

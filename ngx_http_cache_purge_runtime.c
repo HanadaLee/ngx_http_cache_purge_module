@@ -5,7 +5,7 @@
 #include <sched.h>
 
 
-#define NGX_HTTP_CACHE_PURGE_STATE_VERSION  7
+#define NGX_HTTP_CACHE_PURGE_STATE_VERSION  8
 #define NGX_HTTP_CACHE_PURGE_STATE_LIMIT    256
 #define NGX_HTTP_CACHE_PURGE_FILE_BATCH     8
 
@@ -39,12 +39,12 @@ struct ngx_http_cache_purge_message_s {
 struct ngx_http_cache_purge_shared_s {
     ngx_uint_t                   version;
     ngx_atomic_t                 published;
-    ngx_atomic_t                 filtering;
+    ngx_atomic_t                 before;
     ngx_atomic_t                 complex;
     ngx_atomic_t                 ready;
     ngx_pid_t                    owner;
     ngx_queue_t                  rules, messages, pending;
-    ngx_uint_t                   rule_count, message_count;
+    ngx_uint_t                   rule_count, message_count, local_count;
     ngx_uint_t                   ends[3];
     ngx_http_cache_purge_rule_t *index[NGX_HTTP_CACHE_PURGE_STATE_LIMIT];
     size_t                       message_bytes, capacity;
@@ -355,14 +355,43 @@ ngx_http_cache_purge_state_index(ngx_http_cache_purge_state_t *state)
 }
 
 
+/* Called under the shared mutex, for published rules only. */
+static void
+ngx_http_cache_purge_state_local(ngx_http_cache_purge_state_t *state,
+    ngx_http_cache_purge_rule_t *rule, ngx_uint_t local)
+{
+    ngx_atomic_uint_t  before;
+
+    if (rule->local == local) {
+        return;
+    }
+    rule->local = local;
+    if (local) {
+        state->shared->local_count++;
+        before = (ngx_atomic_uint_t) rule->issued;
+        if ((uint64_t) before != rule->issued) {
+            before = (ngx_atomic_uint_t) -1;
+        }
+        before = ngx_max(before, state->shared->before);
+    } else {
+        state->shared->local_count--;
+        /* Keep a conservative bound until the last local rule finishes. */
+        before = state->shared->local_count ? state->shared->before : 0;
+    }
+    if (rule->select.type != NGX_HTTP_CACHE_PURGE_SELECT_URL
+        && rule->select.type != NGX_HTTP_CACHE_PURGE_SELECT_PREFIX)
+    {
+        (void) ngx_atomic_fetch_add(&state->shared->complex, local ? 1 : -1);
+    }
+    ngx_memory_barrier();
+    state->shared->before = before;
+}
+
+
 static void
 ngx_http_cache_purge_state_publish(ngx_http_cache_purge_state_t *state,
-    ngx_http_cache_purge_rule_t  *rule, const ngx_http_cache_purge_job_t *job)
+    ngx_http_cache_purge_rule_t *rule, const ngx_http_cache_purge_job_t *job)
 {
-    ngx_uint_t  local;
-
-    local = rule->published && rule->local;
-    rule->local = !job->done;
     rule->retain_until = job->retain_until;
     if (!rule->published) {
         rule->published = 1;
@@ -370,17 +399,7 @@ ngx_http_cache_purge_state_publish(ngx_http_cache_purge_state_t *state,
         ngx_memory_barrier();
         (void) ngx_atomic_fetch_add(&state->shared->published, 1);
     }
-    if (local != rule->local) {
-        ngx_memory_barrier();
-        (void) ngx_atomic_fetch_add(&state->shared->filtering,
-                                     rule->local ? 1 : -1);
-        if (rule->select.type != NGX_HTTP_CACHE_PURGE_SELECT_URL
-            && rule->select.type != NGX_HTTP_CACHE_PURGE_SELECT_PREFIX)
-        {
-            (void) ngx_atomic_fetch_add(&state->shared->complex,
-                                         rule->local ? 1 : -1);
-        }
-    }
+    ngx_http_cache_purge_state_local(state, rule, !job->done);
 }
 
 
@@ -392,14 +411,7 @@ ngx_http_cache_purge_state_remove(ngx_http_cache_purge_state_t *state,
     state->shared->rule_count--;
     if (rule->published) {
         (void) ngx_atomic_fetch_add(&state->shared->published, -1);
-        if (rule->local) {
-            (void) ngx_atomic_fetch_add(&state->shared->filtering, -1);
-            if (rule->select.type != NGX_HTTP_CACHE_PURGE_SELECT_URL
-                && rule->select.type != NGX_HTTP_CACHE_PURGE_SELECT_PREFIX)
-            {
-                (void) ngx_atomic_fetch_add(&state->shared->complex, -1);
-            }
-        }
+        ngx_http_cache_purge_state_local(state, rule, 0);
     }
 
     ngx_slab_free_locked(state->pool, rule);
@@ -725,16 +737,8 @@ ngx_http_cache_purge_state_finish(ngx_http_cache_purge_state_t *state,
 
     ngx_shmtx_lock(&state->pool->mutex);
     rule = ngx_http_cache_purge_state_find(state, id);
-    if (rule != NULL && rule->local) {
-        rule->local = 0;
-        if (rule->published) {
-            (void) ngx_atomic_fetch_add(&state->shared->filtering, -1);
-            if (rule->select.type != NGX_HTTP_CACHE_PURGE_SELECT_URL
-                && rule->select.type != NGX_HTTP_CACHE_PURGE_SELECT_PREFIX)
-            {
-                (void) ngx_atomic_fetch_add(&state->shared->complex, -1);
-            }
-        }
+    if (rule != NULL && rule->published) {
+        ngx_http_cache_purge_state_local(state, rule, 0);
     }
 
     ngx_shmtx_unlock(&state->pool->mutex);
@@ -1261,9 +1265,14 @@ ngx_http_cache_purge_state_active(ngx_http_cache_purge_state_t *state)
 
 
 ngx_uint_t
-ngx_http_cache_purge_state_filtering(ngx_http_cache_purge_state_t *state)
+ngx_http_cache_purge_state_filtering(ngx_http_cache_purge_state_t *state,
+    uint64_t date)
 {
-    return state->shared->filtering;
+    ngx_atomic_uint_t  before;
+
+    before = state->shared->before;
+
+    return before != 0 && (before == (ngx_atomic_uint_t) -1 || date < before);
 }
 
 
