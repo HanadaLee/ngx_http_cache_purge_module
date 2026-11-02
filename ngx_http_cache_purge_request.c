@@ -1481,7 +1481,7 @@ ngx_http_cache_purge_handler(ngx_http_request_t *r)
 {
     uint64_t                           issued;
     ngx_int_t                          rc;
-    ngx_str_t                          type, action, stamp, value, operation[2];
+    ngx_str_t                          type, action, stamp, value, names[2];
     ngx_uint_t                         i, enabled;
     ngx_http_cache_purge_ctx_t        *ctx;
     ngx_http_cache_purge_entry_t       entry;
@@ -1651,14 +1651,14 @@ ngx_http_cache_purge_handler(ngx_http_request_t *r)
     }
 
     if (ngx_http_cache_purge_get_pair(r, NGX_HTTP_CACHE_PURGE_OPERATION,
-                                      operation) != NGX_OK
-        || (operation[0].len == 0) != (operation[1].len == 0))
+                                      names) != NGX_OK
+        || ngx_http_cache_purge_get_header(r, names[0], &ctx->operation_id)
+           == NGX_ERROR
+        || ngx_http_cache_purge_get_header(r, names[1], &stamp) == NGX_ERROR
+        || (ctx->operation_id.len == 0) != (stamp.len == 0))
     {
         return NGX_HTTP_BAD_REQUEST;
     }
-
-    ctx->operation_id = operation[0];
-    stamp = operation[1];
 
     if (ctx->operation_id.len == 0) {
         if (getrandom(random, sizeof(random), 0) != sizeof(random)) {

@@ -54,6 +54,14 @@ A `202 Accepted` response confirms that the task is durable and its shared rule 
 
 Releases are source tags. Build the modules against the nginx or OpenResty source and dependencies used by your server. GitHub Actions checks branch updates, pull requests, and `5.*` tags; it does not publish prebuilt modules.
 
+## Upgrading to 5.1.1
+
+Version 5.1.1 changes `cache_purge_operation_headers` to accept literal request header names. Replace its `$http_*` expressions with the corresponding header names:
+
+```nginx
+cache_purge_operation_headers id=X-Cache-Purge-Operation-Id issued_at=X-Cache-Purge-Issued-At;
+```
+
 ## Upgrading to 5.1.0
 
 Version 5.1.0 uses `cache_key_*` for both indexing and purge selection. All selectors are scoped to the configured namespace, including URL, prefix, host, and host-TAG. An empty namespace selects only the empty namespace.
@@ -352,20 +360,18 @@ Sets the PURGE action from a variable or literal: `delete` or `invalidate`. An e
 
 ### cache_purge_operation_headers
 
-| Syntax: | **cache_purge_operation_headers** `id=value issued_at=value`; |
+| Syntax: | **cache_purge_operation_headers** `id=name issued_at=name`; |
 | :--- | :--- |
 | Default: | See below. |
 | Context: | `http`, `server`, `location`, `when` |
 
 ```nginx
-cache_purge_operation_headers
-    id=$http_x_cache_purge_operation_id
-    issued_at=$http_x_cache_purge_issued_at;
+cache_purge_operation_headers id=X-Cache-Purge-Operation-Id issued_at=X-Cache-Purge-Issued-At;
 ```
 
-Both named parameters are required, in either order, and accept variables.
+Sets the request header names used to read the operation ID and timestamp. Both named parameters are required, in either order. Names must differ, case-insensitively, and contain 1–255 ASCII letters, digits, hyphens, or underscores. Names are literal and cannot contain variables. Request header names are matched case-insensitively; repeated occurrences of either configured header are rejected.
 
-When both values are empty, the module generates an operation ID and timestamp. Supplying only one value is rejected. IDs contain 1–128 ASCII letters, digits, hyphens, underscores, or periods. The timestamp is decimal Unix epoch milliseconds, at least `1000`, compared at native cache second precision.
+When both headers are absent or empty, the module generates an operation ID and timestamp. Supplying only one nonempty value is rejected. IDs contain 1–128 ASCII letters, digits, hyphens, underscores, or periods. The timestamp is decimal Unix epoch milliseconds, at least `1000`, compared at native cache second precision.
 
 Keep both values and the selector/action unchanged when retrying. Reusing an ID for different work in the same namespace returns `409 Conflict`; different namespaces may use the same ID independently.
 

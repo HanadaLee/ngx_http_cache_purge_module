@@ -373,8 +373,19 @@ if args.public_module:
     if args.expr:
         control_config += '''
         when custom_operation {
-            cache_purge_operation_headers
-                issued_at=$http_x_pair_time id=$http_x_pair_id;
+            cache_purge_operation_headers issued_at=X-Pair-Time id=X-Pair-Id;
+        }'''
+    api_config += '''
+        location /operation-headers/ {
+            proxy_cache_purge on;
+            cache_key_scheme http;
+            cache_key_host cache.test;
+            cache_key_uri /operation-target;
+            cache_purge_operation_headers id=X-Operation-Id issued_at=X-Operation-Time;
+            location /operation-headers/inherited { }
+            location /operation-headers/override {
+                cache_purge_operation_headers id=X-Override-Id issued_at=X-Override-Time;
+            }
         }'''
     variant_identity = '''cache_key_host variants.test;
             cache_key_uri $uri;
@@ -534,8 +545,18 @@ if args.public_module:
 
     for directive, values in (
         ('cache_purge_operation_headers', (
-            ('id= issued_at=', True),
-            ('issued_at=$http_x_pair_time id=$http_x_pair_id', True),
+            ('id=X-Id issued_at=X-Time', True),
+            ('issued_at=X-Time id=X-Id', True),
+            ('id=' + 'a' * 255 + ' issued_at=' + 'b' * 255, True),
+            ('id= issued_at=', False),
+            ('id=X-Id issued_at=', False),
+            ('id= issued_at=X-Time', False),
+            ('issued_at=$http_x_pair_time id=$http_x_pair_id', False),
+            ('id=X-Id issued_at=x-id', False),
+            ('id=X:Id issued_at=X-Time', False),
+            ('id=X-Id issued_at=X:Time', False),
+            ('id=' + 'a' * 256 + ' issued_at=X-Time', False),
+            ('id=X-Id issued_at=' + 'b' * 256, False),
             ('id=one', False), ('id=one id=two', False),
             ('id=one unknown=two', False))),
         ('cache_purge_propagation_headers', (
@@ -1014,7 +1035,37 @@ try:
                 assert json.loads(response['body'])['operation_id'] == 'test-72'
                 assert progress(71)['status'] == 404
                 assert progress(72)['status'] == 200
-            checks.append('operation input pairs support automatic generation, reject partial values and select a complete when candidate')
+            checks.append('operation headers support automatic generation, reject partial values and select a complete when candidate')
+
+            issued = str(int(time.time() * 1000))
+            for path, prefix in (('inherited', 'Operation'), ('override', 'Override')):
+                identifier = 'header-' + path
+                headers = {
+                    'X-Cache-Purge-Operation-Id': 'unused',
+                    'X-Cache-Purge-Issued-At': 'invalid',
+                    'x-' + prefix.lower() + '-id': identifier,
+                    'X-' + prefix.upper() + '-TIME': issued}
+                if path == 'override':
+                    headers.update({'X-Operation-Id': 'unused', 'X-Operation-Time': 'invalid'})
+                response = request('/operation-headers/' + path, headers, method='PURGE')
+                assert response['status'] == 202, response
+                assert json.loads(response['body'])['operation_id'] == identifier
+            checks.append('custom operation header names match case-insensitively and inherit or override as a complete pair')
+
+            for headers in (
+                    {'X-Operation-Id': 'partial'},
+                    {'X-Operation-Time': issued},
+                    {'X-Operation-Id': 'duplicate', 'x-operation-id': 'other',
+                     'X-Operation-Time': issued},
+                    {'X-Operation-Id': 'duplicate', 'X-Operation-Time': issued,
+                     'x-operation-time': issued},
+                    {'X-Operation-Id': 'invalid-time', 'X-Operation-Time': 'invalid'}):
+                response = request('/operation-headers/inherited', headers, method='PURGE')
+                assert response['status'] == 400, response
+            response = request('/operation-headers/inherited', method='PURGE')
+            assert response['status'] == 202, response
+            assert re.fullmatch('[0-9a-f]{32}', json.loads(response['body'])['operation_id'])
+            checks.append('custom operation headers reject partial, repeated and invalid values and generate an ID when both are absent')
 
             for identifier, kind in enumerate(('url', 'key', 'prefix', 'host', 'host-tag'), 80):
                 hit('/opaque/item')

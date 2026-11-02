@@ -83,8 +83,8 @@ static ngx_str_t  ngx_http_cache_purge_header_parameters[] = {
 
 static ngx_str_t  ngx_http_cache_purge_group_defaults[][2] = {
     { ngx_null_string, ngx_null_string },
-    { ngx_string("$http_x_cache_purge_operation_id"),
-      ngx_string("$http_x_cache_purge_issued_at") },
+    { ngx_string("X-Cache-Purge-Operation-Id"),
+      ngx_string("X-Cache-Purge-Issued-At") },
     { ngx_string("X-Cache-Purge-Time"),
       ngx_string("X-Cache-Purge-Action") }
 };
@@ -540,21 +540,19 @@ ngx_http_cache_purge_set_group_slot(ngx_conf_t *cf, ngx_command_t *cmd,
             return "requires both parameters";
         }
 
-        if (names == ngx_http_cache_purge_header_parameters) {
-            for (i = 0; i < 2; i++) {
-                rc = ngx_http_cache_purge_header_name(selected[i]);
+        for (i = 0; i < 2; i++) {
+            rc = ngx_http_cache_purge_header_name(selected[i]);
 
-                if (rc != NGX_CONF_OK) {
-                    return rc;
-                }
+            if (rc != NGX_CONF_OK) {
+                return rc;
             }
+        }
 
-            if (selected[0].len == selected[1].len
-                && ngx_strncasecmp(selected[0].data, selected[1].data,
-                                   selected[0].len) == 0)
-            {
-                return "requires distinct header names";
-            }
+        if (selected[0].len == selected[1].len
+            && ngx_strncasecmp(selected[0].data, selected[1].data,
+                               selected[0].len) == 0)
+        {
+            return "requires distinct header names";
         }
     }
 
