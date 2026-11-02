@@ -859,6 +859,7 @@ try:
             response = request(targets[-1])
             assert response['cache'] == 'REVALIDATED' and response['body'] == 'body-v2', response
             assert last_file.stat().st_ino == last_inode
+            assert hit(targets[-1])['body'] == 'body-v2'
             response = request(targets[-1], {'X-Test-Identity': 'invalid'})
             assert response['status'] == 200 and response['cache'] == 'HIT', response
             assert json.loads(progress(7)['body'])['cleanup']['state'] == 'pending'
@@ -883,13 +884,15 @@ try:
             assert response['cache'] == 'MISS' and response['body'] == 'body-v3', response
             response = request(targets[-1])
             assert response['cache'] == 'MISS' and response['body'] == 'body-v3', response
+            # Receiving the response does not imply cache publication is done.
+            assert hit(targets[-1])['body'] == 'body-v3'
             response = request(targets[-1], {'X-Test-Identity': 'invalid'})
             assert response['status'] == 200 and response['cache'] == 'HIT', response
             assert json.loads(progress(8)['body'])['cleanup']['state'] == 'pending'
             finished(8)
             assert request(targets[-1])['cache'] == 'HIT'
             checks.append('pending prefix Delete fetches a new entity and background work preserves the refreshed object')
-            checks.append('fresh HITs skip URL evaluation while older prefix tasks remain pending')
+            checks.append('fresh HITs skip cache identity evaluation while older prefix tasks remain pending')
             checks.append('a pre-purge in-flight response completes without becoming a cache HIT while its rule is pending')
             for _ in range(2):
                 response = request('/memory-error')
@@ -1145,6 +1148,8 @@ except BaseException as exc:
         'error': repr(exc), 'responses': responses, 'origin_calls': state['calls'],
         'protocol_calls': state['protocol_calls']},
         indent=2) + '\n')
+    if (run / 'error.log').exists():
+        print((run / 'error.log').read_text()[-16000:], file=sys.stderr)
     raise
 finally:
     if process is not None and process.poll() is None:
