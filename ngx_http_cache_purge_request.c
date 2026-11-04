@@ -737,7 +737,12 @@ ngx_http_cache_purge_create_request(ngx_http_request_t *r)
         }
 
         if ((uint64_t) cache->date < match.delete_before) {
-            r->upstream->cache_status = NGX_HTTP_CACHE_MISS;
+            /* BYPASS creates its cache file after receiving the response. */
+
+            if (r->upstream->cache_status != NGX_HTTP_CACHE_BYPASS) {
+                r->upstream->cache_status = NGX_HTTP_CACHE_MISS;
+            }
+
             cache->valid_sec = 0;
         }
 #if (NGX_RESTY_EXT)
@@ -859,7 +864,9 @@ ngx_http_cache_purge_send_filter(void *data, ngx_chain_t *in)
     u->request_bufs = ctx->body;
 
     if (r->cache != NULL) {
-        if ((uint64_t) r->cache->date < ctx->known.delete_before) {
+        if ((uint64_t) r->cache->date < ctx->known.delete_before
+            && u->cache_status != NGX_HTTP_CACHE_BYPASS)
+        {
             u->cache_status = NGX_HTTP_CACHE_MISS;
         }
 #if (NGX_RESTY_EXT)

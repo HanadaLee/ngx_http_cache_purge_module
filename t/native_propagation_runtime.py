@@ -209,6 +209,11 @@ events {{ worker_connections 128; }}
 http {{
     log_format trace escape=json '{{"uri":"$uri","request_id":"$http_x_test_request","time":"$http_{time_header.lower().replace('-', '_')}","action":"$http_{action_header.lower().replace('-', '_')}","tag":"$http_x_cache_purge_tags","cache":"$upstream_cache_status"}}';
     access_log {run}/access.log trace;
+    map $upstream_cache_status $test_no_cache {{
+        volatile;
+        BYPASS $http_x_no_store;
+        default 0;
+    }}
     cache_purge_index_store {run}/store;
     cache_purge_state_zone zone=purge:1m{' state=' + str(run / 'purge.zone') if args.state else ''};
     {header_names}
@@ -239,6 +244,7 @@ http {{
             proxy_cache {'$test_cache_zone' if tier == 'l1' else 'cache'};
             proxy_cache_key "$http_x_test_namespace$uri";
             proxy_cache_bypass $http_x_bypass;
+            proxy_no_cache $test_no_cache;
             proxy_cache_revalidate on;
             proxy_hide_header X-Test-Cache;
             proxy_http_version 1.1;
@@ -269,6 +275,20 @@ http {{
                 pass
             assert time.monotonic() < deadline
             time.sleep(.02)
+
+    for action in ('delete', 'invalidate'):
+        for no_store in (False, True):
+            path = f'/bypass-{action}-{int(no_store)}'
+            result = request('l2', path, headers={
+                'X-Bypass': '1', 'X-No-Store': str(int(no_store)),
+                time_header: str(int(time.time() - 1) * 1000),
+                action_header: action})
+            assert result['status'] == 200 and result['cache'] == 'BYPASS', result
+            assert result['body'] == 'body-v1', result
+            if no_store:
+                assert request('l2', path)['cache'] == 'MISS'
+            assert hit('l2', path)['body'] == 'body-v1'
+    checks.append('incoming Delete and Invalidate preserve BYPASS, cache publication, and status-based no-cache rules without worker crashes')
 
     path = '/header-input'
     hit('l2', path)
@@ -342,6 +362,12 @@ http {{
             assert time.monotonic() < deadline
             time.sleep(.02)
     state['version'] = 2
+    result = request('l1', path, headers={'X-Bypass': '1', 'X-No-Store': '1'})
+    assert result['cache'] == 'BYPASS' and result['body'] == 'body-v2', result
+    seen = parent_log(path)
+    assert seen['cache'] == 'BYPASS' and seen['time'] == str(operation['effective_at']), seen
+    assert seen['action'] == 'delete', seen
+    checks.append('local URL Delete preserves BYPASS and no-cache through both cache tiers')
     result = request('l1', path)
     assert result['body'] == 'body-v2' and result['cache'] == 'MISS', result
     seen = parent_log(path)
@@ -363,6 +389,14 @@ http {{
     operation = submit(path, 'delete', 'tag')
     state['version'] = 3
     payload = b'body must survive the asynchronous lookup' * 1024
+    result = request('l1', path, body=payload,
+                     headers={'X-Bypass': '1', 'X-No-Store': '1'})
+    assert result['cache'] == 'BYPASS' and result['body'] == 'body-v3', result
+    assert state['calls'][-1]['body_sha256'] == hashlib.sha256(payload).hexdigest()
+    seen = parent_log(path)
+    assert seen['cache'] == 'BYPASS' and seen['time'] == str(operation['effective_at']), seen
+    assert seen['action'] == 'delete', seen
+    checks.append('asynchronous TAG Delete lookup preserves BYPASS, no-cache, propagation headers, and the request body')
     result = request('l1', path, body=payload)
     assert result['body'] == 'body-v3' and result['cache'] == 'MISS', result
     assert state['calls'][-1]['body_sha256'] == hashlib.sha256(payload).hexdigest()
