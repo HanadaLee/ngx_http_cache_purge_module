@@ -98,7 +98,13 @@ The addon links with `-lrocksdb -lstdc++ -lm -pthread` by default. Set `CACHE_PU
 
 Build `ngx_expr_module` statically before this addon in the nginx configure arguments to enable `when` blocks. Use `cache_key_*` to select identity components from variables.
 
-`NGX_RESTY_EXT` enables strict Invalidate handling. Automatic proxy request-header integration additionally requires `NGX_HTTP_PROXY_FILTER`. Ordinary nginx uses its native stale policy and the propagation variables described below.
+For strict Invalidate handling on nginx 1.31.8, apply the bundled core patch before configuring nginx:
+
+```sh
+bash "$module/util/apply-nginx-patches.sh" /path/to/nginx
+```
+
+The script selects the patch matching the cache implementation. Without the patch, native stale policy applies. Automatic proxy request-header integration requires `ngx_http_proxy_filter_module` and its core patch. Shared-memory persistence remains an optional core capability.
 
 ## Conditional configuration
 
@@ -454,7 +460,7 @@ PURGE requests have no body and can be sent to the original business location or
 
 For prefix purges, supply the prefix itself without a trailing wildcard. Regex selectors and physical cache-filename selectors are not supported.
 
-The `delete` action removes matching files. The `invalidate` action expires them for upstream validation. With `NGX_RESTY_EXT`, only successful validation permits reuse: a 304 reuses the entity, a 200 replaces it, and an upstream failure cannot serve the invalidated entity. Enable the protocol's native cache-revalidation directive to allow conditional revalidation. Without the extension, ordinary nginx stale policy applies.
+The `delete` action removes matching files. The `invalidate` action expires them for upstream validation. With the bundled core patch, only successful validation permits reuse: a 304 reuses the entity, a 200 replaces it, and an upstream failure cannot serve the invalidated entity. Enable the protocol's native cache-revalidation directive to allow conditional revalidation. Without the patch, ordinary nginx stale policy applies.
 
 A dedicated endpoint can obtain identity fields from configured headers:
 
@@ -489,7 +495,7 @@ Acceptance waits for task persistence and shared-rule publication, not file enum
 
 Propagation is one-way: L1 sends a timestamp and action to L2 on an upstream request. L2 compares them with its native cache date and either serves the cache or applies Delete/Invalidate before obtaining a response. Responses carry no receipt or other propagation metadata. This protocol applies only to proxy caches.
 
-Builds with both `NGX_RESTY_EXT` and `NGX_HTTP_PROXY_FILTER` set outgoing headers automatically. Other builds require `proxy_set_header` in the managed parent-facing location:
+Builds with `ngx_http_proxy_filter_module` set outgoing headers automatically. Other builds require `proxy_set_header` in the managed parent-facing location:
 
 ```nginx
 proxy_cache_purge_propagation on;
@@ -530,13 +536,14 @@ Missing-file records are collected in the background, retaining known TAG relati
 
 ## Tests
 
-GitHub Actions tests both nginx and nginx-ext with static, dynamic, and sanitizer builds. nginx-ext runs also enable expr, proxy-header integration, and shared-zone persistence. Release tags run the extended Clang and Valgrind checks.
+GitHub Actions tests unmodified nginx, nginx with the bundled patch, and nginx-ext with static, dynamic, and sanitizer builds. nginx-ext runs also enable expr, proxy-header integration, and shared-zone persistence. Release tags run the extended Clang and Valgrind checks.
 
-Run either container profile locally:
+Run a container profile locally:
 
 ```sh
 mkdir -p t/test-results
 NGINX_VARIANT=nginx docker compose -f t/docker-compose.test.yml run --build --rm nginx-test
+NGINX_VARIANT=nginx-patched docker compose -f t/docker-compose.test.yml run --build --rm nginx-test
 NGINX_VARIANT=nginx-ext docker compose -f t/docker-compose.test.yml run --build --rm nginx-test
 ```
 
@@ -560,11 +567,11 @@ python3 t/native_cache_runtime.py \
     --output /tmp/native-cache.json
 ```
 
-Use `--extension 1` with nginx-ext to test strict Invalidate handling. `--dynamic`, `--slice`, and `--protocols` add separate-module loading, sliced caches, and FastCGI/uwsgi/scgi coverage. `--expr` and `--proxy-filter` take paths to optional modules. The public suite uses the bundled key module for variant and slice identities. Sanitizer runs require `--sanitize` and backend libraries built with `CACHE_PURGE_STORE_SANITIZE=ON`.
+Use `--extension 1` with nginx-ext. Strict Invalidate support is detected from the applied core patch. `--dynamic`, `--slice`, and `--protocols` add separate-module loading, sliced caches, and FastCGI/uwsgi/scgi coverage. `--expr` and `--proxy-filter` take paths to optional modules. The public suite uses the bundled key module for variant and slice identities. Sanitizer runs require `--sanitize` and backend libraries built with `CACHE_PURGE_STORE_SANITIZE=ON`.
 
 With a persistence-capable nginx-ext build, `--state` also verifies saved native cache zones, the first request after restart, and retained propagation rules. The combined runner `t/persistent_runtime.py` accepts the same option with `--extension 1`.
 
-`t/persistent_runtime.py` also runs the key variable suite against the combined build. To run it against an existing combined binary, use `python3 t/key_runtime.py --binary /path/to/nginx --output /tmp/key.json`; add `--modules /path/to/modules` for a dynamic build and `--expr` when enabled.
+`t/persistent_runtime.py` also checks key variables and the independence of origin revalidation policy and strict Invalidate. To run the key suite against an existing combined binary, use `python3 t/key_runtime.py --binary /path/to/nginx --output /tmp/key.json`; add `--modules /path/to/modules` for a dynamic build and `--expr` when enabled.
 
 `t/native_propagation_runtime.py` checks two cache tiers, propagation headers, retained TAG relationships, and the outgoing timeout using an already built nginx binary. `t/native_cache_benchmark.py` compares foreground latency, throughput, and process memory with and without indexing and background purges. Run either with `--help` for its options; benchmark results depend on workload and resource limits.
 

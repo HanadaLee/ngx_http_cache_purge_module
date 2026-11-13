@@ -20,7 +20,7 @@ class WorkflowContract(unittest.TestCase):
         self.assertNotIn('contents: write', workflow)
         self.assertNotIn('gh release', workflow)
 
-    def test_both_cores_have_static_dynamic_and_sanitized_checks(self):
+    def test_all_cores_have_static_dynamic_and_sanitized_checks(self):
         for full in ('false', 'true'):
             with self.subTest(full=full), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -33,7 +33,7 @@ class WorkflowContract(unittest.TestCase):
                 values = dict(line.split('=', 1) for line in output.read_text().splitlines())
                 matrix = json.loads(values['integration'])['include']
                 self.assertEqual(values['run'], 'true')
-                for core in ('nginx', 'nginx-ext'):
+                for core in ('nginx', 'nginx-patched', 'nginx-ext'):
                     entries = [entry for entry in matrix if entry['core'] == core
                                and entry['nginx'] == '1.31.8']
                     expected = {(False, False, 'gcc'), (True, False, 'gcc'),

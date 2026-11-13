@@ -35,7 +35,7 @@
 #include <ngx_md5.h>
 #include <sys/random.h>
 
-#if (NGX_RESTY_EXT && NGX_HTTP_PROXY_FILTER)
+#if (NGX_HTTP_PROXY_FILTER)
 #include <ngx_http_proxy_filter_module.h>
 #endif
 
@@ -119,7 +119,7 @@ static ngx_int_t ngx_http_cache_purge_send_filter(void *data, ngx_chain_t *in);
 static void ngx_http_cache_purge_lookup_handler(ngx_event_t *event);
 static ngx_int_t ngx_http_cache_purge_subrequest_done(ngx_http_request_t *r,
     void *data, ngx_int_t rc);
-#if (NGX_RESTY_EXT && NGX_HTTP_PROXY_FILTER)
+#if (NGX_HTTP_PROXY_FILTER)
 static ngx_int_t ngx_http_cache_purge_proxy_request_filter(
     ngx_http_request_t *r, ngx_http_proxy_filter_ctx_t *filter);
 #endif
@@ -584,7 +584,7 @@ ngx_http_cache_purge_guard_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data)
 {
     ngx_http_cache_purge_main_conf_t  *main;
-#if (NGX_RESTY_EXT)
+#if (NGX_HTTP_CACHE_PURGE_CORE)
     ngx_int_t          purged;
     ngx_http_cache_t  *cache;
 
@@ -620,7 +620,7 @@ ngx_http_cache_purge_guard_variable(ngx_http_request_t *r,
         main->finalize[data] = r->upstream->finalize_request;
         r->upstream->finalize_request = ngx_http_cache_purge_finalize_request;
     }
-#if (NGX_RESTY_EXT)
+#if (NGX_HTTP_CACHE_PURGE_CORE)
     cache = r->cache;
 
     if (cache != NULL && cache->file_cache != NULL) {
@@ -720,7 +720,7 @@ ngx_http_cache_purge_create_request(ngx_http_request_t *r)
 
     cache = r->cache;
     ngx_memzero(&entry, sizeof(entry));
-#if (NGX_RESTY_EXT)
+#if (NGX_HTTP_CACHE_PURGE_CORE)
     if (cache != NULL && cache->secondary && cache->file_cache != NULL) {
         cache->purged =
             ngx_http_cache_purge_native_node(cache->file_cache, cache->key, 0,
@@ -745,7 +745,7 @@ ngx_http_cache_purge_create_request(ngx_http_request_t *r)
 
             cache->valid_sec = 0;
         }
-#if (NGX_RESTY_EXT)
+#if (NGX_HTTP_CACHE_PURGE_CORE)
         if ((uint64_t) cache->date < match.delete_before
             || (uint64_t) cache->date < match.invalidate_before)
         {
@@ -869,7 +869,7 @@ ngx_http_cache_purge_send_filter(void *data, ngx_chain_t *in)
         {
             u->cache_status = NGX_HTTP_CACHE_MISS;
         }
-#if (NGX_RESTY_EXT)
+#if (NGX_HTTP_CACHE_PURGE_CORE)
         if ((uint64_t) r->cache->date < ctx->known.delete_before
             || (uint64_t) r->cache->date < ctx->known.invalidate_before)
         {
@@ -998,7 +998,7 @@ ngx_http_cache_purge_header_filter(ngx_http_request_t *r)
     }
 
     if (u->cache_status == NGX_HTTP_CACHE_STALE) {
-#if !(NGX_RESTY_EXT)
+#if !(NGX_HTTP_CACHE_PURGE_CORE)
         if (!remove) {
             return ngx_http_next_header_filter(r);
         }
@@ -1007,7 +1007,7 @@ ngx_http_cache_purge_header_filter(ngx_http_request_t *r)
                    u->state->status :
                    NGX_HTTP_BAD_GATEWAY;
     }
-#if !(NGX_RESTY_EXT)
+#if !(NGX_HTTP_CACHE_PURGE_CORE)
     if (!remove && u->cache_status == NGX_HTTP_CACHE_UPDATING) {
         return ngx_http_next_header_filter(r);
     }
@@ -1032,7 +1032,7 @@ ngx_http_cache_purge_header_filter(ngx_http_request_t *r)
     r->cache->valid_sec = 0;
     r->cache->updating_sec = 0;
     r->cache->error_sec = 0;
-#if (NGX_RESTY_EXT)
+#if (NGX_HTTP_CACHE_PURGE_CORE)
     r->cache->purged = 1;
 #endif
     ctx->retry = 1;
@@ -1219,7 +1219,7 @@ ngx_http_cache_purge_propagation_variable(ngx_http_request_t *r,
 }
 
 
-#if (NGX_RESTY_EXT && NGX_HTTP_PROXY_FILTER)
+#if (NGX_HTTP_PROXY_FILTER)
 static ngx_int_t
 ngx_http_cache_purge_proxy_request_filter(ngx_http_request_t *r,
     ngx_http_proxy_filter_ctx_t *filter)
@@ -1869,7 +1869,7 @@ ngx_http_cache_purge_init_handlers(ngx_conf_t *cf)
         ngx_string("$cache_purge_scgi_guard"),
         ngx_string("$cache_purge_uwsgi_guard")
     };
-#if (NGX_RESTY_EXT && NGX_HTTP_PROXY_FILTER)
+#if (NGX_HTTP_PROXY_FILTER)
     ngx_http_proxy_filter_pt           *filter;
     ngx_http_proxy_filter_main_conf_t  *filters;
 
@@ -1991,7 +1991,7 @@ ngx_http_cache_purge_init_handlers(ngx_conf_t *cf)
     }
 
     *handler = ngx_http_cache_purge_log_handler;
-#if (NGX_RESTY_EXT && NGX_HTTP_PROXY_FILTER)
+#if (NGX_HTTP_PROXY_FILTER)
     filters =
         ngx_http_conf_get_module_main_conf(cf, ngx_http_proxy_filter_module);
     filter = ngx_array_push(&filters->phases[NGX_HTTP_PROXY_REQUEST_FILTER]);

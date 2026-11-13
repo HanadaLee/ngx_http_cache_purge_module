@@ -1,0 +1,117 @@
+--- a/src/http/ngx_http_cache.h
++++ b/src/http/ngx_http_cache.h
+@@ -22,6 +22,9 @@
+ #define NGX_HTTP_CACHE_REVALIDATED   6
+ #define NGX_HTTP_CACHE_HIT           7
+ #define NGX_HTTP_CACHE_SCARCE        8
++
++#define NGX_HTTP_CACHE_PURGE_CORE  1
++
+ 
+ #define NGX_HTTP_CACHE_KEY_LEN       16
+ #define NGX_HTTP_CACHE_ETAG_LEN      128
+--- a/src/http/ngx_http_file_cache.c
++++ b/src/http/ngx_http_file_cache.c
+@@ -312,7 +312,15 @@
+     if (rc == NGX_OK) {
+ 
+         if (c->error) {
++#if (NGX_HTTP_CACHE_PURGE_CORE)
++            if (!c->purged) {
++                return c->error;
++            }
++
++            c->error = 0;
++#else
+             return c->error;
++#endif
+         }
+ 
+         c->temp_file = 1;
+@@ -655,7 +663,11 @@
+ 
+     now = ngx_time();
+ 
++#if (NGX_HTTP_CACHE_PURGE_CORE)
++    if (c->valid_sec < now || c->purged) {
++#else
+     if (c->valid_sec < now) {
++#endif
+         c->stale_updating = c->valid_sec + c->updating_sec >= now;
+         c->stale_error = c->valid_sec + c->error_sec >= now;
+ 
+@@ -1332,6 +1344,12 @@
+     h->date = c->date;
+     h->crc32 = c->crc32;
+     h->valid_msec = (u_short) c->valid_msec;
++
++#if (NGX_HTTP_CACHE_PURGE_CORE)
++    /* A new cache entity no longer inherits the old purge requirement. */
++    c->purged = 0;
++#endif
++
+     h->header_start = (u_short) c->header_start;
+     h->body_start = (u_short) c->body_start;
+ 
+--- a/src/http/ngx_http_upstream.c
++++ b/src/http/ngx_http_upstream.c
+@@ -963,6 +963,12 @@
+ 
+     case NGX_HTTP_CACHE_STALE:
+ 
++#if (NGX_HTTP_CACHE_PURGE_CORE)
++        if (c->purged) {
++            break;
++        }
++#endif
++
+         if (((u->conf->cache_use_stale & NGX_HTTP_UPSTREAM_FT_UPDATING)
+              || c->stale_updating) && !r->background
+             && u->conf->cache_background_update)
+@@ -980,6 +986,13 @@
+         break;
+ 
+     case NGX_HTTP_CACHE_UPDATING:
++
++#if (NGX_HTTP_CACHE_PURGE_CORE)
++        if (c->purged) {
++            rc = NGX_HTTP_CACHE_STALE;
++            break;
++        }
++#endif
+ 
+         if (((u->conf->cache_use_stale & NGX_HTTP_UPSTREAM_FT_UPDATING)
+              || c->stale_updating) && !r->background)
+@@ -2851,6 +2864,9 @@
+ #if (NGX_HTTP_CACHE)
+ 
+         if (u->cache_status == NGX_HTTP_CACHE_EXPIRED
++#if (NGX_HTTP_CACHE_PURGE_CORE)
++            && !r->cache->purged
++#endif
+             && (u->conf->cache_use_stale & un->mask))
+         {
+             ngx_int_t  rc;
+@@ -2938,6 +2954,12 @@
+             r->cache->error_sec = error;
+ 
+             r->cache->date = now;
++
++#if (NGX_HTTP_CACHE_PURGE_CORE)
++            if (rc == NGX_OK || rc == NGX_AGAIN) {
++                r->cache->purged = 0;
++            }
++#endif
+ 
+             ngx_http_file_cache_update_header(r);
+         }
+@@ -4727,6 +4749,9 @@
+ #if (NGX_HTTP_CACHE)
+ 
+         if (u->cache_status == NGX_HTTP_CACHE_EXPIRED
++#if (NGX_HTTP_CACHE_PURGE_CORE)
++            && !r->cache->purged
++#endif
+             && ((u->conf->cache_use_stale & ft_type) || r->cache->stale_error))
+         {
+             ngx_int_t  rc;

@@ -119,6 +119,15 @@ def main():
             if args.expr:
                 key_args += ['--expr']
             suite('key', 'key_runtime.py', key_args)
+            policy_args = ['--binary', nginx / 'objs/nginx',
+                           '--must-revalidate', args.extension,
+                           '--strict', int(public['strict_invalidation'])]
+            if args.dynamic:
+                policy_args += ['--modules', nginx / 'objs']
+            suite('policy', 'cache_policy_runtime.py', policy_args)
+            if args.dynamic:
+                suite('policy-without-module', 'cache_policy_runtime.py',
+                      [*policy_args, '--without-module'])
             # This standalone primitive harness does not import expr headers.
             if not args.expr:
                 suite('native', 'native_files_runtime.py', [
@@ -126,7 +135,7 @@ def main():
             propagation = ['--binary', nginx / 'objs/nginx']
             if args.dynamic:
                 propagation += ['--modules', nginx / 'objs']
-            if args.proxy_filter and args.extension:
+            if args.proxy_filter:
                 propagation += ['--framework']
             if args.expr:
                 propagation += ['--expr']

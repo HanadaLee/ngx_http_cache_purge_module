@@ -24,6 +24,8 @@ RUN --mount=type=secret,id=apt_mirror \
 FROM tools AS core-source
 WORKDIR /src
 COPY t/download.sh t/prepare_sources.sh /src/t/
+COPY util/apply-nginx-patches.sh /src/util/
+COPY patches/ /src/patches/
 ARG NGINX_VERSION=1.31.8
 ARG NGINX_VARIANT=nginx
 RUN NGINX_VERSION="$NGINX_VERSION" NGINX_VARIANT="$NGINX_VARIANT" \

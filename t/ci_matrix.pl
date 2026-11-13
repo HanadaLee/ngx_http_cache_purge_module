@@ -19,7 +19,7 @@ if (!$full && $base =~ /^[0-9a-f]{40}$/ && $base !~ /^0+$/) {
 }
 
 my @integration;
-for my $core ('nginx', 'nginx-ext') {
+for my $core ('nginx', 'nginx-patched', 'nginx-ext') {
     push @integration,
         {name => "$core-static", core => $core, nginx => '1.31.8', dynamic => 'false', sanitize => 'false', cc => 'gcc', cxx => 'g++'},
         {name => "$core-dynamic", core => $core, nginx => '1.31.8', dynamic => 'true', sanitize => 'false', cc => 'gcc', cxx => 'g++'},

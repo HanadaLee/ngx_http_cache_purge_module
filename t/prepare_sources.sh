@@ -11,7 +11,7 @@ if [[ -e "$TEST_SOURCE_DIR" ]]; then
 fi
 mkdir -p "$TEST_SOURCE_DIR/nginx"
 case "${NGINX_VARIANT:-nginx}" in
-    nginx)
+    nginx|nginx-patched)
         source="https://nginx.org/download/nginx-$NGINX_VERSION.tar.gz"
         ;;
     nginx-ext)
@@ -33,12 +33,17 @@ case "${NGINX_VARIANT:-nginx}" in
         done
         ;;
     *)
-        echo 'NGINX_VARIANT must be nginx or nginx-ext' >&2
+        echo 'NGINX_VARIANT must be nginx, nginx-patched or nginx-ext' >&2
         exit 1
         ;;
 esac
 sh "$repo/t/download.sh" "$source" "$TEST_SOURCE_DIR/nginx.tar.gz"
 tar --no-same-owner -xzf "$TEST_SOURCE_DIR/nginx.tar.gz" --strip-components=1 -C "$TEST_SOURCE_DIR/nginx"
+if [[ "${NGINX_VARIANT:-nginx}" != nginx ]]; then
+    [[ "$NGINX_VERSION" == 1.31.8 ]]
+    bash "$repo/util/apply-nginx-patches.sh" "$TEST_SOURCE_DIR/nginx"
+fi
+
 git -C "$TEST_SOURCE_DIR/nginx" init -q
 git -C "$TEST_SOURCE_DIR/nginx" add .
 git -C "$TEST_SOURCE_DIR/nginx" -c user.name='Test source snapshot' -c user.email='test@localhost' \

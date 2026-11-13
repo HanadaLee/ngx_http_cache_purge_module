@@ -79,6 +79,8 @@ with tarfile.open(fileobj=io.BytesIO(archive)) as source:
         assert (build / entry.name).read_bytes() == source.extractfile(entry).read(), entry.name
 state_supported = args.extension and 'NGX_RESTY_SHM_PERSISTENCE' in (build / 'src/core/ngx_cycle.h').read_text()
 assert not args.state or state_supported, 'core has no shared memory persistence support'
+strict_invalidation = bool(re.search(r'^#define NGX_HTTP_CACHE_PURGE_CORE  +1$',
+                                     (build / 'src/http/ngx_http_cache.h').read_text(), re.M))
 inputs = ('ngx_http_cache_purge_files.c', 'ngx_http_cache_purge.h',
           'ngx_http_cache_purge_internal.h', 'rocksdb/ngx_http_cache_rocksdb.h',
           't/ngx_http_cache_purge_native_probe.c')
@@ -734,12 +736,12 @@ try:
     assert expired != original and cached.stat().st_ino == inode
     state['fail'] = True
     response = request()
-    if args.extension:
+    if strict_invalidation:
         assert response['status'] == 500 and response['body'] == 'failure', response
     else:
         assert response['status'] == 200 and response['cache'] == 'STALE', response
         assert response['body'] == 'body-v1'
-    checks.append('purged blocks failed-origin stale in extension; macro-off keeps native fallback')
+    checks.append('strict invalidation blocks failed-origin stale; unpatched cores retain native fallback')
 
     state['fail'] = False
     response = request()
@@ -1089,13 +1091,13 @@ try:
             assert finished(26)['affected'] == 1
             state['fail'] = True
             response = request(target, {'Accept-Language': 'zh'})
-            assert response['status'] == (500 if args.extension else 200), response
-            if not args.extension:
+            assert response['status'] == (500 if strict_invalidation else 200), response
+            if not strict_invalidation:
                 assert response['cache'] == 'STALE', response
             assert request(target, {'Accept-Language': 'en'})['cache'] == 'HIT'
             state['fail'] = False
             hit(target, {'Accept-Language': 'zh'})
-            checks.append('TAG Invalidate of a secondary Vary file enforces extension stale policy without invalidating the primary variant')
+            checks.append('TAG Invalidate of a secondary Vary file enforces strict stale policy without invalidating the primary variant')
             time.sleep(1.05)
             assert accepted('delete', 'http://variants.test' + target, 25, 'key')['status'] == 202
             assert finished(25)['affected'] == 2
@@ -1179,8 +1181,8 @@ try:
                 assert purge('invalidate', target, 30 + number * 3)['affected'] == 1
                 state['fail'] = True
                 response = request(target)
-                assert response['status'] == (500 if args.extension else 200), response
-                if not args.extension:
+                assert response['status'] == (500 if strict_invalidation else 200), response
+                if not strict_invalidation:
                     assert response['cache'] == 'STALE', response
                 state['fail'] = False
                 response = request(target)
@@ -1237,6 +1239,7 @@ report = {'status': 'passed', 'root': str(root), 'run': str(run),
           'sanitize': args.sanitize,
           'cache_io': args.cache_io,
           'extension': args.extension,
+          'strict_invalidation': strict_invalidation,
           'core_revision': revision, 'core_files_unchanged': len(core_files),
           'checks': checks, 'responses': responses,
           'sources': hashes, 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),

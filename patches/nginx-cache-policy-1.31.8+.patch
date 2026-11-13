@@ -1,0 +1,116 @@
+--- a/src/http/ngx_http_cache.h
++++ b/src/http/ngx_http_cache.h
+@@ -23,6 +23,9 @@
+ #define NGX_HTTP_CACHE_REVALIDATED   6
+ #define NGX_HTTP_CACHE_HIT           7
+ #define NGX_HTTP_CACHE_SCARCE        8
++
++#define NGX_HTTP_CACHE_PURGE_CORE  1
++
+ 
+ #define NGX_HTTP_CACHE_KEY_LEN       16
+ #define NGX_HTTP_CACHE_ETAG_LEN      128
+--- a/src/http/ngx_http_file_cache.c
++++ b/src/http/ngx_http_file_cache.c
+@@ -318,7 +318,15 @@
+     if (rc == NGX_OK) {
+ 
+         if (c->error) {
++#if (NGX_HTTP_CACHE_PURGE_CORE)
++            if (!c->purged) {
++                return c->error;
++            }
++
++            c->error = 0;
++#else
+             return c->error;
++#endif
+         }
+ 
+         c->temp_file = 1;
+@@ -673,7 +681,11 @@
+ 
+     now = ngx_time();
+ 
++#if (NGX_HTTP_CACHE_PURGE_CORE)
++    if (c->valid_sec < now || c->purged) {
++#else
+     if (c->valid_sec < now) {
++#endif
+         c->stale_updating = c->valid_sec + c->updating_sec >= now;
+         c->stale_error = c->valid_sec + c->error_sec >= now;
+ 
+@@ -1350,6 +1362,11 @@
+     h->date = c->date;
+     h->crc32 = c->crc32;
+     h->valid_msec = (u_short) c->valid_msec;
++
++#if (NGX_HTTP_CACHE_PURGE_CORE)
++    /* A new cache entity no longer inherits the old purge requirement. */
++    c->purged = 0;
++#endif
+ 
+ #if (NGX_RESTY_EXT)
+     /*
+--- a/src/http/ngx_http_upstream.c
++++ b/src/http/ngx_http_upstream.c
+@@ -1350,6 +1350,12 @@
+ 
+     case NGX_HTTP_CACHE_STALE:
+ 
++#if (NGX_HTTP_CACHE_PURGE_CORE)
++        if (c->purged) {
++            break;
++        }
++#endif
++
+ #if (NGX_RESTY_EXT)
+ #if (NGX_EXPR)
+         stale = ngx_http_upstream_get_bitmask(r,
+@@ -1388,6 +1394,13 @@
+ 
+     case NGX_HTTP_CACHE_UPDATING:
+ 
++#if (NGX_HTTP_CACHE_PURGE_CORE)
++        if (c->purged) {
++            rc = NGX_HTTP_CACHE_STALE;
++            break;
++        }
++#endif
++
+ #if (NGX_RESTY_EXT)
+ #if (NGX_EXPR)
+         stale = ngx_http_upstream_get_bitmask(r,
+@@ -3537,6 +3550,9 @@
+ #if (NGX_HTTP_CACHE)
+ 
+         if (u->cache_status == NGX_HTTP_CACHE_EXPIRED
++#if (NGX_HTTP_CACHE_PURGE_CORE)
++            && !r->cache->purged
++#endif
+ #if (NGX_RESTY_EXT)
+             && !r->cache->must_revalidate
+ #endif
+@@ -3638,6 +3654,12 @@
+             r->cache->error_sec = error;
+ 
+             r->cache->date = now;
++
++#if (NGX_HTTP_CACHE_PURGE_CORE)
++            if (rc == NGX_OK || rc == NGX_AGAIN) {
++                r->cache->purged = 0;
++            }
++#endif
+ 
+             ngx_http_file_cache_update_header(r);
+         }
+@@ -5723,6 +5745,9 @@
+ #endif
+ 
+         if (u->cache_status == NGX_HTTP_CACHE_EXPIRED
++#if (NGX_HTTP_CACHE_PURGE_CORE)
++            && !r->cache->purged
++#endif
+ #if (NGX_RESTY_EXT)
+             && !r->cache->must_revalidate
+ #endif
