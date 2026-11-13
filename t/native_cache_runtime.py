@@ -36,7 +36,6 @@ parser.add_argument('--no-thread-pool', action='store_true')
 parser.add_argument('--expr', type=Path)
 parser.add_argument('--proxy-filter', type=Path)
 parser.add_argument('--slice', action='store_true')
-parser.add_argument('--dynamic', action='store_true')
 parser.add_argument('--protocols', action='store_true')
 parser.add_argument('--ssl', action='store_true')
 parser.add_argument('--state', action='store_true',
@@ -54,7 +53,7 @@ cache_io = '''sendfile on;
     open_file_cache_min_uses 1;'''
 if args.public_module:
     assert args.backend, '--public-module requires --backend'
-if args.slice or args.dynamic or args.protocols:
+if args.slice or args.protocols:
     assert args.public_module, 'extended HTTP checks require --public-module'
 if args.state:
     assert args.public_module and args.extension, '--state requires the public module and nginx-ext'
@@ -121,7 +120,7 @@ command = ['sh', configure, '--prefix=' + str(run), '--with-threads',
            '--with-cc-opt=-O2 -DNGX_RESTY_EXT=' + str(args.extension)
            + (' -DNGX_HTTP_CACHE_PURGE_OWNER_TEST=1'
               if args.backend and not args.public_module else ''),
-           ('--add-dynamic-module=' if args.dynamic else '--add-module=') + str(addon)]
+           '--add-module=' + str(addon)]
 if args.no_thread_pool:
     command.remove('--with-threads')
 if args.slice:
@@ -153,13 +152,20 @@ try:
             assert ('ngx_http_ssl_module' in
                     (build / 'objs/ngx_modules.c').read_text()) == args.ssl
             assert ('ngx_http_cache_key_module' in
-                    (build / 'objs/ngx_modules.c').read_text()) == (args.public_module and not args.dynamic)
-            assert ('--add-dynamic-module=' + str(addon) in
-                    (build / 'objs/ngx_auto_config.h').read_text()) == args.dynamic
+                    (build / 'objs/ngx_modules.c').read_text()) == args.public_module
         reconfigure = not args.reuse_build or (args.backend and any(
             str(args.backend / name) not in (build / 'objs/Makefile').read_text()
             for name in backend_hashes))
         if reconfigure:
+            if args.public_module:
+                dynamic = [value.replace('--add-module=' + str(addon),
+                                         '--add-dynamic-module=' + str(addon))
+                           for value in command]
+                rejected = subprocess.run(dynamic, cwd=build, capture_output=True, text=True)
+                message = rejected.stdout + rejected.stderr
+                (root / 'dynamic-rejected.log').write_text(message)
+                assert rejected.returncode != 0, 'configure accepted a dynamic module'
+                assert 'ngx_http_cache_purge_module must be built with --add-module' in message, message
             subprocess.run(command, cwd=build, stdout=log, stderr=subprocess.STDOUT, check=True)
         subprocess.run(['make', '-j2'], cwd=build, stdout=log, stderr=subprocess.STDOUT, check=True)
 except subprocess.CalledProcessError:
@@ -465,12 +471,7 @@ cache2_state = f' keys_state={run}/cache2.zone' if args.state else ''
 second_cache = (f'proxy_cache_path {run}/cache2 levels=1:2 keys_zone=test2:1m{cache2_state};\n'
                 'map $http_x_zone $native_cache_zone { default test; second test2; }'
                 if args.backend else '')
-loads = ('\n'.join(f'load_module {build}/objs/{name}.so;'
-                  for name in ('ngx_http_cache_key_module', 'ngx_http_cache_rocksdb_module',
-                               'ngx_http_cache_purge_module'))
-         if args.dynamic else '')
-config = f'''{loads}
-daemon off;
+config = f'''daemon off;
 master_process {'on' if args.backend else 'off'};
 worker_processes {2 if args.backend else 1};
 pid {run}/nginx.pid;
@@ -505,6 +506,8 @@ binary = build / 'objs/nginx'
 process = None
 output = (root / 'runtime.log').open('w')
 checks, responses = [], []
+if args.public_module and not args.reuse_build:
+    checks.append('configure rejects dynamic module builds')
 expected_manager_exits = []
 
 if args.public_module:
@@ -1232,7 +1235,6 @@ report = {'status': 'passed', 'root': str(root), 'run': str(run),
           'proxy_filter': str(args.proxy_filter) if args.proxy_filter else None,
           'key_module': str(repo / 'key') if args.public_module else None,
           'slice': args.slice,
-          'dynamic': args.dynamic,
           'state': args.state,
           'protocols': list(protocol_servers),
           'nginx_thread_pool': not args.no_thread_pool,
@@ -1243,10 +1245,6 @@ report = {'status': 'passed', 'root': str(root), 'run': str(run),
           'core_revision': revision, 'core_files_unchanged': len(core_files),
           'checks': checks, 'responses': responses,
           'sources': hashes, 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
-          'module_sha256': {name: hashlib.sha256((build / 'objs' / name).read_bytes()).hexdigest()
-                            for name in ('ngx_http_cache_key_module.so', 'ngx_http_cache_rocksdb_module.so',
-                                         'ngx_http_cache_purge_module.so')}
-                           if args.dynamic else {},
           'scope': ('Public PURGE, task status, native operations, shared request rules and the native cache manager; this is not full feature or performance acceptance.'
                     if args.public_module else
                     'Native operations and optional worker-0 owner through a test HTTP adapter; public HTTP integration is outside this run.')}

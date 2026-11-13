@@ -14,7 +14,6 @@ x-test-base: &test-base
     - ..:/src:ro
     - ./test-results:/reports
   environment:
-    TEST_DYNAMIC: ${TEST_DYNAMIC:-false}
     TEST_SANITIZE: ${TEST_SANITIZE:-false}
     CC: ${CC:-gcc}
     CXX: ${CXX:-g++}

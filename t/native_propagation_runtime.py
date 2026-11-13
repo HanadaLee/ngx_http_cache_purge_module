@@ -19,7 +19,6 @@ import time
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--binary', type=Path, required=True)
 parser.add_argument('--output', type=Path, required=True)
-parser.add_argument('--modules', type=Path)
 parser.add_argument('--root', type=Path)
 parser.add_argument('--framework', action='store_true')
 parser.add_argument('--expr', action='store_true')
@@ -194,12 +193,8 @@ try:
                 conditions += '\n    expr custom_headers str_eq $request_method GET;'
                 header_names = ('when custom_headers { ' + header_names + ' }\n'
                     '    cache_purge_propagation_headers time=X-Unselected-Time action=X-Unselected-Action;')
-        loads = ('\n'.join(f'load_module {args.modules.resolve() / name};'
-                          for name in ('ngx_http_cache_key_module.so', 'ngx_http_cache_rocksdb_module.so', 'ngx_http_cache_purge_module.so'))
-                 if args.modules else '')
         user = ('user ' + pwd.getpwuid(0).pw_name + ' ' + grp.getgrgid(os.getegid()).gr_name + ';') if os.geteuid() == 0 else ''
-        config = f'''{loads}
-{user}
+        config = f'''{user}
 daemon off;
 master_process on;
 worker_processes 1;
@@ -529,9 +524,6 @@ for tier in ports:
     assert not any(marker in errors for marker in ('[alert]', '[crit]', '[emerg]', 'AddressSanitizer', 'runtime error:')), errors
 args.output.write_text(json.dumps({'status': 'passed', 'root': str(root),
     'binary_sha256': hashlib.sha256(args.binary.read_bytes()).hexdigest(),
-    'modules': {name: hashlib.sha256((args.modules / name).read_bytes()).hexdigest()
-                for name in ('ngx_http_cache_key_module.so', 'ngx_http_cache_rocksdb_module.so', 'ngx_http_cache_purge_module.so')}
-               if args.modules else {},
     'framework': args.framework, 'expr': args.expr, 'tls': args.tls, 'streaming': args.streaming,
     'state': args.state,
     'permission_check': os.geteuid() != 0,

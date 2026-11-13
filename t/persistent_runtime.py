@@ -28,8 +28,6 @@ def main():
     parser.add_argument('--build', type=Path)
     parser.add_argument('--reports', type=Path, required=True)
     parser.add_argument('--jobs', type=int, default=2)
-    parser.add_argument('--dynamic', action='store_true',
-                        default=os.getenv('TEST_DYNAMIC', '').lower() in ('1', 'true'))
     parser.add_argument('--sanitize', action='store_true',
                         default=os.getenv('TEST_SANITIZE', '').lower() in ('1', 'true'))
     parser.add_argument('--backend-only', action='store_true')
@@ -51,7 +49,7 @@ def main():
     build = args.build.resolve() if args.build else Path(tempfile.mkdtemp(prefix='cache-purge-build-'))
     result = {'build': str(build), 'backend_only': args.backend_only,
               'state': args.state,
-              'dynamic': args.dynamic, 'sanitize': args.sanitize, 'stages': [],
+              'sanitize': args.sanitize, 'stages': [],
               'status': 'running'}
 
     def save():
@@ -107,34 +105,23 @@ def main():
             for option, path in (('--expr', args.expr), ('--proxy-filter', args.proxy_filter)):
                 if path:
                     public_args += [option, path.resolve()]
-            if args.dynamic:
-                public_args += ['--dynamic']
             if args.state:
                 public_args += ['--state']
             public = suite('public', 'native_cache_runtime.py', public_args)
             nginx = Path(public['root']) / 'nginx'
             key_args = ['--binary', nginx / 'objs/nginx']
-            if args.dynamic:
-                key_args += ['--modules', nginx / 'objs']
             if args.expr:
                 key_args += ['--expr']
             suite('key', 'key_runtime.py', key_args)
             policy_args = ['--binary', nginx / 'objs/nginx',
                            '--must-revalidate', args.extension,
                            '--strict', int(public['strict_invalidation'])]
-            if args.dynamic:
-                policy_args += ['--modules', nginx / 'objs']
             suite('policy', 'cache_policy_runtime.py', policy_args)
-            if args.dynamic:
-                suite('policy-without-module', 'cache_policy_runtime.py',
-                      [*policy_args, '--without-module'])
             # This standalone primitive harness does not import expr headers.
             if not args.expr:
                 suite('native', 'native_files_runtime.py', [
                     '--nginx', nginx, '--backend', build, '--state', *flags])
             propagation = ['--binary', nginx / 'objs/nginx']
-            if args.dynamic:
-                propagation += ['--modules', nginx / 'objs']
             if args.proxy_filter:
                 propagation += ['--framework']
             if args.expr:

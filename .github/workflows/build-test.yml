@@ -86,14 +86,13 @@ jobs:
           provenance: false
       - name: Backend, native cache, four protocols and one-way propagation
         env:
-          TEST_DYNAMIC: ${{ matrix.dynamic }}
           TEST_SANITIZE: ${{ matrix.sanitize }}
           CC: ${{ matrix.cc }}
           CXX: ${{ matrix.cxx }}
         run: |
           mkdir -p t/test-results
           docker run --rm --network none --user "$(id -u):$(id -g)" \
-            -e TEST_DYNAMIC -e TEST_SANITIZE -e CC -e CXX \
+            -e TEST_SANITIZE -e CC -e CXX \
             --mount "type=bind,src=$PWD/t/test-results,dst=/reports" \
             cache-purge-test:local
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

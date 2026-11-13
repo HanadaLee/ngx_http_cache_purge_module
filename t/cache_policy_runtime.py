@@ -15,7 +15,6 @@ import time
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--binary', type=Path, required=True)
-parser.add_argument('--modules', type=Path)
 parser.add_argument('--must-revalidate', type=int, choices=(0, 1), required=True)
 parser.add_argument('--strict', type=int, choices=(0, 1), required=True)
 parser.add_argument('--without-module', action='store_true')
@@ -66,10 +65,6 @@ threading.Thread(target=origin.serve_forever, daemon=True).start()
 with socket.socket() as listener:
     listener.bind(('127.0.0.1', 0))
     port = listener.getsockname()[1]
-load = ''
-if args.modules and not args.without_module:
-    for name in ('key', 'rocksdb', 'purge'):
-        load += f'load_module {args.modules}/ngx_http_cache_{name}_module.so;\n'
 settings = ''
 locations = ''
 cache_key = '$uri'
@@ -91,8 +86,7 @@ if not args.without_module:
     '''
     cache_key = '$cache_key_full'
     managed = 'proxy_cache_purge on;'
-(root / 'nginx.conf').write_text(f'''{load}
-daemon off;
+(root / 'nginx.conf').write_text(f'''daemon off;
 master_process on;
 worker_processes 1;
 pid {root}/nginx.pid;

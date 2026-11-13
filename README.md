@@ -84,15 +84,7 @@ cmake --build "$module/build"
 export CACHE_PURGE_ROCKSDB_LIB_DIR="$module/build"
 ```
 
-Build nginx statically with `--add-module=/path/to/ngx_cache_purge`, or dynamically with `--add-dynamic-module=/path/to/ngx_cache_purge`. A dynamic build produces three modules:
-
-```nginx
-load_module modules/ngx_http_cache_key_module.so;
-load_module modules/ngx_http_cache_rocksdb_module.so;
-load_module modules/ngx_http_cache_purge_module.so;
-```
-
-Load the key and RocksDB modules before purge, in the order shown above. All three modules build through the repository's root `config`; there is no separate key-module build. Build the modules and backend libraries from the same source revision.
+Build nginx with `--add-module=/path/to/ngx_cache_purge`. Dynamic modules are not supported. The root `config` builds the key, RocksDB, and purge modules together. Build the modules and backend libraries from the same source revision.
 
 The addon links with `-lrocksdb -lstdc++ -lm -pthread` by default. Set `CACHE_PURGE_ROCKSDB_LIBS` when a different link configuration is needed, such as static RocksDB with its compression dependencies.
 
@@ -536,7 +528,7 @@ Missing-file records are collected in the background, retaining known TAG relati
 
 ## Tests
 
-GitHub Actions tests unmodified nginx, nginx with the bundled patch, and nginx-ext with static, dynamic, and sanitizer builds. nginx-ext runs also enable expr, proxy-header integration, and shared-zone persistence. Release tags run the extended Clang and Valgrind checks.
+GitHub Actions tests unmodified nginx, nginx with the bundled patch, and nginx-ext with static and sanitizer builds, including rejection of dynamic builds. nginx-ext runs also enable expr, proxy-header integration, and shared-zone persistence. Release tags run the extended Clang and Valgrind checks.
 
 Run a container profile locally:
 
@@ -567,11 +559,11 @@ python3 t/native_cache_runtime.py \
     --output /tmp/native-cache.json
 ```
 
-Use `--extension 1` with nginx-ext. Strict Invalidate support is detected from the applied core patch. `--dynamic`, `--slice`, and `--protocols` add separate-module loading, sliced caches, and FastCGI/uwsgi/scgi coverage. `--expr` and `--proxy-filter` take paths to optional modules. The public suite uses the bundled key module for variant and slice identities. Sanitizer runs require `--sanitize` and backend libraries built with `CACHE_PURGE_STORE_SANITIZE=ON`.
+Use `--extension 1` with nginx-ext. Strict Invalidate support is detected from the applied core patch. `--slice` and `--protocols` add sliced caches and FastCGI/uwsgi/scgi coverage. `--expr` and `--proxy-filter` take paths to optional modules. The public suite uses the bundled key module for variant and slice identities. Sanitizer runs require `--sanitize` and backend libraries built with `CACHE_PURGE_STORE_SANITIZE=ON`.
 
 With a persistence-capable nginx-ext build, `--state` also verifies saved native cache zones, the first request after restart, and retained propagation rules. The combined runner `t/persistent_runtime.py` accepts the same option with `--extension 1`.
 
-`t/persistent_runtime.py` also checks key variables and the independence of origin revalidation policy and strict Invalidate. To run the key suite against an existing combined binary, use `python3 t/key_runtime.py --binary /path/to/nginx --output /tmp/key.json`; add `--modules /path/to/modules` for a dynamic build and `--expr` when enabled.
+`t/persistent_runtime.py` also checks key variables and the independence of origin revalidation policy and strict Invalidate. To run the key suite against an existing combined binary, use `python3 t/key_runtime.py --binary /path/to/nginx --output /tmp/key.json`; add `--expr` when enabled.
 
 `t/native_propagation_runtime.py` checks two cache tiers, propagation headers, retained TAG relationships, and the outgoing timeout using an already built nginx binary. `t/native_cache_benchmark.py` compares foreground latency, throughput, and process memory with and without indexing and background purges. Run either with `--help` for its options; benchmark results depend on workload and resource limits.
 

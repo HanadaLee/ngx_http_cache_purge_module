@@ -20,7 +20,7 @@ class WorkflowContract(unittest.TestCase):
         self.assertNotIn('contents: write', workflow)
         self.assertNotIn('gh release', workflow)
 
-    def test_all_cores_have_static_dynamic_and_sanitized_checks(self):
+    def test_all_cores_have_static_and_sanitized_checks(self):
         for full in ('false', 'true'):
             with self.subTest(full=full), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -36,12 +36,12 @@ class WorkflowContract(unittest.TestCase):
                 for core in ('nginx', 'nginx-patched', 'nginx-ext'):
                     entries = [entry for entry in matrix if entry['core'] == core
                                and entry['nginx'] == '1.31.8']
-                    expected = {(False, False, 'gcc'), (True, False, 'gcc'),
-                                (False, True, 'gcc')}
+                    expected = {(False, 'gcc'), (True, 'gcc')}
                     if full == 'true':
-                        expected.add((True, False, 'clang'))
-                    self.assertEqual({(e['dynamic'] == 'true', e['sanitize'] == 'true',
-                                       e['cc']) for e in entries}, expected)
+                        expected.add((False, 'clang'))
+                    self.assertEqual({(e['sanitize'] == 'true', e['cc'])
+                                      for e in entries}, expected)
+                    self.assertTrue(all('dynamic' not in e for e in entries))
 
 
 class ValgrindGate(unittest.TestCase):

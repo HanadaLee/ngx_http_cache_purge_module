@@ -15,7 +15,6 @@ import urllib.request
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--binary', type=Path, required=True)
-parser.add_argument('--modules', type=Path)
 parser.add_argument('--expr', action='store_true')
 parser.add_argument('--output', type=Path, required=True)
 args = parser.parse_args()
@@ -30,10 +29,7 @@ os.environ['UBSAN_OPTIONS'] = 'halt_on_error=1:print_stacktrace=1'
 with socket.socket() as sock:
     sock.bind(('127.0.0.1', 0))
     port = sock.getsockname()[1]
-load = (''.join(f'load_module {args.modules}/{name}.so;\n' for name in (
-    'ngx_http_cache_key_module', 'ngx_http_cache_rocksdb_module',
-    'ngx_http_cache_purge_module')) if args.modules else '')
-prefix = load + f'''daemon off;
+prefix = f'''daemon off;
 master_process on;
 worker_processes 2;
 pid {run}/pid;
@@ -165,9 +161,6 @@ assert not any(marker in log for marker in ('exited on signal', '[alert]', 'Addr
 result = {'status': 'passed', 'root': str(root), 'expr': args.expr,
           'checks': checks,
           'source_sha256': hashlib.sha256((repo / 'key/ngx_http_cache_key_module.c').read_bytes()).hexdigest()}
-if args.modules:
-    name = 'ngx_http_cache_key_module.so'
-    result['modules'] = {name: hashlib.sha256((args.modules / name).read_bytes()).hexdigest()}
 args.output.parent.mkdir(parents=True, exist_ok=True)
 args.output.write_text(json.dumps(result, indent=2) + '\n')
 print('PASS', len(checks), 'cache key checks', flush=True)
