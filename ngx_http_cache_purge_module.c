@@ -751,7 +751,7 @@ ngx_http_cache_purge_state_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *data)
     ssize_t     size;
     ngx_str_t  *value, name, file, s;
     ngx_uint_t  i;
-#if (NGX_RESTY_EXT && NGX_RESTY_SHM_PERSISTENCE)
+#if (NGX_RESTY_SHM_PERSISTENCE)
     ngx_shm_zone_params_t  zp;
 #endif
 
@@ -828,7 +828,7 @@ ngx_http_cache_purge_state_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *data)
     }
 
     if (file.data != NULL) {
-#if (NGX_RESTY_EXT && NGX_RESTY_SHM_PERSISTENCE)
+#if (NGX_RESTY_SHM_PERSISTENCE)
         ngx_memzero(&zp, sizeof(ngx_shm_zone_params_t));
         zp.name = name;
         zp.size = size;

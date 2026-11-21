@@ -1,1 +1,1 @@
-NGX_HTTP_CACHE_PURGE_CORE src/http/ngx_http_cache.h nginx-1.31.8+.patch 1 nginx-cache-policy-1.31.8+.patch nginx-cache-policy-legacy-1.31.8.patch
+NGX_HTTP_CACHE_PURGE_CORE src/http/ngx_http_cache.h nginx-1.31.8+.patch 1 nginx-cache-policy-1.31.9+.patch nginx-cache-policy-1.31.8+.patch nginx-cache-policy-legacy-1.31.8.patch

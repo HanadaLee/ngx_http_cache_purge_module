@@ -117,10 +117,12 @@ else:
     os.environ['CACHE_PURGE_ROCKSDB_LIB_DIR'] = str(args.backend)
 configure = 'auto/configure' if (build / 'auto/configure').exists() else 'configure'
 command = ['sh', configure, '--prefix=' + str(run), '--with-threads',
-           '--with-cc-opt=-O2 -DNGX_RESTY_EXT=' + str(args.extension)
+           '--with-cc-opt=-O2 -DNGX_EXT=' + str(args.extension)
            + (' -DNGX_HTTP_CACHE_PURGE_OWNER_TEST=1'
               if args.backend and not args.public_module else ''),
            '--add-module=' + str(addon)]
+if not args.extension and '--without-ext)' in (build / 'auto/options').read_text():
+    command.append('--without-ext')
 if args.no_thread_pool:
     command.remove('--with-threads')
 if args.slice:
@@ -142,7 +144,7 @@ backend_hashes = {name: hashlib.sha256((args.backend / name).read_bytes()).hexdi
 try:
     with (root / 'build.log').open('a' if args.reuse_build else 'w') as log:
         if args.reuse_build:
-            assert '-DNGX_RESTY_EXT=' + str(args.extension) in (build / 'objs/Makefile').read_text()
+            assert '-DNGX_EXT=' + str(args.extension) in (build / 'objs/Makefile').read_text()
             assert ('-DNGX_HTTP_CACHE_PURGE_OWNER_TEST=1' in
                     (build / 'objs/Makefile').read_text()) == bool(args.backend and not args.public_module)
             assert ('-fsanitize=address,undefined' in
@@ -650,7 +652,9 @@ def owner_placement():
             owns_store = any(path.startswith(str(run / 'store') + '/') for path in files)
             if name.startswith(b'nginx: worker process'):
                 assert not owns_store, (pid, files)
-                if args.no_thread_pool:
+                if not args.extension and '--without-ext)' in (build / 'auto/options').read_text():
+    command.append('--without-ext')
+if args.no_thread_pool:
                     assert len(list((directory / 'task').iterdir())) == 1, pid
             if owns_store:
                 assert name.startswith(b'nginx: cache manager process'), (pid, name)

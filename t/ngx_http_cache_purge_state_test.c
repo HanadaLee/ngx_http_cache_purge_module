@@ -12,7 +12,7 @@ ngx_pid_t              ngx_pid;
 ngx_int_t              ngx_ncpu = 2;
 volatile ngx_cycle_t  *ngx_cycle;
 
-#if (NGX_RESTY_EXT && NGX_RESTY_SHM_PERSISTENCE)
+#if (NGX_RESTY_SHM_PERSISTENCE)
 static ngx_time_t       ngx_http_cache_purge_time;
 volatile ngx_time_t    *ngx_cached_time = &ngx_http_cache_purge_time;
 
@@ -545,7 +545,7 @@ ngx_http_cache_purge_empty(ngx_http_cache_purge_state_t *state)
 }
 
 
-#if (NGX_RESTY_EXT && NGX_RESTY_SHM_PERSISTENCE)
+#if (NGX_RESTY_SHM_PERSISTENCE)
 
 static void
 ngx_http_cache_purge_test_restore(ngx_shm_zone_t *zone)
@@ -1107,7 +1107,7 @@ ngx_http_cache_purge_test_main(void)
     ngx_http_cache_purge_empty(&state);
     ngx_http_cache_purge_test_dates(&state);
     ngx_http_cache_purge_empty(&state);
-#if (NGX_RESTY_EXT && NGX_RESTY_SHM_PERSISTENCE)
+#if (NGX_RESTY_SHM_PERSISTENCE)
     ngx_http_cache_purge_test_restore(&zone);
 #endif
     ngx_expect(pool->pfree == baseline);

@@ -28,7 +28,7 @@ command = ['cc', '-std=gnu89', '-Wall', '-Wextra', '-Werror', '-O2', '-g',
 if args.sanitize:
     command += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
 if args.extension:
-    command.append('-DNGX_RESTY_EXT=1')
+    command.append('-DNGX_EXT=1')
 for name in ('objs', 'src/core', 'src/event', 'src/event/modules',
              'src/event/quic', 'src/os/unix', 'src/http', 'src/http/modules',
              'src/http/v2', 'src/http/v3'):

@@ -5,7 +5,7 @@ set -euo pipefail
 nginx_source="$(cd "${1:?Usage: apply-nginx-patches.sh <nginx-source>}" && pwd)"
 module_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-while read -r feature header patch_file version alternate legacy; do
+while read -r feature header patch_file version alternatives; do
     version="${version:-1}"
     if grep -q "^#define $feature  *$version$" "$nginx_source/$header"; then
         continue
@@ -16,12 +16,10 @@ while read -r feature header patch_file version alternate legacy; do
         exit 1
     fi
 
-    candidates=("$patch_file")
-    [[ -z "$alternate" ]] || candidates+=("$alternate")
-    [[ -z "$legacy" ]] || candidates+=("$legacy")
+    read -r -a candidates <<< "$alternatives"
     selected=""
 
-    for candidate in "${candidates[@]}"; do
+    for candidate in "$patch_file" "${candidates[@]}"; do
         if patch --dry-run --batch --forward --fuzz=0 \
             -d "$nginx_source" -p1 < "$module_root/patches/$candidate" \
             >/dev/null 2>&1

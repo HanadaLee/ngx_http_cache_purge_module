@@ -113,7 +113,7 @@ static void ngx_http_cache_purge_state_publish(
     const ngx_http_cache_purge_job_t *job);
 static void ngx_http_cache_purge_state_remove(
     ngx_http_cache_purge_state_t *state, ngx_http_cache_purge_rule_t *rule);
-#if (NGX_RESTY_EXT && NGX_RESTY_SHM_PERSISTENCE)
+#if (NGX_RESTY_SHM_PERSISTENCE)
 static void ngx_http_cache_purge_state_restore(
     ngx_http_cache_purge_state_t *state);
 #endif
@@ -673,7 +673,7 @@ ngx_http_cache_purge_state_remove(ngx_http_cache_purge_state_t *state,
 }
 
 
-#if (NGX_RESTY_EXT && NGX_RESTY_SHM_PERSISTENCE)
+#if (NGX_RESTY_SHM_PERSISTENCE)
 
 ngx_int_t
 ngx_http_cache_purge_state_signature(ngx_conf_t *cf, ngx_str_t *signature)
@@ -788,7 +788,7 @@ ngx_http_cache_purge_state_init(ngx_shm_zone_t *zone, void *old)
 
     state->shared = shared;
 
-#if (NGX_RESTY_EXT && NGX_RESTY_SHM_PERSISTENCE)
+#if (NGX_RESTY_SHM_PERSISTENCE)
     if (old == NULL && zone->restore) {
         ngx_http_cache_purge_state_restore(state);
     }

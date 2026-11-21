@@ -84,7 +84,7 @@ typedef struct {
 
 
 /* zone->data points to a cycle-owned state context. */
-#if (NGX_RESTY_EXT && NGX_RESTY_SHM_PERSISTENCE)
+#if (NGX_RESTY_SHM_PERSISTENCE)
 ngx_int_t ngx_http_cache_purge_state_signature(ngx_conf_t *cf,
     ngx_str_t *signature);
 #endif
