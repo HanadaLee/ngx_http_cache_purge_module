@@ -652,9 +652,7 @@ def owner_placement():
             owns_store = any(path.startswith(str(run / 'store') + '/') for path in files)
             if name.startswith(b'nginx: worker process'):
                 assert not owns_store, (pid, files)
-                if not args.extension and '--without-ext)' in (build / 'auto/options').read_text():
-    command.append('--without-ext')
-if args.no_thread_pool:
+                if args.no_thread_pool:
                     assert len(list((directory / 'task').iterdir())) == 1, pid
             if owns_store:
                 assert name.startswith(b'nginx: cache manager process'), (pid, name)
